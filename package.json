@@ -14,5 +14,8 @@
     "test": "pnpm -r --filter '!@opslane/test-e2e' test",
     "test:unit": "pnpm -r --filter '!@opslane/test-e2e' test",
     "test:e2e": "pnpm --filter @opslane/test-e2e test"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.0"
   }
 }

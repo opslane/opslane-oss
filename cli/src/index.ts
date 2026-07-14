@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import { login } from './login.js';
 import { init } from './init.js';
@@ -10,12 +11,18 @@ import { verify } from './verify.js';
 import { status } from './status.js';
 import { listErrors, getError } from './errors.js';
 
+// Derive the version from package.json so Changesets bumps propagate to
+// `opslane --version` without a hand edit (dist/index.js -> ../package.json).
+const pkg = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+) as { version: string };
+
 const program = new Command();
 
 program
   .name('opslane')
   .description('Opslane CLI - AI-powered production error resolution')
-  .version('0.0.1');
+  .version(pkg.version);
 
 program
   .command('login')
