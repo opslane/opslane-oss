@@ -115,14 +115,12 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./packages/ingestion/db/migrations:/migrations
-    entrypoint: >
-      sh -c "for f in /migrations/*.sql; do
-        echo \"Applying $$f...\";
-        PGPASSWORD=opslane_dev psql -h postgres -U opslane -d opslane -f $$f;
-      done"
+      - ./packages/ingestion/db/migrations:/migrations:ro
+      - ./scripts/run-migrations.sh:/run-migrations.sh:ro
+    entrypoint: ["/run-migrations.sh"]
     environment:
-      PGPASSWORD: opslane_dev
+      MIGRATION_DIR: /migrations
+      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane
 
 volumes:
   pgdata:
