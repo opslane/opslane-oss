@@ -1,0 +1,39 @@
+# Opslane
+
+> AI-powered production error-resolution engine for browser JavaScript apps: errors in, verified fix PRs (or explicit needs_human incidents) out. Self-hostable via Docker Compose. Server code AGPL-3.0-only; SDK/CLI/shared types MIT.
+
+This file indexes the agent-relevant documentation. All canonical content is plain Markdown in this repository. (Location decision: repo root, so it ships with every clone; recorded in issue #18.)
+
+## Start here
+
+- [README](README.md): what Opslane is, honest scope, architecture, licensing boundary, run-it-locally
+- [Self-host quickstart](docs/quickstart/self-host.md): two paths — no-credentials smoke test (ends needs_human) and full error-to-PR
+- [Install guide](docs/install.md): hosted setup and manual SDK fallback
+
+## Architecture and trust
+
+- [Architecture overview](docs/architecture/overview.md): components, trust boundaries, no-external-queue design
+- [Life of an error](docs/architecture/life-of-an-error.md): capture → group → claim → triage → fix → route by confidence
+- [Precision](docs/architecture/precision.md): exactly what "verified" guarantees and what it does not
+- [Trust and security model](docs/architecture/trust.md): GitHub permissions, data flow, credential storage, masking, honest gaps (incl. no automated replay retention)
+- [Replay privacy](docs/replay-privacy.md): what replay data may contain
+
+## Reference (drift-checked against source in CI)
+
+- [SDK options](docs/reference/sdk-options.md): every init() option with defaults, from SdkInitOptions
+- [HTTP routes](docs/reference/http-routes.md): every registered route with auth mode
+- [Environment variables](docs/reference/environment-variables.md): every var each service reads, plus known dead config
+- [Reason codes](docs/reference/reason-codes.md): all 22 needs_human reason codes with remediations
+- Drift check: scripts/check-docs-drift.mjs (run: pnpm docs:check)
+
+## Contributing and agents
+
+- [AGENTS.md](AGENTS.md): repository conventions, verification requirements, guardrails
+- [SDK README](packages/sdk/README.md): install, framework integrations, config table, privacy defaults
+- Issue tracker: https://github.com/opslane/opslane-oss/issues (docs epic: #2)
+
+## Not yet written (tracked)
+
+- CLI reference: blocked on the CLI contract settling (issue #3, then #16)
+- Production self-hosting operations: blocked on retention/backup readiness (issue #23)
+- Task guides for Vue/React/vanilla/source-maps/GitHub App/replay privacy: issue #20
