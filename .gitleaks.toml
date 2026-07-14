@@ -1,7 +1,10 @@
 [extend]
 useDefault = true
 
-[[allowlists]]
+# NOTE: this must stay the singular [allowlist] table. The plural
+# [[allowlists]] form is silently ignored as a global allowlist by the
+# gitleaks version pinned in CI, which un-suppresses every entry below.
+[allowlist]
 description = "Synthetic credentials used to verify secret masking and authentication failures"
 paths = [
   '''packages/ingestion/db/agent_session_test\.go''',
@@ -9,4 +12,9 @@ paths = [
   '''packages/sdk/src/__tests__/scrub\.test\.ts''',
   '''test-e2e/error-to-pr\.test\.ts''',
   '''test-e2e/replay-contract\.test\.ts''',
+]
+regexes = [
+  # Deterministic canary values planted by the keyless E2E lane's token-leak
+  # scan (.github/workflows/ci.yml). Not secrets by construction.
+  '''OPSLANE-E2E-CANARY-[a-z]+-[0-9a-f]+''',
 ]

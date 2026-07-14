@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:ab47a724d0e37131ac950b98ff2beeb3fdb3bfcc592d73c6cc4b4e7626649671
         env:
           POSTGRES_USER: opslane
           POSTGRES_PASSWORD: opslane_dev
@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:ab47a724d0e37131ac950b98ff2beeb3fdb3bfcc592d73c6cc4b4e7626649671
         env:
           POSTGRES_USER: opslane
           POSTGRES_PASSWORD: opslane_dev
@@ -86,6 +86,8 @@ jobs:
         run: pnpm --filter @opslane/sdk exec playwright install --with-deps chromium
       - run: pnpm -r build
       - run: pnpm test
+      - name: License-boundary check (MIT-published packages)
+        run: node scripts/check-licenses.mjs
 
   compose:
     name: Compose validation
@@ -179,11 +181,27 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  security:
+    name: Secret scan and action pinning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Gitleaks secret scan
+        run: >
+          docker run --rm -v "$PWD:/repo:ro"
+          ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+          dir /repo --config /repo/.gitleaks.toml --no-banner --redact
+      - name: Enforce SHA-pinned actions
+        run: node scripts/check-action-pins.mjs
+
   ci-ok:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker, e2e-keyless]
+    needs: [go, js, compose, docker, e2e-keyless, security]
     if: always()
     steps:
       - name: Report job results
