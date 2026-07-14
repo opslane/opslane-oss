@@ -55,7 +55,7 @@ Expected result:
  needs_human | missing_github_token | Failed to clone repository: GITHUB_TOKEN is not set
 ```
 
-That `needs_human` + reason code is the product's core contract: every investigation ends in an explicit terminal state — a verified fix PR, or a stated reason a human is needed. Which specific reason code you see depends on which credential the worker misses first; the guarantee is the explicit terminal state, not a particular code.
+That `needs_human` + reason code is the product's core contract: every investigation ends in an explicit state — a verified fix PR (`pr_created`), a posted root-cause analysis awaiting your go-ahead (`investigated`, for medium/low-confidence results), or a stated reason a human is needed (`needs_human`). Which specific reason code you see depends on which credential the worker misses first; the guarantee is the explicit state, not a particular code.
 
 ## Path 2 — full error-to-PR
 
@@ -82,7 +82,7 @@ Then send an error that originates from code in that repository (install [`@opsl
 docker compose logs -f worker
 ```
 
-A successful run ends with the error group in `pr_created` and a pull request on the target repo containing the fix and its verification evidence. Runs that can't be verified end in `needs_human` with the reason — the worker never opens an unverified PR.
+A successful run ends with the error group in `pr_created` and a pull request on the target repo containing the fix and its verification evidence. Medium/low-confidence analyses end in `investigated` — the root cause is posted and the fix waits for you to trigger it from the dashboard. Runs that can't progress end in `needs_human` with the reason. The worker never opens an unverified PR.
 
 The same contract is exercised by `test-e2e/error-to-pr.test.ts`, which skips itself unless `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are present.
 
@@ -105,4 +105,4 @@ docker compose down -v     # stop and delete all local data (destructive)
 
 - **Event returns 401** — the API key header is wrong or the seed didn't run. Re-run the seed command; it's idempotent.
 - **Job stays pending** — check `docker compose ps`: the worker container must be up and healthy. `docker compose logs worker` shows claim/completion lines.
-- **Dashboard shows a login page you can't get past** — dashboard sign-in uses GitHub OAuth and needs a GitHub App configured (`GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`). Path 1 doesn't require the dashboard.
+- **Dashboard shows a login page you can't get past** — dashboard sign-in uses GitHub OAuth and needs a GitHub App configured (`GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`) plus `DASHBOARD_ORIGIN=http://localhost:8082`, all set before `docker compose up`. Without `DASHBOARD_ORIGIN`, a successful GitHub sign-in redirects to port 3000, where nothing is listening in this setup. Path 1 doesn't require the dashboard.

@@ -26,7 +26,7 @@ flowchart LR
 
 Postgres is both the system of record and the job queue — there is no Redis or external queue to run.
 
-Every investigation ends in an explicit terminal state. A fix PR is only opened when the fix passed verification; anything else becomes a `needs_human` incident with a reason code, a plain-language explanation, and a suggested remediation.
+Every investigation ends in an explicit state, one of three: a fix PR is opened only when the fix passed verification with high confidence (`pr_created`); a medium/low-confidence analysis is posted as `investigated`, with the root cause waiting for you to review and trigger a fix; and anything the worker cannot progress becomes a `needs_human` incident with a reason code, a plain-language explanation, and a suggested remediation.
 
 ## Run it locally
 
@@ -54,7 +54,7 @@ What you can do next depends on which credentials you provide:
 
    The event is captured and grouped, the worker picks up the investigation, and — since it has no AI or GitHub credentials — the error group ends in a `needs_human` state with an explicit reason code and message.
 
-2. **Dashboard sign-in** uses GitHub OAuth, which requires a GitHub App (`GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET` in your environment before `docker compose up`).
+2. **Dashboard sign-in** uses GitHub OAuth, which requires a GitHub App: set `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, and `DASHBOARD_ORIGIN=http://localhost:8082` in your environment before `docker compose up`. (Without `DASHBOARD_ORIGIN`, the OAuth callback redirects to port 3000 — the dashboard dev-server default — where nothing is listening in the Compose setup.)
 
 3. **Full error-to-PR** additionally needs `ANTHROPIC_API_KEY`, `E2B_API_KEY`, and GitHub credentials with access to a repository the worker may open pull requests against.
 
