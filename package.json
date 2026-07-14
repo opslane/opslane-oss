@@ -3,6 +3,9 @@
   "license": "AGPL-3.0-only",
   "private": true,
   "packageManager": "pnpm@10.6.4+sha1.2036e172356d1e918e11cb21d795160cd6696fa9",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "db:up": "docker compose up -d postgres",
     "db:migrate": "docker compose run --rm migrate",

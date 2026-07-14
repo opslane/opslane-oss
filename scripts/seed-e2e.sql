@@ -13,7 +13,7 @@ ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO projects (id, org_id, name, github_repo, default_branch) VALUES
   ('00000000-0000-0000-0000-000000000010', '00000000-0000-0000-0000-000000000001',
-   'Opslane Test Fixture', 'opslane/opslane-test-fixture', 'main')
+   'Opslane Test Fixture', 'opslane/defender-test-fixture', 'main')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO environments (id, project_id, name) VALUES

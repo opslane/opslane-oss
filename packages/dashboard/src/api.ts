@@ -13,10 +13,11 @@ const BASE = '/api/v1';
 
 const AUTHED_KEY = 'opslane_authed';
 
-// One-time cleanup of pre-cookie token storage.
-localStorage.removeItem('opslane_access_token');
-localStorage.removeItem('opslane_refresh_token');
-localStorage.removeItem('opslane_token_expires_at');
+// One-time cleanup of pre-cookie token storage. These are the historical key
+// names an older build actually wrote — do not rename them.
+localStorage.removeItem('defender_access_token');
+localStorage.removeItem('defender_refresh_token');
+localStorage.removeItem('defender_token_expires_at');
 
 export interface AuthUser {
   id: string;
@@ -35,9 +36,10 @@ export function markAuthed(): void {
 
 export function clearAuth(): void {
   localStorage.removeItem(AUTHED_KEY);
-  localStorage.removeItem('opslane_access_token');
-  localStorage.removeItem('opslane_refresh_token');
-  localStorage.removeItem('opslane_token_expires_at');
+  // Historical pre-cookie key names — do not rename.
+  localStorage.removeItem('defender_access_token');
+  localStorage.removeItem('defender_refresh_token');
+  localStorage.removeItem('defender_token_expires_at');
 }
 
 
