@@ -1,0 +1,121 @@
+# @opslane/sdk
+
+Browser error-monitoring SDK for [Opslane](https://github.com/opslane/opslane-oss) — an AI-powered production error-resolution engine. The SDK captures unhandled errors, console/network breadcrumbs, and (optionally) session replays, and ships them to your Opslane instance, which investigates each error and opens a verified fix PR or files an actionable incident.
+
+The SDK is MIT licensed. It never throws into your application code: every hook is wrapped so an SDK failure cannot break your app.
+
+## Install
+
+```bash
+npm install @opslane/sdk
+```
+
+## Initialize
+
+Call `init` once, as early as possible in your browser entry point:
+
+```ts
+import { init } from '@opslane/sdk';
+
+init({
+  apiKey: 'your-opslane-ingest-key',
+  endpoint: 'https://your-opslane-instance.example.com', // omit for hosted Opslane
+  release: import.meta.env.VITE_OPSLANE_RELEASE,          // e.g. your git SHA
+});
+```
+
+`init` installs global `error`/`unhandledrejection` handlers and instruments `console`, `fetch`, and `XMLHttpRequest` for breadcrumbs. Calling it twice is a no-op. `destroy()` reverses everything.
+
+`release` should match the source maps you upload for that deploy — use the commit SHA or another immutable build identifier.
+
+## Framework integrations
+
+### Vue 3
+
+The Vue plugin hooks `app.config.errorHandler` (preserving any existing handler) and tags events with the failing component name:
+
+```ts
+import { createApp } from 'vue';
+import { init, opslaneVuePlugin } from '@opslane/sdk';
+
+init({ apiKey: '...' });
+createApp(App).use(opslaneVuePlugin).mount('#app');
+```
+
+### React 18/19
+
+An error boundary that reports render errors, from the `/react` entry:
+
+```tsx
+import { init } from '@opslane/sdk';
+import { OpslaneErrorBoundary } from '@opslane/sdk/react';
+
+init({ apiKey: '...' });
+
+<OpslaneErrorBoundary fallback={<p>Something went wrong</p>}>
+  <App />
+</OpslaneErrorBoundary>
+```
+
+React and Vue are optional peer dependencies — installing the SDK pulls in neither.
+
+### Vite source maps
+
+Upload source maps at build time so investigations see your original code instead of minified bundles:
+
+```ts
+// vite.config.ts
+import { opslaneSourceMapPlugin } from '@opslane/sdk/vite-plugin';
+
+export default {
+  plugins: [
+    opslaneSourceMapPlugin({
+      endpoint: 'https://your-opslane-instance.example.com',
+      apiKey: process.env.OPSLANE_API_KEY!,
+      release: process.env.GIT_SHA, // must match init()'s release
+    }),
+  ],
+};
+```
+
+## Configuration
+
+All `init` options, from the SDK's `SdkInitOptions` type:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | *(required)* | Project ingest key. `init` is a no-op without it. |
+| `endpoint` | `string` | `https://api.opslane.com` | Your Opslane instance. Must be a valid http(s) URL. |
+| `release` | `string` | `''` | Immutable build identifier; must match uploaded source maps. |
+| `maxBreadcrumbs` | `number` | `50` | Maximum breadcrumbs kept in the ring buffer. |
+| `breadcrumbMaxAge` | `number` | `30000` | Milliseconds a breadcrumb stays relevant before being dropped. |
+| `flushInterval` | `number` | `5000` | Milliseconds between batched event flushes. |
+| `maxBatchSize` | `number` | `10` | Maximum events per flush batch. |
+| `debug` | `boolean` | `false` | Log SDK-internal problems to the console. |
+| `replay.enabled` | `boolean` | `false` | Capture session replays around errors. **Off by default.** |
+| `sampleRate` | `number` | `1` | Fraction of events sent, clamped to `[0, 1]`. |
+| `errorThrottleMs` | `number` | `1000` | Minimum milliseconds between reports of the same error. |
+| `beforeSend` | `(event) => event \| null` | — | Inspect/modify every event before sending; return `null` to drop it. |
+
+## Manual capture and user context
+
+```ts
+import { captureException, setUser, clearUser } from '@opslane/sdk';
+
+captureException(new Error('caught but worth reporting'));
+setUser({ id: 'user-123' });
+clearUser();
+```
+
+## Privacy defaults
+
+- **Replay is opt-in** (`replay.enabled` defaults to `false`).
+- When enabled, replay masks **all input values** (`maskAllInputs: true`) and any element matching the `.opslane-mask` selector.
+- Captured URLs are scrubbed of query strings, userinfo, and token-bearing hashes; captured text is scrubbed of JWTs, `Bearer` tokens, and `password`/`secret`/`api_key`-style key-value pairs before leaving the browser.
+- Use `beforeSend` to drop or redact anything scrubbing doesn't cover.
+
+See [replay privacy](https://github.com/opslane/opslane-oss/blob/main/docs/replay-privacy.md) for what replay data may contain.
+
+## License
+
+MIT — see [LICENSE](./LICENSE). The Opslane server components are licensed separately (AGPL-3.0-only).

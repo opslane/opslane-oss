@@ -1,0 +1,20 @@
+# SDK options
+
+All options accepted by `init()` from `@opslane/sdk`, mirrored from `SdkInitOptions` and the defaults object in `packages/sdk/src/config.ts`. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if the type and this page disagree.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | *(required)* | Per-environment ingest key. `init` refuses to start without it. |
+| `endpoint` | `string` | `https://api.opslane.com` | Your Opslane instance; validated as an http(s) URL. |
+| `release` | `string` | `''` | Immutable build identifier (git SHA); must match uploaded source maps. |
+| `maxBreadcrumbs` | `number` | `50` | Ring-buffer size for breadcrumbs attached to each event. |
+| `breadcrumbMaxAge` | `number` | `30000` | Milliseconds before a breadcrumb is considered stale and dropped. |
+| `flushInterval` | `number` | `5000` | Milliseconds between transport flushes. |
+| `maxBatchSize` | `number` | `10` | Maximum events per flush. |
+| `debug` | `boolean` | `false` | Log SDK-internal problems to the console. |
+| `replay` | `{ enabled?: boolean }` | `{ enabled: false }` | Session replay capture — opt-in. |
+| `sampleRate` | `number` | `1` | Fraction of events sent; clamped to `[0, 1]`. |
+| `errorThrottleMs` | `number` | `1000` | Minimum interval between reports of the same error. |
+| `beforeSend` | `(event) => event \| null` | `undefined` | Final hook: mutate the outgoing payload or return `null` to drop it. |
+
+Related exports: `captureException(err)`, `setUser({ id })`, `clearUser()`, `destroy()`, `opslaneVuePlugin`, and (from `@opslane/sdk/react`) `OpslaneErrorBoundary` / `captureReactError`. Build-time source-map upload lives in `@opslane/sdk/vite-plugin` — see the [SDK README](../../packages/sdk/README.md).

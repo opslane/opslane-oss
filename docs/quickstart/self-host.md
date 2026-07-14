@@ -1,0 +1,108 @@
+# Self-host quickstart
+
+Run Opslane locally with Docker Compose. This is **developer self-hosting** — the default Compose file uses development credentials and is not a production deployment (production operations are tracked separately).
+
+There are two paths, depending on which credentials you have. Both start the same way.
+
+## Prerequisites
+
+- Docker with Compose
+- Ports `8082` (API + dashboard), `5434` (Postgres), and `9012` (MinIO) free on your machine
+
+No other tools are required for Path 1. Nothing here needs Node, Go, or pnpm — everything runs in containers.
+
+## Start the stack
+
+```bash
+git clone https://github.com/opslane/opslane-oss.git
+cd opslane-oss
+docker compose up -d
+curl http://localhost:8082/health
+```
+
+`docker compose up -d` starts Postgres, MinIO (replay storage), the ingestion API (which also serves the dashboard at <http://localhost:8082>), and the worker. A one-shot `migrate` service applies all database migrations automatically — you do not run migrations by hand.
+
+If the `curl` returns `{"status":"ok"}`-style output with HTTP 200, the stack is up.
+
+> **Port conflict?** If `docker compose up` reports "port is already allocated", another service holds 8082/5434/9012. `docker ps` will show the holder. The compose command's output is the source of truth — a healthy response on 8082 can come from a different app entirely, so always check `docker compose ps` shows *these* services healthy.
+
+## Path 1 — no credentials: watch an error become an incident
+
+**What this proves:** ingestion, grouping, the job queue, and the worker's honest terminal states — without any AI or GitHub account.
+
+Seed a test project and API key, then send a fake browser error:
+
+```bash
+docker compose exec -T postgres psql -U opslane -d opslane < scripts/seed-e2e.sql
+
+curl -X POST http://localhost:8082/api/v1/events \
+  -H 'Content-Type: application/json' -H 'X-API-Key: e2e-test-key-plaintext' \
+  -d '{"timestamp":"2026-01-01T00:00:00Z","error":{"type":"ReferenceError","message":"demo is not defined","stack":"ReferenceError: demo is not defined\n  at app.js:1:1"},"breadcrumbs":[],"context":{"url":"https://example.com","user_agent":"smoke test"},"sdk_version":"0.0.1"}'
+```
+
+You should get HTTP `202` with an `error_group_id`. Within ~30 seconds the worker claims the investigation job and — because it has no credentials to clone your repo or run AI analysis — closes it honestly:
+
+```bash
+docker compose exec -T postgres psql -U opslane -d opslane \
+  -c "SELECT status, reason_code, reason_message FROM error_groups ORDER BY created_at DESC LIMIT 1;"
+```
+
+Expected result:
+
+```text
+   status    |     reason_code      |                   reason_message
+-------------+----------------------+-----------------------------------------------------
+ needs_human | missing_github_token | Failed to clone repository: GITHUB_TOKEN is not set
+```
+
+That `needs_human` + reason code is the product's core contract: every investigation ends in an explicit state — a verified fix PR (`pr_created`), a posted root-cause analysis awaiting your go-ahead (`investigated`, for medium/low-confidence results), or a stated reason a human is needed (`needs_human`). Which specific reason code you see depends on which credential the worker misses first; the guarantee is the explicit state, not a particular code.
+
+## Path 2 — full error-to-PR
+
+**What this proves:** the complete loop — error in, investigated, fix written, verified in a sandbox, pull request out.
+
+Requires all of the following set in your environment **before** `docker compose up`:
+
+| Variable | What it's for | Where to get it |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | AI investigation and fix generation | [console.anthropic.com](https://console.anthropic.com) |
+| `E2B_API_KEY` | Sandbox where fixes are verified before a PR is opened | [e2b.dev](https://e2b.dev) |
+| `GITHUB_TOKEN` | Cloning the repo and opening the PR | GitHub → Settings → Developer settings → fine-grained PAT with `contents` + `pull_requests` write on the target repo |
+
+You also need a **target repository the worker may open PRs against** — use a fork of a small fixture app (e.g. this repo's `test-fixtures/vue-app` pushed to a scratch repo), never a production repo you aren't ready to receive AI PRs on. Point your project's `github_repo` at it (via the dashboard, or by editing the seeded project row).
+
+```bash
+export ANTHROPIC_API_KEY=... E2B_API_KEY=... GITHUB_TOKEN=...
+docker compose up -d
+```
+
+Then send an error that originates from code in that repository (install [`@opslane/sdk`](../../packages/sdk/README.md) in the fixture app, or replay a stack trace that matches its files). Watch the job:
+
+```bash
+docker compose logs -f worker
+```
+
+A successful run ends with the error group in `pr_created` and a pull request on the target repo containing the fix and its verification evidence. Medium/low-confidence analyses end in `investigated` — the root cause is posted and the fix waits for you to trigger it from the dashboard. Runs that can't progress end in `needs_human` with the reason. The worker never opens an unverified PR.
+
+The same contract is exercised by `test-e2e/error-to-pr.test.ts`, which skips itself unless `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are present.
+
+## The 15-minute definition
+
+When we say this quickstart takes under fifteen minutes, the timer is defined as:
+
+- **Start:** the `git clone` command begins, on a machine with Docker installed and images *not* pre-pulled, on a residential-class connection.
+- **End (Path 1):** the `SELECT` above shows a `needs_human` row.
+- Prerequisites (installing Docker, creating accounts for Path 2 credentials) are outside the timer.
+
+## Cleanup
+
+```bash
+docker compose down        # stop the stack, keep data
+docker compose down -v     # stop and delete all local data (destructive)
+```
+
+## Troubleshooting
+
+- **Event returns 401** — the API key header is wrong or the seed didn't run. Re-run the seed command; it's idempotent.
+- **Job stays pending** — check `docker compose ps`: the worker container must be up and healthy. `docker compose logs worker` shows claim/completion lines.
+- **Dashboard shows a login page you can't get past** — dashboard sign-in uses GitHub OAuth and needs a GitHub App configured (`GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`) plus `DASHBOARD_ORIGIN=http://localhost:8082`, all set before `docker compose up`. Without `DASHBOARD_ORIGIN`, a successful GitHub sign-in redirects to port 3000, where nothing is listening in this setup. Path 1 doesn't require the dashboard.
