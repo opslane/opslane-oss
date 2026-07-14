@@ -1,0 +1,23 @@
+{
+  "name": "@opslane/eval",
+  "version": "0.0.1",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval": "tsx src/runner.ts",
+    "eval:dry": "tsx src/runner.ts --dry-run",
+    "eval:json": "tsx src/runner.ts --json",
+    "test": "vitest run",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@opslane/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.0"
+  }
+}

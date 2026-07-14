@@ -1,0 +1,547 @@
+{
+  "events": [
+    {
+      "type": 4,
+      "data": {
+        "href": "http://localhost:5173/",
+        "width": 1280,
+        "height": 720
+      },
+      "timestamp": 1780255658752
+    },
+    {
+      "type": 2,
+      "data": {
+        "node": {
+          "type": 0,
+          "childNodes": [
+            {
+              "type": 1,
+              "name": "html",
+              "publicId": "",
+              "systemId": "",
+              "id": 2
+            },
+            {
+              "type": 2,
+              "tagName": "html",
+              "attributes": {
+                "lang": "en"
+              },
+              "childNodes": [
+                {
+                  "type": 2,
+                  "tagName": "head",
+                  "attributes": {},
+                  "childNodes": [
+                    {
+                      "type": 3,
+                      "textContent": "\n  ",
+                      "id": 5
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "script",
+                      "attributes": {
+                        "type": "module",
+                        "src": "http://localhost:5173/@vite/client"
+                      },
+                      "childNodes": [],
+                      "id": 6
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n\n  ",
+                      "id": 7
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "meta",
+                      "attributes": {
+                        "charset": "UTF-8"
+                      },
+                      "childNodes": [],
+                      "id": 8
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n  ",
+                      "id": 9
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "meta",
+                      "attributes": {
+                        "name": "viewport",
+                        "content": "width=device-width, initial-scale=1.0"
+                      },
+                      "childNodes": [],
+                      "id": 10
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n  ",
+                      "id": 11
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "title",
+                      "attributes": {},
+                      "childNodes": [
+                        {
+                          "type": 3,
+                          "textContent": "Opslane Fixture App",
+                          "id": 13
+                        }
+                      ],
+                      "id": 12
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n",
+                      "id": 14
+                    }
+                  ],
+                  "id": 4
+                },
+                {
+                  "type": 3,
+                  "textContent": "\n",
+                  "id": 15
+                },
+                {
+                  "type": 2,
+                  "tagName": "body",
+                  "attributes": {},
+                  "childNodes": [
+                    {
+                      "type": 3,
+                      "textContent": "\n  ",
+                      "id": 17
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "div",
+                      "attributes": {
+                        "id": "app",
+                        "data-v-app": ""
+                      },
+                      "childNodes": [
+                        {
+                          "type": 2,
+                          "tagName": "div",
+                          "attributes": {},
+                          "childNodes": [
+                            {
+                              "type": 2,
+                              "tagName": "nav",
+                              "attributes": {},
+                              "childNodes": [
+                                {
+                                  "type": 2,
+                                  "tagName": "button",
+                                  "attributes": {
+                                    "data-testid": "nav-home"
+                                  },
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "Home",
+                                      "id": 22
+                                    }
+                                  ],
+                                  "id": 21
+                                },
+                                {
+                                  "type": 2,
+                                  "tagName": "button",
+                                  "attributes": {
+                                    "data-testid": "nav-usercard"
+                                  },
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "UserCard",
+                                      "id": 24
+                                    }
+                                  ],
+                                  "id": 23
+                                },
+                                {
+                                  "type": 2,
+                                  "tagName": "button",
+                                  "attributes": {
+                                    "data-testid": "nav-async"
+                                  },
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "AsyncLoader",
+                                      "id": 26
+                                    }
+                                  ],
+                                  "id": 25
+                                },
+                                {
+                                  "type": 2,
+                                  "tagName": "button",
+                                  "attributes": {
+                                    "data-testid": "nav-watcher"
+                                  },
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "WatcherBug",
+                                      "id": 28
+                                    }
+                                  ],
+                                  "id": 27
+                                },
+                                {
+                                  "type": 2,
+                                  "tagName": "button",
+                                  "attributes": {
+                                    "data-testid": "nav-fetch"
+                                  },
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "FetchUser",
+                                      "id": 30
+                                    }
+                                  ],
+                                  "id": 29
+                                }
+                              ],
+                              "id": 20
+                            },
+                            {
+                              "type": 2,
+                              "tagName": "main",
+                              "attributes": {},
+                              "childNodes": [
+                                {
+                                  "type": 2,
+                                  "tagName": "p",
+                                  "attributes": {},
+                                  "childNodes": [
+                                    {
+                                      "type": 3,
+                                      "textContent": "Select a bug to trigger",
+                                      "id": 33
+                                    }
+                                  ],
+                                  "id": 32
+                                },
+                                {
+                                  "type": 5,
+                                  "textContent": "v-if",
+                                  "id": 34
+                                },
+                                {
+                                  "type": 5,
+                                  "textContent": "v-if",
+                                  "id": 35
+                                },
+                                {
+                                  "type": 5,
+                                  "textContent": "v-if",
+                                  "id": 36
+                                },
+                                {
+                                  "type": 5,
+                                  "textContent": "v-if",
+                                  "id": 37
+                                }
+                              ],
+                              "id": 31
+                            }
+                          ],
+                          "id": 19
+                        }
+                      ],
+                      "id": 18
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n  ",
+                      "id": 38
+                    },
+                    {
+                      "type": 2,
+                      "tagName": "script",
+                      "attributes": {
+                        "type": "module",
+                        "src": "http://localhost:5173/src/main.ts"
+                      },
+                      "childNodes": [],
+                      "id": 39
+                    },
+                    {
+                      "type": 3,
+                      "textContent": "\n\n\n",
+                      "id": 40
+                    }
+                  ],
+                  "id": 16
+                }
+              ],
+              "id": 3
+            }
+          ],
+          "id": 1
+        },
+        "initialOffset": {
+          "left": 0,
+          "top": 0
+        }
+      },
+      "timestamp": 1780255658766
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 1,
+        "positions": [
+          {
+            "x": 96,
+            "y": 18,
+            "id": 23,
+            "timeOffset": 0
+          }
+        ]
+      },
+      "timestamp": 1780255658810
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 1,
+        "id": 23,
+        "x": 96.08000183105469,
+        "y": 18.5
+      },
+      "timestamp": 1780255658812
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 5,
+        "id": 23
+      },
+      "timestamp": 1780255658812
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 0,
+        "id": 23,
+        "x": 96.08000183105469,
+        "y": 18.5
+      },
+      "timestamp": 1780255658812
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 2,
+        "id": 23,
+        "x": 96,
+        "y": 18,
+        "pointerType": 0
+      },
+      "timestamp": 1780255658812
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 0,
+        "texts": [],
+        "attributes": [],
+        "removes": [
+          {
+            "parentId": 31,
+            "id": 32
+          },
+          {
+            "parentId": 31,
+            "id": 34
+          }
+        ],
+        "adds": [
+          {
+            "parentId": 31,
+            "nextId": 35,
+            "node": {
+              "type": 2,
+              "tagName": "div",
+              "attributes": {
+                "class": "user-card",
+                "data-testid": "user-card"
+              },
+              "childNodes": [],
+              "id": 41
+            }
+          },
+          {
+            "parentId": 41,
+            "nextId": null,
+            "node": {
+              "type": 2,
+              "tagName": "button",
+              "attributes": {
+                "data-testid": "edit-profile-btn"
+              },
+              "childNodes": [],
+              "id": 42
+            }
+          },
+          {
+            "parentId": 42,
+            "nextId": null,
+            "node": {
+              "type": 3,
+              "textContent": "Edit Profile",
+              "id": 43
+            }
+          },
+          {
+            "parentId": 31,
+            "nextId": 41,
+            "node": {
+              "type": 5,
+              "textContent": "v-if",
+              "id": 44
+            }
+          },
+          {
+            "parentId": 41,
+            "nextId": 42,
+            "node": {
+              "type": 2,
+              "tagName": "button",
+              "attributes": {
+                "data-testid": "like-btn"
+              },
+              "childNodes": [],
+              "id": 45
+            }
+          },
+          {
+            "parentId": 41,
+            "nextId": 45,
+            "node": {
+              "type": 2,
+              "tagName": "p",
+              "attributes": {},
+              "childNodes": [],
+              "id": 46
+            }
+          },
+          {
+            "parentId": 41,
+            "nextId": 46,
+            "node": {
+              "type": 2,
+              "tagName": "h2",
+              "attributes": {},
+              "childNodes": [],
+              "id": 47
+            }
+          },
+          {
+            "parentId": 47,
+            "nextId": null,
+            "node": {
+              "type": 3,
+              "textContent": "alice",
+              "id": 48
+            }
+          },
+          {
+            "parentId": 46,
+            "nextId": null,
+            "node": {
+              "type": 3,
+              "textContent": "Likes: 0",
+              "id": 49
+            }
+          },
+          {
+            "parentId": 45,
+            "nextId": null,
+            "node": {
+              "type": 3,
+              "textContent": "Like",
+              "id": 50
+            }
+          }
+        ]
+      },
+      "timestamp": 1780255658815
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 1,
+        "id": 42,
+        "x": 88.69999694824219,
+        "y": 141.30999755859375
+      },
+      "timestamp": 1780255658852
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 6,
+        "id": 23
+      },
+      "timestamp": 1780255658853
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 5,
+        "id": 42
+      },
+      "timestamp": 1780255658853
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 0,
+        "id": 42,
+        "x": 88.69999694824219,
+        "y": 141.30999755859375
+      },
+      "timestamp": 1780255658853
+    },
+    {
+      "type": 3,
+      "data": {
+        "source": 2,
+        "type": 2,
+        "id": 42,
+        "x": 88,
+        "y": 141,
+        "pointerType": 0
+      },
+      "timestamp": 1780255658853
+    }
+  ],
+  "meta": {
+    "sdk_version": "0.0.0-dev",
+    "page_url": "http://localhost:5173/",
+    "started_at": 1780255658752,
+    "ended_at": 1780255658861,
+    "crash_timestamp": 1780255658861
+  }
+}

@@ -1,0 +1,162 @@
+import type { Breadcrumb } from '@opslane/shared';
+import { addBreadcrumb } from './breadcrumbs';
+import { getConfig } from './config';
+
+// -- Fetch interceptor --
+
+let originalFetch: typeof globalThis.fetch | null = null;
+
+function isSdkEndpoint(url: string): boolean {
+  try {
+    const config = getConfig();
+    return url.startsWith(config.endpoint);
+  } catch {
+    return false;
+  }
+}
+
+function extractFetchInfo(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): { url: string; method: string } {
+  let url: string;
+  let method: string;
+
+  if (input instanceof Request) {
+    url = input.url;
+    method = input.method || 'GET';
+  } else {
+    url = String(input);
+    method = init?.method || 'GET';
+  }
+
+  return { url, method: method.toUpperCase() };
+}
+
+export function patchFetch(): void {
+  if (originalFetch) return;
+
+  originalFetch = globalThis.fetch;
+  const orig = originalFetch;
+
+  globalThis.fetch = async function (
+    input: RequestInfo | URL,
+    init?: RequestInit
+  ): Promise<Response> {
+    const { url, method } = extractFetchInfo(input, init);
+
+    if (isSdkEndpoint(url)) {
+      return orig.call(globalThis, input, init);
+    }
+
+    try {
+      const response = await orig.call(globalThis, input, init);
+
+      try {
+        const crumb: Breadcrumb = {
+          type: 'fetch',
+          timestamp: new Date().toISOString(),
+          category: 'fetch',
+          message: `${method} ${url}`,
+          level: response.ok ? 'info' : 'warning',
+          data: {
+            method,
+            url,
+            status_code: response.status,
+          },
+        };
+        addBreadcrumb(crumb);
+      } catch {
+        // SDK must never throw
+      }
+
+      return response;
+    } catch (error: unknown) {
+      try {
+        const crumb: Breadcrumb = {
+          type: 'fetch',
+          timestamp: new Date().toISOString(),
+          category: 'fetch',
+          message: `${method} ${url}`,
+          level: 'error',
+          data: {
+            method,
+            url,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        };
+        addBreadcrumb(crumb);
+      } catch {
+        // SDK must never throw
+      }
+
+      throw error; // Re-throw the original error to the app
+    }
+  };
+}
+
+export function unpatchFetch(): void {
+  if (!originalFetch) return;
+  globalThis.fetch = originalFetch;
+  originalFetch = null;
+}
+
+// -- XMLHttpRequest interceptor --
+
+let originalXHROpen: typeof XMLHttpRequest.prototype.open | null = null;
+
+interface XHRWithOpslane extends XMLHttpRequest {
+  _opslaneMethod?: string;
+  _opslaneUrl?: string;
+}
+
+export function patchXHR(): void {
+  if (originalXHROpen) return;
+
+  originalXHROpen = XMLHttpRequest.prototype.open;
+  const origOpen = originalXHROpen;
+
+  XMLHttpRequest.prototype.open = function (
+    this: XHRWithOpslane,
+    method: string,
+    url: string | URL,
+    ...rest: unknown[]
+  ): void {
+    this._opslaneMethod = method.toUpperCase();
+    this._opslaneUrl = String(url);
+
+    this.addEventListener('loadend', function (this: XHRWithOpslane) {
+      try {
+        const reqUrl = this._opslaneUrl || '';
+        const reqMethod = this._opslaneMethod || 'GET';
+
+        if (isSdkEndpoint(reqUrl)) return;
+
+        const crumb: Breadcrumb = {
+          type: 'xhr',
+          timestamp: new Date().toISOString(),
+          category: 'xhr',
+          message: `${reqMethod} ${reqUrl}`,
+          level: this.status >= 400 ? 'warning' : 'info',
+          data: {
+            method: reqMethod,
+            url: reqUrl,
+            status_code: this.status,
+          },
+        };
+        addBreadcrumb(crumb);
+      } catch {
+        // SDK must never throw
+      }
+    });
+
+    // XHR.open has overloaded signatures; targeted cast to forward variadic args
+    (origOpen as (...args: unknown[]) => void).apply(this, [method, url, ...rest]);
+  };
+}
+
+export function unpatchXHR(): void {
+  if (!originalXHROpen) return;
+  XMLHttpRequest.prototype.open = originalXHROpen;
+  originalXHROpen = null;
+}

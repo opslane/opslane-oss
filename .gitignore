@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.js.map
+.env
+.env.*
+!.env.example
+pgdata/
+.opslane.json
+.worktrees/
+.dex/
+eval/results/
+.verify/*
+!.verify/spec.md
+.claude/
+.omx/

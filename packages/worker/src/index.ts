@@ -1,0 +1,672 @@
+import crypto from 'node:crypto';
+import http from 'node:http';
+import type { ClaimedJob } from './db.js';
+import * as db from './db.js';
+import { requeueStaleJobs, updateGroupStatus, closePool, updateGroupInvestigation, updateGroupAndCreateFixJob, getGroupInvestigation, resolveSilentMergedGroups, updateJobTraceUrl } from './db.js';
+import { buildReason } from './reason-codes.js';
+import { logger, setWorkerId } from './logger.js';
+import { fetchObject, getMinIOConfig } from './minio-client.js';
+import { investigateError } from './investigate.js';
+import { runPipeline } from './pipeline.js';
+import { createPoller } from './poller.js';
+import { cloneRepo } from './repo-clone.js';
+import { getInstallationToken } from './github-app.js';
+import { type ReplaySignals } from './pr.js';
+import { processSetupPrJob } from './setup-pr.js';
+
+import { parseStackFrames, resolveFrame, type ResolvedFrame } from './source-map.js';
+import { initTracing, shutdownTracing, withJobTrace, getActiveTraceId, buildLangfuseTraceUrl } from './tracing.js';
+import { runVisualAnalysis, type VisualAnalysisOutput } from './visual-analysis.js';
+import { buildReplayEvidenceFromRecording } from './replay-evidence.js';
+import { hasNoAppFrames } from './harness/stack-trace-utils.js';
+
+/**
+ * Maps the raw DB/SDK replay_signals JSON (nested, snake_case) to the flat camelCase
+ * ReplaySignals interface used by pr.ts for PR body rendering.
+ *
+ * SDK format:  { event_type_counts, console: { error_count, ... }, network: { ... }, last_user_actions }
+ * Worker format: { eventTypeCounts, consoleErrorCount, ..., lastUserActions }
+ */
+function mapDbSignals(raw: unknown): ReplaySignals | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const s = raw as Record<string, unknown>;
+
+  const console_ = (s['console'] ?? {}) as Record<string, unknown>;
+  const network_ = (s['network'] ?? {}) as Record<string, unknown>;
+
+  return {
+    eventTypeCounts: (s['event_type_counts'] ?? s['eventTypeCounts'] ?? undefined) as Record<string, number> | undefined,
+    consoleErrorCount: (console_['error_count'] ?? s['consoleErrorCount'] ?? 0) as number,
+    consoleWarningCount: (console_['warning_count'] ?? s['consoleWarningCount'] ?? 0) as number,
+    consoleErrorMessages: (console_['error_messages'] ?? s['consoleErrorMessages'] ?? []) as string[],
+    consoleWarningMessages: (console_['warning_messages'] ?? s['consoleWarningMessages'] ?? []) as string[],
+    networkAnomalyCount: (network_['anomaly_count'] ?? s['networkAnomalyCount'] ?? 0) as number,
+    networkAnomalies: (network_['anomalies'] ?? s['networkAnomalies'] ?? []) as ReplaySignals['networkAnomalies'],
+    lastUserActions: (s['last_user_actions'] ?? s['lastUserActions'] ?? []) as ReplaySignals['lastUserActions'],
+  };
+}
+
+const POLL_INTERVAL_MS = parseInt(
+  process.env['POLL_INTERVAL_MS'] ?? '5000',
+  10
+);
+const LEASE_DURATION_MS = parseInt(
+  process.env['LEASE_DURATION_MS'] ?? '300000', // 5 minutes default
+  10
+);
+const REAPER_INTERVAL_MS = parseInt(
+  process.env['REAPER_INTERVAL_MS'] ?? '60000', // 60 seconds default
+  10
+);
+const SILENCE_CHECK_INTERVAL_MS = parseInt(
+  process.env['SILENCE_CHECK_INTERVAL_MS'] ?? '300000', // 5 minutes default
+  10
+);
+const WORKER_ID =
+  process.env['WORKER_ID'] ?? `worker-${crypto.randomUUID()}`;
+setWorkerId(WORKER_ID);
+const HEALTH_PORT = parseInt(
+  process.env['HEALTH_PORT'] ?? '8081',
+  10
+);
+
+// Counters for health endpoint
+let jobsProcessed = 0;
+let jobsFailed = 0;
+let lastJobAt: string | null = null;
+const startTime = Date.now();
+
+function checkAbort(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new Error('Pipeline aborted: lease lost');
+  }
+}
+
+async function processJob(job: ClaimedJob, signal: AbortSignal): Promise<void> {
+  await withJobTrace(job.id, job.errorGroupId ?? job.sourceId ?? 'unknown', job.projectId, () => processJobInner(job, signal));
+}
+
+async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<void> {
+  // Fire-and-forget: persist Langfuse trace URL on the job row
+  const traceId = getActiveTraceId();
+  if (traceId) {
+    const traceUrl = buildLangfuseTraceUrl(traceId);
+    if (traceUrl) {
+      updateJobTraceUrl(job.id, traceUrl).catch(() => {});
+    }
+  }
+
+  logger.info('Processing job', {
+    job_id: job.id,
+    job_type: job.jobType,
+    error_group_id: job.errorGroupId,
+    source_id: job.sourceId,
+    project_id: job.projectId,
+    attempt: job.attempts + 1,
+  });
+
+  if (job.jobType === 'setup_pr') {
+    await processSetupPrJob({ id: job.id, projectId: job.projectId });
+    return;
+  }
+
+  if (!job.errorGroupId) {
+    throw new Error(`Job ${job.id} missing error_group_id`);
+  }
+  const errorJob = job as ClaimedJob & { errorGroupId: string };
+
+  if (errorJob.jobType === 'fix') {
+    try {
+      await processFixJob(errorJob, signal);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Lease-lost / abort: do NOT terminate the group — rethrow so the job can be
+      // legitimately requeued and picked up by another worker. The heartbeat sets
+      // signal.aborted before checkAbort throws, so that flag is the reliable signal;
+      // 'lease lost' is a narrow belt-and-suspenders. We deliberately do NOT match a
+      // bare 'aborted' substring — genuine errors ("operation was aborted") would
+      // otherwise be misclassified as lease-loss and requeued instead of handed to a human.
+      if (signal.aborted || message.includes('lease lost')) {
+        throw err;
+      }
+      // Genuine error: terminate as needs_human (preserve reason; root_cause untouched)
+      // and DO NOT rethrow, so the poller completes the job rather than requeuing it
+      // and re-running over a now-terminal incident.
+      const safeMessage = message.replace(/https:\/\/[^@]+@/g, 'https://***@');
+      await updateGroupStatus(errorJob.errorGroupId, errorJob.projectId, 'needs_human', {
+        reason: buildReason('worker_runtime_error', `Fix job error: ${safeMessage}`),
+      }).catch(() => {});
+      logger.error('Fix job threw — terminated as needs_human', { job_id: errorJob.id, error: safeMessage });
+    }
+  } else {
+    await processInvestigateJob(errorJob, signal);
+  }
+}
+
+/**
+ * Investigation job: runs codebase-aware investigation, stores results,
+ * and routes based on confidence (high → auto-fix, medium/low → investigated).
+ */
+export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: string }, signal: AbortSignal): Promise<void> {
+  const jobStart = Date.now();
+  await updateGroupStatus(job.errorGroupId, job.projectId, 'analyzing');
+  checkAbort(signal);
+
+  // Fetch real data
+  const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
+  if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+
+  const event = group.sample_event_id
+    ? await db.getErrorEvent(group.sample_event_id, job.projectId)
+    : null;
+
+  // Pre-clone guard: errors with no application stack frames (cross-origin
+  // "Script error.", non-Error promise rejections) are inherently unfixable by
+  // the agent. Short-circuit to needs_human BEFORE cloning the repo or spending
+  // an LLM/sandbox. The reason code is non-retriable, so the single collapsed
+  // stackless group won't reopen on every recurrence.
+  if (hasNoAppFrames(event?.stack_trace_raw ?? '')) {
+    await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: {
+        reason_code: 'unfixable_no_app_frames',
+        reason_message:
+          'Error has no application stack frames (cross-origin "Script error." or a non-Error promise rejection), so there is nothing to investigate.',
+        remediation:
+          'Add the `crossorigin` attribute to your <script> tags (with CORS headers on the script host) so the browser exposes real stack traces, and throw/reject Error objects rather than strings so the SDK can capture a stack.',
+      },
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    logger.info('Investigation: needs_human (no app frames, pre-clone short-circuit)', {
+      job_id: job.id,
+      error_group_id: job.errorGroupId,
+    });
+    return;
+  }
+
+  const project = await db.getProject(job.projectId);
+  if (!project) throw new Error(`Project ${job.projectId} not found`);
+
+  checkAbort(signal);
+
+  // Resolve GitHub token
+  let githubToken: string | undefined;
+  const installInfo = await db.getProjectGitHubInstallation(job.projectId);
+  if (installInfo?.installationId) {
+    try {
+      githubToken = await getInstallationToken(installInfo.installationId);
+    } catch (err: unknown) {
+      logger.error('Failed to get GitHub installation token', { project_id: job.projectId, error: String(err) });
+    }
+  }
+  if (!githubToken) {
+    githubToken = process.env['GITHUB_TOKEN'];
+  }
+
+  checkAbort(signal);
+
+  // Clone repo for investigation
+  let repoDir: string;
+  let cleanup: () => Promise<void>;
+  try {
+    const cloneResult = await cloneRepo({
+      githubRepo: project.github_repo,
+      defaultBranch: project.default_branch,
+      jobId: job.id,
+      githubToken,
+    });
+    repoDir = cloneResult.repoDir;
+    cleanup = cloneResult.cleanup;
+  } catch (err: unknown) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
+    const message = rawMessage.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: {
+        reason_code: isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
+        reason_message: `Failed to clone repository: ${message}`,
+        remediation: isTokenMissing
+          ? 'Set the GITHUB_TOKEN environment variable with repo scope'
+          : 'Ensure GITHUB_TOKEN has read access to the repository',
+      },
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    return;
+  }
+
+  try {
+    // Source map resolution
+    const [replay, sourceMaps] = await Promise.all([
+      db.getReplayForGroup(job.errorGroupId, job.projectId),
+      event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
+    ]);
+
+    const minioConfig = getMinIOConfig();
+    let resolvedStack: ResolvedFrame[] | null = null;
+    if (sourceMaps.length > 0 && event) {
+      if (minioConfig) {
+        const frames = parseStackFrames(event.stack_trace_raw);
+        const resolved: ResolvedFrame[] = [];
+        for (const frame of frames.slice(0, 5)) {
+          const basename = frame.file.split('/').pop() ?? frame.file;
+          const mapEntry = sourceMaps.find((m) =>
+            basename.endsWith(m.filename.replace('.map', '')),
+          );
+          if (mapEntry) {
+            const mapContent = await fetchObject(mapEntry.object_key, minioConfig);
+            const result = resolveFrame(frame, mapContent.toString('utf-8'));
+            if (result) resolved.push(result);
+          }
+        }
+        if (resolved.length > 0) resolvedStack = resolved;
+      }
+    }
+
+    checkAbort(signal);
+
+    // Run codebase-aware investigation
+    const apiKey = process.env['ANTHROPIC_API_KEY'];
+    if (!apiKey) {
+      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
+        reason: {
+          reason_code: 'missing_llm_key',
+          reason_message: 'ANTHROPIC_API_KEY environment variable is not set',
+          remediation: 'Set the ANTHROPIC_API_KEY environment variable with a valid Anthropic API key',
+        },
+      });
+      jobsFailed++;
+      lastJobAt = new Date().toISOString();
+      return;
+    }
+
+    const triage = await investigateError(apiKey, {
+      errorType: event?.error_type ?? 'Unknown',
+      title: group.title,
+      errorMessage: event?.error_message ?? '',
+      stackTrace: event?.stack_trace_raw ?? '',
+      resolvedStackTrace: resolvedStack ?? event?.stack_trace_resolved ?? null,
+      breadcrumbs: event?.breadcrumbs ?? '[]',
+    }, repoDir);
+
+    logger.info('Investigation result', {
+      job_id: job.id,
+      fixable: triage.fixable,
+      confidence: triage.confidence,
+      reason: triage.reason,
+    });
+
+    const durationMs = Date.now() - jobStart;
+
+    // Route based on investigation result
+    if (!triage.fixable && triage.confidence === 'high') {
+      // Definitely unfixable → needs_human with investigation results
+      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
+        rootCause: triage.reason,
+        confidence: triage.confidence,
+        reason: {
+          reason_code: triage.reason_code ?? 'triage_unfixable',
+          reason_message: triage.reason ?? 'Error classified as unfixable by investigation',
+          remediation: triage.remediation ?? 'Review the error manually',
+        },
+      });
+      jobsFailed++;
+      logger.warn('Investigation: needs_human (unfixable)', {
+        job_id: job.id, duration_ms: durationMs,
+      });
+    } else if (triage.fixable && triage.confidence === 'high') {
+      // High confidence fixable → auto-trigger fix (atomic transaction)
+      const fixJobId = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+        rootCause: triage.reason,
+        suggestedMitigation: triage.remediation,
+        confidence: triage.confidence,
+      });
+      jobsProcessed++;
+      logger.info('Investigation: auto-triggering fix', {
+        job_id: job.id, fix_job_id: fixJobId, duration_ms: durationMs,
+      });
+    } else {
+      // Medium/low confidence → investigated, wait for user
+      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
+        rootCause: triage.reason,
+        suggestedMitigation: triage.remediation,
+        confidence: triage.confidence,
+      });
+      jobsProcessed++;
+      logger.info('Investigation: investigated (awaiting user)', {
+        job_id: job.id, confidence: triage.confidence, duration_ms: durationMs,
+      });
+    }
+  } finally {
+    await cleanup();
+  }
+
+  lastJobAt = new Date().toISOString();
+}
+
+/**
+ * Fix job: loads investigation context, runs the full agent fix pipeline,
+ * and creates a PR or reverts to investigated on failure.
+ */
+export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, signal: AbortSignal): Promise<void> {
+  const jobStart = Date.now();
+  checkAbort(signal);
+
+  // Fetch real data
+  const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
+  if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+
+  const event = group.sample_event_id
+    ? await db.getErrorEvent(group.sample_event_id, job.projectId)
+    : null;
+
+  const project = await db.getProject(job.projectId);
+  if (!project) throw new Error(`Project ${job.projectId} not found`);
+
+  // Load investigation context
+  const investigation = await getGroupInvestigation(job.errorGroupId, job.projectId);
+
+  // Parallel fetch for independent data
+  const [replay, sourceMaps] = await Promise.all([
+    db.getReplayForGroup(job.errorGroupId, job.projectId),
+    event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
+  ]);
+  const artifacts = replay ? await db.getReplayArtifacts(replay.id, job.projectId) : [];
+
+  checkAbort(signal);
+
+  // Resolve GitHub token
+  let githubToken: string | undefined;
+  const installInfo = await db.getProjectGitHubInstallation(job.projectId);
+  if (installInfo?.installationId) {
+    try {
+      githubToken = await getInstallationToken(installInfo.installationId);
+    } catch (err: unknown) {
+      logger.error('Failed to get GitHub installation token', { project_id: job.projectId, error: String(err) });
+    }
+  }
+  if (!githubToken) {
+    githubToken = process.env['GITHUB_TOKEN'];
+  }
+
+  checkAbort(signal);
+
+  // Clone repo
+  let repoDir: string;
+  let cleanup: () => Promise<void>;
+  try {
+    const cloneResult = await cloneRepo({
+      githubRepo: project.github_repo,
+      defaultBranch: project.default_branch,
+      jobId: job.id,
+      githubToken,
+    });
+    repoDir = cloneResult.repoDir;
+    cleanup = cloneResult.cleanup;
+  } catch (err: unknown) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = rawMessage.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
+    await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: buildReason(
+        isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
+        `Failed to clone repository: ${message}`,
+      ),
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    return;
+  }
+
+  const minioConfig = getMinIOConfig();
+
+  try {
+    // Source map resolution
+    let resolvedStack: ResolvedFrame[] | null = null;
+    if (sourceMaps.length > 0 && event) {
+      if (minioConfig) {
+        const frames = parseStackFrames(event.stack_trace_raw);
+        const resolved: ResolvedFrame[] = [];
+        for (const frame of frames.slice(0, 5)) {
+          const basename = frame.file.split('/').pop() ?? frame.file;
+          const mapEntry = sourceMaps.find((m) =>
+            basename.endsWith(m.filename.replace('.map', '')),
+          );
+          if (mapEntry) {
+            const mapContent = await fetchObject(mapEntry.object_key, minioConfig);
+            const result = resolveFrame(frame, mapContent.toString('utf-8'));
+            if (result) resolved.push(result);
+          }
+        }
+        if (resolved.length > 0) resolvedStack = resolved;
+      }
+    }
+
+    // Visual analysis
+    let visualOutput: VisualAnalysisOutput | null = null;
+    if (artifacts.length > 0) {
+      if (minioConfig) {
+        const screenshots = await Promise.all(
+          artifacts.map(async (a) => {
+            const data = await fetchObject(a.object_key, minioConfig);
+            return {
+              base64: data.toString('base64'),
+              contentType: a.content_type,
+              kind: a.kind,
+            };
+          }),
+        );
+        visualOutput = await runVisualAnalysis({
+          screenshots,
+          signals: mapDbSignals(replay?.replay_signals) ?? {},
+          errorType: event?.error_type ?? 'Unknown',
+          errorMessage: event?.error_message ?? '',
+        });
+      }
+    } else if (replay?.object_key && minioConfig) {
+      // rrweb replays upload a recording.json (no screenshot artifacts). Extract
+      // crash-time DOM + user-action evidence directly from the event stream so the
+      // fix agent and PR body get real replay evidence instead of `visual_replay: n/a`.
+      try {
+        const recordingBuf = await fetchObject(replay.object_key, minioConfig);
+        const recording = JSON.parse(recordingBuf.toString('utf-8')) as Parameters<
+          typeof buildReplayEvidenceFromRecording
+        >[0];
+        visualOutput = buildReplayEvidenceFromRecording(recording, {
+          errorType: event?.error_type ?? 'Unknown',
+          errorMessage: event?.error_message ?? '',
+        });
+      } catch (err: unknown) {
+        logger.warn('Failed to build rrweb replay evidence', { replay_id: replay.id, error: String(err) });
+      }
+    }
+
+    checkAbort(signal);
+
+    const repoUrl = `https://github.com/${project.github_repo}.git`;
+
+    const result = await runPipeline({
+      jobId: job.id,
+      errorGroupId: job.errorGroupId,
+      projectId: job.projectId,
+      title: group.title,
+      errorType: event?.error_type ?? 'Unknown',
+      errorMessage: event?.error_message ?? '',
+      stackTrace: event?.stack_trace_raw ?? '',
+      resolvedStackTrace: resolvedStack ?? event?.stack_trace_resolved ?? null,
+      breadcrumbs: event?.breadcrumbs ?? '[]',
+      context: event?.context ?? '{}',
+      sourceFiles: [],
+      visualAnalysis: visualOutput,
+      repoPath: repoDir,
+      repoUrl,
+      githubRepo: project.github_repo,
+      defaultBranch: project.default_branch,
+      githubToken,
+      replay: replay ? {
+        id: replay.id,
+        sessionId: replay.session_id,
+        triggerType: replay.trigger_type,
+        pageUrl: replay.page_url,
+        startedAt: replay.started_at,
+        endedAt: replay.ended_at,
+        status: replay.status,
+        sizeBytes: replay.size_bytes,
+        signals: mapDbSignals(replay.replay_signals),
+      } : null,
+      investigation: investigation.rootCause ? {
+        rootCause: investigation.rootCause,
+        suggestedMitigation: investigation.suggestedMitigation ?? '',
+        guidance: job.guidance ?? undefined,
+      } : undefined,
+    });
+
+    const durationMs = Date.now() - jobStart;
+
+    if (result.status === 'pr_created') {
+      await updateGroupStatus(job.errorGroupId, job.projectId, 'pr_created', {
+        confidence: result.confidence,
+        pr_url: result.pr_url,
+        pr_number: result.pr_number,
+      });
+      jobsProcessed++;
+      logger.info('Fix job completed: pr_created', {
+        job_id: job.id, duration_ms: durationMs, pr_url: result.pr_url,
+      });
+    } else {
+      // Fix did not clear the precision floor (or failed) — terminate as needs_human,
+      // preserving the full writeup (reason + confidence). root_cause is untouched.
+      await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
+        reason: result.reason ?? buildReason('worker_runtime_error', 'Fix pipeline failed without a reason'),
+        confidence: result.confidence,
+      });
+      jobsFailed++;
+      logger.warn('Fix job completed: needs_human (writeup preserved)', {
+        job_id: job.id, duration_ms: durationMs, reason_code: result.reason?.reason_code, confidence: result.confidence,
+      });
+    }
+  } finally {
+    await cleanup();
+  }
+
+  lastJobAt = new Date().toISOString();
+}
+
+async function main(): Promise<void> {
+  logger.info('Opslane worker starting');
+
+  const requiredEnv = ['DATABASE_URL'];
+  for (const key of requiredEnv) {
+    if (!process.env[key]) {
+      logger.error('Missing required environment variable', { key });
+      process.exit(1);
+    }
+  }
+
+  // Warn about optional env vars that will cause job failures if missing
+  const warnEnv = ['ANTHROPIC_API_KEY', 'E2B_API_KEY', 'GITHUB_TOKEN'];
+  for (const key of warnEnv) {
+    if (!process.env[key]) {
+      logger.warn('Optional environment variable not set — jobs requiring it will fail', { key });
+    }
+  }
+
+  // Initialize tracing (no-op if LANGFUSE env vars unset).
+  // Must complete before poller starts so Anthropic SDK is instrumented.
+  await initTracing();
+
+  // Start health HTTP server
+  const healthServer = http.createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        worker_id: WORKER_ID,
+        uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+        jobs_processed: jobsProcessed,
+        jobs_failed: jobsFailed,
+        last_job_at: lastJobAt,
+      }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  healthServer.listen(HEALTH_PORT, () => {
+    logger.info('Health server started', { port: HEALTH_PORT });
+  });
+
+  const poller = createPoller({
+    intervalMs: POLL_INTERVAL_MS,
+    leaseDurationMs: LEASE_DURATION_MS,
+    workerId: WORKER_ID,
+    processJob,
+  });
+  poller.start();
+
+  // Reaper: periodically reclaim jobs with expired leases
+  const reaperTimer = setInterval(() => {
+    requeueStaleJobs()
+      .then((count) => {
+        if (count > 0) {
+          logger.info('Reaper: requeued stale jobs', { count });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.error('Reaper error', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }, REAPER_INTERVAL_MS);
+
+  // Silence window checker — auto-resolve merged groups after 24h of no recurrence
+  const silenceTimer = setInterval(() => {
+    resolveSilentMergedGroups()
+      .then((ids) => {
+        if (ids.length > 0) {
+          logger.info('Silence checker: resolved merged groups', { count: ids.length, group_ids: ids });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.error('Silence checker error', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }, SILENCE_CHECK_INTERVAL_MS);
+
+  logger.info('Worker ready', {
+    worker_id: WORKER_ID,
+    poll_interval_ms: POLL_INTERVAL_MS,
+    lease_duration_ms: LEASE_DURATION_MS,
+    reaper_interval_ms: REAPER_INTERVAL_MS,
+    silence_check_interval_ms: SILENCE_CHECK_INTERVAL_MS,
+    health_port: HEALTH_PORT,
+  });
+
+  async function shutdown(): Promise<void> {
+    logger.info('Worker shutting down');
+    clearInterval(reaperTimer);
+    clearInterval(silenceTimer);
+    await poller.stop();
+    healthServer.close();
+    await shutdownTracing();
+    await closePool();
+    logger.info('Worker shutdown complete');
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
+}
+
+// Auto-start only when run as the entrypoint (node dist/index.js / tsx watch).
+// Under vitest (which sets VITEST) this module is imported to unit-test
+// processInvestigateJob, so skip startup to avoid booting the poller/servers.
+if (!process.env['VITEST']) {
+  main().catch((err: unknown) => {
+    logger.error('Worker failed to start', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    process.exit(1);
+  });
+}

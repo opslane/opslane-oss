@@ -1,0 +1,172 @@
+import type { ErrorEventPayload, Breadcrumb } from '@opslane/shared';
+import { getConfig } from './config';
+import { addBreadcrumb, getBreadcrumbs } from './breadcrumbs';
+import { enqueueEvent } from './transport';
+import { getSessionId } from './session.js';
+import { SDK_VERSION } from './version';
+
+let installed = false;
+
+// === B2B user identity ===
+
+interface UserIdentity {
+  id: string;
+  email?: string;
+  account?: { id: string; name?: string };
+}
+
+let currentUser: UserIdentity | null = null;
+
+export function setUser(user: UserIdentity): void {
+  if (!user.id) return;
+  currentUser = user;
+}
+
+export function clearUser(): void {
+  currentUser = null;
+}
+
+export function getCurrentUser(): UserIdentity | null {
+  return currentUser;
+}
+
+/** Map UserIdentity to the wire-format user context object. */
+export function buildUserContext(user: UserIdentity): NonNullable<ErrorEventPayload['context']['user']> {
+  return {
+    id: user.id,
+    email: user.email,
+    account_id: user.account?.id,
+    account_name: user.account?.name,
+  };
+}
+
+export function buildPayload(
+  errorType: string,
+  errorMessage: string,
+  stack: string,
+  breadcrumb: Breadcrumb
+): ErrorEventPayload {
+  const config = getConfig();
+
+  addBreadcrumb(breadcrumb);
+
+  const context: ErrorEventPayload['context'] = {
+    url: typeof window !== 'undefined' ? window.location.href : '',
+    user_agent:
+      typeof navigator !== 'undefined' ? navigator.userAgent : '',
+  };
+  if (currentUser) {
+    context.user = buildUserContext(currentUser);
+  }
+
+  return {
+    timestamp: new Date().toISOString(),
+    error: {
+      type: errorType,
+      message: errorMessage,
+      stack,
+    },
+    breadcrumbs: getBreadcrumbs(),
+    context,
+    sdk_version: SDK_VERSION,
+    release: config.release || undefined,
+    session_id: getSessionId() || undefined,
+  };
+}
+
+function handleError(event: ErrorEvent): void {
+  try {
+    const { errorType, errorMessage, stack } = normalizeError(event.error, event.message || undefined, 'Error');
+    const payload = buildPayload(errorType, errorMessage, stack, errorBreadcrumb(errorType, errorMessage));
+    enqueueEvent(payload, 'uncaught_error');
+  } catch (_e) {
+    // SDK must never throw into the customer's app
+  }
+}
+
+function handleUnhandledRejection(event: PromiseRejectionEvent): void {
+  try {
+    const { errorType, errorMessage, stack } = normalizeError(event.reason, undefined, 'UnhandledRejection');
+    const payload = buildPayload(errorType, errorMessage, stack, errorBreadcrumb(errorType, errorMessage));
+    enqueueEvent(payload, 'uncaught_error');
+  } catch (_e) {
+    // SDK must never throw into the customer's app
+  }
+}
+
+function errorBreadcrumb(errorType: string, errorMessage: string): Breadcrumb {
+  return {
+    type: 'error',
+    timestamp: new Date().toISOString(),
+    category: 'exception',
+    message: `${errorType}: ${errorMessage}`,
+    level: 'error',
+  };
+}
+
+/** Check whether a stack string contains at least one user-code frame (at file:line:col). */
+function hasUserFrames(stack: string): boolean {
+  // Match V8-style "at <something>:<digits>:<digits>" patterns,
+  // skipping native/internal frames like "<anonymous>" or "native code".
+  return /at\s+.*\w+\.\w+:\d+:\d+/.test(stack);
+}
+
+function normalizeError(input: unknown, fallbackMessage?: string, fallbackType = 'Error'): {
+  errorType: string;
+  errorMessage: string;
+  stack: string;
+} {
+  if (input instanceof Error) {
+    let stack = input.stack || '';
+
+    // Browser-internal errors (e.g. SyntaxError from JSON.parse) often have
+    // no user-code frames. Capture a synthetic stack at the catch point so
+    // the worker can identify which component triggered the error.
+    if (!hasUserFrames(stack)) {
+      const synthetic = new Error('__opslane_synthetic__').stack || '';
+      // Append synthetic frames (skip the first line which is our marker)
+      const syntheticFrames = synthetic.split('\n').slice(1).join('\n');
+      if (syntheticFrames) {
+        stack = stack ? `${stack}\n    --- synthetic caller stack ---\n${syntheticFrames}` : syntheticFrames;
+      }
+    }
+
+    return {
+      errorType: input.constructor.name || fallbackType,
+      errorMessage: input.message,
+      stack,
+    };
+  }
+
+  return {
+    errorType: fallbackType,
+    errorMessage: fallbackMessage || String(input),
+    stack: '',
+  };
+}
+
+export function captureException(input: unknown): void {
+  try {
+    const { errorType, errorMessage, stack } = normalizeError(input, undefined, 'CapturedException');
+    const payload = buildPayload(errorType, errorMessage, stack, errorBreadcrumb(errorType, errorMessage));
+    enqueueEvent(payload, 'capture_exception');
+  } catch {
+    // SDK must never throw into the customer's app
+  }
+}
+
+export function installGlobalHandlers(): void {
+  if (installed) return;
+  installed = true;
+
+  window.addEventListener('error', handleError);
+  window.addEventListener('unhandledrejection', handleUnhandledRejection);
+}
+
+export function uninstallGlobalHandlers(): void {
+  if (!installed) return;
+  installed = false;
+
+  window.removeEventListener('error', handleError);
+  window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+}

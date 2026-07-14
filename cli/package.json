@@ -1,0 +1,26 @@
+{
+  "name": "@opslane/cli",
+  "version": "0.0.1",
+  "license": "MIT",
+  "bin": {
+    "opslane": "dist/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "chalk": "^5.4.0",
+    "commander": "^13.0.0",
+    "inquirer": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.0"
+  }
+}

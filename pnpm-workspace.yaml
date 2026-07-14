@@ -1,0 +1,7 @@
+packages:
+  - 'packages/*'
+  - 'shared'
+  - 'cli'
+  - 'test-e2e'
+  - 'test-fixtures/*'
+  - 'eval'

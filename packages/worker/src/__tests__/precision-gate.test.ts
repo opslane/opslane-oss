@@ -1,0 +1,77 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { PipelineInput } from '../pipeline.js';
+
+vi.mock('../agent-fix.js', () => ({ runAgentFix: vi.fn() }));
+vi.mock('../repo-clone.js', () => ({ gitCommitAndPush: vi.fn(), validateDiffPaths: vi.fn(() => ({ valid: true })) }));
+vi.mock('../pr.js', () => ({ createPR: vi.fn(), createGitHubClient: vi.fn() }));
+
+const { runAgentFix } = await import('../agent-fix.js');
+const { createPR } = await import('../pr.js');
+const { gitCommitAndPush } = await import('../repo-clone.js');
+const { runPipeline } = await import('../pipeline.js');
+
+const mockRunAgentFix = vi.mocked(runAgentFix);
+const mockCreatePR = vi.mocked(createPR);
+
+function input(): PipelineInput {
+  return {
+    jobId: 'j', errorGroupId: 'grp-12345678', projectId: 'p', title: 'T',
+    errorType: 'TypeError', errorMessage: 'm', stackTrace: 's', resolvedStackTrace: null,
+    breadcrumbs: '[]', context: '{}', sourceFiles: [], visualAnalysis: null,
+    repoPath: '/tmp/r', repoUrl: 'https://github.com/o/r.git', githubRepo: 'o/r', defaultBranch: 'main',
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(gitCommitAndPush).mockResolvedValue(undefined as never);
+  mockCreatePR.mockResolvedValue({ status: 'created', prUrl: 'https://github.com/o/r/pull/1', prNumber: 1 } as never);
+});
+
+describe('precision gate — directional invariants (C3)', () => {
+  it('ABOVE floor: high confidence fix → PR opens', async () => {
+    mockRunAgentFix.mockResolvedValue({
+      status: 'fix_ready',
+      diff: '--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n',
+      confidence: 'high',
+      rootCause: 'rc',
+      affectedFiles: ['f'],
+    });
+    const r = await runPipeline(input());
+    expect(r.status).toBe('pr_created');
+    expect(mockCreatePR).toHaveBeenCalledTimes(1);
+  });
+
+  for (const c of ['medium', 'low'] as const) {
+    it(`BELOW floor: ${c} confidence needs_human → NO PR, reason preserved`, async () => {
+      mockRunAgentFix.mockResolvedValue({
+        status: 'needs_human',
+        diff: '--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n',
+        confidence: c,
+        rootCause: 'rc',
+        reason: { reason_code: 'low_confidence_fix', reason_message: 'unverified', remediation: 'review manually' },
+      });
+      const r = await runPipeline(input());
+      expect(r.status).toBe('needs_human');
+      expect(r.pr_url).toBeUndefined();
+      expect(mockCreatePR).not.toHaveBeenCalled();
+      expect(r.reason?.reason_code).toBe('low_confidence_fix');
+      expect(r.reason?.reason_message).toBeTruthy();
+      expect(r.reason?.remediation).toBeTruthy();
+      expect(r.confidence).toBe(c);
+    });
+  }
+
+  it('GUARD: a fix_ready that slips through with non-high confidence still never opens a PR', async () => {
+    mockRunAgentFix.mockResolvedValue({
+      status: 'fix_ready',
+      diff: '--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n',
+      confidence: 'medium',
+      rootCause: 'rc',
+      affectedFiles: ['f'],
+    });
+    const r = await runPipeline(input());
+    expect(r.status).toBe('needs_human');
+    expect(mockCreatePR).not.toHaveBeenCalled();
+  });
+});

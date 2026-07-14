@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic credentials used to verify secret masking and authentication failures"
+paths = [
+  '''packages/ingestion/db/agent_session_test\.go''',
+  '''packages/ingestion/masking/masking_test\.go''',
+  '''packages/sdk/src/__tests__/scrub\.test\.ts''',
+  '''test-e2e/error-to-pr\.test\.ts''',
+  '''test-e2e/replay-contract\.test\.ts''',
+]

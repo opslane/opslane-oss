@@ -1,0 +1,207 @@
+package handler
+
+import (
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func NewRouter(deps *Dependencies) *chi.Mux {
+	return NewRouterWithPool(deps, nil)
+}
+
+// NewRouterWithPool creates the router with structured logging and enhanced health
+// checks backed by the given DB pool. If pool is nil, a simple health check is used.
+func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
+	logger := slog.Default()
+
+	r := chi.NewRouter()
+	r.Use(RequestID)
+	r.Use(StructuredLogger(logger))
+	r.Use(middleware.Recoverer)
+	r.Use(corsMiddleware())
+
+	// Health check — enhanced with DB + MinIO checks if pool is provided
+	if pool != nil {
+		hc := NewHealthChecker(pool, deps.MinIO)
+		r.Get("/health", hc.Handler())
+	} else {
+		r.Get("/health", simpleHealth)
+	}
+
+	// Metrics endpoint (no auth needed — internal endpoint)
+	r.Get("/metrics", Metrics)
+
+	// Auth endpoints (unauthenticated)
+	r.Post("/auth/refresh", deps.Refresh)
+
+	// GitHub OAuth (unauthenticated — user auth via GitHub)
+	r.Get("/auth/github", deps.GitHubOAuthStart)
+	r.Get("/auth/github/callback", deps.GitHubOAuthCallback)
+
+	// OAuth endpoints (unauthenticated — used by CLI PKCE flow)
+	r.HandleFunc("/oauth/authorize", deps.OAuthAuthorize) // GET + POST
+	r.Post("/oauth/token", deps.OAuthToken)
+
+	// Agent-first onboarding (unauthenticated — session ID is the secret)
+	r.Post("/api/v1/agent/setup", deps.AgentSetup)
+	r.Get("/api/v1/agent/poll/{sessionID}", deps.AgentPoll)
+	r.Get("/agent/auth/{sessionID}", deps.AgentAuthRedirect)
+	r.Get("/agent/auth/callback", deps.AgentAuthCallback)
+
+	// GitHub webhook (unauthenticated — uses HMAC signature verification)
+	r.Post("/api/v1/github/webhook", deps.HandleWebhook)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		// SDK endpoints (authenticated by API key, rate-limited per project).
+		// Browser endpoints (events, replays) are also origin-gated. Sourcemaps are
+		// uploaded at build time from Node (no Origin header), so EnforceOrigin is
+		// not applied there.
+		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(eventsLimiter)).Post("/events", deps.IngestEvent)
+		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/init", deps.ReplayInit)
+		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/{replayID}/complete", deps.ReplayComplete)
+		r.With(deps.AuthenticateSDK, rateLimitByProject(sourcemapsLimiter)).Post("/sourcemaps", deps.UploadSourceMap)
+
+		// Session-authenticated endpoints (dashboard + CLI)
+		r.With(deps.AuthenticateSession).Get("/auth/me", deps.AuthMe)
+		r.With(deps.AuthenticateSession).Get("/auth/verify", deps.AuthVerify)
+		r.With(deps.AuthenticateSession).Post("/auth/logout", deps.Logout)
+
+		// Onboarding
+		r.With(deps.AuthenticateSession).Post("/onboarding/setup", deps.OnboardingSetup)
+
+		// Project CRUD
+		r.With(deps.AuthenticateSession).Get("/projects", deps.ListProjects)
+		r.With(deps.AuthenticateSession).Post("/projects", deps.CreateProjectEndpoint)
+		r.With(deps.AuthenticateSession).Patch("/projects/{projectID}", deps.UpdateProjectEndpoint)
+
+		// Environment CRUD
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/environments", deps.ListEnvironmentsEndpoint)
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/environments", deps.CreateEnvironmentEndpoint)
+
+		// API Key CRUD
+		r.With(deps.AuthenticateSession).Post("/environments/{envID}/api-keys", deps.CreateAPIKeyEndpoint)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/api-keys", deps.ListAPIKeysEndpoint)
+
+		// Stats (session or SDK auth — CLI uses API key, dashboard uses JWT)
+		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/event-count", deps.GetEventCountEndpoint)
+
+		// Incidents (session or SDK auth — CLI uses API key, dashboard uses JWT)
+		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents", deps.ListIncidents)
+		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents/{incidentID}", deps.GetIncident)
+		// === Project D: replay retrieval (project-scoped, dashboard JWT auth) ===
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/replays/{replayID}", deps.GetReplay)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/incidents/{incidentID}/affected-users", deps.ListAffectedUsers)
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/fix", deps.TriggerFix)
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/resolve", deps.ResolveIncident)
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/archive", deps.ArchiveIncident)
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/unarchive", deps.UnarchiveIncident)
+
+		// B2B Accounts
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts", deps.ListAccounts)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts/{accountID}", deps.GetAccount)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts/{accountID}/incidents", deps.ListAccountIncidents)
+
+		// GitHub App integration
+		r.With(deps.AuthenticateSession).Get("/github/setup", deps.GitHubSetupCallback)
+		r.With(deps.AuthenticateSession).Get("/github/status", deps.GetGitHubAppStatus)
+		r.With(deps.AuthenticateSession).Get("/github/repos", deps.ListGitHubRepos)
+
+		// Per-project GitHub config
+		r.With(deps.AuthenticateSession).Put("/projects/{projectID}/github", deps.SetGitHubConfig)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/github", deps.GetGitHubConfig)
+		r.With(deps.AuthenticateSession).Delete("/projects/{projectID}/github", deps.DeleteGitHubConfig)
+
+		// Setup PR
+		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/setup-pr", deps.SetupPR)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/setup-pr", deps.GetSetupPR)
+	})
+
+	// Serve dashboard SPA (must be last — catch-all).
+	// DASHBOARD_DIR should point to the Vite build output containing index.html.
+	dashboardDir := os.Getenv("DASHBOARD_DIR")
+	if dashboardDir != "" {
+		cleanRoot := filepath.Clean(dashboardDir)
+		fileServer := http.FileServer(http.Dir(dashboardDir))
+		r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// Clean path to prevent traversal oracle via os.Stat
+			cleaned := filepath.Join(cleanRoot, filepath.Clean("/"+req.URL.Path))
+			if !strings.HasPrefix(cleaned, cleanRoot+string(os.PathSeparator)) && cleaned != cleanRoot {
+				http.NotFound(w, req)
+				return
+			}
+			// Try to serve the file directly
+			if _, err := os.Stat(cleaned); err == nil {
+				fileServer.ServeHTTP(w, req)
+				return
+			}
+			// Missing static asset — return 404 instead of index.html
+			if ext := filepath.Ext(req.URL.Path); ext != "" && ext != ".html" {
+				http.NotFound(w, req)
+				return
+			}
+			// Fall back to index.html for SPA client-side routing
+			http.ServeFile(w, req, cleanRoot+"/index.html")
+		}))
+	}
+
+	return r
+}
+
+// simpleHealth is a minimal health check for when the DB pool is not available.
+func simpleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// corsMiddleware applies a split CORS policy:
+//   - SDK endpoints reflect Origin; server-side EnforceOrigin is the real gate.
+//   - Dashboard endpoints are restricted to DASHBOARD_ORIGIN env var.
+func corsMiddleware() func(http.Handler) http.Handler {
+	dashboardOrigin := os.Getenv("DASHBOARD_ORIGIN")
+	if dashboardOrigin == "" {
+		dashboardOrigin = "http://localhost:3000"
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			w.Header().Add("Vary", "Origin")
+
+			if isSDKEndpoint(r.URL.Path) {
+				if origin != "" {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				}
+			} else if origin == dashboardOrigin {
+				w.Header().Set("Access-Control-Allow-Origin", dashboardOrigin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// isSDKEndpoint returns true for paths that should use the permissive CORS policy (Origin: *).
+func isSDKEndpoint(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/events") ||
+		strings.HasPrefix(path, "/api/v1/replays") ||
+		strings.HasPrefix(path, "/api/v1/sourcemaps")
+}

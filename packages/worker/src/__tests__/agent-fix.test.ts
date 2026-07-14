@@ -1,0 +1,807 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Mock e2b
+vi.mock('e2b', () => ({
+  Sandbox: {
+    create: vi.fn(),
+  },
+}));
+
+// Mock the agent loop
+vi.mock('../harness/agent-loop.js', () => ({
+  runAgentLoop: vi.fn(),
+}));
+
+// Mock the diff judge
+vi.mock('../harness/diff-judge.js', () => ({
+  judgeDiff: vi.fn(),
+}));
+
+// Mock the investigation module (vi.hoisted ensures the fn exists before vi.mock factory runs)
+const { mockInvestigateError } = vi.hoisted(() => ({
+  mockInvestigateError: vi.fn(),
+}));
+vi.mock('../investigate.js', () => ({
+  investigateError: mockInvestigateError,
+}));
+
+// Mock Anthropic SDK (used by triageError)
+const mockMessagesCreate = vi.fn();
+vi.mock('@anthropic-ai/sdk', () => ({
+  default: vi.fn().mockImplementation(() => ({
+    messages: { create: mockMessagesCreate },
+  })),
+}));
+
+import { runAgentFix, triageError } from '../agent-fix.js';
+import type { AgentFixInput } from '../agent-fix.js';
+import type { AgentCompletionResult } from '../harness/types.js';
+import { Sandbox } from 'e2b';
+import { runAgentLoop } from '../harness/agent-loop.js';
+import { judgeDiff } from '../harness/diff-judge.js';
+
+function makeAgentResult(overrides?: Partial<AgentCompletionResult>): AgentCompletionResult {
+  return {
+    success: true,
+    summary: 'Fixed it',
+    turnCount: 3,
+    toolCallCount: 5,
+    testsRan: false,
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0 },
+    toolHistory: [],
+    ...overrides,
+  };
+}
+
+const mockSandbox = {
+  files: { read: vi.fn(), write: vi.fn() },
+  commands: { run: vi.fn() },
+  kill: vi.fn(),
+};
+
+function makeInput(overrides?: Partial<AgentFixInput>): AgentFixInput {
+  return {
+    errorGroupId: 'eg-1',
+    projectId: 'proj-1',
+    title: 'TypeError in foo.ts',
+    errorType: 'TypeError',
+    errorMessage: 'Cannot read properties of null',
+    stackTrace: 'at foo.ts:10:5',
+    resolvedStackTrace: null,
+    breadcrumbs: '[]',
+    context: '{}',
+    sourceFiles: [],
+    visualAnalysis: null,
+    repoUrl: 'https://github.com/test/repo.git',
+    defaultBranch: 'main',
+    ...overrides,
+  };
+}
+
+const DIFF_STDOUT = 'diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-bad\n+good\n';
+
+/** Default commands.run: returns "none" for test detection, diff for git diff, empty otherwise */
+function defaultCommandsRun(cmd: string) {
+  if (cmd.includes('vitest.config') && cmd.includes('echo')) {
+    // Test runner detection → no runner
+    return Promise.resolve({ exitCode: 0, stdout: 'none', stderr: '' });
+  }
+  if (cmd.includes('git diff')) {
+    return Promise.resolve({ exitCode: 0, stdout: DIFF_STDOUT, stderr: '' });
+  }
+  return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+}
+
+/** Sandbox impl where the test gate detects vitest and tests pass — lets a fix reach the gate's
+ *  fix_ready path. Use in tests that assert the full happy path through to a PR-worthy fix. */
+function mockSandboxWithPassingTests() {
+  mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+    if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+    if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+    if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+    return { exitCode: 0, stdout: '', stderr: '' };
+  });
+}
+
+/** Helper: mock triage to return fixable (default for most tests) */
+function mockTriageFixable() {
+  mockMessagesCreate.mockResolvedValue({
+    content: [{
+      type: 'tool_use',
+      id: 'triage-1',
+      name: 'classify_error',
+      input: { fixable: true, confidence: 'medium', reason: 'Has application frames' },
+    }],
+  });
+}
+
+/** Helper: mock triage to return unfixable with high confidence */
+function mockTriageUnfixable(overrides?: Partial<{ fixable: boolean; confidence: string; reason: string; reason_code: string | undefined; remediation: string }>) {
+  mockMessagesCreate.mockResolvedValue({
+    content: [{
+      type: 'tool_use',
+      id: 'triage-1',
+      name: 'classify_error',
+      input: {
+        fixable: false,
+        confidence: 'high',
+        reason: 'Stack trace only contains anonymous frames',
+        reason_code: 'unfixable_no_app_frames',
+        remediation: 'This error was thrown from the browser console, not application code',
+        ...overrides,
+      },
+    }],
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  process.env['ANTHROPIC_API_KEY'] = 'test-key';
+  vi.mocked(Sandbox.create).mockResolvedValue(mockSandbox as unknown as import('e2b').Sandbox);
+  mockSandbox.commands.run.mockImplementation(defaultCommandsRun);
+  mockSandbox.kill.mockResolvedValue(undefined);
+  // Default: triage says fixable (so existing tests pass through)
+  mockTriageFixable();
+  // Default: judge passes quality
+  vi.mocked(judgeDiff).mockResolvedValue({
+    scope: 2, correctness: 2, preservation: 2, total: 6,
+    qualityPassed: true, explanation: 'Looks good',
+  });
+});
+
+describe('triageError', () => {
+  it('returns fixable=true for errors with application frames', async () => {
+    mockMessagesCreate.mockResolvedValue({
+      content: [{
+        type: 'tool_use',
+        id: 'triage-1',
+        name: 'classify_error',
+        input: { fixable: true, confidence: 'high', reason: 'Stack trace references src/components/App.vue' },
+      }],
+    });
+
+    const result = await triageError('test-key', {
+      errorType: 'TypeError',
+      title: 'Cannot read property of null',
+      errorMessage: "Cannot read properties of null (reading 'map')",
+      stackTrace: 'TypeError: Cannot read properties of null\n    at App.vue:42:10\n    at renderList (vue.js:1234)',
+      resolvedStackTrace: null,
+      breadcrumbs: '[]',
+    });
+
+    expect(result.fixable).toBe(true);
+    expect(result.confidence).toBe('high');
+  });
+
+  it('returns fixable=false for anonymous-only stack traces', async () => {
+    mockTriageUnfixable();
+
+    const result = await triageError('test-key', {
+      errorType: 'Error',
+      title: 'Opslane test error new 2',
+      errorMessage: 'Opslane test error new 2',
+      stackTrace: 'Error: Opslane test error new 2\n    at <anonymous>:1:26',
+      resolvedStackTrace: null,
+      breadcrumbs: '[]',
+    });
+
+    expect(result.fixable).toBe(false);
+    expect(result.confidence).toBe('high');
+    expect(result.reason_code).toBe('unfixable_no_app_frames');
+  });
+
+  it('returns fixable=true with low confidence when API returns no tool_use', async () => {
+    mockMessagesCreate.mockResolvedValue({ content: [{ type: 'text', text: 'I cannot classify this' }] });
+
+    const result = await triageError('test-key', {
+      errorType: 'Error',
+      title: 'Some error',
+      errorMessage: 'Something went wrong',
+      stackTrace: 'Error: Something went wrong',
+      resolvedStackTrace: null,
+      breadcrumbs: '[]',
+    });
+
+    // Should default to fixable to avoid false negatives
+    expect(result.fixable).toBe(true);
+    expect(result.confidence).toBe('low');
+  });
+
+  it('normalizes invalid confidence values to low', async () => {
+    mockMessagesCreate.mockResolvedValue({
+      content: [{
+        type: 'tool_use',
+        id: 'triage-1',
+        name: 'classify_error',
+        input: { fixable: false, confidence: 'very_high', reason: 'Test error' },
+      }],
+    });
+
+    const result = await triageError('test-key', {
+      errorType: 'Error',
+      title: 'Test',
+      errorMessage: 'Test',
+      stackTrace: 'Error',
+      resolvedStackTrace: null,
+      breadcrumbs: '[]',
+    });
+
+    expect(result.confidence).toBe('low');
+  });
+
+  it('includes resolvedStackTrace in prompt when available', async () => {
+    mockMessagesCreate.mockResolvedValue({
+      content: [{
+        type: 'tool_use',
+        id: 'triage-1',
+        name: 'classify_error',
+        input: { fixable: true, confidence: 'high', reason: 'Resolved stack trace shows App.vue:42' },
+      }],
+    });
+
+    await triageError('test-key', {
+      errorType: 'TypeError',
+      title: 'Cannot read property of null',
+      errorMessage: 'Cannot read properties of null',
+      stackTrace: 'TypeError: Cannot read properties of null\n    at <anonymous>:1:26',
+      resolvedStackTrace: [{ file: 'src/App.vue', line: 42, column: 10 }],
+      breadcrumbs: '[]',
+    });
+
+    // Verify the prompt sent to the API includes the resolved stack trace
+    const apiCall = mockMessagesCreate.mock.calls[0];
+    const prompt = apiCall[0].messages[0].content as string;
+    expect(prompt).toContain('Resolved Stack Trace');
+    expect(prompt).toContain('App.vue');
+  });
+});
+
+describe('runAgentFix', () => {
+  it('returns fix_ready with high confidence when test gate passes', async () => {
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+      if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('fix_ready');
+    expect(result.diff).toContain('diff --git');
+    expect(result.confidence).toBe('high');
+    expect(mockSandbox.kill).toHaveBeenCalled();
+  });
+
+  it('adds optional humanSummary to fix_ready when summary generation returns text', async () => {
+    mockMessagesCreate
+      .mockResolvedValueOnce({
+        content: [{
+          type: 'tool_use',
+          id: 'triage-1',
+          name: 'classify_error',
+          input: { fixable: true, confidence: 'medium', reason: 'Has application frames' },
+        }],
+      })
+      .mockResolvedValueOnce({
+        content: [{
+          type: 'text',
+          text: 'The user saved a profile. The page crashed because data was missing. The fix checks the value before rendering.',
+        }],
+      });
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true, summary: 'Missing null guard' }));
+
+    const result = await runAgentFix(makeInput());
+
+    expect(result.status).toBe('fix_ready');
+    expect(result.humanSummary).toBe('The user saved a profile. The page crashed because data was missing. The fix checks the value before rendering.');
+  });
+
+  it('GATE: no test runner → needs_human (below floor), diff attached, confidence medium', async () => {
+    // defaultCommandsRun reports runner "none" (tests skipped); judge default = qualityPassed:true.
+    // Under the precision gate, a fix we cannot verify by tests never opens a PR.
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
+
+    const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' })); // single tier
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('low_confidence_fix');
+    expect(result.confidence).toBe('medium'); // judge liked it, but tests could not run
+    expect(result.diff).toContain('diff --git'); // candidate diff preserved for the human
+  });
+
+  it('GATE: tests pass but judge fails on the last/only tier → needs_human, no PR', async () => {
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+      if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+    vi.mocked(judgeDiff).mockResolvedValue({
+      scope: 0, correctness: 1, preservation: 1, total: 2, qualityPassed: false, explanation: 'Over-scoped',
+    });
+
+    const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' })); // single tier
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('low_confidence_fix');
+    expect(result.confidence).toBe('low');
+    expect(result.diff).toContain('diff --git');
+  });
+
+  it('GATE: judge runs even on the last (single) tier', async () => {
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+      if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+    expect(judgeDiff).toHaveBeenCalledTimes(1); // judge no longer skipped on the last tier
+    expect(result.status).toBe('fix_ready');
+    expect(result.confidence).toBe('high');
+  });
+
+  it('retries once when test gate fails, then succeeds', async () => {
+    let testCallCount = 0;
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
+      if (cmd.includes('npm test')) {
+        testCallCount++;
+        if (testCallCount === 1) throw new Error('Tests failed: 1 assertion failed');
+        return { exitCode: 0, stdout: 'All tests passed', stderr: '' };
+      }
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('fix_ready');
+    expect(result.confidence).toBe('high');
+    // Agent loop called twice (initial + retry)
+    expect(runAgentLoop).toHaveBeenCalledTimes(2);
+    // Retry message contains failure output
+    const retryCall = vi.mocked(runAgentLoop).mock.calls[1];
+    expect(retryCall[1]).toContain('previous fix attempt failed tests');
+  });
+
+  it('returns needs_human with tests_failed after retry exhaustion', async () => {
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
+      if (cmd.includes('npm test')) throw new Error('Tests failed: assertion error');
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('tests_failed');
+    expect(result.diff).toContain('diff --git');
+    expect(result.confidence).toBe('low'); // writeup preserves a below-floor confidence
+    // 2 attempts per model tier x 2 tiers (Haiku → Sonnet cascade)
+    expect(runAgentLoop).toHaveBeenCalledTimes(4);
+  });
+
+  it('returns needs_human when agent gives up', async () => {
+    vi.mocked(runAgentLoop).mockImplementation(async (config) => {
+      if (config.externalState) {
+        config.externalState.gaveUp = true;
+        config.externalState.giveUpReason = {
+          reason_code: 'worker_runtime_error',
+          reason_message: 'CDN is down',
+          remediation: 'Check CDN status',
+        };
+      }
+      return makeAgentResult({ summary: 'CDN is down', turnCount: 2, toolCallCount: 1, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } });
+    });
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('worker_runtime_error');
+    expect(mockSandbox.kill).toHaveBeenCalled();
+  });
+
+  it('escalates to Sonnet when judge rejects Haiku fix, then accepts a verified Sonnet fix', async () => {
+    // Tests run + pass so a clean fix can clear the gate after escalation.
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+      if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    // Haiku tier judge rejects → escalate; Sonnet tier judge passes (default mock).
+    vi.mocked(judgeDiff).mockResolvedValueOnce({
+      scope: 0, correctness: 1, preservation: 1, total: 2,
+      qualityPassed: false, explanation: 'Over-scoped changes',
+    });
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('fix_ready');
+    expect(result.confidence).toBe('high');
+    // Agent loop called twice: once for Haiku, once for Sonnet
+    expect(runAgentLoop).toHaveBeenCalledTimes(2);
+    // Judge now runs on BOTH tiers (no last-tier skip)
+    expect(judgeDiff).toHaveBeenCalledTimes(2);
+  });
+
+  it('GATE: judge throwing means quality not confirmed → escalate, then needs_human on last tier', async () => {
+    // Tests pass, but the judge errors on every tier → we cannot confirm quality → below floor.
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
+      if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+    vi.mocked(judgeDiff).mockRejectedValue(new Error('API rate limited'));
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('low_confidence_fix');
+    expect(result.diff).toContain('diff --git');
+    // Haiku judge throws → escalate → Sonnet judge throws → below floor
+    expect(runAgentLoop).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns needs_human with budget_exhausted when budget exceeded', async () => {
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ success: false, summary: 'Budget exceeded', turnCount: 5, toolCallCount: 10, tokenUsage: { input: 1000000, output: 500000, cacheRead: 0, cacheWrite: 0 } }));
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('budget_exhausted');
+    // Haiku fails → escalate to Sonnet → also fails
+    expect(runAgentLoop).toHaveBeenCalledTimes(2);
+  });
+
+  it('always closes sandbox even on error', async () => {
+    vi.mocked(runAgentLoop).mockRejectedValue(new Error('LLM crashed'));
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(mockSandbox.kill).toHaveBeenCalled();
+  });
+
+  it('runs gitignore hardening → install → baseline commit → agent loop in order', async () => {
+    const commands: string[] = [];
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      commands.push(cmd);
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'none', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: 'diff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-old\n+new\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ summary: 'Fixed', turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput());
+
+    const gitignoreIdx = commands.findIndex(c => c.includes('.gitignore'));
+    const installIdx = commands.findIndex(c => c.includes('npm install') || c.includes('pnpm install'));
+    const baselineIdx = commands.findIndex(c => c.includes('baseline: setup'));
+    const addAllIdx = commands.findIndex(c => c.includes('git add -A') && !c.includes('commit'));
+
+    expect(gitignoreIdx).toBeGreaterThan(-1);
+    expect(installIdx).toBeGreaterThan(gitignoreIdx);
+    expect(baselineIdx).toBeGreaterThan(installIdx);
+    expect(addAllIdx).toBeGreaterThan(baselineIdx);
+  });
+
+  it('does not include dist or build in gitignore safety net', async () => {
+    const commands: string[] = [];
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      commands.push(cmd);
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'none', stderr: '' };
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: 'diff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-old\n+new\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ summary: 'Fixed', turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput());
+
+    const gitignoreCmd = commands.find(c => c.includes('.gitignore'));
+    expect(gitignoreCmd).toBeDefined();
+    expect(gitignoreCmd).not.toContain('dist');
+    expect(gitignoreCmd).not.toContain('build');
+    expect(gitignoreCmd).toContain('node_modules');
+  });
+
+  it('handles Sandbox.create failure gracefully', async () => {
+    vi.mocked(Sandbox.create).mockRejectedValueOnce(new Error('E2B API key not set'));
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('worker_runtime_error');
+    expect(result.reason?.reason_message).toContain('Agent harness error');
+  });
+
+  it('sanitizes secrets from test output before retry prompt', async () => {
+    let testCallCount = 0;
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
+      if (cmd.includes('npm test')) {
+        testCallCount++;
+        if (testCallCount === 1) throw new Error('Error: https://user:ghp_SECRET123@github.com/repo failed with sk-ant-KEY123');
+        return { exitCode: 0, stdout: 'All tests passed', stderr: '' };
+      }
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+    await runAgentFix(makeInput());
+    const retryCall = vi.mocked(runAgentLoop).mock.calls[1];
+    const retryMsg = retryCall[1];
+    expect(retryMsg).not.toContain('ghp_SECRET123');
+    expect(retryMsg).not.toContain('sk-ant-KEY123');
+    expect(retryMsg).toContain('[REDACTED]');
+  });
+
+  it('treats test timeout as worker_runtime_error, not tests_failed', async () => {
+    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
+      if (cmd.includes('npm test')) throw new Error('Command timed out after 120000ms');
+      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+    const result = await runAgentFix(makeInput());
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('worker_runtime_error');
+    expect(result.reason?.reason_message).toContain('timed out');
+  });
+
+  it('short-circuits with needs_human when triage says unfixable with high confidence', async () => {
+    mockTriageUnfixable();
+
+    const result = await runAgentFix(makeInput({
+      title: 'Opslane test error new 2',
+      errorMessage: 'Opslane test error new 2',
+      stackTrace: 'Error: Opslane test error new 2\n    at <anonymous>:1:26',
+    }));
+
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('unfixable_no_app_frames');
+    expect(result.reason?.reason_message).toContain('anonymous');
+    // Should NOT create a sandbox or run the agent loop
+    expect(Sandbox.create).not.toHaveBeenCalled();
+    expect(runAgentLoop).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to agent when triage says unfixable with medium confidence', async () => {
+    mockMessagesCreate.mockResolvedValue({
+      content: [{
+        type: 'tool_use',
+        id: 'triage-1',
+        name: 'classify_error',
+        input: { fixable: false, confidence: 'medium', reason: 'Might be a console error' },
+      }],
+    });
+
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput());
+    // Should proceed despite unfixable classification (confidence not high)
+    expect(Sandbox.create).toHaveBeenCalled();
+    expect(runAgentLoop).toHaveBeenCalled();
+    expect(result.status).toBe('fix_ready');
+  });
+
+  it('proceeds to agent when triage API call fails', async () => {
+    mockMessagesCreate.mockRejectedValue(new Error('Anthropic API rate limited'));
+
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput());
+    // Triage failure should not block the agent pipeline
+    expect(Sandbox.create).toHaveBeenCalled();
+    expect(runAgentLoop).toHaveBeenCalled();
+    expect(result.status).toBe('fix_ready');
+  });
+
+  it('uses triage_unfixable fallback when triage returns no reason_code', async () => {
+    mockTriageUnfixable({ reason_code: undefined });
+
+    const result = await runAgentFix(makeInput({
+      title: 'Some unfixable error',
+      errorMessage: 'Some unfixable error',
+      stackTrace: 'Error\n    at <anonymous>:1:1',
+    }));
+
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('triage_unfixable');
+    expect(Sandbox.create).not.toHaveBeenCalled();
+  });
+
+  it('passes structured tool history between cascade tiers', async () => {
+    // Haiku fails → Sonnet succeeds. Sonnet should receive structured context from Haiku.
+    vi.mocked(runAgentLoop)
+      .mockResolvedValueOnce(makeAgentResult({
+        success: false, summary: 'Could not fix', turnCount: 15, toolCallCount: 20,
+        tokenUsage: { input: 5000, output: 2000, cacheRead: 0, cacheWrite: 0 },
+        toolHistory: [
+          { name: 'read', input: { path: '/home/user/repo/src/App.vue' } },
+          { name: 'search', input: { pattern: 'null reference' } },
+          { name: 'bash', input: { command: 'grep -r "items" src/' } },
+        ],
+      }))
+      .mockResolvedValueOnce(makeAgentResult({ turnCount: 5, toolCallCount: 8, tokenUsage: { input: 3000, output: 1000, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput());
+
+    // Sonnet tier should receive structured prior context including files read
+    const sonnetCall = vi.mocked(runAgentLoop).mock.calls[1];
+    const sonnetUserMsg = sonnetCall[1] as string;
+    expect(sonnetUserMsg).toContain('src/App.vue');
+    expect(sonnetUserMsg).toContain('null reference');
+  });
+
+  it('passes prior tier summary to Sonnet on escalation', async () => {
+    // Haiku fails → Sonnet succeeds. Check that Sonnet gets Haiku's summary.
+    vi.mocked(runAgentLoop)
+      .mockResolvedValueOnce(makeAgentResult({
+        success: false, summary: 'Searched for error in src/, found nothing in components/', turnCount: 15, toolCallCount: 20,
+        tokenUsage: { input: 5000, output: 2000, cacheRead: 0, cacheWrite: 0 },
+      }))
+      .mockResolvedValueOnce(makeAgentResult({ turnCount: 5, toolCallCount: 8, tokenUsage: { input: 3000, output: 1000, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput());
+
+    // Second call (Sonnet tier) should include prior investigation context wrapped in untrusted_data
+    const sonnetCall = vi.mocked(runAgentLoop).mock.calls[1];
+    const sonnetUserMsg = sonnetCall[1] as string;
+    expect(sonnetUserMsg).toContain('previous investigation attempt');
+    expect(sonnetUserMsg).toContain('<untrusted_data>');
+    expect(sonnetUserMsg).toContain('Searched for error in src/');
+    expect(sonnetUserMsg).toContain('Do NOT repeat searches');
+  });
+
+  it('runs both Haiku triage and investigation when repoPath is provided', async () => {
+    mockTriageFixable();
+    mockInvestigateError.mockResolvedValue({
+      fixable: true, confidence: 'high', reason: 'Found null items in App.vue',
+      filesRead: ['src/App.vue'], findings: 'Null ref',
+    });
+
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput({ repoPath: '/tmp/opslane-repo-test' }));
+    expect(result.status).toBe('fix_ready');
+    // Both should have been called: Haiku triage first, then investigation
+    expect(mockMessagesCreate).toHaveBeenCalled(); // Haiku triage
+    expect(mockInvestigateError).toHaveBeenCalled(); // Sonnet investigation
+  });
+
+  it('short-circuits at Haiku triage before investigation when clearly unfixable', async () => {
+    mockTriageUnfixable({ reason_code: 'unfixable_infra' });
+
+    const result = await runAgentFix(makeInput({ repoPath: '/tmp/opslane-repo-test' }));
+
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('unfixable_infra');
+    // Investigation should NOT have been called
+    expect(mockInvestigateError).not.toHaveBeenCalled();
+    expect(Sandbox.create).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits via investigation when unfixable with high confidence', async () => {
+    mockInvestigateError.mockResolvedValue({
+      fixable: false, confidence: 'high',
+      reason: 'Error is from browser console, searched codebase and found no matching source',
+      reason_code: 'unfixable_no_app_frames',
+      remediation: 'This error was thrown from the browser console',
+    });
+
+    const result = await runAgentFix(makeInput({ repoPath: '/tmp/opslane-repo-test' }));
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('unfixable_no_app_frames');
+    // Should NOT create a sandbox or run the agent loop
+    expect(Sandbox.create).not.toHaveBeenCalled();
+    expect(runAgentLoop).not.toHaveBeenCalled();
+  });
+
+  it('falls back to blind triage when repoPath is not provided', async () => {
+    mockTriageFixable();
+
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput()); // no repoPath
+    expect(result.status).toBe('fix_ready');
+    // Investigation should NOT have been called
+    expect(mockInvestigateError).not.toHaveBeenCalled();
+    // Blind triage (Anthropic SDK) should have been called
+    expect(mockMessagesCreate).toHaveBeenCalled();
+  });
+
+  it('proceeds to agent when investigation fails with exception', async () => {
+    mockInvestigateError.mockRejectedValue(new Error('Investigation crashed'));
+
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ testsRan: true }));
+
+    const result = await runAgentFix(makeInput({ repoPath: '/tmp/opslane-repo-test' }));
+    // Investigation failure should not block the agent pipeline
+    expect(Sandbox.create).toHaveBeenCalled();
+    expect(runAgentLoop).toHaveBeenCalled();
+    expect(result.status).toBe('fix_ready');
+  });
+
+  it('skips triage when investigation context is provided', async () => {
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue({
+      ...makeAgentResult({ summary: 'Fixed with guidance', testsRan: true }),
+    });
+
+    const result = await runAgentFix(makeInput({
+      investigation: {
+        rootCause: 'Null check missing in items array',
+        suggestedMitigation: 'Add optional chaining to items.map',
+        guidance: 'Focus on the items prop in ItemList.vue',
+      },
+    }));
+
+    expect(result.status).toBe('fix_ready');
+    // Triage/investigation should NOT have been called; the post-fix summary still runs.
+    expect(mockMessagesCreate).toHaveBeenCalledTimes(1);
+    expect(mockInvestigateError).not.toHaveBeenCalled();
+    // Agent should still run
+    expect(Sandbox.create).toHaveBeenCalled();
+    expect(runAgentLoop).toHaveBeenCalled();
+  });
+
+  it('includes filesRead and findings in system prompt when investigation provides them', async () => {
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ summary: 'Fixed', turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput({
+      investigation: {
+        rootCause: 'Null reference in items array',
+        suggestedMitigation: 'Add optional chaining',
+        filesRead: ['src/App.vue', 'src/utils/helpers.ts'],
+        findings: 'App.vue line 42 accesses items.map without null check',
+      },
+    }));
+
+    const agentLoopCall = vi.mocked(runAgentLoop).mock.calls[0];
+    const systemPrompt = (agentLoopCall[0] as { systemPrompt: string }).systemPrompt;
+    expect(systemPrompt).toContain('src/App.vue');
+    expect(systemPrompt).toContain('src/utils/helpers.ts');
+    expect(systemPrompt).toContain('items.map without null check');
+    expect(systemPrompt).toContain('Do NOT re-read');
+  });
+
+  it('includes investigation context in system prompt', async () => {
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ summary: 'Fixed', turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
+
+    await runAgentFix(makeInput({
+      investigation: {
+        rootCause: 'Missing null guard',
+        suggestedMitigation: 'Add nullish coalescing',
+        guidance: 'User says: check line 42',
+      },
+    }));
+
+    // Verify the system prompt passed to runAgentLoop contains investigation context
+    const agentLoopCall = vi.mocked(runAgentLoop).mock.calls[0];
+    const systemPrompt = (agentLoopCall[0] as { systemPrompt: string }).systemPrompt;
+    expect(systemPrompt).toContain('Prior Investigation');
+    expect(systemPrompt).toContain('Missing null guard');
+    expect(systemPrompt).toContain('Add nullish coalescing');
+    expect(systemPrompt).toContain('User says: check line 42');
+    expect(systemPrompt).toContain('untrusted_user_data');
+  });
+});

@@ -1,0 +1,129 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    ports:
+      - "9012:9000"
+    volumes:
+      - minio-data:/data
+
+  minio-setup:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      sh -c "until mc alias set local http://minio:9000 minio minio12345; do sleep 1; done &&
+      mc mb -p local/opslane-replays || true &&
+      mc anonymous set download local/opslane-replays || true"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: opslane
+      POSTGRES_PASSWORD: opslane_dev
+      POSTGRES_DB: opslane
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./packages/ingestion/db/migrations:/migrations
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opslane -d opslane"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: packages/ingestion/Dockerfile
+    ports:
+      - "8082:8080"
+    environment:
+      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane?sslmode=disable
+      PORT: "8080"
+      DASHBOARD_DIR: /app/dashboard
+      REPLAY_STORE_ENDPOINT: http://minio:9000
+      REPLAY_STORE_PUBLIC_ENDPOINT: http://localhost:9012
+      REPLAY_STORE_BUCKET: opslane-replays
+      REPLAY_STORE_REGION: us-east-1
+      REPLAY_STORE_ACCESS_KEY: minio
+      REPLAY_STORE_SECRET_KEY: minio12345
+      JWT_SECRET: opslane-dev-jwt-secret-key-minimum-32-bytes-long
+      ALLOW_REGISTRATION: "true"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_CLIENT_ID: ${GITHUB_APP_CLIENT_ID:-}
+      GITHUB_APP_CLIENT_SECRET: ${GITHUB_APP_CLIENT_SECRET:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-defender-dev}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build:
+      context: .
+      dockerfile: packages/worker/Dockerfile
+    environment:
+      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane
+      INGESTION_BASE_URL: http://ingestion:8080
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      E2B_API_KEY: ${E2B_API_KEY:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com}
+      LANGFUSE_PROJECT_ID: ${LANGFUSE_PROJECT_ID:-}
+      POLL_INTERVAL_MS: "5000"
+      HEALTH_PORT: "8081"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio12345
+      MINIO_BUCKET: opslane-replays
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ingestion:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8081/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  migrate:
+    image: postgres:16
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./packages/ingestion/db/migrations:/migrations
+    entrypoint: >
+      sh -c "for f in /migrations/*.sql; do
+        echo \"Applying $$f...\";
+        PGPASSWORD=opslane_dev psql -h postgres -U opslane -d opslane -f $$f;
+      done"
+    environment:
+      PGPASSWORD: opslane_dev
+
+volumes:
+  pgdata:
+  minio-data:

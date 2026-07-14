@@ -1,0 +1,91 @@
+/* === Self-hosted fonts === */
+
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('/fonts/dm-sans-variable.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono-400.woff2') format('woff2');
+}
+
+/* === Design tokens === */
+
+:root {
+  /* Surfaces */
+  --color-background: #080c0f;
+  --color-surface: #0f1419;
+  --color-surface-2: #161d24;
+  --color-border: #1e2a35;
+  --color-border-subtle: #121920;
+
+  /* Text */
+  --color-text: #f0ede8;
+  --color-text-muted: #8a9aa6;
+  --color-text-faint: #5a6b78; /* decorative/disabled only — fails WCAG AA on all surfaces */
+
+  /* Semantic */
+  --color-teal: #2dd4bf;
+  --color-indigo: #818cf8;
+  --color-green: #4ade80;
+  --color-amber: #f5a623;
+  --color-red: #ff4d4d;
+
+  /* Typography */
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* === Reusable component classes === */
+
+@layer components {
+  .btn-primary {
+    @apply rounded-md bg-teal px-4 py-2 text-sm font-medium text-background hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50;
+  }
+
+  .btn-secondary {
+    @apply rounded-md bg-surface-2 border border-border px-4 py-2 text-sm font-medium text-text hover:bg-border focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background;
+  }
+
+  .tab-active {
+    @apply border-teal text-teal;
+  }
+
+  .tab-inactive {
+    @apply border-transparent text-text-muted hover:text-text hover:border-text-faint;
+  }
+}
+
+/* === Global dark select styling === */
+
+select {
+  appearance: none;
+  background-color: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%238a9aa6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 28px;
+}
+
+select:focus {
+  outline: 2px solid var(--color-teal);
+  outline-offset: -1px;
+}
+
+select option {
+  background-color: var(--color-surface);
+  color: var(--color-text);
+}

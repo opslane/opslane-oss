@@ -1,0 +1,30 @@
+{
+  "name": "@opslane/dashboard",
+  "private": true,
+  "version": "0.0.1",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@rrweb/types": "2.0.0-alpha.18",
+    "date-fns": "^4.1.0",
+    "rrweb": "2.0.0-alpha.18",
+    "vue": "^3.5.0",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.4.0",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.0",
+    "vue-tsc": "^2.2.0"
+  }
+}
