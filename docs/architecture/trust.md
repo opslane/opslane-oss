@@ -26,10 +26,10 @@ Secrets hygiene in the sandbox: before the agent loop runs, well-known secret va
 
 ## Browser data and masking
 
-Defense in two layers, both on by default:
+Defense in two layers, both on by default — with an honest note on their scope:
 
-- **In the browser (SDK):** replays are **opt-in** (`replay.enabled` defaults to false); when enabled, all input values are masked (`maskAllInputs: true`) plus anything matching `.opslane-mask`. Captured text and URLs are scrubbed of JWTs, `Bearer` tokens, `password`/`secret`/`api_key`-style pairs, query strings, and URL userinfo before transmission.
-- **Server-side (ingestion):** sensitive headers (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-csrf-token`), well-known API-key prefixes (`sk_live_`, `sk_test_`, `AKIA`, `ghp_`, …), and URL-embedded credentials are replaced with `[REDACTED]` before persistence.
+- **In the browser (SDK):** replays are **opt-in** (`replay.enabled` defaults to false); when enabled, all input values are masked (`maskAllInputs: true`) plus anything matching `.opslane-mask`. For **error events and console breadcrumbs**, captured text and URLs are scrubbed of JWTs, `Bearer` tokens, `password`/`secret`/`api_key`-style pairs, query strings, and URL userinfo before transmission. This scrubbing does *not* run over the replay's serialized DOM — visible page text is captured as rendered unless masked.
+- **Server-side (ingestion):** for events, sensitive headers (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-csrf-token`), well-known API-key prefixes (`sk_live_`, `sk_test_`, `AKIA`, `ghp_`, …), and URL-embedded credentials are replaced with `[REDACTED]` before persistence. For **replays**, the browser uploads directly to object storage via a pre-signed URL and ingestion redacts by *rewriting the object at completion* — an upload interrupted before completion leaves the raw recording in storage (compounded by [#13](https://github.com/opslane/opslane-oss/issues/13) and the absence of retention cleanup below).
 
 See [replay privacy](../replay-privacy.md) for what replay data may contain.
 

@@ -52,7 +52,15 @@ The sourcemap upload endpoint is authenticated by API key but **not** origin-gat
 
 ## Verifying
 
-After a deploy, trigger a test error from the built app. In the incident, resolved frames show original file paths; if you instead see minified paths or a `needs_human` with `sourcemap_unresolved`, the release strings don't match — compare what the SDK sent (`release` in the event payload) with what CI uploaded.
+Verify the upload itself first — each accepted map returns HTTP `201` with its storage key:
+
+```json
+{"status": "uploaded", "object_key": "sourcemaps/<project>/<release>/index-abc123.js.map"}
+```
+
+and is recorded in the `source_maps` table (self-host: `SELECT release, filename FROM source_maps ORDER BY uploaded_at DESC LIMIT 5;`).
+
+Then verify end-to-end by triggering a test error from the built app: with maps in place for the matching release, investigations proceed against your original source instead of ending in `needs_human` with `sourcemap_unresolved` / `unfixable_no_sourcemap`. (Resolved frames are used inside the investigation; the incident view does not currently display a resolved stack, so the absence of those reason codes — and a sensible root-cause writeup referencing your real files — is the observable signal.) If you do hit `sourcemap_unresolved`, the release strings don't match — compare what the SDK sent (`release` in the event payload) with what CI uploaded.
 
 ## Other bundlers
 
