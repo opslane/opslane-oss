@@ -189,6 +189,23 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
 
   checkAbort(signal);
 
+  // The LLM key is the pipeline's most fundamental prerequisite. Check it
+  // before token resolution and the repo clone so the terminal reason names
+  // the real blocker instead of a downstream clone failure.
+  const apiKey = process.env['ANTHROPIC_API_KEY'];
+  if (!apiKey) {
+    await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: {
+        reason_code: 'missing_llm_key',
+        reason_message: 'ANTHROPIC_API_KEY environment variable is not set',
+        remediation: 'Set the ANTHROPIC_API_KEY environment variable with a valid Anthropic API key',
+      },
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    return;
+  }
+
   // Resolve GitHub token
   let githubToken: string | undefined;
   const installInfo = await db.getProjectGitHubInstallation(job.projectId);
@@ -266,20 +283,6 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
     checkAbort(signal);
 
     // Run codebase-aware investigation
-    const apiKey = process.env['ANTHROPIC_API_KEY'];
-    if (!apiKey) {
-      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
-        reason: {
-          reason_code: 'missing_llm_key',
-          reason_message: 'ANTHROPIC_API_KEY environment variable is not set',
-          remediation: 'Set the ANTHROPIC_API_KEY environment variable with a valid Anthropic API key',
-        },
-      });
-      jobsFailed++;
-      lastJobAt = new Date().toISOString();
-      return;
-    }
-
     const triage = await investigateError(apiKey, {
       errorType: event?.error_type ?? 'Unknown',
       title: group.title,

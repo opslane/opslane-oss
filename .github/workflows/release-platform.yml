@@ -1,0 +1,176 @@
+name: Platform release
+
+# Manual-dispatch-only promotion of a soaked candidate. The maintainer names a
+# CalVer version and the candidate CI run; the workflow validates everything,
+# creates the tag AFTER validation (v* tags are immutable with no bypass — a
+# premature tag would be stranded forever), re-tags the existing candidate
+# digests without rebuilding, and publishes a GitHub Release with the digest
+# manifest. Nothing anywhere triggers on tag push: a stray hand-pushed v* tag
+# is inert. No `latest` tag is ever created.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'CalVer version to release (e.g. v26.7.0)'
+        required: true
+      candidate_run_id:
+        description: 'Run ID of the main-branch CI run that published the candidate images'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, tag, promote, publish
+    if: github.repository == 'opslane/opslane-oss'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the version tag + the GitHub Release
+      packages: write # re-tag the candidate images
+      actions: read # inspect the candidate workflow run
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ inputs.version }}
+      RUN_ID: ${{ inputs.candidate_run_id }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate version syntax and release uniqueness
+        run: |
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]{2}\.(1[0-2]|[1-9])\.(0|[1-9][0-9]*)$'; then
+            echo "Version '$VERSION' is not exact CalVer (vYY.M.PATCH, e.g. v26.7.0)."
+            exit 1
+          fi
+          if gh release view "$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists."
+            exit 1
+          fi
+
+      - name: Verify the candidate came from a successful main CI run
+        id: run
+        run: |
+          run_json=$(gh api "repos/$REPO/actions/runs/$RUN_ID")
+          conclusion=$(echo "$run_json" | jq -r .conclusion)
+          path=$(echo "$run_json" | jq -r .path)
+          branch=$(echo "$run_json" | jq -r .head_branch)
+          event=$(echo "$run_json" | jq -r .event)
+          sha=$(echo "$run_json" | jq -r .head_sha)
+          attempt=$(echo "$run_json" | jq -r .run_attempt)
+          echo "run: path=$path branch=$branch event=$event conclusion=$conclusion sha=$sha attempt=$attempt"
+          [ "$conclusion" = "success" ] || { echo "Candidate run did not succeed."; exit 1; }
+          [ "$path" = ".github/workflows/ci.yml" ] || { echo "Run is not the CI workflow."; exit 1; }
+          [ "$branch" = "main" ] || { echo "Run is not a main-branch run."; exit 1; }
+          [ "$event" = "push" ] || { echo "Run is not a push run."; exit 1; }
+          git merge-base --is-ancestor "$sha" origin/main || { echo "SHA is not an ancestor of main."; exit 1; }
+          # Immutable-tag handling: a pre-existing version tag is fatal unless
+          # it already points at this exact SHA (then this run is a resume of a
+          # partially-failed promotion).
+          existing=$(git ls-remote --tags origin "refs/tags/$VERSION" | cut -f1)
+          if [ -n "$existing" ] && [ "$existing" != "$sha" ]; then
+            echo "Tag $VERSION already exists at $existing (not $sha) — immutable tags are never reused."
+            exit 1
+          fi
+          [ -n "$existing" ] && echo "Tag $VERSION already points at $sha — resuming promotion."
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "attempt=$attempt" >> "$GITHUB_OUTPUT"
+          echo "tag_exists=${existing:+yes}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve candidate digests
+        id: digests
+        env:
+          SHA: ${{ steps.run.outputs.sha }}
+          ATTEMPT: ${{ steps.run.outputs.attempt }}
+        run: |
+          # A partially re-run candidate build (rerun-failed-jobs) can leave
+          # each image published under a different run attempt, so resolve
+          # per image, trying the aggregate attempt down to 1.
+          cand_tag=""
+          for image in ingestion worker; do
+            digest=""
+            for attempt in $(seq "$ATTEMPT" -1 1); do
+              ref="ghcr.io/$OWNER/opslane-$image:main-$SHA-$RUN_ID-$attempt"
+              if d=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest) \
+                 && [ -n "$d" ] && [ "$d" != "null" ]; then
+                digest="$d"
+                cand_tag="main-$SHA-$RUN_ID-$attempt"
+                echo "$image: $ref -> $digest"
+                break
+              fi
+            done
+            [ -n "$digest" ] || { echo "No candidate image found for $image (run $RUN_ID, attempts $ATTEMPT..1)."; exit 1; }
+            echo "$image=$digest" >> "$GITHUB_OUTPUT"
+          done
+          echo "cand_tag=$cand_tag" >> "$GITHUB_OUTPUT"
+
+      # Registry promotion happens BEFORE the immutable git tag: retagging is
+      # idempotent and repeatable, while a stranded v* tag can never be
+      # removed. The tag is only created once both images are verified.
+      - name: Re-tag candidate digests as the version (no rebuild)
+        env:
+          INGESTION_DIGEST: ${{ steps.digests.outputs.ingestion }}
+          WORKER_DIGEST: ${{ steps.digests.outputs.worker }}
+        run: |
+          for image in ingestion worker; do
+            digest_var=$(echo "$image" | tr '[:lower:]' '[:upper:]')_DIGEST
+            digest=$(eval "echo \$$digest_var")
+            src="ghcr.io/$OWNER/opslane-$image@$digest"
+            dst="ghcr.io/$OWNER/opslane-$image:$VERSION"
+            docker buildx imagetools create --tag "$dst" "$src"
+            promoted=$(docker buildx imagetools inspect "$dst" --format '{{json .Manifest}}' | jq -r .digest)
+            [ "$promoted" = "$digest" ] || { echo "Digest mismatch after retag: $promoted != $digest"; exit 1; }
+            echo "$dst -> $digest (verified)"
+          done
+
+      - name: Create the version tag (after successful registry promotion)
+        if: steps.run.outputs.tag_exists != 'yes'
+        env:
+          SHA: ${{ steps.run.outputs.sha }}
+        run: gh api "repos/$REPO/git/refs" -f ref="refs/tags/$VERSION" -f sha="$SHA"
+
+      - name: Publish the GitHub Release with the digest manifest
+        env:
+          SHA: ${{ steps.run.outputs.sha }}
+          CAND_TAG: ${{ steps.digests.outputs.cand_tag }}
+          INGESTION_DIGEST: ${{ steps.digests.outputs.ingestion }}
+          WORKER_DIGEST: ${{ steps.digests.outputs.worker }}
+        run: |
+          cat > "release-manifest-$VERSION.json" <<MANIFEST
+          {
+            "version": "$VERSION",
+            "source_sha": "$SHA",
+            "candidate_run": "https://github.com/$REPO/actions/runs/$RUN_ID",
+            "candidate_tag": "$CAND_TAG",
+            "platforms": ["linux/amd64"],
+            "images": {
+              "ingestion": {
+                "ref": "ghcr.io/$OWNER/opslane-ingestion:$VERSION",
+                "digest": "$INGESTION_DIGEST"
+              },
+              "worker": {
+                "ref": "ghcr.io/$OWNER/opslane-worker:$VERSION",
+                "digest": "$WORKER_DIGEST"
+              }
+            },
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          MANIFEST
+          gh release create "$VERSION" "release-manifest-$VERSION.json" \
+            --repo "$REPO" \
+            --title "$VERSION" \
+            --notes "$(printf 'Promoted from candidate run %s (commit %s).\n\nImage digests:\n- ghcr.io/%s/opslane-ingestion@%s\n- ghcr.io/%s/opslane-worker@%s\n\nPin images by digest or by the %s tag. There is no latest tag.' \
+              "https://github.com/$REPO/actions/runs/$RUN_ID" "$SHA" "$OWNER" "$INGESTION_DIGEST" "$OWNER" "$WORKER_DIGEST" "$VERSION")"

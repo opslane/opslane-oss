@@ -1,0 +1,78 @@
+name: npm release
+
+# Changesets is the sole npm publishing authority. On every push to main this
+# either (a) opens/refreshes the "Version Packages" PR when changesets are
+# pending, or (b) publishes to npm when the Version Packages PR was just
+# merged. Publishing uses npm Trusted Publishing (OIDC) — no npm token exists
+# anywhere. Platform v* tags never trigger this workflow, and package tags
+# never trigger the platform release.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Credential-free verification. This job installs freshly-resolved
+  # third-party dependency code (the clean-consumer checks), so it must never
+  # hold publish credentials.
+  verify:
+    name: Clean-consumer tarball checks
+    if: github.repository == 'opslane/opslane-oss'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install (lifecycle scripts blocked)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build publishable packages
+        run: pnpm --filter @opslane/sdk... --filter @opslane/cli... build
+      - name: Clean-consumer tarball checks
+        run: node scripts/check-packed-packages.mjs
+
+  # Credentialed publish. Runs only trusted code: frozen-lockfile install with
+  # lifecycle scripts blocked, our own builds, and changesets. No consumer
+  # installs happen here.
+  release:
+    name: Version PR or publish
+    if: github.repository == 'opslane/opslane-oss'
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write # changesets action pushes the version branch
+      pull-requests: write # and opens/updates the Version Packages PR
+      id-token: write # npm Trusted Publishing (OIDC) + provenance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - name: Update npm (trusted publishing requires >= 11.5.1)
+        run: npm install -g npm@latest && npm --version
+      - name: Install (lifecycle scripts blocked)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build publishable packages
+        run: pnpm --filter @opslane/sdk... --filter @opslane/cli... build
+      - name: Version PR or publish
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: pnpm changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'true'

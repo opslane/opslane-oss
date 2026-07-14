@@ -12,6 +12,7 @@
  *   INGESTION_URL      — Base URL for ingestion API (default: http://localhost:8082)
  */
 
+import crypto from 'node:crypto';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   seedTenant,
@@ -23,6 +24,7 @@ import {
   cleanupTenant,
   closePool,
   type TestTenant,
+  type Incident,
 } from './helpers.js';
 
 // All reason codes from shared/src/types.ts
@@ -165,49 +167,61 @@ describe.skipIf(hasLLMKey || !keylessWorkerRunning)(
       await closePool();
     });
 
-    it('worker produces needs_human with missing_llm_key reason', async () => {
-      const eventPayload = {
-        timestamp: new Date().toISOString(),
-        error: {
-          type: 'ReferenceError',
-          message: 'foo is not defined',
-          stack: 'ReferenceError: foo is not defined\n  at bar.js:10:5',
-        },
-        breadcrumbs: [],
-        context: {
-          url: 'https://app.example.com/test',
-          user_agent: 'Mozilla/5.0 (E2E Test)',
-        },
-        sdk_version: '0.0.1-e2e',
-      };
+    it(
+      'worker produces needs_human with missing_llm_key reason',
+      async () => {
+        // Unique marker so we can assert on the EXACT event we submit —
+        // an empty incident list is a failure, never a silent pass.
+        const marker = `e2e-keyless-${crypto.randomUUID()}`;
+        const eventPayload = {
+          timestamp: new Date().toISOString(),
+          error: {
+            type: 'ReferenceError',
+            message: `${marker} is not defined`,
+            stack: `ReferenceError: ${marker} is not defined\n  at bar.js:10:5`,
+          },
+          breadcrumbs: [],
+          context: {
+            url: 'https://app.example.com/test',
+            user_agent: 'Mozilla/5.0 (E2E Test)',
+          },
+          sdk_version: '0.0.1-e2e',
+        };
 
-      const postRes = await postEvent(tenant.apiKey, eventPayload);
-      expect(postRes.status).toBe(202);
+        const postRes = await postEvent(tenant.apiKey, eventPayload);
+        expect(postRes.status).toBe(202);
 
-      // Wait for the worker to pick it up (may take a few seconds)
-      // Then poll for terminal status
-      const incidents = await listIncidents(tenant.apiKey, tenant.projectId);
-      if (incidents.length === 0) {
-        // Event may not have created a group yet (ingest handler is a stub)
-        // Skip the poll in that case — this is expected for the current state
-        return;
-      }
+        // The submitted event must surface as an incident. Poll — grouping is
+        // synchronous but the worker claim is not — and fail hard on timeout.
+        const deadline = Date.now() + 60_000;
+        let incident: Incident | undefined;
+        while (Date.now() < deadline && !incident) {
+          const incidents = await listIncidents(tenant.apiKey, tenant.projectId);
+          incident = incidents.find((i) => i.title.includes(marker));
+          if (!incident) await new Promise((r) => setTimeout(r, 2_000));
+        }
+        if (!incident) {
+          throw new Error(
+            `Submitted event (marker ${marker}) never appeared as an incident — ingestion or grouping is broken`
+          );
+        }
 
-      const incident = incidents[0]!;
-      const terminal = await pollUntilTerminal(
-        tenant.apiKey,
-        tenant.projectId,
-        incident.id,
-        ['needs_human'],
-        45_000
-      );
+        const terminal = await pollUntilTerminal(
+          tenant.apiKey,
+          tenant.projectId,
+          incident.id,
+          ['needs_human'],
+          90_000
+        );
 
-      expect(terminal.status).toBe('needs_human');
-      expect(terminal.reason).toBeDefined();
-      expect(terminal.reason!.reason_code).toBe('missing_llm_key');
-      expect(terminal.reason!.reason_message).toBeTruthy();
-      expect(terminal.reason!.remediation).toBeTruthy();
-    });
+        expect(terminal.status).toBe('needs_human');
+        expect(terminal.reason).toBeDefined();
+        expect(terminal.reason!.reason_code).toBe('missing_llm_key');
+        expect(terminal.reason!.reason_message).toBeTruthy();
+        expect(terminal.reason!.remediation).toBeTruthy();
+      },
+      180_000
+    );
   }
 );
 
