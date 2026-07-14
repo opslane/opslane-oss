@@ -17,4 +17,6 @@ regexes = [
   # Deterministic canary values planted by the keyless E2E lane's token-leak
   # scan (.github/workflows/ci.yml). Not secrets by construction.
   '''OPSLANE-E2E-CANARY-[a-z]+-[0-9a-f]+''',
+  # Documentation placeholder API key used in README/docs curl examples.
+  '''e2e-test-key-plaintext''',
 ]
