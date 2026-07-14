@@ -16,7 +16,7 @@ Record every session cheaply (compressed, chunked), enrich the recording with a 
 
 ## What changed in v4 (second Codex review)
 
-The core concept held; a second adversarial pass found 20 issues in the *mechanisms*. 19 were accepted and are baked in below; 1 was deferred as a product decision. Two of the accepted findings describe live repository vulnerabilities and were filed as standalone security issues (#47, #48). Accepted corrections, by theme:
+The core concept held; a second adversarial pass found 20 issues in the *mechanisms*. 19 were accepted and are baked in below; 1 (finding 15, always-on vs. opt-in) was a product call, now **decided in favor of always-on** with rollout requirements attached. Two of the accepted findings describe live repository vulnerabilities and were filed as standalone security issues (#47, #48). Accepted corrections, by theme:
 
 **Upload pipe (findings 1, 19, 11, 3)**
 1. **Chunks need a commit signal.** A presigned PUT does not notify ingestion, so `uploaded_at`, `size_bytes`, `last_chunk_at`, scrub-queueing, session close, and re-analysis have no reliable trigger. Added an explicit per-chunk commit call (or storage bucket-event notification). Section 2.
@@ -50,7 +50,7 @@ The core concept held; a second adversarial pass found 20 issues in the *mechani
 19. **Receipts are idempotent + attributable.** GitHub redelivers webhooks; store the delivery id with a UNIQUE constraint; record the fix-job id on the PR at creation so outcomes are attributable. Section 5.
 20. **Rollback story is per-change and honest.** "Ignore new columns" is true only for added columns. Dropped tables lose data; a Postgres enum value cannot be removed. Drops are deferred until the feature is stable; enum additions are permanent, so N−1 compatibility is designed, not assumed. Section 1.
 
-**Deferred (finding 15) — product/legal decision, not resolved here:** always-on recording for everyone silently changes the meaning of an absent `replay` config and contradicts today's public opt-in promise (`docs/architecture/trust.md`). This is an explicit open decision (see Open Questions), owned outside this design. **Until it is decided, the design assumes opt-in remains the default** and always-on is gated behind an affirmative, versioned opt-in.
+**Decided (finding 15) — always-on recording defaults ON for everyone.** This was the one finding raised as a product/legal concern; the product decision is made: recording is on by default, not opt-in. Codex's concern (a silent change to the meaning of an absent `replay` config, contradicting today's public opt-in promise in `docs/architecture/trust.md`) does **not** block the decision — it converts into concrete work items that must ship *with* the switch: a major-version SDK release so the default flips only on a deliberate upgrade, a migration/consent note in the changelog and docs, an updated `trust.md`, and a runtime kill switch + `replay: { enabled: false }` escape hatch. These are requirements, not open questions.
 
 ## What changed in v3 (post-migration re-verification)
 
@@ -76,7 +76,7 @@ The design was written against the `defender` repo; the code now lives in `opsla
 |----------|--------|-----------|
 | Organizing primitive | One unified **incident** (kind: `error` \| `friction`) | One inbox, one status model, one pipeline, one bill. |
 | Error+friction in same session | Fold friction into the error incident as evidence + impact boost, **with real write paths to every impact read** (v4-17) | One moment of pain = one incident. Depends on the client-timestamp fix (#27). |
-| Capture policy | **Opt-in by default (unchanged from today) until the always-on decision is made** (v4-deferred); when enabled: rrweb + interaction telemetry, gzipped chunks every ~30s, each chunk self-contained (full snapshot) | Storage is cheap once compressed; analysis, not storage, is the cost. Always-on is a product/legal call, not assumed. |
+| Capture policy | **Always-on recording, default ON for everyone** (v4-15, decided): rrweb + interaction telemetry, gzipped chunks every ~30s, each chunk self-contained (full snapshot). Ships behind a major-version SDK release + consent/docs update + kill switch. | Storage is cheap once compressed; analysis, not storage, is the cost. Default-on is the product decision; the versioned rollout keeps it honest. |
 | Chunk durability | **Server-acknowledged commit per chunk** (v4-1); **full rrweb snapshot at each chunk boundary** (v4-19); **size-capped presigned PUTs + per-project byte budget** (v4-3, #48) | A recording the server never hears about cannot be scrubbed, closed, or analyzed; a chunk that depends on a lost predecessor is unplayable; unbounded PUTs are a flood/OOM primitive. |
 | SDK role | Recorder + **thin interaction telemetry** (click annotations, network-request-start markers via `send()`, form submits) as rrweb custom events | Server rules need signals rrweb doesn't carry. Detection logic stays server-side. |
 | Friction detection location | **Server-side, on stored streams**, versioned rules | Detector iteration at deploy speed; retroactive re-analysis. |
@@ -92,7 +92,7 @@ The design was written against the `defender` repo; the code now lives in `opsla
 | Retention | 14–30 day deletion for chunks/sessions incl. **MinIO object deletion (new client op)**; **evidence-pinning + tombstones + PII-inclusive sweeps**; incident-referenced windows retained but hard-capped (90 days) (v4-16, #29) | "Open incidents retained" must not mean forever, and deletion must not orphan raw data or leave selector/text PII. |
 | Privacy | **Fail-closed**: private bucket (#47), masking-at-capture primary + scrubber second pass, **read/analyze blocked until `scrubbed_at` set**, selector/text masked (v4-13), strict mode, runtime kill switch, consent snippet in Batch 1 docs | Recording is the FullStory posture — commitments, not parking. |
 | Replay model migration | **Bridge `session_replays` ↔ `sessions`/`session_chunks`**: error replays become pointers into the chunk stream (v4-6) | Don't orphan the dashboard player/worker evidence; don't double-store every error moment. |
-| Deferred | Custom behavioral signals, VLM-on-everything, autonomy auto-promotion, model-level learning; **always-on-by-default (v4-15, product decision)** | YAGNI until the core loop proves out. |
+| Deferred | Custom behavioral signals, VLM-on-everything, autonomy auto-promotion, model-level learning | YAGNI until the core loop proves out. |
 
 ## Dependencies (must land first or alongside)
 
@@ -131,7 +131,7 @@ Old `friction_groups`/`friction_events`/`friction_group_affected_users` (never p
 
 ### 2. Capture: SDK = recorder + thin telemetry
 
-- **Opt-in unchanged until the always-on decision (v4-15).** When recording is enabled:
+- **Always-on, default ON (v4-15, decided).** Shipped behind a major-version SDK bump so the default flips only on a deliberate upgrade; `replay: { enabled: false }` and the runtime kill switch remain the escape hatches.
 - **Durable sessions**: session ID persisted in `sessionStorage`; **`next_chunk_seq` persisted alongside it (v4-15)** so a reload doesn't reset to `chunk-0`; rotated after 30 min idle **and on identity change — login/logout starts a new session (v4-16)**. `setUser()` updates the session server-side.
 - **rrweb records continuously**; the SDK injects custom events: click annotations (derived selector, computed `cursor`), **network-request-start markers via patched XHR `send()` and fetch (v4-12)**, form-submit events. Detection logic stays server-side.
 - **Chunk protocol (v4-1, v4-19, v4-3)**: `POST /sessions/init` registers the session; every ~30s (and on `visibilitychange`) the SDK gzips the buffer (`CompressionStream`) and PUTs `chunk-{seq}.json.gz` to a **size-capped presigned URL** (`content-length-range`, #48). **Each chunk begins with a full rrweb snapshot** so it is independently playable (v4-19). After each PUT the SDK **calls a commit endpoint** (or the server consumes a bucket notification) recording existence + size (v4-1). Failures retry with backoff into a bounded buffer.
@@ -228,7 +228,7 @@ Full-session LLM sweeps; headless rrweb renderer for screenshots (real infra). G
 
 ## Open questions (parked, with owners)
 
-- **Always-on vs. opt-in (v4-15, product/legal):** does recording default on for everyone, silently changing an absent `replay` config and today's public opt-in promise? **Owned outside this design; until decided, opt-in stays the default.** Blocks Batch 1's capture-policy shape.
+- ~~Always-on vs. opt-in (v4-15):~~ **Decided: recording defaults ON.** Ships behind a major-version SDK release + consent/docs update + kill switch (see Decisions). No longer open.
 - Pricing: does a friction fix bill like an error fix? Decide before Batch 5.
 - Consent tooling: snippet ships in Batch 1 docs; full consent-management is customer-side.
 - Mobile chunk cadence vs battery: measure in Batch 1; fallback 60s cadence + visibility-only flushes.
