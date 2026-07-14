@@ -111,11 +111,79 @@ jobs:
           persist-credentials: false
       - run: docker build -f packages/${{ matrix.image }}/Dockerfile .
 
+  e2e-keyless:
+    name: Keyless smoke E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Deterministic canaries planted where real secrets would live; the leak
+      # scan below fails the job if they surface in logs or HTTP responses.
+      GITHUB_APP_CLIENT_SECRET: OPSLANE-E2E-CANARY-ingestion-2f9c41d7
+      E2B_API_KEY: OPSLANE-E2E-CANARY-worker-8b1e63aa
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Assert the LLM key is absent
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "ANTHROPIC_API_KEY must not be set in the keyless lane."
+            exit 1
+          fi
+      - name: Boot the stack without an LLM key
+        run: |
+          docker compose up -d postgres minio minio-setup
+          docker compose run --rm migrate
+          docker compose up -d --build --wait ingestion worker
+      - name: Assert the worker container is keyless
+        run: docker compose exec -T worker sh -c '[ -z "$ANTHROPIC_API_KEY" ]'
+      - name: Run E2E contracts with hard assertions
+        env:
+          DATABASE_URL: postgres://opslane:opslane_dev@localhost:5434/opslane
+          INGESTION_URL: http://localhost:8082
+          E2E_WORKER_NO_KEY: "1"
+        run: >
+          pnpm --filter @opslane/test-e2e exec vitest run
+          --reporter=default --reporter=json
+          --outputFile=${{ runner.temp }}/e2e-results.json
+      - name: Enforce zero unexpected skips
+        env:
+          # The with-secrets PR pipeline suite is the only allowed skip here.
+          E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
+          E2E_MIN_TESTS: "15"
+        run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
+      - name: Token-leak scan over logs and public HTTP surfaces
+        run: |
+          docker compose logs --no-color > "${{ runner.temp }}/stack-logs.txt"
+          curl -fsS http://localhost:8082/health > "${{ runner.temp }}/responses.txt" || true
+          curl -fsS http://localhost:8082/ >> "${{ runner.temp }}/responses.txt" || true
+          leak=0
+          for canary in "OPSLANE-E2E-CANARY-ingestion-2f9c41d7" "OPSLANE-E2E-CANARY-worker-8b1e63aa"; do
+            if grep -qF "$canary" "${{ runner.temp }}/stack-logs.txt" "${{ runner.temp }}/responses.txt"; then
+              echo "Token leak detected: $canary appeared in scanned surfaces."
+              leak=1
+            fi
+          done
+          [ "$leak" -eq 0 ] && echo "Leak scan clean."
+          exit "$leak"
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs --no-color | tail -300
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
   ci-ok:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker]
+    needs: [go, js, compose, docker, e2e-keyless]
     if: always()
     steps:
       - name: Report job results
