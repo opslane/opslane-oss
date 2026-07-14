@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    name: Go build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: opslane
+          POSTGRES_PASSWORD: opslane_dev
+          POSTGRES_DB: opslane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opslane"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://opslane:opslane_dev@localhost:5432/opslane?sslmode=disable
+    defaults:
+      run:
+        working-directory: packages/ingestion
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: packages/ingestion/go.mod
+          cache-dependency-path: packages/ingestion/go.sum
+      - name: Apply migrations
+        run: MIGRATION_DIR=db/migrations ../../scripts/run-migrations.sh
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  js:
+    name: JS build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: opslane
+          POSTGRES_PASSWORD: opslane_dev
+          POSTGRES_DB: opslane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opslane"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://opslane:opslane_dev@localhost:5432/opslane?sslmode=disable
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Apply migrations
+        run: MIGRATION_DIR=packages/ingestion/db/migrations ./scripts/run-migrations.sh
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright chromium (SDK browser tests)
+        run: pnpm --filter @opslane/sdk exec playwright install --with-deps chromium
+      - run: pnpm -r build
+      - run: pnpm test
+
+  compose:
+    name: Compose validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: docker compose config --quiet
+
+  docker:
+    name: Docker build (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ingestion, worker]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: docker build -f packages/${{ matrix.image }}/Dockerfile .
+
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [go, js, compose, docker]
+    if: always()
+    steps:
+      - name: Report job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS"
+      - name: Fail on any failed, cancelled, or skipped required job
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
