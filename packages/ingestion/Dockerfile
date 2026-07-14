@@ -16,7 +16,7 @@ COPY packages/ingestion/ .
 RUN CGO_ENABLED=0 go build -o /ingestion .
 
 # Stage 3: Final image
-FROM alpine:3.19
+FROM alpine:3.24
 LABEL org.opencontainers.image.source="https://github.com/opslane/opslane-oss"
 LABEL org.opencontainers.image.description="Opslane ingestion service"
 RUN apk add --no-cache ca-certificates wget postgresql16-client
