@@ -49,4 +49,4 @@ Every `needs_human` incident carries a `reason_code`, a `reason_message`, and a 
 | `worker_runtime_error` | Review the error manually — the Opslane worker hit an unexpected internal error while processing this incident. |
 | `lease_lost` | No action needed — the job lease expired mid-run and the incident will be retried automatically. |
 
-22 codes total. The [drift check](../../scripts/check-docs-drift.mjs) fails CI if this page and `shared/src/types.ts` disagree.
+22 codes total. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `shared/src/types.ts` disagree.

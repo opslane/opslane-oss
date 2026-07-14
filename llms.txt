@@ -18,7 +18,7 @@ This file indexes the agent-relevant documentation. All canonical content is pla
 - [Trust and security model](docs/architecture/trust.md): GitHub permissions, data flow, credential storage, masking, honest gaps (incl. no automated replay retention)
 - [Replay privacy](docs/replay-privacy.md): what replay data may contain
 
-## Reference (drift-checked against source in CI)
+## Reference (drift-checked against source by the pnpm test gate)
 
 - [SDK options](docs/reference/sdk-options.md): every init() option with defaults, from SdkInitOptions
 - [HTTP routes](docs/reference/http-routes.md): every registered route with auth mode

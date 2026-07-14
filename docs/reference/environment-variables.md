@@ -1,6 +1,6 @@
 # Environment variables
 
-Every variable each service actually reads, from `os.Getenv` (ingestion) and `process.env` (worker). The [drift check](../../scripts/check-docs-drift.mjs) fails CI if code and this page disagree.
+Every variable each service actually reads, from `os.Getenv` (ingestion) and `process.env` (worker). The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if code and this page disagree.
 
 ## Ingestion API
 
@@ -20,8 +20,9 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `REPLAY_STORE_ENDPOINT` / `REPLAY_STORE_PUBLIC_ENDPOINT` | for replays | S3-compatible endpoint (internal / browser-visible) |
 | `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` | for replays | Storage credentials |
 | `REPLAY_STORE_BUCKET` / `REPLAY_STORE_REGION` | for replays | Bucket and region |
-| `MINIO_ENDPOINT` / `MINIO_PUBLIC_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` / `MINIO_REGION` | legacy aliases | Fallback names for the same storage settings |
 | `VERSION` | no | Reported by `/health` |
+
+Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in its test code, not runtime configuration.
 
 ## Worker
 
@@ -32,13 +33,12 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `E2B_API_KEY` | for verification | Sandbox where fixes are tested |
 | `GITHUB_TOKEN` | one of the two GitHub modes | PAT for clone + PR |
 | `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` | the other mode | GitHub App installation tokens |
-| `INGESTION_BASE_URL` | yes (Compose sets it) | Reaching the ingestion API |
 | `DASHBOARD_URL` / `DASHBOARD_ORIGIN` | no | Links in PR bodies and notifications |
 | `WORKER_ID` | no (generated) | Stable worker identity for lease ownership |
 | `POLL_INTERVAL_MS` / `LEASE_DURATION_MS` / `REAPER_INTERVAL_MS` / `SILENCE_CHECK_INTERVAL_MS` | no | Queue tuning |
 | `HEALTH_PORT` | no (8081) | Health endpoint port |
-| `REPLAY_STORE_*` (endpoint, access key, secret key, bucket) | for replay analysis | Reading stored replays |
-| `MINIO_*` (endpoint, access key, secret key, bucket) | legacy aliases | Fallback names for the same settings |
+| `REPLAY_STORE_ENDPOINT` / `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` / `REPLAY_STORE_BUCKET` | for replay analysis | Reading stored replays |
+| `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | legacy aliases | Worker-side fallback names for the same settings |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` / `LANGFUSE_PROJECT_ID` | no | Optional LLM tracing |
 
 The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHROPIC_API_KEY`, `E2B_API_KEY`, and `GITHUB_TOKEN` — jobs then end in explicit `needs_human` states rather than crashing.
@@ -49,3 +49,4 @@ The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHR
 | --- | --- |
 | `ALLOW_REGISTRATION` | Read by nothing; there is no self-serve registration path (sign-in is GitHub OAuth). |
 | `ENCRYPTION_KEY` | Read by nothing except a sandbox scrub list; at-rest token encryption is not implemented (see [trust](../architecture/trust.md#honest-gaps-current-state)). |
+| `INGESTION_BASE_URL` | Set for the worker in Compose, but no worker code reads it — the worker talks to Postgres and storage directly. |

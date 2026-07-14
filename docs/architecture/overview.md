@@ -21,10 +21,11 @@ flowchart LR
     SDK -->|events, replays, source maps| ING
     ING --> PG
     ING --> S3
+    ING -->|OAuth sign-in, repo listing| GH
     WRK --> PG
     WRK --> S3
     WRK --> E2B
-    WRK --> GH
+    WRK -->|clone, branch push, PR| GH
     WRK --> ANT
 ```
 
@@ -42,7 +43,7 @@ flowchart LR
 ## Trust boundaries
 
 1. **Browser → ingestion.** Authenticated by per-environment API keys (stored hashed), origin-gated for browser endpoints, and rate-limited per project. Scrubbing starts in the browser (SDK) and continues server-side ([masking](trust.md#masking)).
-2. **Host → external services.** Only the worker crosses this boundary, and only when credentialed: Anthropic (investigation), E2B (fix verification sandbox), GitHub (clone + PR). With no credentials configured, nothing leaves your host and investigations end in explicit `needs_human` states.
+2. **Host → external services.** Two services cross this boundary, each only when credentialed. The **worker** reaches Anthropic (investigation), E2B (fix verification sandbox), and GitHub (clone, fix-branch push, PR). The **ingestion API** also reaches GitHub — OAuth code exchange and user/email lookup during dashboard sign-in, and installation/repository listing during GitHub App setup — so egress rules must allow GitHub from both services, not just the worker. With no credentials configured, nothing leaves your host and investigations end in explicit `needs_human` states.
 3. **Worker → sandbox.** Candidate fixes execute in an isolated E2B sandbox, not on your Opslane host. Repository code is cloned into the sandbox; secrets in the worker's environment are scrubbed from what the agent can read (`repo-clone.ts`).
 
 ## Read next

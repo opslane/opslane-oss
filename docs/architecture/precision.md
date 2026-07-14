@@ -8,7 +8,7 @@ A PR is opened only when **all** of the following held during the run (`packages
 
 1. The candidate fix was produced and applied inside an isolated sandbox against a real clone of your repository.
 2. The project's **test suite ran and passed** in that sandbox, judged by exit code — not by parsing output text.
-3. The fix carries **high confidence** from the investigation. This is a hard, independent guard: even a plausible fix with medium confidence does not ship. It becomes `investigated` (analysis posted, fix awaits your go-ahead) or `needs_human` (`low_confidence_fix`), with the candidate diff preserved for your review.
+3. The fix carries **high confidence**. This is a hard, independent guard: even a plausible fix with medium confidence does not ship — it terminates as `needs_human` (`low_confidence_fix`). The root cause from investigation is preserved; the sub-bar candidate diff itself is not stored. (Medium/low-confidence *investigations* stop before fix generation entirely, posting their analysis as `investigated` for you to review and trigger.)
 
 If dependency installation fails in the sandbox, tests cannot run — and a fix without a test run **cannot** reach high confidence and cannot become a PR (`tests_failed` / `low_confidence_fix`).
 

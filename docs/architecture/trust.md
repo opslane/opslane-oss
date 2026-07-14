@@ -17,7 +17,8 @@ The worker pushes exactly one thing: a newly created fix branch (`git push origi
 | --- | --- | --- |
 | Anthropic API | Error details, stack traces, relevant source file contents, test output | Only during investigation, only with `ANTHROPIC_API_KEY` set |
 | E2B sandbox | A clone of the connected repository, the candidate fix, dependency installs, test runs | Only during fix verification, only with `E2B_API_KEY` set |
-| GitHub | The fix branch and PR body (root cause, diff, verification evidence) | Only on `pr_created` |
+| GitHub (worker) | The fix branch (pushed **before** PR creation — if the PR call then fails, the pushed branch remains and the incident ends `needs_human`), then the PR body (root cause, diff, verification evidence). The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery and setup-PR |
+| GitHub (ingestion) | OAuth code exchange and user/email lookup (sign-in); installation and repository listing (App setup) | During dashboard sign-in and GitHub setup |
 
 With no credentials configured, **nothing leaves your host** — the stack ingests, groups, and files `needs_human` incidents entirely locally.
 

@@ -1,6 +1,6 @@
 # SDK options
 
-All options accepted by `init()` from `@opslane/sdk`, mirrored from `SdkInitOptions` and the defaults object in `packages/sdk/src/config.ts`. The [drift check](../../scripts/check-docs-drift.mjs) fails CI if the type and this page disagree.
+All options accepted by `init()` from `@opslane/sdk`, mirrored from `SdkInitOptions` and the defaults object in `packages/sdk/src/config.ts`. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if the type and this page disagree.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |

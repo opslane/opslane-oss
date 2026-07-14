@@ -2,7 +2,7 @@
 
 All routes registered by the ingestion API (`packages/ingestion/handler/routes.go`). Auth column legend: **none** (public), **SDK** (`X-API-Key` per-environment key; browser endpoints also origin-gated and rate-limited per project), **session** (dashboard JWT cookie or CLI token), **either** (session or SDK).
 
-These are curated tables, not a stability contract — the API is early-stage and may change. The [drift check](../../scripts/check-docs-drift.mjs) fails CI if this page and `routes.go` disagree.
+These are curated tables, not a stability contract — the API is early-stage and may change. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `routes.go` disagree.
 
 ## Public
 
