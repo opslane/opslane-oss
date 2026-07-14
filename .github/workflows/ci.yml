@@ -193,3 +193,46 @@ jobs:
       - name: Fail on any failed, cancelled, or skipped required job
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: exit 1
+
+  # Candidate images: only on push to main, only after ci-ok. The unique tag
+  # main-<sha>-<run-id>-<attempt> IS the candidate's identity (no stored
+  # manifest); the release workflow resolves digests from it at promotion.
+  candidate-images:
+    name: Publish candidate images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ci-ok]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ingestion, worker]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push candidate
+        id: push
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/opslane-${{ matrix.image }}
+          TAG: main-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker build -f "packages/${{ matrix.image }}/Dockerfile" -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "Candidate pushed: $IMAGE:$TAG"
+          echo "Digest: $digest"
+          {
+            echo "### Candidate: \`${{ matrix.image }}\`"
+            echo '```'
+            echo "tag:    $IMAGE:$TAG"
+            echo "digest: $digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

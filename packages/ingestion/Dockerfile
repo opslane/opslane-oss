@@ -1,10 +1,11 @@
-# Stage 1: Build dashboard
+# Stage 1: Build dashboard (workspace lockfile, reproducible)
 FROM node:22-alpine AS dashboard-builder
 WORKDIR /app
-COPY packages/dashboard/package.json ./
-RUN npm install
-COPY packages/dashboard/ .
-RUN npx vue-tsc && npx vite build
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
+COPY packages/dashboard/package.json packages/dashboard/
+RUN corepack enable pnpm && pnpm install --frozen-lockfile
+COPY packages/dashboard/ packages/dashboard/
+RUN pnpm --filter @opslane/dashboard build
 
 # Stage 2: Build Go service
 FROM golang:1.24-alpine AS builder
@@ -23,7 +24,7 @@ RUN addgroup -S ingestion && adduser -S ingestion -G ingestion
 COPY --from=builder /ingestion /usr/local/bin/ingestion
 COPY --from=builder /app/db/migrations /app/db/migrations
 COPY scripts/run-migrations.sh /app/run-migrations.sh
-COPY --from=dashboard-builder /app/dist /app/dashboard
+COPY --from=dashboard-builder /app/packages/dashboard/dist /app/dashboard
 ENV DASHBOARD_DIR=/app/dashboard
 ENV PORT=8080
 WORKDIR /app
