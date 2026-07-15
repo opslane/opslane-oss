@@ -28,8 +28,34 @@ Secrets hygiene in the sandbox: before the agent loop runs, well-known secret va
 
 Defense in two layers, both on by default — with an honest note on their scope:
 
-- **In the browser (SDK):** replays are **opt-in** (`replay.enabled` defaults to false); when enabled, all input values are masked (`maskAllInputs: true`) plus anything matching `.opslane-mask`. For **error events and console breadcrumbs**, captured text and URLs are scrubbed of JWTs, `Bearer` tokens, `password`/`secret`/`api_key`-style pairs, query strings, and URL userinfo before transmission. This scrubbing does *not* run over the replay's serialized DOM — visible page text is captured as rendered unless masked.
-- **Server-side (ingestion):** for events, sensitive headers (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-csrf-token`), well-known API-key prefixes (`sk_live_`, `sk_test_`, `AKIA`, `ghp_`, …), and URL-embedded credentials are replaced with `[REDACTED]` before persistence. For **replays**, the browser uploads directly to object storage via a pre-signed URL and ingestion redacts by *rewriting the object at completion* — an upload interrupted before completion leaves the raw recording in storage (compounded by [#13](https://github.com/opslane/opslane-oss/issues/13) and the absence of retention cleanup below).
+**In the browser (SDK):** since SDK 1.0.0, session recording is **on by
+default** (`replay.enabled` defaults to `true`). Earlier versions defaulted to
+off; the default changed only across a major version, so it never flips under an
+existing integration. Opt out with `replay: { enabled: false }`, or disable
+recording for a whole project through the server-side `recording_enabled`
+setting without redeploying. A dashboard control is not included in Batch 1.
+
+Every session is recorded, not only error moments. All input values are masked
+(`maskAllInputs: true`), as is anything matching `.opslane-mask`;
+`.opslane-block` skips a subtree entirely. **Rendered page text is captured as
+displayed unless you mask it** — this has not changed, but it now applies to
+every session rather than only sessions that hit an error. If you have not
+reviewed your masking, do that before upgrading.
+
+For **chunked session recordings**, the browser uploads gzipped ~30s chunks
+directly to private object storage via a size-capped presigned POST policy. A
+server-side scrubber inflates each chunk under a hard ceiling, redacts it, and
+re-stores it. A chunk is **unreadable until that completes**: `scrubbed_at` is
+the only thing that makes it visible to any reader, and a chunk that cannot be
+scrubbed stays unreadable permanently rather than being served raw.
+
+The older error-triggered one-shot replay path still redacts by rewriting the
+object at completion, so an upload interrupted before completion leaves the raw
+recording in storage. That path is retired once error replays resolve to chunk
+pointers.
+
+For error events, ingestion also replaces sensitive headers, well-known API-key
+prefixes, and URL-embedded credentials with `[REDACTED]` before persistence.
 
 See [replay privacy](../replay-privacy.md) for what replay data may contain.
 
@@ -43,7 +69,8 @@ See [replay privacy](../replay-privacy.md) for what replay data may contain.
 
 These are known, tracked, and stated here so you can make an informed deployment decision:
 
-- **No automated replay retention.** `session_replays` rows and stored replay payloads have no expiry column and no cleanup job — replays persist until you delete them. If you enable replay on sensitive flows, plan manual cleanup.
+- **Replay and session retention.** Chunked session recordings are deleted on a per-project clock (default 30 days, `projects.session_retention_days`), removing both the database rows and the entire stored-object prefix. Sessions pinned as incident evidence survive the normal window but are hard-capped at 90 days. Deleted session ids are tombstoned and their prefixes are re-swept continuously, so an upload accepted just before policy expiry cannot permanently recreate the data.
+- **The older one-shot replay path still has no retention.** `session_replays` rows from the error-triggered path have no expiry or cleanup job and persist until you delete them. See [#29](https://github.com/opslane/opslane-oss/issues/29).
 - **`github_token_encrypted` is unused.** The schema has an encrypted-token column, but no code path writes or reads it; GitHub credentials come from the environment (PAT or App key). Envelope-encrypted at-rest token storage is not implemented yet.
 - **The bundled Compose file is a development deployment.** Development credentials, no backups, no upgrade/rollback procedure. A production operations guide is tracked separately and blocked on that work.
 

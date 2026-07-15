@@ -19,9 +19,7 @@ const read = (p) => readFileSync(join(root, p), 'utf8');
 const problems = [];
 
 // Known drift, allowlisted with a tracking issue. Remove entries as bugs close.
-const KNOWN_DRIFT = new Map([
-  ['POST /api/v1/replays/{param}/fail', 'https://github.com/opslane/opslane-oss/issues/13'],
-]);
+const KNOWN_DRIFT = new Map([]);
 
 const normalize = (p) => p.replace(/\{[^}]+\}/g, '{param}');
 
