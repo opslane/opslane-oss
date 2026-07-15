@@ -1,0 +1,13 @@
+[
+  {
+    "events": [
+      { "type": 2, "data": {}, "timestamp": 1720000000000 },
+      { "type": 4, "data": { "href": "https://app.example.com/checkout/42?q=1" }, "timestamp": 1720000000001 },
+      { "type": 3, "data": { "source": 5, "id": 10, "text": "*" }, "timestamp": 1720000001000 },
+      { "type": 3, "data": { "source": 5, "id": 11, "text": "*" }, "timestamp": 1720000007000 },
+      { "type": 3, "data": { "source": 5, "id": 12, "text": "*" }, "timestamp": 1720000013000 },
+      { "type": 5, "data": { "tag": "opslane.telemetry", "payload": { "kind": "form_submit", "selector": "[data-testid=\"checkout\"]", "at": 1720000014000 } }, "timestamp": 1720000014000 }
+    ],
+    "meta": { "sdk_version": "fixture", "has_full_snapshot": true, "chunked_at": 1720000030000 }
+  }
+]

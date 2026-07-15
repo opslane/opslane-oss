@@ -133,6 +133,20 @@ describe('createPR', () => {
     );
   });
 
+  it('stamps friction pull requests as suggestions', async () => {
+    const createPullRequest = vi
+      .fn<GitHubClient['createPullRequest']>()
+      .mockResolvedValue({ url: 'https://github.com/org/repo/pull/1', number: 1 });
+    const client = makeMockClient({ createPullRequest });
+
+    await createPR(makeInput({ kind: 'friction' }), () => client);
+
+    expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({
+      title: expect.stringMatching(/^\[Opslane\] Suggestion:/),
+      body: expect.stringContaining('## 💡 Opslane suggestion:'),
+    }));
+  });
+
   it('returns failed for invalid repo format', async () => {
     const client = makeMockClient();
     const result = await createPR(
@@ -148,6 +162,12 @@ describe('createPR', () => {
 });
 
 describe('buildPRBody', () => {
+  it('never labels a friction change as an Opslane fix', () => {
+    const body = buildPRBody(makeInput({ kind: 'friction', title: 'Dead Save button' }));
+    expect(body).toContain('## 💡 Opslane suggestion: Dead Save button');
+    expect(body).not.toContain('Opslane fixed');
+  });
+
   it('uses the explicit human summary as a header-free lede', () => {
     const body = buildPRBody(makeInput({
       humanSummary: '### The user submitted the form. The app crashed on submit. The fix guards the missing value.',

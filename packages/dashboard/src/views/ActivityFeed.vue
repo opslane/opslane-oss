@@ -15,13 +15,16 @@ const projectId = ref('');
 const currentFilters = ref<IncidentFilters>({});
 
 const statusOrder: Record<ErrorGroupStatus, number> = {
+  candidate: -1,
   new: 0,
   queued: 1,
   analyzing: 2,
   fixing: 3,
   investigated: 4,
+  awaiting_approval: 4,
   pr_created: 5,
   needs_human: 6,
+  insight: 7,
   resolved: 7,
   merged: 8,
   archived: 9,

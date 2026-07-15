@@ -28,18 +28,31 @@ export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
     throw new Error('GITHUB_TOKEN is not set');
   }
 
+  // Reject stored values that git could parse as options (second-order argument
+  // injection, e.g. a branch of "--upload-pack=..."). Branch names never start
+  // with '-' or contain whitespace; repos are "owner/name".
+  if (!/^[^\s-][^\s]*$/.test(defaultBranch)) {
+    throw new Error('Refusing to clone: unsafe branch name');
+  }
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(githubRepo)) {
+    throw new Error('Refusing to clone: unsafe repository name');
+  }
+
   const repoDir = `/tmp/opslane-repo-${jobId}`;
   const cloneUrl = `https://x-access-token:${token}@github.com/${githubRepo}.git`;
 
   try {
+    // `--branch=` attached form + `--` end-of-options so neither the branch nor
+    // the positional URL/dir can be reinterpreted as a git option.
     await execFile('git', [
-      'clone', '--depth', '1', '--branch', defaultBranch,
-      cloneUrl, repoDir,
+      'clone', '--depth', '1', `--branch=${defaultBranch}`,
+      '--', cloneUrl, repoDir,
     ], { timeout: timeoutMs, env: scrubbedEnv() });
   } catch (err: unknown) {
-    // Scrub token from error messages before propagating
+    // Scrub token from error messages before propagating (bounded quantifier
+    // to avoid polynomial backtracking on adversarial input).
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(msg.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@'));
+    throw new Error(msg.replace(/x-access-token:[^@]{1,512}@/g, 'x-access-token:***@'));
   }
 
   return {

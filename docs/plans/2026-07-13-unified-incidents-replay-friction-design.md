@@ -118,7 +118,7 @@ New tables (idempotent, append-only from `002`):
 - **`error_groups`** gains `kind TEXT NOT NULL DEFAULT 'error' CHECK (kind IN ('error','friction'))`, nullable `signal_type` / `element_selector` / `page_url_normalized`, and status values `candidate` (hidden, v4-10), `awaiting_approval` and `insight` (v4-4).
 - **`error_group_jobs`** gains `triggered_by TEXT` (`auto` | `human`) and a nullable typed **`session_id` FK** for `session_analysis` jobs (v4-15).
 - **`pr_outcomes`** — immutable log: error_group_id, pr_number, outcome, occurred_at, **github_delivery_id (UNIQUE, v4-17)**, **fix_job_id (v4-17)**. Webhook writes here before any state clearing.
-- **`accounts`** *(new entity, v4-18)* — accounts are derived today; per-account record/deep-analyze flags need a real row. Introduce the table or key flags by the derived account string and accept the coupling (decision in Batch 3).
+- **Accounts entity (v4-18) — Decided in Batch 3: no table.** Future per-account flags key on the derived `(project_id, external_account_id)` string, matching the existing account aggregation and `idx_end_users_account`. A table would require backfill and dual writes before there is a reader.
 - **project settings** — autonomy level per category; per-account flags.
 
 **Indexes shipped with the schema (v4-18):** `session_chunks(scrubbed_at) WHERE scrubbed_at IS NULL`; `sessions(last_chunk_at) WHERE status='recording'`; `sessions(end_user_id, started_at)` and an account/time variant; `friction_signals(project_id, environment_id, fingerprint, occurred_at)` for the 7-day distinct-user aggregation.
@@ -233,4 +233,4 @@ Full-session LLM sweeps; headless rrweb renderer for screenshots (real infra). G
 - Consent tooling: snippet ships in Batch 1 docs; full consent-management is customer-side.
 - Mobile chunk cadence vs battery: measure in Batch 1; fallback 60s cadence + visibility-only flushes.
 - Anonymous-session aggregation: session-count fallback good enough, or keep anonymous friction sub-threshold? Decide with Batch 4 data.
-- Accounts entity (v4-18): real table vs. keying flags by derived account string — decide in Batch 3.
+- Accounts entity (v4-18): **Decided (Batch 3)** — key flags by the derived `(project_id, external_account_id)` string; do not introduce an accounts table without a concrete consumer.

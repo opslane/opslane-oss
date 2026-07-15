@@ -21,6 +21,7 @@ type incidentJSON struct {
 	Fingerprint         string              `json:"fingerprint"`
 	Title               string              `json:"title"`
 	Status              string              `json:"status"`
+	Kind                string              `json:"kind"`
 	FirstSeen           string              `json:"first_seen"`
 	LastSeen            string              `json:"last_seen"`
 	OccurrenceCount     int                 `json:"occurrence_count"`
@@ -65,6 +66,7 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 		Fingerprint:         g.Fingerprint,
 		Title:               g.Title,
 		Status:              g.Status,
+		Kind:                g.Kind,
 		FirstSeen:           g.FirstSeen.Format(time.RFC3339),
 		LastSeen:            g.LastSeen.Format(time.RFC3339),
 		OccurrenceCount:     g.OccurrenceCount,
@@ -616,7 +618,7 @@ func (d *Dependencies) GetEventCountEndpoint(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]bool{"has_events": hasEvents})
 }
 
-// TriggerFix creates a fix job for an investigated incident.
+// TriggerFix creates a fix job for an incident in its kind-specific trigger state.
 // POST /api/v1/projects/{projectID}/incidents/{incidentID}/fix
 func (d *Dependencies) TriggerFix(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
@@ -649,7 +651,7 @@ func (d *Dependencies) TriggerFix(w http.ResponseWriter, r *http.Request) {
 	jobID, err := d.Queries.TriggerFixJob(r.Context(), projectID, incidentID, guidance)
 	if err != nil {
 		if errors.Is(err, db.ErrNotInvestigated) {
-			writeJSONError(w, http.StatusConflict, "incident is not in investigated state")
+			writeJSONError(w, http.StatusConflict, "incident is not in a fix-triggerable state")
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, "failed to trigger fix")
@@ -724,7 +726,7 @@ func (d *Dependencies) ArchiveIncident(w http.ResponseWriter, r *http.Request) {
 	d.respondWithIncident(w, r, projectID, incidentID)
 }
 
-// UnarchiveIncident restores an archived incident to the investigated state.
+// UnarchiveIncident restores an archived incident to a conservative kind-safe state.
 // POST /api/v1/projects/{projectID}/incidents/{incidentID}/unarchive
 func (d *Dependencies) UnarchiveIncident(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
