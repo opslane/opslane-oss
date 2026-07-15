@@ -16,26 +16,32 @@ import (
 // incidentJSON is the JSON representation of an incident, matching the
 // Incident type in shared/src/types.ts. Fields use snake_case.
 type incidentJSON struct {
-	ID                  string            `json:"id"`
-	ProjectID           string            `json:"project_id"`
-	Fingerprint         string            `json:"fingerprint"`
-	Title               string            `json:"title"`
-	Status              string            `json:"status"`
-	Kind                string            `json:"kind"`
-	FirstSeen           string            `json:"first_seen"`
-	LastSeen            string            `json:"last_seen"`
-	OccurrenceCount     int               `json:"occurrence_count"`
-	AffectedUsersCount  int               `json:"affected_users_count"`
-	Confidence          *string           `json:"confidence,omitempty"`
-	PrURL               *string           `json:"pr_url,omitempty"`
-	ReplayID            *string           `json:"replay_id,omitempty"`
-	Reason              *needsHumanReason `json:"reason,omitempty"`
-	RootCause           *string           `json:"root_cause,omitempty"`
-	SuggestedMitigation *string           `json:"suggested_mitigation,omitempty"`
-	MergedAt            *string           `json:"merged_at,omitempty"`
-	ResolvedAt          *string           `json:"resolved_at,omitempty"`
-	ArchivedAt          *string           `json:"archived_at,omitempty"`
-	TraceURL            *string           `json:"trace_url,omitempty"`
+	ID                  string              `json:"id"`
+	ProjectID           string              `json:"project_id"`
+	Fingerprint         string              `json:"fingerprint"`
+	Title               string              `json:"title"`
+	Status              string              `json:"status"`
+	Kind                string              `json:"kind"`
+	FirstSeen           string              `json:"first_seen"`
+	LastSeen            string              `json:"last_seen"`
+	OccurrenceCount     int                 `json:"occurrence_count"`
+	AffectedUsersCount  int                 `json:"affected_users_count"`
+	Confidence          *string             `json:"confidence,omitempty"`
+	PrURL               *string             `json:"pr_url,omitempty"`
+	ReplayID            *string             `json:"replay_id,omitempty"`
+	SessionPointer      *sessionPointerJSON `json:"session_pointer,omitempty"`
+	Reason              *needsHumanReason   `json:"reason,omitempty"`
+	RootCause           *string             `json:"root_cause,omitempty"`
+	SuggestedMitigation *string             `json:"suggested_mitigation,omitempty"`
+	MergedAt            *string             `json:"merged_at,omitempty"`
+	ResolvedAt          *string             `json:"resolved_at,omitempty"`
+	ArchivedAt          *string             `json:"archived_at,omitempty"`
+	TraceURL            *string             `json:"trace_url,omitempty"`
+}
+
+type sessionPointerJSON struct {
+	SessionID string `json:"session_id"`
+	ErrorAt   string `json:"error_at"`
 }
 
 type needsHumanReason struct {
@@ -222,6 +228,11 @@ func (d *Dependencies) GetIncident(w http.ResponseWriter, r *http.Request) {
 	// ranks matches by precision (group > event > session) over recency.
 	if replayID, err := d.Queries.ReplayIDForGroup(r.Context(), incidentID, projectID); err == nil && replayID != "" {
 		inc.ReplayID = &replayID
+	}
+	// Pointer identity is valid before any chunk becomes readable. Readers poll
+	// manifest readiness; the incident contract must not hide processing sessions.
+	if sessionID, errorAt, ok, err := d.Queries.SessionPointerForGroup(r.Context(), incidentID, projectID); err == nil && ok {
+		inc.SessionPointer = &sessionPointerJSON{SessionID: sessionID, ErrorAt: errorAt.Format(time.RFC3339)}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

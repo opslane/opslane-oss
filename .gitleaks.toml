@@ -13,6 +13,9 @@ paths = [
   # a Stripe-shaped token does not survive redaction, so a token gitleaks
   # ignores would prove nothing.
   '''packages/ingestion/scrubber/scrubber_test\.go''',
+  # The read handler repeats that guarantee after fetching stored chunks; keep
+  # its realistic canary scoped to this integration-test file as well.
+  '''packages/ingestion/handler/session_read_test\.go''',
   '''packages/sdk/src/__tests__/scrub\.test\.ts''',
   '''test-e2e/error-to-pr\.test\.ts''',
   '''test-e2e/replay-contract\.test\.ts''',

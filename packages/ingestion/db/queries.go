@@ -283,6 +283,10 @@ type IngestResult struct {
 	Requeued bool // true if an existing group was re-queued due to recurrence policy
 }
 
+// evidencePinDays keeps incident-linked recordings available while the
+// incident is fresh. The retention hard cap remains authoritative.
+const evidencePinDays = 30
+
 // InsertErrorEventAndGroup atomically inserts an error event, upserts the error group,
 // and creates a queue job — all in a single transaction.
 func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) (*IngestResult, error) {
@@ -324,6 +328,22 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 	).Scan(&eventID)
 	if err != nil {
 		return nil, fmt.Errorf("insert error event: %w", err)
+	}
+
+	// Pin the referenced always-on recording in the same transaction as the
+	// event insert. An unknown session id intentionally matches zero rows: old
+	// SDKs and out-of-order delivery must not make event ingestion fail.
+	if p.SessionID != "" {
+		if _, err := tx.Exec(ctx,
+			`UPDATE sessions
+			    SET retain_until = GREATEST(
+			        COALESCE(retain_until, 'epoch'::timestamptz),
+			        now() + make_interval(days => $3))
+			  WHERE id = $1 AND project_id = $2`,
+			p.SessionID, p.ProjectID, evidencePinDays,
+		); err != nil {
+			return nil, fmt.Errorf("pin session for evidence: %w", err)
+		}
 	}
 
 	// 2. Upsert error group

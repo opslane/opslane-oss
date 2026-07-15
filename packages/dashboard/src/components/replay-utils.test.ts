@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { eventWithTime } from '@rrweb/types';
-import { crashSeekMs, formatTime, isActiveEvent, replayDurationMs, sortedReplayEvents } from './replay-utils';
+import { crashSeekMs, ensureReplayMeta, formatTime, isActiveEvent, replayDurationMs, sortedReplayEvents } from './replay-utils';
 
 const ev = (timestamp: number, type: number, source?: number): eventWithTime =>
   ({ timestamp, type, data: source === undefined ? {} : { source } } as unknown as eventWithTime);
@@ -54,5 +54,23 @@ describe('isActiveEvent', () => {
 describe('sortedReplayEvents', () => {
   it('sorts defensively by timestamp', () => {
     expect(sortedReplayEvents([ev(3000, 3, 1), ev(1000, 2)]).map((event) => event.timestamp)).toEqual([1000, 3000]);
+  });
+});
+
+describe('ensureReplayMeta', () => {
+  it('prepends exactly one viewport event to a Meta-less stream', () => {
+    const events = [ev(1000, 2), ev(2000, 3, 1)];
+    const result = ensureReplayMeta(events);
+    expect(result.map((event) => event.type)).toEqual([4, 2, 3]);
+    expect(result[0]).toMatchObject({
+      timestamp: 1000,
+      data: { width: 1280, height: 720 },
+    });
+    expect(events).toHaveLength(2);
+  });
+
+  it('leaves a stream with Meta untouched', () => {
+    const events = [ev(1000, 4), ev(1000, 2)];
+    expect(ensureReplayMeta(events)).toBe(events);
   });
 });

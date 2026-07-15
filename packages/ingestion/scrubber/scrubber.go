@@ -110,6 +110,7 @@ func (s *Scrubber) scrubOne(ctx context.Context, chunk db.ChunkRef) error {
 		_ = s.MinIO.RemoveObject(ctx, chunk.ObjectKey)
 		return errors.New("chunk is not valid JSON")
 	}
+	firstEventMs, lastEventMs := chunkEventBounds(plain)
 
 	regz, err := compress.Deflate(masking.RedactRecording(plain))
 	if err != nil {
@@ -118,5 +119,36 @@ func (s *Scrubber) scrubOne(ctx context.Context, chunk db.ChunkRef) error {
 	if err := s.MinIO.PutObject(ctx, chunk.ObjectKey, regz, "application/gzip"); err != nil {
 		return fmt.Errorf("store scrubbed chunk: %w", err)
 	}
-	return s.Q.MarkChunkScrubbed(ctx, chunk.SessionID, chunk.ProjectID, chunk.Seq)
+	return s.Q.MarkChunkScrubbed(ctx, chunk.SessionID, chunk.ProjectID, chunk.Seq,
+		firstEventMs, lastEventMs, int64(len(plain)))
+}
+
+// chunkEventBounds returns the minimum and maximum numeric rrweb timestamps in
+// a chunk envelope. Entries are decoded independently so one malformed event
+// cannot discard valid timestamps from the rest of the chunk.
+func chunkEventBounds(plain []byte) (first, last *int64) {
+	var envelope struct {
+		Events []json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(plain, &envelope); err != nil {
+		return nil, nil
+	}
+	for _, raw := range envelope.Events {
+		var event struct {
+			Timestamp *int64 `json:"timestamp"`
+		}
+		if err := json.Unmarshal(raw, &event); err != nil || event.Timestamp == nil {
+			continue
+		}
+		timestamp := *event.Timestamp
+		if first == nil || timestamp < *first {
+			value := timestamp
+			first = &value
+		}
+		if last == nil || timestamp > *last {
+			value := timestamp
+			last = &value
+		}
+	}
+	return first, last
 }

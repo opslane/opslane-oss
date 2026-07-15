@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ClaimedJob, ErrorGroupData, ErrorEventData, ProjectData } from '../db.js';
 
 // index.ts is the worker entrypoint: it imports the whole world and calls main()
@@ -16,6 +16,8 @@ vi.mock('../db.js', () => ({
   updateGroupAndCreateFixJob: vi.fn(),
   getGroupInvestigation: vi.fn(),
   getReplayForGroup: vi.fn(),
+  getSessionPointerForGroup: vi.fn(),
+  getPlayableChunkMetas: vi.fn(),
   getReplayArtifacts: vi.fn(),
   getSourceMaps: vi.fn(),
   requeueStaleJobs: vi.fn(),
@@ -70,6 +72,8 @@ const mockGetProject = vi.mocked(db.getProject);
 const mockUpdateGroupStatus = vi.mocked(db.updateGroupStatus);
 const mockCloneRepo = vi.mocked(cloneRepo);
 const mockRunPipeline = vi.mocked(runPipeline);
+const mockGetSessionPointerForGroup = vi.mocked(db.getSessionPointerForGroup);
+const mockGetPlayableChunkMetas = vi.mocked(db.getPlayableChunkMetas);
 
 function makeJob(): ClaimedJob & { errorGroupId: string } {
   return {
@@ -125,6 +129,7 @@ function unfixableCall() {
 describe('processInvestigateJob — pre-clone guard for stackless errors', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSessionPointerForGroup.mockResolvedValue(null);
   });
 
   it('short-circuits a stackless event to needs_human WITHOUT cloning the repo', async () => {
@@ -174,6 +179,8 @@ describe('processInvestigateJob — pre-clone guard for stackless errors', () =>
 describe('processFixJob — preserves writeup on failure (no revert/null)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSessionPointerForGroup.mockResolvedValue(null);
+    mockGetPlayableChunkMetas.mockResolvedValue([]);
     mockGetErrorGroup.mockResolvedValue({
       id: 'g1', title: 'Null deref', fingerprint: 'fp', sample_event_id: 'e1',
       occurrence_count: 3, status: 'fixing',
@@ -196,6 +203,12 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
   function fixJob(): ClaimedJob & { errorGroupId: string } {
     return { id: 'j1', errorGroupId: 'g1', sourceId: null, projectId: 'p1', jobType: 'fix', attempts: 0, guidance: null, triggeredBy: null, sessionId: null };
   }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env['INGESTION_BASE_URL'];
+    delete process.env['INTERNAL_READ_TOKEN'];
+  });
 
   it('terminates as needs_human with all reason fields + confidence when the fix is below floor', async () => {
     mockRunPipeline.mockResolvedValue({
@@ -229,6 +242,44 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     const call = mockUpdateGroupStatus.mock.calls.find((c) => c[2] === 'pr_created');
     expect(call).toBeTruthy();
     expect(call![3]?.pr_url).toBe('https://github.com/org/app/pull/7');
+  });
+
+  it('prefers session-pointer evidence fetched through ingestion', async () => {
+    const errorAt = '2026-07-15T12:00:00.000Z';
+    const errorAtMs = Date.parse(errorAt);
+    mockGetSessionPointerForGroup.mockResolvedValue({ session_id: 'sess/a', error_at: errorAt });
+    mockGetPlayableChunkMetas.mockResolvedValue([{
+      seq: 3,
+      size_bytes: 100,
+      decoded_size_bytes: 500,
+      has_full_snapshot: true,
+      first_event_ms: errorAtMs - 1_000,
+      last_event_ms: errorAtMs + 1_000,
+    }]);
+    process.env['INGESTION_BASE_URL'] = 'http://ingestion:8080';
+    process.env['INTERNAL_READ_TOKEN'] = 'secret';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ events: [
+      { type: 2, timestamp: errorAtMs - 500, data: { node: {
+        type: 0, id: 1, childNodes: [{
+          type: 2, tagName: 'button', id: 2,
+          childNodes: [{ type: 3, id: 3, textContent: 'Save profile' }],
+        }],
+      } } },
+      { type: 3, timestamp: errorAtMs - 100, data: { source: 2, type: 2, id: 2 } },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    mockRunPipeline.mockResolvedValue({
+      status: 'pr_created', confidence: 'high', pr_url: 'https://github.com/org/app/pull/8', pr_number: 8,
+    });
+
+    await processFixJob(fixJob(), new AbortController().signal);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'http://ingestion:8080/internal/v1/projects/p1/sessions/sess%2Fa/chunks/3',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual({ headers: { 'X-Internal-Token': 'secret' } });
+    const pipelineInput = mockRunPipeline.mock.calls[0]?.[0];
+    expect(pipelineInput?.visualAnalysis?.failureMoment).toContain('Save profile');
   });
 });
 

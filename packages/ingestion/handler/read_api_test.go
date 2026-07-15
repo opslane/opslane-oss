@@ -36,3 +36,28 @@ func TestIncidentJSONIncludesKind(t *testing.T) {
 		t.Errorf("expected friction kind in JSON, got %s", string(b))
 	}
 }
+
+func TestIncidentJSON_SessionPointer(t *testing.T) {
+	inc := incidentJSON{
+		ID: "g1",
+		SessionPointer: &sessionPointerJSON{
+			SessionID: "sess_12345678",
+			ErrorAt:   "2026-07-15T10:00:00Z",
+		},
+	}
+	body, err := json.Marshal(inc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"session_pointer":{"session_id":"sess_12345678","error_at":"2026-07-15T10:00:00Z"}`) {
+		t.Fatalf("session pointer missing from %s", body)
+	}
+
+	without, err := json.Marshal(incidentJSON{ID: "g2"})
+	if err != nil {
+		t.Fatalf("marshal without pointer: %v", err)
+	}
+	if strings.Contains(string(without), "session_pointer") {
+		t.Fatalf("nil session pointer was not omitted: %s", without)
+	}
+}

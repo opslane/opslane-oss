@@ -147,6 +147,8 @@ export interface Incident {
   confidence?: ConfidenceLevel;
   pr_url?: string;
   replay_id?: string;
+  /** Pointer into the always-on recording for this incident occurrence. */
+  session_pointer?: { session_id: string; error_at: string };
   reason?: NeedsHumanReason;
   root_cause?: string;
   visual_summary?: string;

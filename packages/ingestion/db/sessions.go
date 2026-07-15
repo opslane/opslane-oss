@@ -244,11 +244,13 @@ func (q *Queries) ClaimUnscrubbedChunks(ctx context.Context, limit int) ([]Chunk
 
 // MarkChunkScrubbed makes a chunk readable. Call it only after the redacted
 // bytes are durably stored.
-func (q *Queries) MarkChunkScrubbed(ctx context.Context, sessionID, projectID string, seq int) error {
+func (q *Queries) MarkChunkScrubbed(ctx context.Context, sessionID, projectID string, seq int, firstEventMs, lastEventMs *int64, decodedSizeBytes int64) error {
 	_, err := q.pool.Exec(ctx,
-		`UPDATE session_chunks SET scrubbed_at = now(), scrub_error = NULL, scrub_claimed_at = NULL
+		`UPDATE session_chunks
+		    SET scrubbed_at = now(), scrub_error = NULL, scrub_claimed_at = NULL,
+		        first_event_ms = $4, last_event_ms = $5, decoded_size_bytes = $6
 		  WHERE session_id = $1 AND seq = $2 AND project_id = $3`,
-		sessionID, seq, projectID,
+		sessionID, seq, projectID, firstEventMs, lastEventMs, decodedSizeBytes,
 	)
 	if err != nil {
 		return fmt.Errorf("mark chunk scrubbed: %w", err)
@@ -323,19 +325,30 @@ func (q *Queries) MarkSessionDeleting(ctx context.Context, sessionID, projectID 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	tag, err := tx.Exec(ctx,
+		`UPDATE sessions SET status = 'deleting', deletion_started_at = COALESCE(deletion_started_at, now())
+		  WHERE id = $1 AND project_id = $2 AND status <> 'deleting'
+		    AND (started_at < now() - make_interval(days => $3)
+		     OR (started_at < now() - make_interval(days => (
+		           SELECT session_retention_days FROM projects WHERE id = $2))
+		         AND (retain_until IS NULL OR retain_until <= now())))`,
+		sessionID, projectID, hardCapDays,
+	)
+	if err != nil {
+		return fmt.Errorf("mark session deleting: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Candidate selection is advisory. A retention pin may have committed
+		// after that read; in that case this stale candidate is a clean no-op.
+		return tx.Commit(ctx)
+	}
+
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO session_tombstones (session_id, project_id) VALUES ($1, $2)
 		 ON CONFLICT (session_id) DO NOTHING`,
 		sessionID, projectID,
 	); err != nil {
 		return fmt.Errorf("insert tombstone: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE sessions SET status = 'deleting', deletion_started_at = COALESCE(deletion_started_at, now())
-		  WHERE id = $1 AND project_id = $2`,
-		sessionID, projectID,
-	); err != nil {
-		return fmt.Errorf("mark session deleting: %w", err)
 	}
 	return tx.Commit(ctx)
 }

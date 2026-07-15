@@ -1,6 +1,4 @@
-import type { Breadcrumb } from '@opslane/shared';
 import { EventType, type eventWithTime } from '@rrweb/types';
-import { getBreadcrumbs } from './breadcrumbs';
 import { _resetChunkUploadState, flushInline, uploadChunk } from './chunk-upload';
 import { getConfig } from './config';
 import { getCurrentUser, onIdentityChange } from './core';
@@ -9,42 +7,8 @@ import { sdkFetch } from './network';
 import { ensureSessionID, nextChunkSeq, resetSessionId, rotateSessionIfIdle, touchSession, type SessionProgress } from './session.js';
 import { scrubUrl } from './scrub';
 import { setTelemetrySink } from './telemetry';
-import { SDK_VERSION } from './version';
 
 export type ReplayTriggerType = 'uncaught_error' | 'capture_exception';
-
-interface ReplayInitResponse {
-  replay_id: string;
-  upload_url: string;
-  upload_headers?: Record<string, string>;
-}
-
-interface ReplayUploadInput {
-  triggerType: ReplayTriggerType;
-  errorType: string;
-  errorMessage: string;
-  eventId?: string;
-  errorGroupId?: string;
-}
-
-interface ReplaySignals {
-  console: {
-    error_count: number;
-    warning_count: number;
-    error_messages: string[];
-    warning_messages: string[];
-  };
-  network: {
-    anomaly_count: number;
-    anomalies: Array<{
-      type: string;
-      method: string;
-      url: string;
-      status_code: number | null;
-      message: string;
-    }>;
-  };
-}
 
 const CHUNK_MS = 30_000;
 const MAX_CHUNK_RAW_BYTES = 20 * 1024 * 1024;
@@ -60,6 +24,8 @@ let startGeneration = 0;
 let rotationGeneration = 0;
 let streamReady = false;
 let awaitingRotationSnapshot = false;
+let pendingMeta: eventWithTime | null = null;
+let errorFlushInFlight = false;
 
 function approxEventBytes(event: eventWithTime): number {
   try {
@@ -79,32 +45,43 @@ function onEmit(event: eventWithTime, isCheckout?: boolean): void {
     }
 
     if (!streamReady) {
+      if (event.type === EventType.Meta) {
+        pendingMeta = event;
+        return;
+      }
       if (event.type === EventType.FullSnapshot && awaitingRotationSnapshot) {
-        buffer = [event];
-        bufferBytes = approxEventBytes(event);
+        buffer = pendingMeta ? [pendingMeta, event] : [event];
+        bufferBytes = buffer.reduce((total, bufferedEvent) => total + approxEventBytes(bufferedEvent), 0);
+        pendingMeta = null;
         awaitingRotationSnapshot = false;
         streamReady = true;
       }
       return;
     }
     // rrweb emits checkout metadata immediately before the checkout's full
-    // snapshot, and marks both events isCheckout=true. Metadata cannot open an
-    // independently playable chunk, so wait for the FullSnapshot boundary.
+    // snapshot, and marks both events isCheckout=true. Hold that metadata so
+    // the next independently playable chunk opens with [Meta, FullSnapshot].
+    if (isCheckout && event.type === EventType.Meta) {
+      pendingMeta = event;
+      return;
+    }
     if (isCheckout && event.type !== EventType.FullSnapshot) return;
     if (isCheckout && buffer.length > 0) {
       const chunk = buffer;
       const seq = currentSeq >= 0 ? currentSeq : nextChunkSeq();
       const sessionID = currentSessionID;
-      buffer = [event];
-      bufferBytes = approxEventBytes(event);
+      buffer = pendingMeta ? [pendingMeta, event] : [event];
+      bufferBytes = buffer.reduce((total, bufferedEvent) => total + approxEventBytes(bufferedEvent), 0);
+      pendingMeta = null;
       currentSeq = -1;
       if (seq >= 0 && sessionID) void shipChunk(sessionID, seq, chunk);
       return;
     }
 
     if (isCheckout) {
-      buffer = [event];
-      bufferBytes = approxEventBytes(event);
+      buffer = pendingMeta ? [pendingMeta, event] : [event];
+      bufferBytes = buffer.reduce((total, bufferedEvent) => total + approxEventBytes(bufferedEvent), 0);
+      pendingMeta = null;
       return;
     }
 
@@ -121,6 +98,38 @@ function onEmit(event: eventWithTime, isCheckout?: boolean): void {
   } catch {
     // SDK must never throw.
   }
+}
+
+/**
+ * Ship the in-flight recording as a normal session chunk as soon as an error
+ * is accepted. This closes the early-session gap without creating a second
+ * replay object; capture resumes from a fresh Meta + FullSnapshot boundary.
+ */
+export function flushReplayBufferForError(): void {
+  if (!replayInstalled || !streamReady || buffer.length === 0 || errorFlushInFlight) return;
+
+  errorFlushInFlight = true;
+  const chunk = buffer;
+  const seq = currentSeq >= 0 ? currentSeq : nextChunkSeq();
+  const sessionID = currentSessionID;
+  buffer = [];
+  bufferBytes = 0;
+  currentSeq = -1;
+  pendingMeta = null;
+
+  if (seq >= 0 && sessionID) void shipChunk(sessionID, seq, chunk);
+  try {
+    takeFullSnapshotFn?.(true);
+  } catch {
+    // rrweb is best-effort.
+  }
+
+  // Keep the guard through this turn. rrweb may synchronously refill the
+  // buffer while takeFullSnapshot runs; a second accepted error in the same
+  // turn must not immediately ship that snapshot-only replacement chunk.
+  void Promise.resolve().then(() => {
+    errorFlushInFlight = false;
+  });
 }
 
 async function shipChunk(sessionID: string, seq: number, events: eventWithTime[]): Promise<void> {
@@ -243,6 +252,7 @@ function beginSessionRotation(newSessionID: string, previous: SessionProgress): 
   currentSessionID = newSessionID;
   streamReady = false;
   awaitingRotationSnapshot = false;
+  pendingMeta = null;
 
   if (pending.length > 0 && pendingSeq >= 0 && oldSessionID) {
     void uploadChunk(oldSessionID, pendingSeq, pending, true);
@@ -304,6 +314,8 @@ export function stopReplayCapture(): void {
   currentSessionID = '';
   streamReady = false;
   awaitingRotationSnapshot = false;
+  pendingMeta = null;
+  errorFlushInFlight = false;
   replayInstalled = false;
 
   const stop = stopFn;
@@ -315,161 +327,6 @@ export function stopReplayCapture(): void {
       // replay is best-effort.
     }
   }
-}
-
-/**
- * Legacy error-triggered replay upload retained until Batch 2 migrates the
- * dashboard and worker readers from session_replays to chunk pointers.
- */
-export async function uploadReplayForTrigger(input: ReplayUploadInput): Promise<void> {
-  let replayID = '';
-  try {
-    const config = getConfig();
-    if (!config.replayEnabled) return;
-    const events = snapshotRrwebEvents();
-    if (events.length === 0) return;
-
-    const sessionID = ensureSessionID();
-    const now = Date.now();
-    const startedAt = Number.isFinite(events[0]?.timestamp) ? events[0].timestamp : now;
-    const pageURL = currentPageUrl();
-    const body = JSON.stringify({
-      events,
-      meta: {
-        sdk_version: SDK_VERSION,
-        page_url: pageURL,
-        started_at: startedAt,
-        ended_at: now,
-        crash_timestamp: now,
-      },
-    });
-
-    const initResponse = await sdkFetch(`${config.endpoint}/api/v1/replays/init`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': config.apiKey },
-      body: JSON.stringify({
-        session_id: sessionID,
-        error_event_id: input.eventId ?? null,
-        error_group_id: input.errorGroupId ?? null,
-        trigger_type: input.triggerType,
-        page_url: pageURL,
-        started_at: new Date(startedAt).toISOString(),
-        ended_at: new Date(now).toISOString(),
-      }),
-    });
-    if (!initResponse.ok) return;
-
-    const initPayload = (await initResponse.json()) as ReplayInitResponse;
-    replayID = initPayload.replay_id;
-    const uploadResponse = await sdkFetch(initPayload.upload_url, {
-      method: 'PUT',
-      headers: { ...(initPayload.upload_headers || {}), 'Content-Type': 'application/json' },
-      body,
-    });
-    if (!uploadResponse.ok) throw new Error(`upload failed with status ${uploadResponse.status}`);
-
-    const completed = await completeReplayUpload(
-      config.endpoint,
-      config.apiKey,
-      replayID,
-      utf8ByteLength(body),
-      buildReplaySignals(getBreadcrumbs()),
-    );
-    if (!completed) throw new Error('complete replay upload failed');
-  } catch (error) {
-    try {
-      if (!replayID) return;
-      const config = getConfig();
-      await sdkFetch(`${config.endpoint}/api/v1/replays/${encodeURIComponent(replayID)}/fail`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-API-Key': config.apiKey },
-        body: JSON.stringify({
-          reason: error instanceof Error ? error.message : 'unknown replay upload error',
-        }),
-      });
-    } catch {
-      // replay is best-effort.
-    }
-  }
-}
-
-async function completeReplayUpload(
-  endpoint: string,
-  apiKey: string,
-  replayID: string,
-  sizeBytes: number,
-  signals: ReplaySignals,
-): Promise<boolean> {
-  try {
-    const response = await sdkFetch(`${endpoint}/api/v1/replays/${encodeURIComponent(replayID)}/complete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
-      body: JSON.stringify({ size_bytes: sizeBytes, signals }),
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-function buildReplaySignals(breadcrumbs: Breadcrumb[]): ReplaySignals {
-  let consoleErrorCount = 0;
-  let consoleWarningCount = 0;
-  const consoleErrorMessages: string[] = [];
-  const consoleWarningMessages: string[] = [];
-  let networkAnomalyCount = 0;
-  const networkAnomalies: ReplaySignals['network']['anomalies'] = [];
-
-  for (const crumb of breadcrumbs) {
-    if (crumb.type === 'console') {
-      if (crumb.level === 'error') {
-        consoleErrorCount += 1;
-        if (crumb.message) consoleErrorMessages.push(crumb.message);
-      }
-      if (crumb.level === 'warning') {
-        consoleWarningCount += 1;
-        if (crumb.message) consoleWarningMessages.push(crumb.message);
-      }
-    }
-    if (crumb.type === 'fetch' || crumb.type === 'xhr') {
-      const method = typeof crumb.data?.method === 'string' ? crumb.data.method : 'GET';
-      const url = typeof crumb.data?.url === 'string' ? crumb.data.url : '';
-      const statusCode = typeof crumb.data?.status_code === 'number' ? crumb.data.status_code : undefined;
-      if (crumb.level === 'error' || crumb.level === 'warning' || (statusCode != null && statusCode >= 400)) {
-        networkAnomalyCount += 1;
-        networkAnomalies.push({
-          type: crumb.type,
-          method,
-          url,
-          status_code: statusCode ?? null,
-          message: crumb.message,
-        });
-      }
-    }
-  }
-
-  return {
-    console: {
-      error_count: consoleErrorCount,
-      warning_count: consoleWarningCount,
-      error_messages: uniqueHead(consoleErrorMessages, 5),
-      warning_messages: uniqueHead(consoleWarningMessages, 5),
-    },
-    network: { anomaly_count: networkAnomalyCount, anomalies: networkAnomalies.slice(-5) },
-  };
-}
-
-function uniqueHead(values: string[], limit: number): string[] {
-  const output: string[] = [];
-  const seen = new Set<string>();
-  for (const value of values) {
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    output.push(trimmed);
-    if (output.length >= limit) break;
-  }
-  return output;
 }
 
 function currentPageUrl(): string {
@@ -486,10 +343,6 @@ function utf8ByteLength(value: string): number {
   } catch {
     return value.length;
   }
-}
-
-export function snapshotRrwebEvents(): eventWithTime[] {
-  return [...buffer].sort((left, right) => left.timestamp - right.timestamp);
 }
 
 export function _resetReplayState(): void {

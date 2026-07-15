@@ -7,10 +7,9 @@ import { emitTelemetry } from '../telemetry';
 import { _rehydrateFromStorage, peekChunkSeq, resetSessionId } from '../session';
 import {
   _resetReplayState,
-  snapshotRrwebEvents,
+  flushReplayBufferForError,
   startReplayCapture,
   stopReplayCapture,
-  uploadReplayForTrigger,
 } from '../replay';
 
 type RecordOptions = {
@@ -215,9 +214,56 @@ describe('continuous chunked recording', () => {
     expect(chunkMocks.uploadChunk).toHaveBeenCalledTimes(2);
     expect(chunkMocks.uploadChunk.mock.calls.map((call) => call[1])).toEqual([0, 1]);
     for (const call of chunkMocks.uploadChunk.mock.calls) {
-      expect((call[2] as eventWithTime[])[0].type).toBe(EventType.FullSnapshot);
+      expect((call[2] as eventWithTime[]).slice(0, 2).map((event) => event.type)).toEqual([
+        EventType.Meta,
+        EventType.FullSnapshot,
+      ]);
       expect(call[3]).toBe(true);
     }
+  });
+
+  it('flushes the current Meta + FullSnapshot buffer immediately for an accepted error', async () => {
+    await startEnabled();
+    emit(meta(999), false);
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+
+    flushReplayBufferForError();
+    await drainMicrotasks();
+
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledTimes(1);
+    expect(chunkMocks.uploadChunk.mock.calls[0]?.[1]).toBe(0);
+    expect((chunkMocks.uploadChunk.mock.calls[0]?.[2] as eventWithTime[]).slice(0, 2).map((event) => event.type)).toEqual([
+      EventType.Meta,
+      EventType.FullSnapshot,
+    ]);
+    expect(rrwebState.takeFullSnapshot).toHaveBeenCalledWith(true);
+  });
+
+  it('does not double-ship on two error flushes in the same turn', async () => {
+    await startEnabled();
+    emit(meta(999), false);
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+
+    flushReplayBufferForError();
+    flushReplayBufferForError();
+    await drainMicrotasks();
+
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not flush an empty or stopped capture', async () => {
+    await startEnabled();
+    flushReplayBufferForError();
+    expect(chunkMocks.uploadChunk).not.toHaveBeenCalled();
+
+    emit(meta(999), false);
+    emit(fullSnapshot(1_000), true);
+    stopReplayCapture();
+    flushReplayBufferForError();
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk).not.toHaveBeenCalled();
   });
 
   it('does not upload an empty chunk on the first checkout', async () => {
@@ -364,27 +410,4 @@ describe('continuous chunked recording', () => {
     );
   });
 
-  it('retains the legacy error-triggered upload until Batch 2', async () => {
-    await startEnabled();
-    emit(fullSnapshot(1_000), true);
-    emit(incremental(1_500));
-    fetchMock
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ replay_id: 'replay-1', upload_url: 'https://storage.example.com/replay', upload_headers: {} }),
-      })
-      .mockResolvedValueOnce({ ok: true })
-      .mockResolvedValueOnce({ ok: true });
-    await uploadReplayForTrigger({
-      triggerType: 'uncaught_error',
-      errorType: 'Error',
-      errorMessage: 'boom',
-      eventId: 'event-1',
-    });
-    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
-    expect(urls).toContain('https://ingest.example.com/api/v1/replays/init');
-    expect(urls).toContain('https://storage.example.com/replay');
-    expect(urls).toContain('https://ingest.example.com/api/v1/replays/replay-1/complete');
-    expect(snapshotRrwebEvents()[0].type).toBe(EventType.FullSnapshot);
-  });
 });

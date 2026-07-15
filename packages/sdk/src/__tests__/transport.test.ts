@@ -6,13 +6,18 @@ import {
   startTransport,
   stopTransport,
   getQueueLength,
-  resolveGroupId,
   _resetQueue,
 } from '../transport';
 import { loadConfig, resetConfig, getConfig } from '../config';
 import { _resetThrottle } from '../throttle';
 import { setUser, clearUser } from '../core';
 import type { ErrorEventPayload } from '@opslane/shared';
+
+const replayMocks = vi.hoisted(() => ({
+  flushReplayBufferForError: vi.fn(),
+}));
+
+vi.mock('../replay', () => replayMocks);
 
 // Counter gives each event a unique stack frame so the identical-error throttle
 // (default 1000ms) does not collapse multi-event tests. The suite also disables
@@ -53,6 +58,7 @@ describe('Transport Layer', () => {
     fetchMock = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }));
     globalThis.fetch = fetchMock;
     vi.useFakeTimers();
+    replayMocks.flushReplayBufferForError.mockReset();
   });
 
   afterEach(() => {
@@ -123,6 +129,31 @@ describe('Transport Layer', () => {
     await flushEvents();
 
     expect(getQueueLength()).toBe(0);
+  });
+
+  it('flushes the replay buffer after a replay-trigger error is accepted', async () => {
+    resetConfig();
+    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'k', replay: { enabled: true } });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ event_id: 'evt-1', group_id: 'grp-1' }), {
+      status: 202,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    enqueueEvent(makeEvent(), 'uncaught_error');
+    await flushEvents();
+
+    expect(replayMocks.flushReplayBufferForError).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not flush replay capture when error ingest is rejected', async () => {
+    resetConfig();
+    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'k', replay: { enabled: true } });
+    fetchMock.mockResolvedValueOnce(new Response('nope', { status: 500 }));
+
+    enqueueEvent(makeEvent(), 'uncaught_error');
+    await flushEvents();
+
+    expect(replayMocks.flushReplayBufferForError).not.toHaveBeenCalled();
   });
 
   it('should keep events in queue on network failure and retry on next flush', async () => {
@@ -393,18 +424,5 @@ describe('Transport Layer', () => {
     resetConfig();
     loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'k' });
     expect(getConfig().sampleRate).toBe(1);
-  });
-});
-
-describe('resolveGroupId (C1 correlation)', () => {
-  it('prefers error_group_id', () => {
-    expect(resolveGroupId({ error_group_id: 'eg-1', group_id: 'g-1' })).toBe('eg-1');
-  });
-  it('falls back to group_id when error_group_id is absent', () => {
-    expect(resolveGroupId({ group_id: 'g-1' })).toBe('g-1');
-  });
-  it('returns undefined when neither present', () => {
-    expect(resolveGroupId({})).toBeUndefined();
-    expect(resolveGroupId(undefined)).toBeUndefined();
   });
 });

@@ -17,7 +17,12 @@ import { processSetupPrJob } from './setup-pr.js';
 import { parseStackFrames, resolveFrame, type ResolvedFrame } from './source-map.js';
 import { initTracing, shutdownTracing, withJobTrace, getActiveTraceId, buildLangfuseTraceUrl } from './tracing.js';
 import { runVisualAnalysis, type VisualAnalysisOutput } from './visual-analysis.js';
-import { buildReplayEvidenceFromRecording } from './replay-evidence.js';
+import {
+  buildReplayEvidenceFromRecording,
+  fetchChunkViaIngestion,
+  pickEvidenceChunks,
+  waitForErrorWindowCoverage,
+} from './replay-evidence.js';
 import { hasNoAppFrames } from './harness/stack-trace-utils.js';
 import { gatherFrictionEvidence } from './friction/friction-evidence.js';
 import { investigateFriction } from './friction/investigate-friction.js';
@@ -519,9 +524,10 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   const investigation = await getGroupInvestigation(job.errorGroupId, job.projectId);
 
   // Parallel fetch for independent data
-  const [replay, sourceMaps] = await Promise.all([
+  const [replay, sourceMaps, sessionPointer] = await Promise.all([
     db.getReplayForGroup(job.errorGroupId, job.projectId),
     event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
+    db.getSessionPointerForGroup(job.errorGroupId, job.projectId),
   ]);
   const artifacts = replay ? await db.getReplayArtifacts(replay.id, job.projectId) : [];
 
@@ -596,7 +602,39 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
 
     // Visual analysis
     let visualOutput: VisualAnalysisOutput | null = null;
-    if (artifacts.length > 0) {
+    if (sessionPointer) {
+      // Prefer the always-on stream. Ingestion owns the scrub gate, bounded
+      // inflate, and redact-on-read; the worker never reads raw chunk objects.
+      const errorAtMs = Date.parse(sessionPointer.error_at);
+      const chunks = await waitForErrorWindowCoverage(
+        sessionPointer.session_id,
+        job.projectId,
+        errorAtMs,
+      );
+      const picked = pickEvidenceChunks(chunks, errorAtMs);
+      const envelopes = await Promise.all(
+        picked.map((chunk) => fetchChunkViaIngestion(job.projectId, sessionPointer.session_id, chunk.seq)),
+      );
+      const events = envelopes
+        .flatMap((envelope) => envelope?.events ?? [])
+        .sort((left, right) => left.timestamp - right.timestamp);
+      if (events.length > 0) {
+        const firstTimestamp = events[0]!.timestamp;
+        const lastTimestamp = events[events.length - 1]!.timestamp;
+        const crashTimestamp = Number.isFinite(errorAtMs)
+          ? Math.min(Math.max(errorAtMs, firstTimestamp), lastTimestamp)
+          : lastTimestamp;
+        visualOutput = buildReplayEvidenceFromRecording(
+          { events, meta: { crash_timestamp: crashTimestamp } },
+          {
+            errorType: event?.error_type ?? 'Unknown',
+            errorMessage: event?.error_message ?? '',
+          },
+        );
+      }
+    }
+
+    if (!visualOutput && artifacts.length > 0) {
       if (minioConfig) {
         const screenshots = await Promise.all(
           artifacts.map(async (a) => {
@@ -615,7 +653,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
           errorMessage: event?.error_message ?? '',
         });
       }
-    } else if (replay?.object_key && minioConfig) {
+    } else if (!visualOutput && replay?.object_key && minioConfig) {
       // rrweb replays upload a recording.json (no screenshot artifacts). Extract
       // crash-time DOM + user-action evidence directly from the event stream so the
       // fix agent and PR body get real replay evidence instead of `visual_replay: n/a`.

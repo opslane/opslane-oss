@@ -1,14 +1,13 @@
 // @vitest-environment node
 //
-// Real-browser rrweb replay capture contract.
+// Real-browser chunked session capture contract.
 // Drives a real Chromium (Playwright) running the Vue fixture with the LOCAL SDK
-// (rrweb capture), triggers an uncaught error, and captures the exact
-// `recording.json` the SDK uploads. Asserts the C4 shape and writes the captured
-// recording to a fixture so it can be inspected (and replayed) from a PR.
+// (rrweb capture), triggers an early error, and captures the normal gzipped chunk
+// uploaded immediately for that error. The current SDK must not call /replays/*.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as http from 'node:http';
 import { resolve } from 'node:path';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 
 let playwrightAvailable = false;
 try {
@@ -29,20 +28,36 @@ interface ViteDevServer { listen(): Promise<unknown>; close(): Promise<unknown>;
 
 let mockServer: http.Server;
 let mockPort: number;
-let capturedRecording: { events: unknown[]; meta: Record<string, unknown> } | null;
-let initBody: Record<string, unknown> | null;
-let completeBody: Record<string, unknown> | null;
+let capturedChunk: { events: unknown[]; meta: Record<string, unknown> } | null;
+let sessionInitBody: Record<string, unknown> | null;
+let chunkPolicyBody: Record<string, unknown> | null;
+let chunkCommitCount: number;
+let legacyReplayRequestCount: number;
 let viteServer: ViteDevServer;
 let vitePort: number;
 let browser: BrowserInstance;
 let page: BrowserPage;
 
 const FIXTURE_APP_DIR = resolve(__dirname, '../../../../test-fixtures/vue-app');
-const OUT_DIR = resolve(__dirname, 'fixtures');
+
+function extractMultipartFile(raw: Buffer, contentType: string): Buffer | null {
+  const match = /boundary=(?:"([^"]+)"|([^;]+))/.exec(contentType);
+  const boundary = match?.[1] ?? match?.[2];
+  if (!boundary) return null;
+  const headerEnd = raw.indexOf(Buffer.from('\r\n\r\n'));
+  if (headerEnd < 0) return null;
+  const fileStart = headerEnd + 4;
+  const fileEnd = raw.indexOf(Buffer.from(`\r\n--${boundary}`), fileStart);
+  return fileEnd < 0 ? null : raw.subarray(fileStart, fileEnd);
+}
 
 describe.skipIf(!playwrightAvailable)('rrweb replay capture (real browser)', () => {
   beforeAll(async () => {
-    capturedRecording = null; initBody = null; completeBody = null;
+    capturedChunk = null;
+    sessionInitBody = null;
+    chunkPolicyBody = null;
+    chunkCommitCount = 0;
+    legacyReplayRequestCount = 0;
 
     mockServer = http.createServer((req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -50,36 +65,47 @@ describe.skipIf(!playwrightAvailable)('rrweb replay capture (real browser)', () 
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key');
       if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
 
-      let body = '';
-      req.on('data', (c) => { body += c; });
+      const bodyParts: Buffer[] = [];
+      req.on('data', (part: Buffer) => { bodyParts.push(part); });
       req.on('end', () => {
         const url = req.url ?? '';
+        const rawBody = Buffer.concat(bodyParts);
+        const body = rawBody.toString('utf8');
         if (url === '/api/v1/events') {
           res.writeHead(202, { 'Content-Type': 'application/json' })
              .end(JSON.stringify({ event_id: 'evt_test', group_id: 'grp_test', error_group_id: 'grp_test' }));
           return;
         }
         if (url === '/api/v1/sessions/init') {
+          try { sessionInitBody = JSON.parse(body); } catch { sessionInitBody = null; }
           res.writeHead(200, { 'Content-Type': 'application/json' })
              .end(JSON.stringify({ recording: true, chunk_interval_ms: 30000, max_chunk_bytes: 5242880 }));
           return;
         }
-        if (url === '/api/v1/replays/init') {
-          try { initBody = JSON.parse(body); } catch { initBody = null; }
+        if (/^\/api\/v1\/sessions\/[^/]+\/chunks\/upload-url$/.test(url)) {
+          try { chunkPolicyBody = JSON.parse(body); } catch { chunkPolicyBody = null; }
           res.writeHead(200, { 'Content-Type': 'application/json' })
-             .end(JSON.stringify({ replay_id: 'rep_test', upload_url: `http://localhost:${mockPort}/upload` }));
+             .end(JSON.stringify({ upload_url: `http://localhost:${mockPort}/chunk-upload`, form_data: {} }));
           return;
         }
-        if (url === '/upload' && req.method === 'PUT') {
-          try { capturedRecording = JSON.parse(body); } catch { capturedRecording = null; }
+        if (url === '/chunk-upload' && req.method === 'POST') {
+          const compressed = extractMultipartFile(rawBody, req.headers['content-type'] ?? '');
+          try {
+            capturedChunk = compressed
+              ? JSON.parse(gunzipSync(compressed).toString('utf8')) as typeof capturedChunk
+              : null;
+          } catch {
+            capturedChunk = null;
+          }
           res.writeHead(200).end();
           return;
         }
-        if (url.endsWith('/complete')) {
-          try { completeBody = JSON.parse(body); } catch { completeBody = null; }
+        if (/^\/api\/v1\/sessions\/[^/]+\/chunks\/\d+\/commit$/.test(url)) {
+          chunkCommitCount += 1;
           res.writeHead(200).end('{}');
           return;
         }
+        if (url.startsWith('/api/v1/replays')) legacyReplayRequestCount += 1;
         res.writeHead(200).end('{}');
       });
     });
@@ -128,47 +154,30 @@ describe.skipIf(!playwrightAvailable)('rrweb replay capture (real browser)', () 
     await new Promise<void>(r => mockServer?.close(() => r()));
   });
 
-  it('captures a valid rrweb recording.json and uploads it on an uncaught error', async () => {
+  it('flushes a self-contained normal chunk for an early error without a one-shot upload', async () => {
     await page.goto(`http://localhost:${vitePort}`);
     // Generate some DOM activity (rrweb incremental events) then trigger the bug.
     await page.click('[data-testid="nav-usercard"]');
     await page.click('[data-testid="edit-profile-btn"]');
-    // Wait for flush (200ms) + replay init→PUT→complete round trip.
+    // Wait for event flush + chunk policy→multipart upload→commit round trip.
     await page.waitForTimeout(2500);
 
-    // A recording was uploaded
-    expect(capturedRecording, 'recording.json was PUT to the upload URL').toBeTruthy();
-    const rec = capturedRecording!;
+    expect(sessionInitBody?.session_id).toEqual(expect.any(String));
+    expect(capturedChunk, 'an error-flushed chunk was uploaded through the session protocol').toBeTruthy();
+    const chunk = capturedChunk!;
+    expect(Array.isArray(chunk.events)).toBe(true);
+    expect(chunk.events.length).toBeGreaterThan(1);
+    expect(typeof chunk.meta.sdk_version).toBe('string');
+    expect(chunk.meta.has_full_snapshot).toBe(true);
+    expect(typeof chunk.meta.chunked_at).toBe('number');
 
-    // C4 shape: events array + meta with epoch-ms crash_timestamp
-    expect(Array.isArray(rec.events)).toBe(true);
-    expect(rec.events.length).toBeGreaterThan(0);
-    expect(typeof rec.meta.crash_timestamp).toBe('number');
-    expect(typeof rec.meta.started_at).toBe('number');
-    expect(typeof rec.meta.sdk_version).toBe('string');
-    // page_url scrubbed (no query string)
-    expect(String(rec.meta.page_url)).not.toContain('?');
-
-    // Valid rrweb: a FullSnapshot (type 2) is present and events are sorted ascending.
-    const types = (rec.events as Array<{ type: number; timestamp: number }>).map(e => e.type);
-    expect(types).toContain(2); // FullSnapshot — required for playback
-    const ts = (rec.events as Array<{ timestamp: number }>).map(e => e.timestamp);
+    // Each chunk is independently playable: viewport Meta then FullSnapshot.
+    const types = (chunk.events as Array<{ type: number; timestamp: number }>).map((event) => event.type);
+    expect(types.slice(0, 2)).toEqual([4, 2]);
+    const ts = (chunk.events as Array<{ timestamp: number }>).map((event) => event.timestamp);
     expect(ts).toEqual([...ts].sort((a, b) => a - b));
-
-    // init body is the C4 7-field shape (no masking_profile / content_type)
-    expect(initBody).toBeTruthy();
-    expect(initBody!).not.toHaveProperty('masking_profile');
-    expect(initBody!).not.toHaveProperty('content_type');
-    // complete body has signals, no artifacts
-    expect(completeBody).toBeTruthy();
-    expect(completeBody!).not.toHaveProperty('artifacts');
-    expect(completeBody!).toHaveProperty('signals');
-
-    // Refresh the committed sample only when explicitly capturing, so normal test
-    // runs don't dirty the working tree. The checked-in fixture is a captured artifact.
-    if (process.env['CAPTURE_REPLAY_FIXTURE']) {
-      mkdirSync(OUT_DIR, { recursive: true });
-      writeFileSync(resolve(OUT_DIR, 'sample-rrweb-recording.json'), JSON.stringify(rec, null, 2));
-    }
+    expect(chunkPolicyBody).toMatchObject({ seq: 0, has_full_snapshot: true });
+    expect(chunkCommitCount).toBe(1);
+    expect(legacyReplayRequestCount).toBe(0);
   }, 20_000);
 });
