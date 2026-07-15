@@ -29,6 +29,11 @@ export default defineConfig({
   plugins: [
     dts({
       include: ['src/**/*.ts', 'src/**/*.tsx', 'vite-plugin/**/*.ts'],
+      // Bundle types into flat per-entry .d.ts files so type-only imports
+      // from the private @opslane/shared package are inlined — without this,
+      // the published tarball's types are unresolvable for npm consumers.
+      rollupTypes: true,
+      bundledPackages: ['@opslane/shared'],
     }),
   ],
   test: {

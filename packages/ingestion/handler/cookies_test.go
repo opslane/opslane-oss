@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 )
@@ -109,7 +110,7 @@ func TestRefresh_CookieModeRotates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen refresh: %v", err)
 	}
-	if err := deps.Queries.StoreRefreshToken(ctx, user.ID, hashRefresh, "fam-1", time.Now().Add(time.Hour)); err != nil {
+	if err := deps.Queries.StoreRefreshToken(ctx, user.ID, hashRefresh, uuid.NewString(), time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("store refresh: %v", err)
 	}
 

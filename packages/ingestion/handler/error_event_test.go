@@ -200,7 +200,7 @@ func TestIngestStacklessEvent_AcceptedAndDefaultsType(t *testing.T) {
 	// ordering bug — defaulting after fingerprinting would fragment groups).
 	var errorType string
 	err = pool.QueryRow(context.Background(),
-		`SELECT error_type FROM error_groups WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1`,
+		`SELECT error_type FROM error_events WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1`,
 		projectID).Scan(&errorType)
 	if err != nil {
 		t.Fatalf("query group: %v", err)
