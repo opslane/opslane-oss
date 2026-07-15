@@ -148,7 +148,7 @@ export async function processJobInner(job: ClaimedJob, signal: AbortSignal): Pro
       // Genuine error: terminate as needs_human (preserve reason; root_cause untouched)
       // and DO NOT rethrow, so the poller completes the job rather than requeuing it
       // and re-running over a now-terminal incident.
-      const safeMessage = message.replace(/https:\/\/[^@]+@/g, 'https://***@');
+      const safeMessage = message.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
       await updateGroupStatus(errorJob.errorGroupId, errorJob.projectId, 'needs_human', {
         reason: buildReason('worker_runtime_error', `Fix job error: ${safeMessage}`),
       }).catch(() => {});
@@ -258,7 +258,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
   } catch (err: unknown) {
     const rawMessage = err instanceof Error ? err.message : String(err);
     const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
-    const message = rawMessage.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    const message = rawMessage.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
     await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
       reason: {
         reason_code: isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
@@ -416,7 +416,7 @@ export async function processFrictionInvestigateJob(
     });
   } catch (error: unknown) {
     const raw = error instanceof Error ? error.message : String(error);
-    const message = raw.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    const message = raw.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
     await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
       reason: buildReason(
         raw.includes('GITHUB_TOKEN') ? 'missing_github_token' : 'repo_access_denied',
@@ -563,7 +563,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
     cleanup = cloneResult.cleanup;
   } catch (err: unknown) {
     const rawMessage = err instanceof Error ? err.message : String(err);
-    const message = rawMessage.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    const message = rawMessage.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
     const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
     await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
       reason: buildReason(
