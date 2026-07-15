@@ -329,6 +329,12 @@ export function stopReplayCapture(): void {
   }
 }
 
+/** Test-only: true once rrweb record() is active and the telemetry sink is
+ * installed — i.e. clicks from this point on land in replay chunks. */
+export function _replayStarted(): boolean {
+  return replayInstalled && stopFn !== null && streamReady;
+}
+
 function currentPageUrl(): string {
   try {
     return typeof window !== 'undefined' ? scrubUrl(window.location.href) : '';
