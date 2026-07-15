@@ -1,5 +1,5 @@
-import type { Sandbox } from 'e2b';
 import type { ToolDefinition, AgentState } from './types.js';
+import type { SandboxRuntime } from './sandbox-runtime.js';
 
 /** Max characters per tool output to prevent context overflow. */
 const MAX_OUTPUT_CHARS = 12_000;
@@ -17,7 +17,7 @@ function cap(output: string, limit = MAX_OUTPUT_CHARS): string {
   return output.slice(0, half) + `\n\n... [${omitted} chars omitted] ...\n\n` + output.slice(-half);
 }
 
-export function createToolBridge(sandbox: Sandbox, state: AgentState): ToolDefinition[] {
+export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): ToolDefinition[] {
   return [
     {
       name: 'read',

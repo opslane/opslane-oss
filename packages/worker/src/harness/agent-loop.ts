@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient } from '../anthropic-client.js';
 import { traceSpan, getToolSpanAttributes } from '../tracing.js';
 import type {
   AgentLoopConfig,
@@ -63,7 +64,7 @@ export async function runAgentLoop(
   config: AgentLoopConfig,
   userMessage: string,
 ): Promise<AgentCompletionResult> {
-  const client = new Anthropic({ apiKey: config.apiKey });
+  const client = createAnthropicClient(config.apiKey);
   const model = config.model ?? DEFAULT_MODEL;
   const emit = config.onEvent;
   const pricing = MODEL_PRICING[model] ?? DEFAULT_PRICING;

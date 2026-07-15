@@ -82,6 +82,24 @@ describe('friction and session queries', () => {
     await setSessionAnalysisStatus('s1', 'p1', 'analyzed', 1);
     expect(mockQuery.mock.calls[0][1]).toEqual(['s1', 'p1', 'analyzed', 1]);
   });
+
+  it('fences session status writes to the current session lease', async () => {
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 's1' }] });
+    await setSessionAnalysisStatus('s1', 'p1', 'analyzed', 1, {
+      id: 'j1',
+      workerId: 'worker-1',
+      leaseGeneration: '7',
+      projectId: 'p1',
+      errorGroupId: null,
+      sessionId: 's1',
+    });
+
+    expect(mockQuery.mock.calls[0][0]).toContain('lease_generation = $7::bigint');
+    expect(mockQuery.mock.calls[0][0]).toContain('session_id IS NOT DISTINCT FROM $1');
+    expect(mockQuery.mock.calls[0][1]).toEqual([
+      's1', 'p1', 'analyzed', 1, 'j1', 'worker-1', '7', null,
+    ]);
+  });
 });
 
 describe('claimJob friction scheduling fields', () => {
@@ -91,6 +109,7 @@ describe('claimJob friction scheduling fields', () => {
     mockQuery.mockResolvedValueOnce({ rows: [{
       id: 'j1', error_group_id: null, source_id: null, project_id: 'p1',
       job_type: 'session_analysis', attempts: 0, guidance: null,
+      worker_id: 'worker-1', lease_generation: '1',
       triggered_by: 'auto', session_id: 's1',
     }] });
 
@@ -114,8 +133,10 @@ describe('getErrorEvent', () => {
     });
     const event = await getErrorEvent('e1', 'p1');
     expect(event).toEqual(expect.objectContaining({
-      id: 'e1', release: 'v1.0.0', session_id: 'sess-1',
+      id: 'e1', breadcrumbs: '[]', context: '{}', release: 'v1.0.0', session_id: 'sess-1',
     }));
+    expect(mockQuery.mock.calls[0][0]).toContain('breadcrumbs::text AS breadcrumbs');
+    expect(mockQuery.mock.calls[0][0]).toContain('context::text AS context');
     expect(mockQuery.mock.calls[0][1]).toEqual(['e1', 'p1']);
   });
 });

@@ -6,6 +6,11 @@ import {
   completeJob,
   failJob,
   requeueStaleJobs,
+  updateGroupStatus,
+  updateGroupInvestigation,
+  updateGroupAndCreateFixJob,
+  updateJobTraceUrl,
+  recordSetupPrResult,
   getPool,
   closePool,
 } from '../db.js';
@@ -78,6 +83,38 @@ async function cleanupTestData(): Promise<void> {
   await testPool.query(`DELETE FROM orgs WHERE id = $1`, [testOrgId]);
 }
 
+async function expireAndReclaimWithSameWorker(): Promise<{
+  jobId: string;
+  errorGroupId: string;
+  staleGeneration: string;
+  currentGeneration: string;
+}> {
+  const { jobId, errorGroupId } = await seedErrorGroupAndJob();
+  const staleClaim = await claimJob('worker-reused', 60_000);
+  expect(staleClaim?.id).toBe(jobId);
+
+  await testPool.query(
+    `UPDATE error_group_jobs
+     SET lease_expires_at = now() - interval '1 second'
+     WHERE id = $1`,
+    [jobId],
+  );
+  expect(await requeueStaleJobs()).toBe(1);
+
+  const currentClaim = await claimJob('worker-reused', 60_000);
+  expect(currentClaim?.id).toBe(jobId);
+  expect(BigInt(currentClaim!.leaseGeneration)).toBe(
+    BigInt(staleClaim!.leaseGeneration) + 1n,
+  );
+
+  return {
+    jobId,
+    errorGroupId,
+    staleGeneration: staleClaim!.leaseGeneration,
+    currentGeneration: currentClaim!.leaseGeneration,
+  };
+}
+
 describeDb('db.ts integration tests', () => {
   beforeAll(async () => {
     testPool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -106,6 +143,8 @@ describeDb('db.ts integration tests', () => {
 
       expect(job).not.toBeNull();
       expect(job!.id).toBe(jobId);
+      expect(job!.workerId).toBe('worker-1');
+      expect(job!.leaseGeneration).toBe('1');
 
       // Verify the job is now claimed in the database
       const dbResult = await testPool.query<{
@@ -163,7 +202,7 @@ describeDb('db.ts integration tests', () => {
       const { jobId } = await seedErrorGroupAndJob();
 
       // First claim the job
-      await claimJob('worker-1', 30_000);
+      const claimed = await claimJob('worker-1', 30_000);
 
       // Get the initial lease_expires_at
       const before = await testPool.query<{ lease_expires_at: Date }>(
@@ -176,7 +215,12 @@ describeDb('db.ts integration tests', () => {
       await new Promise((r) => setTimeout(r, 20));
 
       // Heartbeat with a longer lease
-      const extended = await heartbeat(jobId, 'worker-1', 120_000);
+      const extended = await heartbeat(
+        jobId,
+        'worker-1',
+        claimed!.leaseGeneration,
+        120_000,
+      );
       expect(extended).toBe(true);
 
       // Verify lease was extended
@@ -190,18 +234,28 @@ describeDb('db.ts integration tests', () => {
 
     it('should return false for wrong worker_id', async () => {
       const { jobId } = await seedErrorGroupAndJob();
-      await claimJob('worker-1', 60_000);
+      const claimed = await claimJob('worker-1', 60_000);
 
-      const extended = await heartbeat(jobId, 'wrong-worker', 60_000);
+      const extended = await heartbeat(
+        jobId,
+        'wrong-worker',
+        claimed!.leaseGeneration,
+        60_000,
+      );
       expect(extended).toBe(false);
     });
 
     it('should return false for a completed job', async () => {
       const { jobId } = await seedErrorGroupAndJob();
-      await claimJob('worker-1', 60_000);
-      await completeJob(jobId, 'worker-1');
+      const claimed = await claimJob('worker-1', 60_000);
+      await completeJob(jobId, 'worker-1', claimed!.leaseGeneration);
 
-      const extended = await heartbeat(jobId, 'worker-1', 60_000);
+      const extended = await heartbeat(
+        jobId,
+        'worker-1',
+        claimed!.leaseGeneration,
+        60_000,
+      );
       expect(extended).toBe(false);
     });
   });
@@ -209,9 +263,11 @@ describeDb('db.ts integration tests', () => {
   describe('completeJob', () => {
     it('should mark a claimed job as completed', async () => {
       const { jobId } = await seedErrorGroupAndJob();
-      await claimJob('worker-1', 60_000);
+      const claimed = await claimJob('worker-1', 60_000);
 
-      await completeJob(jobId, 'worker-1');
+      expect(
+        await completeJob(jobId, 'worker-1', claimed!.leaseGeneration),
+      ).toBe(true);
 
       const result = await testPool.query<{ status: string }>(
         `SELECT status FROM error_group_jobs WHERE id = $1`,
@@ -221,15 +277,319 @@ describeDb('db.ts integration tests', () => {
     });
   });
 
+  describe('lease generation fencing', () => {
+    it('does not let an expired owner revive or terminate a claim before reaping', async () => {
+      const { jobId } = await seedErrorGroupAndJob();
+      const claim = await claimJob('worker-expired', 60_000);
+      await testPool.query(
+        `UPDATE error_group_jobs
+         SET lease_expires_at = now() - interval '1 second'
+         WHERE id = $1`,
+        [jobId],
+      );
+
+      expect(
+        await heartbeat(jobId, 'worker-expired', claim!.leaseGeneration, 60_000),
+      ).toBe(false);
+      expect(
+        await completeJob(jobId, 'worker-expired', claim!.leaseGeneration),
+      ).toBe(false);
+      expect(
+        await failJob(
+          jobId,
+          'worker-expired',
+          claim!.leaseGeneration,
+          'late failure',
+        ),
+      ).toBe(false);
+      const row = await testPool.query<{
+        status: string;
+        attempts: number;
+        last_error: string | null;
+      }>(
+        `SELECT status, attempts, last_error
+         FROM error_group_jobs WHERE id = $1`,
+        [jobId],
+      );
+      expect(row.rows[0]).toEqual({
+        status: 'claimed',
+        attempts: 0,
+        last_error: null,
+      });
+    });
+
+    it('rejects a stale heartbeat after the same worker ID reclaims the job', async () => {
+      const { jobId, staleGeneration, currentGeneration } =
+        await expireAndReclaimWithSameWorker();
+      const before = await testPool.query<{
+        status: string;
+        lease_generation: string;
+        lease_expires_at: Date;
+      }>(
+        `SELECT status, lease_generation::text, lease_expires_at
+         FROM error_group_jobs WHERE id = $1`,
+        [jobId],
+      );
+
+      expect(
+        await heartbeat(jobId, 'worker-reused', staleGeneration, 120_000),
+      ).toBe(false);
+
+      const after = await testPool.query<{
+        status: string;
+        lease_generation: string;
+        lease_expires_at: Date;
+      }>(
+        `SELECT status, lease_generation::text, lease_expires_at
+         FROM error_group_jobs WHERE id = $1`,
+        [jobId],
+      );
+      expect(after.rows[0]).toEqual(before.rows[0]);
+      expect(
+        await heartbeat(jobId, 'worker-reused', currentGeneration, 120_000),
+      ).toBe(true);
+    });
+
+    it('rejects stale completion after the same worker ID reclaims the job', async () => {
+      const { jobId, staleGeneration, currentGeneration } =
+        await expireAndReclaimWithSameWorker();
+
+      expect(
+        await completeJob(jobId, 'worker-reused', staleGeneration),
+      ).toBe(false);
+      expect(
+        await testPool.query<{ status: string }>(
+          `SELECT status FROM error_group_jobs WHERE id = $1`,
+          [jobId],
+        ),
+      ).toMatchObject({ rows: [{ status: 'claimed' }] });
+      expect(
+        await completeJob(jobId, 'worker-reused', currentGeneration),
+      ).toBe(true);
+    });
+
+    it('rejects stale failure after the same worker ID reclaims the job', async () => {
+      const { jobId, staleGeneration, currentGeneration } =
+        await expireAndReclaimWithSameWorker();
+
+      expect(
+        await failJob(
+          jobId,
+          'worker-reused',
+          staleGeneration,
+          'stale execution failed',
+        ),
+      ).toBe(false);
+      const afterStale = await testPool.query<{
+        status: string;
+        attempts: number;
+        last_error: string;
+        lease_generation: string;
+      }>(
+        `SELECT status, attempts, last_error, lease_generation::text
+         FROM error_group_jobs WHERE id = $1`,
+        [jobId],
+      );
+      expect(afterStale.rows[0]).toMatchObject({
+        status: 'claimed',
+        attempts: 1,
+        last_error: 'reaper: lease expired (attempt 1)',
+        lease_generation: currentGeneration,
+      });
+      expect(
+        await failJob(
+          jobId,
+          'worker-reused',
+          currentGeneration,
+          'current execution failed',
+        ),
+      ).toBe(true);
+    });
+
+    it('fences trace, group, and fix-job writes with the current generation', async () => {
+      const {
+        jobId,
+        errorGroupId,
+        staleGeneration,
+        currentGeneration,
+      } = await expireAndReclaimWithSameWorker();
+      const staleLease = {
+        id: jobId,
+        workerId: 'worker-reused',
+        leaseGeneration: staleGeneration,
+        projectId: testProjectId,
+        errorGroupId,
+        sessionId: null,
+      };
+      const currentLease = {
+        ...staleLease,
+        leaseGeneration: currentGeneration,
+      };
+
+      expect(
+        await updateJobTraceUrl(
+          jobId,
+          'worker-reused',
+          staleGeneration,
+          'https://trace.invalid/stale',
+        ),
+      ).toBe(false);
+      await expect(
+        updateGroupStatus(
+          errorGroupId,
+          testProjectId,
+          'analyzing',
+          undefined,
+          staleLease,
+        ),
+      ).rejects.toThrow('lease lost');
+      await expect(
+        updateGroupInvestigation(
+          errorGroupId,
+          testProjectId,
+          'investigated',
+          { rootCause: 'stale result' },
+          staleLease,
+        ),
+      ).rejects.toThrow('lease lost');
+
+      const beforeCurrent = await testPool.query<{
+        status: string;
+        root_cause: string | null;
+        trace_url: string | null;
+      }>(
+        `SELECT eg.status, eg.root_cause, j.trace_url
+         FROM error_groups eg
+         JOIN error_group_jobs j ON j.error_group_id = eg.id
+         WHERE eg.id = $1 AND j.id = $2`,
+        [errorGroupId, jobId],
+      );
+      expect(beforeCurrent.rows[0]).toEqual({
+        status: 'queued',
+        root_cause: null,
+        trace_url: null,
+      });
+
+      await updateGroupStatus(
+        errorGroupId,
+        testProjectId,
+        'analyzing',
+        undefined,
+        currentLease,
+      );
+      await expect(
+        updateGroupAndCreateFixJob(
+          errorGroupId,
+          testProjectId,
+          { rootCause: 'stale result' },
+          staleLease,
+        ),
+      ).rejects.toThrow('lease lost');
+      const staleFixCount = await testPool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+         FROM error_group_jobs
+         WHERE error_group_id = $1 AND job_type = 'fix'`,
+        [errorGroupId],
+      );
+      expect(staleFixCount.rows[0]?.count).toBe('0');
+
+      const fixJobId = await updateGroupAndCreateFixJob(
+        errorGroupId,
+        testProjectId,
+        { rootCause: 'current result', confidence: 'high' },
+        currentLease,
+      );
+      expect(fixJobId).toEqual(expect.any(String));
+      const final = await testPool.query<{
+        status: string;
+        root_cause: string | null;
+      }>(
+        `SELECT status, root_cause FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(final.rows[0]).toEqual({
+        status: 'fixing',
+        root_cause: 'current result',
+      });
+    });
+
+    it('does not authorize another tenant with a valid current lease', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+      const claim = await claimJob('tenant-bound-worker', 60_000);
+      expect(claim?.errorGroupId).toBe(errorGroupId);
+
+      const otherOrg = await testPool.query<{ id: string }>(
+        `INSERT INTO orgs (name) VALUES ('lease-other-org') RETURNING id`,
+      );
+      const otherProject = await testPool.query<{ id: string }>(
+        `INSERT INTO projects (org_id, name, github_repo, default_branch)
+         VALUES ($1, 'lease-other-project', 'other/repo', 'main') RETURNING id`,
+        [otherOrg.rows[0]!.id],
+      );
+      const otherGroup = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status)
+         VALUES ($1, $2, 'Other tenant error', now(), now(), 'queued')
+         RETURNING id`,
+        [otherProject.rows[0]!.id, `fp-${crypto.randomUUID()}`],
+      );
+
+      try {
+        await expect(
+          updateGroupStatus(
+            otherGroup.rows[0]!.id,
+            otherProject.rows[0]!.id,
+            'analyzing',
+            undefined,
+            claim!,
+          ),
+        ).rejects.toThrow('lease lost');
+        await expect(
+          updateGroupAndCreateFixJob(
+            otherGroup.rows[0]!.id,
+            otherProject.rows[0]!.id,
+            { rootCause: 'cross-tenant mutation' },
+            claim!,
+          ),
+        ).rejects.toThrow('lease lost');
+        await expect(
+          recordSetupPrResult(
+            otherProject.rows[0]!.id,
+            'opening',
+            {},
+            claim!,
+          ),
+        ).rejects.toThrow('lease lost');
+
+        const untouched = await testPool.query<{ status: string }>(
+          `SELECT status FROM error_groups WHERE id = $1`,
+          [otherGroup.rows[0]!.id],
+        );
+        expect(untouched.rows[0]?.status).toBe('queued');
+      } finally {
+        await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [otherProject.rows[0]!.id]);
+        await testPool.query(`DELETE FROM projects WHERE id = $1`, [otherProject.rows[0]!.id]);
+        await testPool.query(`DELETE FROM orgs WHERE id = $1`, [otherOrg.rows[0]!.id]);
+      }
+    });
+  });
+
   describe('failJob', () => {
     it('should retry (reset to pending) when under max_attempts', async () => {
       const { jobId } = await seedErrorGroupAndJob({
         attempts: 0,
         max_attempts: 3,
       });
-      await claimJob('worker-1', 60_000);
+      const claimed = await claimJob('worker-1', 60_000);
 
-      await failJob(jobId, 'worker-1', 'Something broke');
+      expect(
+        await failJob(
+          jobId,
+          'worker-1',
+          claimed!.leaseGeneration,
+          'Something broke',
+        ),
+      ).toBe(true);
 
       const result = await testPool.query<{
         status: string;
@@ -258,9 +618,16 @@ describeDb('db.ts integration tests', () => {
         attempts: 2,
         max_attempts: 3,
       });
-      await claimJob('worker-1', 60_000);
+      const claimed = await claimJob('worker-1', 60_000);
 
-      await failJob(jobId, 'worker-1', 'Final failure');
+      expect(
+        await failJob(
+          jobId,
+          'worker-1',
+          claimed!.leaseGeneration,
+          'Final failure',
+        ),
+      ).toBe(true);
 
       const result = await testPool.query<{
         status: string;

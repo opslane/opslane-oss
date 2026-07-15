@@ -9,6 +9,7 @@ const deps = () => ({
   runAgentSetup: vi.fn().mockResolvedValue({ status: 'setup_ready', diff: 'D', confidence: 'high', affectedFiles: ['package.json'] }),
   commitAndPush: vi.fn().mockResolvedValue(undefined),
   createPr: vi.fn().mockResolvedValue({ url: 'https://gh/pr/1', number: 1 }),
+  assertLeaseOwned: vi.fn().mockResolvedValue(undefined),
   record: vi.fn().mockResolvedValue(undefined),
 });
 
@@ -59,5 +60,21 @@ describe('runSetupPr', () => {
 
     expect(r.status).toBe('failed');
     expect(d.record).toHaveBeenCalledWith('p', 'failed', expect.objectContaining({ error: expect.any(String) }));
+  });
+
+  it('does not push when the lease is lost immediately before delivery', async () => {
+    const d = deps();
+    d.assertLeaseOwned
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('Job lease lost'));
+
+    const r = await runSetupPr(
+      { jobId: 'j', projectId: 'p', apiKeyEnvVar: 'X', releaseEnvVar: 'Y' },
+      d,
+    );
+
+    expect(r.status).toBe('failed');
+    expect(d.commitAndPush).not.toHaveBeenCalled();
+    expect(d.createPr).not.toHaveBeenCalled();
   });
 });

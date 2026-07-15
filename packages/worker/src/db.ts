@@ -23,14 +23,57 @@ export async function closePool(): Promise<void> {
 
 export interface ClaimedJob {
   id: string;
+  workerId: string;
   errorGroupId: string | null;
   sourceId: string | null;
   projectId: string;
   jobType: JobType;
   attempts: number;
   guidance: string | null;
+  /** Monotonically increasing fencing token for this claim. */
+  leaseGeneration: string;
   triggeredBy: 'auto' | 'human' | null;
   sessionId: string | null;
+}
+
+export interface JobLease {
+  id: string;
+  workerId: string;
+  leaseGeneration: string;
+  projectId: string;
+  errorGroupId: string | null;
+  sessionId: string | null;
+}
+
+export class LeaseLostError extends Error {
+  constructor(jobId: string) {
+    super(`Job lease lost for ${jobId}`);
+    this.name = 'LeaseLostError';
+  }
+}
+
+export async function assertJobLease(lease: JobLease): Promise<void> {
+  const result = await getPool().query(
+    `SELECT 1
+     FROM error_group_jobs
+     WHERE id = $1
+       AND worker_id = $2
+       AND lease_generation = $3::bigint
+       AND project_id = $4
+       AND error_group_id IS NOT DISTINCT FROM $5::uuid
+       AND session_id IS NOT DISTINCT FROM $6
+       AND status = 'claimed'
+       AND lease_expires_at > now()`,
+    [
+      lease.id,
+      lease.workerId,
+      lease.leaseGeneration,
+      lease.projectId,
+      lease.errorGroupId,
+      lease.sessionId,
+    ],
+  );
+  if ((result.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
 }
 
 /** Claims the oldest pending job using FOR UPDATE SKIP LOCKED.
@@ -48,6 +91,8 @@ export async function claimJob(
     job_type: JobType;
     attempts: number;
     guidance: string | null;
+    worker_id: string;
+    lease_generation: string;
     triggered_by: 'auto' | 'human' | null;
     session_id: string | null;
   }>(
@@ -56,6 +101,7 @@ export async function claimJob(
          worker_id = $1,
          claimed_at = now(),
          lease_expires_at = now() + make_interval(secs => $2::double precision),
+         lease_generation = lease_generation + 1,
          updated_at = now()
      WHERE id = (
        SELECT id FROM error_group_jobs
@@ -68,8 +114,9 @@ export async function claimJob(
        LIMIT 1
        FOR UPDATE SKIP LOCKED
      )
-     RETURNING id, error_group_id, source_id, project_id, job_type, attempts,
-               guidance, triggered_by, session_id`,
+     RETURNING id, error_group_id, source_id, project_id, job_type, attempts, guidance,
+               worker_id, lease_generation::text AS lease_generation,
+               triggered_by, session_id`,
     [workerId, leaseDurationMs / 1000]
   );
 
@@ -78,12 +125,14 @@ export async function claimJob(
 
   return {
     id: row.id,
+    workerId: row.worker_id,
     errorGroupId: row.error_group_id,
     sourceId: row.source_id,
     projectId: row.project_id,
     jobType: row.job_type,
     attempts: row.attempts,
     guidance: row.guidance,
+    leaseGeneration: row.lease_generation,
     triggeredBy: row.triggered_by,
     sessionId: row.session_id,
   };
@@ -93,15 +142,20 @@ export async function claimJob(
 export async function heartbeat(
   jobId: string,
   workerId: string,
+  leaseGeneration: string,
   leaseDurationMs: number
 ): Promise<boolean> {
   const db = getPool();
   const result = await db.query(
     `UPDATE error_group_jobs
-     SET lease_expires_at = now() + make_interval(secs => $3::double precision),
+     SET lease_expires_at = now() + make_interval(secs => $4::double precision),
          updated_at = now()
-     WHERE id = $1 AND worker_id = $2 AND status = 'claimed'`,
-    [jobId, workerId, leaseDurationMs / 1000]
+     WHERE id = $1
+       AND worker_id = $2
+       AND lease_generation = $3::bigint
+       AND status = 'claimed'
+       AND lease_expires_at > now()`,
+    [jobId, workerId, leaseGeneration, leaseDurationMs / 1000]
   );
   return (result.rowCount ?? 0) > 0;
 }
@@ -109,16 +163,22 @@ export async function heartbeat(
 /** Marks a claimed job as completed. */
 export async function completeJob(
   jobId: string,
-  workerId: string
-): Promise<void> {
+  workerId: string,
+  leaseGeneration: string
+): Promise<boolean> {
   const db = getPool();
-  await db.query(
+  const result = await db.query(
     `UPDATE error_group_jobs
      SET status = 'completed',
          updated_at = now()
-     WHERE id = $1 AND worker_id = $2 AND status = 'claimed'`,
-    [jobId, workerId]
+     WHERE id = $1
+       AND worker_id = $2
+       AND lease_generation = $3::bigint
+       AND status = 'claimed'
+       AND lease_expires_at > now()`,
+    [jobId, workerId, leaseGeneration]
   );
+  return (result.rowCount ?? 0) > 0;
 }
 
 /**
@@ -128,13 +188,14 @@ export async function completeJob(
 export async function failJob(
   jobId: string,
   workerId: string,
+  leaseGeneration: string,
   error: string
-): Promise<void> {
+): Promise<boolean> {
   const db = getPool();
-  await db.query(
+  const result = await db.query(
     `UPDATE error_group_jobs
      SET attempts = attempts + 1,
-         last_error = $3,
+         last_error = $4,
          status = CASE
            WHEN attempts + 1 >= max_attempts THEN 'dead_letter'::job_status
            ELSE 'pending'::job_status
@@ -152,9 +213,14 @@ export async function failJob(
            ELSE NULL
          END,
          updated_at = now()
-     WHERE id = $1 AND worker_id = $2 AND status = 'claimed'`,
-    [jobId, workerId, error]
+     WHERE id = $1
+       AND worker_id = $2
+       AND lease_generation = $3::bigint
+       AND status = 'claimed'
+       AND lease_expires_at > now()`,
+    [jobId, workerId, leaseGeneration, error]
   );
+  return (result.rowCount ?? 0) > 0;
 }
 
 /**
@@ -235,13 +301,22 @@ export async function requeueStaleJobs(): Promise<number> {
 /** Stores the Langfuse trace URL on a job row (fire-and-forget). */
 export async function updateJobTraceUrl(
   jobId: string,
+  workerId: string,
+  leaseGeneration: string,
   traceUrl: string
-): Promise<void> {
+): Promise<boolean> {
   const db = getPool();
-  await db.query(
-    `UPDATE error_group_jobs SET trace_url = $2, updated_at = now() WHERE id = $1`,
-    [jobId, traceUrl]
+  const result = await db.query(
+    `UPDATE error_group_jobs
+     SET trace_url = $4, updated_at = now()
+     WHERE id = $1
+       AND worker_id = $2
+       AND lease_generation = $3::bigint
+       AND status = 'claimed'
+       AND lease_expires_at > now()`,
+    [jobId, workerId, leaseGeneration, traceUrl]
   );
+  return (result.rowCount ?? 0) > 0;
 }
 
 /**
@@ -257,7 +332,8 @@ export async function updateGroupStatus(
     pr_url?: string;
     pr_number?: number;
     reason?: NeedsHumanReason;
-  }
+  },
+  lease?: JobLease,
 ): Promise<void> {
   if (status === 'needs_human') {
     const reason = fields?.reason;
@@ -275,8 +351,22 @@ export async function updateGroupStatus(
 
   const reason = fields?.reason;
   const db = getPool();
-  await db.query(
-    `UPDATE error_groups
+  const ownedCte = lease
+    ? `WITH owned AS (
+         SELECT id FROM error_group_jobs
+         WHERE id = $10
+           AND worker_id = $11
+           AND lease_generation = $12::bigint
+           AND project_id = $2
+           AND error_group_id = $1
+           AND status = 'claimed'
+           AND lease_expires_at > now()
+         FOR UPDATE
+       )`
+    : '';
+  const result = await db.query(
+    `${ownedCte}
+     UPDATE error_groups
      SET status = $3::error_group_status,
          confidence = $4,
          pr_url = $5,
@@ -285,7 +375,9 @@ export async function updateGroupStatus(
          reason_message = $8,
          remediation = $9,
          updated_at = now()
-     WHERE id = $1 AND project_id = $2`,
+     WHERE id = $1 AND project_id = $2
+       ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
+     RETURNING id`,
     [
       errorGroupId,
       projectId,
@@ -296,8 +388,12 @@ export async function updateGroupStatus(
       reason?.reason_code ?? null,
       reason?.reason_message ?? null,
       reason?.remediation ?? null,
+      ...(lease ? [lease.id, lease.workerId, lease.leaseGeneration] : []),
     ]
   );
+  if (lease && (result.rowCount ?? 0) === 0) {
+    throw new LeaseLostError(lease.id);
+  }
 }
 
 /**
@@ -391,7 +487,7 @@ export async function getErrorEvent(eventId: string, projectId: string): Promise
   const pool = getPool();
   const { rows } = await pool.query<ErrorEventData>(
     `SELECT id, error_type, error_message, stack_trace_raw, stack_trace_resolved,
-            breadcrumbs, context, release, session_id
+            breadcrumbs::text AS breadcrumbs, context::text AS context, release, session_id
      FROM error_events WHERE id = $1 AND project_id = $2`,
     [eventId, projectId],
   );
@@ -419,17 +515,46 @@ export async function recordSetupPrResult(
   projectId: string,
   status: SetupPrStatus,
   fields: { pr_url?: string; pr_number?: number; error?: string } = {},
+  lease?: JobLease,
 ): Promise<void> {
   const pool = getPool();
-  await pool.query(
-    `UPDATE projects
+  const ownedCte = lease
+    ? `WITH owned AS (
+         SELECT id FROM error_group_jobs
+         WHERE id = $6
+           AND worker_id = $7
+           AND lease_generation = $8::bigint
+           AND project_id = $1
+           AND error_group_id IS NOT DISTINCT FROM $9::uuid
+           AND status = 'claimed'
+           AND lease_expires_at > now()
+         FOR UPDATE
+       )`
+    : '';
+  const result = await pool.query(
+    `${ownedCte}
+     UPDATE projects
         SET setup_pr_status = $2,
             setup_pr_url = COALESCE($3, setup_pr_url),
             setup_pr_number = COALESCE($4, setup_pr_number),
             setup_pr_error = $5
-      WHERE id = $1`,
-    [projectId, status, fields.pr_url ?? null, fields.pr_number ?? null, fields.error ?? null],
+      WHERE id = $1
+        ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
+      RETURNING id`,
+    [
+      projectId,
+      status,
+      fields.pr_url ?? null,
+      fields.pr_number ?? null,
+      fields.error ?? null,
+      ...(lease
+        ? [lease.id, lease.workerId, lease.leaseGeneration, lease.errorGroupId]
+        : []),
+    ],
   );
+  if (lease && (result.rowCount ?? 0) === 0) {
+    throw new LeaseLostError(lease.id);
+  }
 }
 
 export interface ReplayData {
@@ -601,7 +726,8 @@ export async function updateGroupInvestigation(
     suggestedMitigation?: string;
     confidence?: ConfidenceLevel;
     reason?: NeedsHumanReason;
-  }
+  },
+  lease?: JobLease,
 ): Promise<void> {
   if (status === 'needs_human') {
     const r = fields.reason;
@@ -613,8 +739,22 @@ export async function updateGroupInvestigation(
   }
   const reason = fields.reason;
   const db = getPool();
-  await db.query(
-    `UPDATE error_groups
+  const ownedCte = lease
+    ? `WITH owned AS (
+         SELECT id FROM error_group_jobs
+         WHERE id = $10
+           AND worker_id = $11
+           AND lease_generation = $12::bigint
+           AND project_id = $2
+           AND error_group_id = $1
+           AND status = 'claimed'
+           AND lease_expires_at > now()
+         FOR UPDATE
+       )`
+    : '';
+  const result = await db.query(
+    `${ownedCte}
+     UPDATE error_groups
      SET status = $3::error_group_status,
          root_cause = $4,
          suggested_mitigation = $5,
@@ -623,7 +763,9 @@ export async function updateGroupInvestigation(
          reason_message = $8,
          remediation = $9,
          updated_at = now()
-     WHERE id = $1 AND project_id = $2`,
+     WHERE id = $1 AND project_id = $2
+       ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
+     RETURNING id`,
     [
       errorGroupId,
       projectId,
@@ -634,8 +776,12 @@ export async function updateGroupInvestigation(
       reason?.reason_code ?? null,
       reason?.reason_message ?? null,
       reason?.remediation ?? null,
+      ...(lease ? [lease.id, lease.workerId, lease.leaseGeneration] : []),
     ]
   );
+  if (lease && (result.rowCount ?? 0) === 0) {
+    throw new LeaseLostError(lease.id);
+  }
 }
 
 /**
@@ -649,13 +795,71 @@ export async function updateGroupAndCreateFixJob(
     rootCause?: string;
     suggestedMitigation?: string;
     confidence?: ConfidenceLevel;
-  }
+  },
+  lease: JobLease,
 ): Promise<string> {
   const db = getPool();
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
+    const owned = await client.query(
+      `SELECT id
+       FROM error_group_jobs
+       WHERE id = $1
+         AND worker_id = $2
+         AND lease_generation = $3::bigint
+         AND error_group_id = $4
+         AND project_id = $5
+         AND status = 'claimed'
+         AND lease_expires_at > now()
+       FOR UPDATE`,
+      [
+        lease.id,
+        lease.workerId,
+        lease.leaseGeneration,
+        errorGroupId,
+        projectId,
+      ],
+    );
+    if ((owned.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
+
+    const group = await client.query<{ status: string }>(
+      `SELECT status
+       FROM error_groups
+       WHERE id = $1 AND project_id = $2
+       FOR UPDATE`,
+      [errorGroupId, projectId],
+    );
+    if ((group.rowCount ?? 0) !== 1) {
+      throw new Error(`Cannot create fix job: group ${errorGroupId} was not found`);
+    }
+
+    const existingFix = await client.query<{ id: string }>(
+      `SELECT id
+       FROM error_group_jobs
+       WHERE error_group_id = $1
+         AND project_id = $2
+         AND job_type IN ('fix', 'error_fix')
+         AND status IN ('pending', 'claimed')
+       ORDER BY created_at, id
+       LIMIT 1`,
+      [errorGroupId, projectId],
+    );
+    if (
+      existingFix.rows[0]
+      && ['analyzing', 'fixing'].includes(group.rows[0]!.status)
+    ) {
+      await client.query(
+        `UPDATE error_groups
+         SET status = 'fixing', updated_at = now()
+         WHERE id = $1 AND project_id = $2`,
+        [errorGroupId, projectId],
+      );
+      await client.query('COMMIT');
+      return existingFix.rows[0].id;
+    }
+
+    const groupUpdate = await client.query(
       `UPDATE error_groups
        SET status = 'fixing',
            root_cause = $3,
@@ -671,6 +875,11 @@ export async function updateGroupAndCreateFixJob(
         fields.confidence ?? null,
       ]
     );
+    if ((groupUpdate.rowCount ?? 0) !== 1) {
+      throw new Error(
+        `Cannot create fix job: group ${errorGroupId} is not in analyzing state`,
+      );
+    }
     const result = await client.query<{ id: string }>(
       `INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
        VALUES ($1, $2, 'fix', 'auto')
@@ -767,15 +976,44 @@ export async function setSessionAnalysisStatus(
   projectId: string,
   status: 'analyzing' | 'analyzed' | 'analysis_failed',
   ruleVersion?: number,
+  lease?: JobLease,
 ): Promise<void> {
   const db = getPool();
-  await db.query(
-    `UPDATE sessions
+  const ownedCte = lease
+    ? `WITH owned AS (
+         SELECT id FROM error_group_jobs
+         WHERE id = $5
+           AND worker_id = $6
+           AND lease_generation = $7::bigint
+           AND project_id = $2
+           AND error_group_id IS NOT DISTINCT FROM $8::uuid
+           AND session_id IS NOT DISTINCT FROM $1
+           AND status = 'claimed'
+           AND lease_expires_at > now()
+         FOR UPDATE
+       )`
+    : '';
+  const result = await db.query(
+    `${ownedCte}
+     UPDATE sessions
      SET status = $3,
          analyzer_rule_version = COALESCE($4, analyzer_rule_version)
-     WHERE id = $1 AND project_id = $2`,
-    [sessionId, projectId, status, ruleVersion ?? null],
+     WHERE id = $1 AND project_id = $2
+       ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
+     RETURNING id`,
+    [
+      sessionId,
+      projectId,
+      status,
+      ruleVersion ?? null,
+      ...(lease
+        ? [lease.id, lease.workerId, lease.leaseGeneration, lease.errorGroupId]
+        : []),
+    ],
   );
+  if (lease && (result.rowCount ?? 0) === 0) {
+    throw new LeaseLostError(lease.id);
+  }
 }
 
 /**

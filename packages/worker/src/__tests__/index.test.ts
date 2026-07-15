@@ -7,6 +7,7 @@ import type { ClaimedJob, ErrorGroupData, ErrorEventData, ProjectData } from '..
 // boot here. The ONE module we deliberately leave real is harness/stack-trace-utils
 // (hasNoAppFrames) — that's the decision under test.
 vi.mock('../db.js', () => ({
+  LeaseLostError: class LeaseLostError extends Error {},
   getErrorGroup: vi.fn(),
   getErrorEvent: vi.fn(),
   getProject: vi.fn(),
@@ -28,12 +29,16 @@ vi.mock('../db.js', () => ({
   getScrubbedChunksForSession: vi.fn(),
   getSessionForAnalysis: vi.fn(),
   setSessionAnalysisStatus: vi.fn(),
+  assertJobLease: vi.fn(),
 }));
 vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
   setWorkerId: vi.fn(),
 }));
-vi.mock('../repo-clone.js', () => ({ cloneRepo: vi.fn() }));
+vi.mock('../repo-clone.js', () => ({
+  cloneRepo: vi.fn(),
+  buildRepoUrl: vi.fn((githubRepo: string) => `https://github.com/${githubRepo}.git`),
+}));
 vi.mock('../minio-client.js', () => ({ fetchObject: vi.fn(), getMinIOConfig: vi.fn(() => null) }));
 vi.mock('../investigate.js', () => ({ investigateError: vi.fn() }));
 vi.mock('../pipeline.js', () => ({ runPipeline: vi.fn() }));
@@ -78,12 +83,14 @@ const mockGetPlayableChunkMetas = vi.mocked(db.getPlayableChunkMetas);
 function makeJob(): ClaimedJob & { errorGroupId: string } {
   return {
     id: 'job-1',
+    workerId: 'worker-1',
     errorGroupId: 'grp-1',
     sourceId: null,
     projectId: 'proj-1',
     jobType: 'investigate',
     attempts: 0,
     guidance: null,
+    leaseGeneration: '1',
     triggeredBy: null,
     sessionId: null,
   };
@@ -174,6 +181,16 @@ describe('processInvestigateJob — pre-clone guard for stackless errors', () =>
     expect(mockCloneRepo).not.toHaveBeenCalled();
     expect(unfixableCall()).toBeDefined();
   });
+
+  it('adopts an already-started fix instead of re-running a recovered investigation', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({ status: 'fixing' }));
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+
+    expect(mockUpdateGroupStatus).not.toHaveBeenCalled();
+    expect(mockGetErrorEvent).not.toHaveBeenCalled();
+    expect(mockCloneRepo).not.toHaveBeenCalled();
+  });
 });
 
 describe('processFixJob — preserves writeup on failure (no revert/null)', () => {
@@ -201,7 +218,19 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
   });
 
   function fixJob(): ClaimedJob & { errorGroupId: string } {
-    return { id: 'j1', errorGroupId: 'g1', sourceId: null, projectId: 'p1', jobType: 'fix', attempts: 0, guidance: null, triggeredBy: null, sessionId: null };
+    return {
+      id: 'j1',
+      workerId: 'worker-1',
+      errorGroupId: 'g1',
+      sourceId: null,
+      projectId: 'p1',
+      jobType: 'fix',
+      attempts: 0,
+      guidance: null,
+      leaseGeneration: '1',
+      triggeredBy: null,
+      sessionId: null,
+    };
   }
 
   afterEach(() => {
@@ -289,6 +318,7 @@ describe('friction worker path', () => {
     process.env['ANTHROPIC_API_KEY'] = 'test-key';
     mockGetErrorGroup.mockResolvedValue(makeGroup({
       kind: 'friction',
+      status: 'candidate',
       sample_event_id: '',
       signal_type: 'dead_click',
       element_selector: '[data-testid="save"]',
@@ -315,6 +345,7 @@ describe('friction worker path', () => {
     expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
     expect(db.updateGroupInvestigation).toHaveBeenCalledWith(
       'grp-1', 'proj-1', 'awaiting_approval', expect.objectContaining({ confidence: 'high' }),
+      makeJob(),
     );
   });
 
@@ -327,6 +358,7 @@ describe('friction worker path', () => {
 
     expect(db.updateGroupInvestigation).toHaveBeenCalledWith(
       'grp-1', 'proj-1', 'insight', expect.objectContaining({ rootCause: expect.any(String) }),
+      makeJob(),
     );
     expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
   });
@@ -336,7 +368,9 @@ describe('friction worker path', () => {
 
     await processFixJob(job, new AbortController().signal);
 
-    expect(mockUpdateGroupStatus).toHaveBeenCalledWith('grp-1', 'proj-1', 'awaiting_approval');
+    expect(mockUpdateGroupStatus).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'awaiting_approval', undefined, job,
+    );
     expect(mockCloneRepo).not.toHaveBeenCalled();
     expect(mockRunPipeline).not.toHaveBeenCalled();
   });
@@ -348,7 +382,8 @@ describe('session_analysis handler', () => {
   });
 
   const job: ClaimedJob & { sessionId: string } = {
-    id: 'analysis-1', errorGroupId: null, sourceId: null, projectId: 'proj-1',
+    id: 'analysis-1', workerId: 'worker-1', leaseGeneration: '1',
+    errorGroupId: null, sourceId: null, projectId: 'proj-1',
     jobType: 'session_analysis', attempts: 0, guidance: null, triggeredBy: 'auto', sessionId: 'session-1',
   };
 
@@ -375,9 +410,10 @@ describe('session_analysis handler', () => {
 
     await processSessionAnalysisJob(job, new AbortController().signal);
 
-    expect(db.setSessionAnalysisStatus).toHaveBeenNthCalledWith(1, 'session-1', 'proj-1', 'analyzing');
+    expect(db.setSessionAnalysisStatus).toHaveBeenNthCalledWith(1, 'session-1', 'proj-1', 'analyzing', undefined, job);
+    expect(db.assertJobLease).toHaveBeenCalledWith(job);
     expect(writeFrictionSignals).toHaveBeenCalledWith(session, [], 1);
-    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analyzed', 1);
+    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analyzed', 1, job);
     expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
   });
 
@@ -389,6 +425,8 @@ describe('session_analysis handler', () => {
     vi.mocked(readChunksBounded).mockRejectedValue(new Error('corrupt gzip'));
 
     await expect(processSessionAnalysisJob(job, new AbortController().signal)).rejects.toThrow('corrupt gzip');
-    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analysis_failed');
+    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith(
+      'session-1', 'proj-1', 'analysis_failed', undefined, job,
+    );
   });
 });

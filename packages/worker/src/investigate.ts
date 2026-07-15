@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient } from './anthropic-client.js';
 import { execFile } from 'node:child_process';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { resolve, relative, normalize } from 'node:path';
@@ -381,7 +382,7 @@ export async function investigateError(
   input: InvestigateInput,
   repoPath: string,
 ): Promise<InvestigationResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createAnthropicClient(apiKey);
   const pricing = MODEL_PRICING[INVESTIGATION_MODEL] ?? DEFAULT_PRICING;
   const tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const filesRead: string[] = [];

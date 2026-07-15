@@ -147,6 +147,7 @@ describe('runPipeline', () => {
   });
 
   it('happy path: agent fix succeeds → git push succeeds → PR created', async () => {
+    const assertLeaseOwned = vi.fn().mockResolvedValue(undefined);
     mockRunAgentFix.mockResolvedValueOnce({
       status: 'fix_ready',
       diff: VALID_DIFF,
@@ -162,7 +163,7 @@ describe('runPipeline', () => {
       prNumber: 99,
     });
 
-    const result = await runPipeline(makePipelineInput());
+    const result = await runPipeline(makePipelineInput({ assertLeaseOwned }));
 
     expect(result.status).toBe('pr_created');
     expect(result.pr_url).toBe('https://github.com/org/repo/pull/99');
@@ -174,12 +175,33 @@ describe('runPipeline', () => {
     expect(mockValidateDiffPaths).toHaveBeenCalledWith(VALID_DIFF);
     expect(mockGitCommitAndPush).toHaveBeenCalledTimes(1);
     expect(mockCreatePR).toHaveBeenCalledTimes(1);
+    expect(assertLeaseOwned).toHaveBeenCalledTimes(2);
     expect(mockCreatePR).toHaveBeenCalledWith(
       expect.objectContaining({
         humanSummary: 'The user opened the page. The app crashed on render. The fix guards the null value.',
       }),
       undefined,
     );
+  });
+
+  it('does not push or create a PR when the authoritative lease check fails', async () => {
+    mockRunAgentFix.mockResolvedValueOnce({
+      status: 'fix_ready',
+      diff: VALID_DIFF,
+      confidence: 'high' as ConfidenceLevel,
+      rootCause: 'Null reference in main()',
+      affectedFiles: ['f.ts'],
+    });
+
+    await expect(
+      runPipeline(
+        makePipelineInput({
+          assertLeaseOwned: vi.fn().mockRejectedValue(new Error('Job lease lost')),
+        }),
+      ),
+    ).rejects.toThrow('Job lease lost');
+    expect(mockGitCommitAndPush).not.toHaveBeenCalled();
+    expect(mockCreatePR).not.toHaveBeenCalled();
   });
 
   it('returns needs_human when agent fix returns needs_human', async () => {

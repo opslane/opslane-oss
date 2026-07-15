@@ -1,5 +1,6 @@
-import { Sandbox } from 'e2b';
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient } from './anthropic-client.js';
+import { createSandboxRuntime, type SandboxRuntime } from './harness/sandbox-runtime.js';
 import { runAgentLoop } from './harness/agent-loop.js';
 import { createToolBridge } from './harness/tool-bridge.js';
 import { createDefaultMiddleware } from './harness/tool-middleware.js';
@@ -10,6 +11,7 @@ import { logger } from './logger.js';
 import { traceSpan } from './tracing.js';
 import type { ConfidenceLevel, NeedsHumanReason, ReasonCode } from '@opslane/shared';
 import { buildReason } from './reason-codes.js';
+import { buildGitNetrc } from './repo-clone.js';
 import type { AgentCompletionResult, VisualAnalysisOutput, SourceFile, AgentState } from './harness/types.js';
 
 export interface AgentFixInput {
@@ -82,7 +84,7 @@ interface TestGateResult {
  * Deterministic test gate: runs the project's test suite in the sandbox and
  * checks the exit code. Replaces the fragile regex-based testsRan heuristic.
  */
-async function runTestGate(sandbox: Sandbox): Promise<TestGateResult> {
+async function runTestGate(sandbox: SandboxRuntime): Promise<TestGateResult> {
   const detectResult = await sandbox.commands.run(
     'cd /home/user/repo && if [ -f vitest.config.ts ] || [ -f vitest.config.js ]; then echo "vitest"; elif node -e "process.exit(require(\'./package.json\').scripts?.test ? 0 : 1)" 2>/dev/null; then echo "npm-test"; else echo "none"; fi',
     { timeoutMs: 10_000 },
@@ -190,7 +192,7 @@ export async function triageError(
   apiKey: string,
   input: Pick<AgentFixInput, 'errorType' | 'title' | 'errorMessage' | 'stackTrace' | 'resolvedStackTrace' | 'breadcrumbs'>,
 ): Promise<TriageResult> {
-  const client = new Anthropic({ apiKey });
+  const client = createAnthropicClient(apiKey);
 
   // If source maps resolved the stack trace, include it so triage can see real file paths
   // even when the raw trace is all <anonymous> or minified.
@@ -273,7 +275,7 @@ async function generateHumanSummary(
   rootCause: string,
   diff: string,
 ): Promise<string | undefined> {
-  const client = new Anthropic({ apiKey });
+  const client = createAnthropicClient(apiKey);
   const visualAnalysis = input.visualAnalysis
     ? [
         `What user saw: ${input.visualAnalysis.whatUserSaw}`,
@@ -528,18 +530,19 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
     });
   }
 
-  let sandbox: Sandbox | null = null;
+  let sandbox: SandboxRuntime | null = null;
 
   try {
-    sandbox = await traceSpan('sandbox-create', {}, () => Sandbox.create());
+    sandbox = await traceSpan('sandbox-create', {}, () => createSandboxRuntime());
 
     // Configure git identity (E2B sandboxes don't have one by default)
     await sandbox.commands.run('git config --global user.email "opslane-agent@opslane.com" && git config --global user.name "Opslane Agent"');
 
     // Clone repo using .netrc for auth (avoids token in clone URL / process list)
     const githubToken = input.githubToken ?? process.env['GITHUB_TOKEN'] ?? '';
-    if (githubToken) {
-      await sandbox.files.write('/home/user/.netrc', `machine github.com\nlogin x-access-token\npassword ${githubToken}\n`);
+    const gitNetrc = githubToken ? buildGitNetrc(input.repoUrl, githubToken) : null;
+    if (gitNetrc) {
+      await sandbox.files.write('/home/user/.netrc', gitNetrc);
       await sandbox.commands.run('chmod 600 /home/user/.netrc');
     }
 
@@ -563,7 +566,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
     }
 
     // Remove .netrc after clone (defense in depth)
-    if (githubToken) {
+    if (gitNetrc) {
       await sandbox.commands.run('rm -f /home/user/.netrc');
     }
 
@@ -1014,7 +1017,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
 }
 
 /** Extract diff and affected files from sandbox working tree. */
-async function extractDiff(sandbox: Sandbox): Promise<{ diff: string; affectedFiles: string[] }> {
+async function extractDiff(sandbox: SandboxRuntime): Promise<{ diff: string; affectedFiles: string[] }> {
   await sandbox.commands.run('cd /home/user/repo && git add -A', { timeoutMs: 30_000 });
   const diffResult = await sandbox.commands.run('cd /home/user/repo && git diff --cached', { timeoutMs: 30_000 });
   const raw = (diffResult.stdout ?? '').replace(/\r\n/g, '\n');

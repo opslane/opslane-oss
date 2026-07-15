@@ -14,7 +14,8 @@
     "services:restart:wipe-db": "./scripts/restart-services.sh --wipe-db",
     "test": "node scripts/check-docs-drift.mjs && pnpm -r --filter '!@opslane/test-e2e' test",
     "test:unit": "pnpm -r --filter '!@opslane/test-e2e' test",
-    "test:e2e": "pnpm --filter @opslane/test-e2e test"
+    "test:e2e": "pnpm --filter @opslane/test-e2e test",
+    "test:reliability:system": "./scripts/run-reliability-system.sh"
   },
   "devDependencies": {
     "@changesets/cli": "^2.31.0"

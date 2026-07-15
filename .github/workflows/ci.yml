@@ -218,6 +218,29 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  reliability-system:
+    name: Deterministic event-to-PR reliability
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run deterministic success pipeline
+        run: pnpm test:reliability:system
+      - name: Dump harness logs on failure
+        if: failure()
+        run: docker compose logs --no-color | tail -300
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
+
   security:
     name: Secret scan and action pinning
     runs-on: ubuntu-latest
@@ -238,7 +261,7 @@ jobs:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker, e2e-keyless, security]
+    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security]
     if: always()
     steps:
       - name: Report job results

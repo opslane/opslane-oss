@@ -43,9 +43,9 @@ services:
       context: .
       dockerfile: packages/ingestion/Dockerfile
     ports:
-      - "8082:8080"
+      - "${INGESTION_PORT:-8082}:8080"
     environment:
-      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane?sslmode=disable
+      DATABASE_URL: ${OPSLANE_COMPOSE_DATABASE_URL:-postgres://opslane:opslane_dev@postgres:5432/opslane?sslmode=disable}
       PORT: "8080"
       DASHBOARD_DIR: /app/dashboard
       REPLAY_STORE_ENDPOINT: http://minio:9000
@@ -83,11 +83,14 @@ services:
       context: .
       dockerfile: packages/worker/Dockerfile
     environment:
-      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane
+      DATABASE_URL: ${OPSLANE_COMPOSE_DATABASE_URL:-postgres://opslane:opslane_dev@postgres:5432/opslane}
       INGESTION_BASE_URL: http://ingestion:8080
       INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      OPSLANE_GITHUB_URL: ${OPSLANE_GITHUB_URL:-}
+      OPSLANE_GITHUB_API_URL: ${OPSLANE_GITHUB_API_URL:-}
       E2B_API_KEY: ${E2B_API_KEY:-}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
@@ -127,7 +130,7 @@ services:
     entrypoint: ["/run-migrations.sh"]
     environment:
       MIGRATION_DIR: /migrations
-      DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane
+      DATABASE_URL: ${OPSLANE_COMPOSE_DATABASE_URL:-postgres://opslane:opslane_dev@postgres:5432/opslane}
 
 volumes:
   pgdata:

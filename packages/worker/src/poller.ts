@@ -16,10 +16,16 @@ export interface PollerOptions {
   workerId: string;
   /** Callback invoked when a job is claimed. */
   processJob: (job: ClaimedJob, signal: AbortSignal) => Promise<void>;
+  /**
+   * Fault-injection seam for reliability tests only. Runs after processJob
+   * resolves and before the completion write, so a test can simulate a crash
+   * or lease loss at that exact boundary. Never set in production.
+   */
+  beforeComplete?: (job: ClaimedJob) => Promise<void>;
 }
 
 export function createPoller(options: PollerOptions): Poller {
-  const { intervalMs, leaseDurationMs, workerId, processJob } = options;
+  const { intervalMs, leaseDurationMs, workerId, processJob, beforeComplete } = options;
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let running = false;
@@ -48,11 +54,19 @@ export function createPoller(options: PollerOptions): Poller {
 
     // AbortController: abort processing if heartbeat detects lease lost
     const controller = new AbortController();
+    let heartbeatInFlight = false;
 
     // Start heartbeat: extend lease every leaseDurationMs/3
     const heartbeatInterval = setInterval(async () => {
+      if (heartbeatInFlight || controller.signal.aborted) return;
+      heartbeatInFlight = true;
       try {
-        const stillOwned = await heartbeat(job.id, workerId, leaseDurationMs);
+        const stillOwned = await heartbeat(
+          job.id,
+          workerId,
+          job.leaseGeneration,
+          leaseDurationMs
+        );
         if (!stillOwned) {
           logger.warn('Heartbeat: lease lost, aborting job', {
             job_id: job.id,
@@ -60,17 +74,36 @@ export function createPoller(options: PollerOptions): Poller {
           controller.abort();
         }
       } catch (err: unknown) {
-        logger.error('Heartbeat failed', {
+        logger.error('Heartbeat failed, aborting job', {
           job_id: job.id,
           error: err instanceof Error ? err.message : String(err),
         });
+        controller.abort();
+      } finally {
+        heartbeatInFlight = false;
       }
     }, Math.floor(leaseDurationMs / 3));
 
     activeJobPromise = (async () => {
       try {
         await processJob(job, controller.signal);
-        await completeJob(job.id, workerId);
+        if (controller.signal.aborted) {
+          logger.warn('Processing stopped: lease lost', {
+            job_id: job.id,
+            lease_generation: job.leaseGeneration,
+          });
+          return;
+        }
+        if (beforeComplete) await beforeComplete(job);
+        const completed = await completeJob(job.id, workerId, job.leaseGeneration);
+        if (!completed) {
+          logger.warn('Completion rejected: lease lost', {
+            job_id: job.id,
+            lease_generation: job.leaseGeneration,
+          });
+          controller.abort();
+          return;
+        }
         logger.info('Completed job', {
           job_id: job.id,
           error_group_id: job.errorGroupId,
@@ -84,7 +117,13 @@ export function createPoller(options: PollerOptions): Poller {
           error: message,
         });
         try {
-          await failJob(job.id, workerId, message);
+          const failed = await failJob(job.id, workerId, job.leaseGeneration, message);
+          if (!failed) {
+            logger.warn('Failure update rejected: lease lost', {
+              job_id: job.id,
+              lease_generation: job.leaseGeneration,
+            });
+          }
         } catch (failErr: unknown) {
           logger.error('Failed to record job failure', {
             job_id: job.id,
