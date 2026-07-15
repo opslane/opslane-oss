@@ -162,3 +162,16 @@ func TestReplayComplete_MissingReplayIDFromEmptyParam(t *testing.T) {
 		t.Errorf("expected 400 for missing replay ID (no chi context), got %d", w.Code)
 	}
 }
+
+func TestReplayFail_MissingProjectContextReturns401(t *testing.T) {
+	deps := &Dependencies{}
+	req := httptest.NewRequest("POST", "/api/v1/replays/r-123/fail", strings.NewReader(`{"reason":"upload failed"}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("replayID", "r-123")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	w := httptest.NewRecorder()
+	deps.ReplayFail(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("got %d, want 401 without project context", w.Code)
+	}
+}

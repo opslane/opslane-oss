@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -13,6 +15,42 @@ import (
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/masking"
 )
+
+type replayFailRequest struct {
+	Reason string `json:"reason"`
+}
+
+// ReplayFail records that the browser could not upload a replay.
+// POST /api/v1/replays/{replayID}/fail
+func (d *Dependencies) ReplayFail(w http.ResponseWriter, r *http.Request) {
+	projectID := ProjectIDFromCtx(r.Context())
+	if projectID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "missing project context")
+		return
+	}
+	replayID := chi.URLParam(r, "replayID")
+	if replayID == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing replay id")
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	var req replayFailRequest
+	_ = json.Unmarshal(body, &req)
+	if len(req.Reason) > 500 {
+		req.Reason = req.Reason[:500]
+	}
+	if err := d.Queries.FailReplay(r.Context(), replayID, projectID, req.Reason); err != nil {
+		slog.Error("fail replay", "error", err, "replay_id", replayID)
+		writeJSONError(w, http.StatusInternalServerError, "failed to record replay failure")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "failed"})
+}
 
 const maxReplayBytes = 8 << 20 // 8 MiB hard cap on recording.json reads
 

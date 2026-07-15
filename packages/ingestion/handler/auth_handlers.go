@@ -59,6 +59,65 @@ func (rl *rateLimiter) allow(ip string) bool {
 	return rl.counts[ip] <= rl.maxPerIP
 }
 
+// byteBudget caps aggregate uploaded bytes per key in a fixed one-minute window.
+//
+// The request-count rateLimiter above bounds how *often* a project may call in;
+// this bounds how *much* it may store. Both are needed: the SDK key is public,
+// so without a byte budget a single attacker under the request limit can still
+// flood storage with large objects (#48).
+//
+// Same limitations as rateLimiter, deliberately: in-memory and per-process, so
+// N ingestion replicas allow N times the budget. Accepted for now — see the
+// note on rateLimiter.
+type byteBudget struct {
+	mu         sync.Mutex
+	used       map[string]int64
+	resetAt    time.Time
+	maxPerKey  int64
+	maxEntries int
+}
+
+func newByteBudget(maxPerKey int64) *byteBudget {
+	return &byteBudget{
+		used:       make(map[string]int64),
+		resetAt:    time.Now().Add(time.Minute),
+		maxPerKey:  maxPerKey,
+		maxEntries: 10000,
+	}
+}
+
+// allow reserves n bytes for key, reporting whether the reservation fit.
+// A rejected reservation consumes nothing.
+func (b *byteBudget) allow(key string, n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	if now.After(b.resetAt) {
+		b.used = make(map[string]int64)
+		b.resetAt = now.Add(time.Minute)
+	}
+	if len(b.used) >= b.maxEntries {
+		if _, known := b.used[key]; !known {
+			b.used = make(map[string]int64)
+			b.resetAt = now.Add(time.Minute)
+		}
+	}
+
+	if b.used[key]+n > b.maxPerKey {
+		return false
+	}
+	b.used[key] += n
+	return true
+}
+
+// forceRollover expires the current window. Test hook.
+func (b *byteBudget) forceRollover() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resetAt = time.Now().Add(-time.Second)
+}
+
 // loginLimiter is shared across login and OAuth authorize endpoints.
 var loginLimiter = newRateLimiter(10)
 

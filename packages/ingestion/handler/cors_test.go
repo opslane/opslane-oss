@@ -27,6 +27,25 @@ func TestCORS_SDKEndpointReflectsOrigin(t *testing.T) {
 	}
 }
 
+func TestCORS_SessionEndpointReflectsOrigin(t *testing.T) {
+	deps := &handler.Dependencies{}
+	router := handler.NewRouter(deps)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/api/v1/sessions/init", nil)
+	req.Header.Set("Origin", "https://customer.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://customer.example.com" {
+		t.Fatalf("expected reflected origin, got %q", got)
+	}
+}
+
 func TestCORS_DashboardEndpointRestricted(t *testing.T) {
 	deps := &handler.Dependencies{}
 	router := handler.NewRouter(deps)
