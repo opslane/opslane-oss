@@ -1,5 +1,6 @@
-import { Sandbox } from 'e2b';
 import { logger } from '../logger.js';
+import { buildGitNetrc } from '../repo-clone.js';
+import { createSandboxRuntime, type SandboxRuntime } from './sandbox-runtime.js';
 
 const SANDBOX_REPO = '/home/user/repo';
 
@@ -36,7 +37,7 @@ function shellEscape(s: string): string {
 }
 
 export interface RepoSandbox {
-  sandbox: Sandbox;
+  sandbox: SandboxRuntime;
   installSucceeded: boolean;
 }
 
@@ -49,12 +50,13 @@ export async function createRepoSandbox(opts: {
   defaultBranch: string;
   githubToken?: string;
 }): Promise<RepoSandbox> {
-  const sandbox = await Sandbox.create();
+  const sandbox = await createSandboxRuntime();
   await sandbox.commands.run('git config --global user.email "opslane-agent@opslane.com" && git config --global user.name "Opslane Agent"');
 
   const token = opts.githubToken ?? process.env['GITHUB_TOKEN'] ?? '';
-  if (token) {
-    await sandbox.files.write('/home/user/.netrc', `machine github.com\nlogin x-access-token\npassword ${token}\n`);
+  const gitNetrc = token ? buildGitNetrc(opts.repoUrl, token) : null;
+  if (gitNetrc) {
+    await sandbox.files.write('/home/user/.netrc', gitNetrc);
     await sandbox.commands.run('chmod 600 /home/user/.netrc');
   }
 
@@ -69,7 +71,7 @@ export async function createRepoSandbox(opts: {
     throw new Error(`clone failed: ${msg}`);
   }
 
-  if (token) await sandbox.commands.run('rm -f /home/user/.netrc');
+  if (gitNetrc) await sandbox.commands.run('rm -f /home/user/.netrc');
 
   await sandbox.commands.run(
     `cd ${SANDBOX_REPO} && printf "\\nnode_modules\\n.cache\\ncoverage\\n" >> .gitignore`,
@@ -96,7 +98,7 @@ export async function createRepoSandbox(opts: {
 }
 
 /** Extract the agent's change as a unified diff. */
-export async function extractDiff(sandbox: Sandbox): Promise<{ diff: string; affectedFiles: string[] }> {
+export async function extractDiff(sandbox: SandboxRuntime): Promise<{ diff: string; affectedFiles: string[] }> {
   await sandbox.commands.run(`cd ${SANDBOX_REPO} && git add -A`, { timeoutMs: 30_000 });
   const res = await sandbox.commands.run(`cd ${SANDBOX_REPO} && git diff --cached`, { timeoutMs: 30_000 });
   const raw = (res.stdout ?? '').replace(/\r\n/g, '\n');
@@ -111,7 +113,7 @@ export interface BuildGateResult {
 }
 
 /** Run the build/typecheck gate. Returns skipped:true when there's nothing to run. */
-export async function runBuildGate(sandbox: Sandbox): Promise<BuildGateResult> {
+export async function runBuildGate(sandbox: SandboxRuntime): Promise<BuildGateResult> {
   let pkg: PackageJsonLike = {};
   try {
     const raw = await sandbox.files.read(`${SANDBOX_REPO}/package.json`);
@@ -138,7 +140,7 @@ export async function runBuildGate(sandbox: Sandbox): Promise<BuildGateResult> {
   }
 }
 
-async function fileExists(sandbox: Sandbox, path: string): Promise<boolean> {
+async function fileExists(sandbox: SandboxRuntime, path: string): Promise<boolean> {
   try {
     await sandbox.files.read(path);
     return true;

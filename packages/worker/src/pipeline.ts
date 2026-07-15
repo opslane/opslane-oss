@@ -26,6 +26,9 @@ export interface PipelineInput {
   githubRepo: string;
   defaultBranch: string;
   githubToken?: string;
+  abortSignal?: AbortSignal;
+  /** Authoritative lease check immediately before irreversible provider writes. */
+  assertLeaseOwned?: () => Promise<void>;
   replay?: ReplayInput | null;
   /** Pre-computed investigation results. When set, agent skips internal triage. */
   investigation?: {
@@ -62,6 +65,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     githubToken: input.githubToken,
     repoPath: input.repoPath,
     investigation: input.investigation,
+    abortSignal: input.abortSignal,
   });
 
   if (fixResult.status === 'needs_human') {
@@ -108,6 +112,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
 
   // Stage 2: Apply diff to local clone, commit + push
   const branchName = `opslane/fix-${input.errorGroupId.slice(0, 8)}-${Date.now()}`;
+  await input.assertLeaseOwned?.();
   try {
     await traceSpan('git-push', { 'git.branch': branchName }, () =>
       gitCommitAndPush(
@@ -129,6 +134,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
   }
 
   // Stage 3: Create PR
+  await input.assertLeaseOwned?.();
   const prResult = await traceSpan(
     'create-pr',
     { 'pr.repo': input.githubRepo, 'pr.branch': branchName },

@@ -304,6 +304,14 @@ export interface GitHubClient {
   }): Promise<{ url: string; number: number } | null>;
 }
 
+export function getGitHubClientOptions(token: string): ConstructorParameters<typeof Octokit>[0] {
+  const configuredBaseUrl = process.env['OPSLANE_GITHUB_API_URL']?.trim();
+  return {
+    auth: token,
+    ...(configuredBaseUrl ? { baseUrl: configuredBaseUrl } : {}),
+  };
+}
+
 /**
  * Create a real GitHub client backed by Octokit.
  * Uses the provided token or falls back to GITHUB_TOKEN env. Returns null if no token available.
@@ -312,7 +320,7 @@ export function createGitHubClient(githubToken?: string): GitHubClient | null {
   const token = githubToken ?? process.env['GITHUB_TOKEN'];
   if (!token) return null;
 
-  const octokit = new Octokit({ auth: token });
+  const octokit = new Octokit(getGitHubClientOptions(token));
 
   return {
     async createPullRequest(params) {

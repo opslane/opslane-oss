@@ -9,7 +9,7 @@ import { fetchObject, getMinIOConfig } from './minio-client.js';
 import { investigateError } from './investigate.js';
 import { runPipeline } from './pipeline.js';
 import { createPoller } from './poller.js';
-import { cloneRepo } from './repo-clone.js';
+import { buildRepoUrl, cloneRepo } from './repo-clone.js';
 import { getInstallationToken } from './github-app.js';
 import { type ReplaySignals } from './pr.js';
 import { processSetupPrJob } from './setup-pr.js';
@@ -82,7 +82,7 @@ function checkAbort(signal: AbortSignal): void {
   }
 }
 
-async function processJob(job: ClaimedJob, signal: AbortSignal): Promise<void> {
+export async function processJob(job: ClaimedJob, signal: AbortSignal): Promise<void> {
   await withJobTrace(job.id, job.errorGroupId ?? job.sourceId ?? 'unknown', job.projectId, () => processJobInner(job, signal));
 }
 
@@ -92,7 +92,12 @@ async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<vo
   if (traceId) {
     const traceUrl = buildLangfuseTraceUrl(traceId);
     if (traceUrl) {
-      updateJobTraceUrl(job.id, traceUrl).catch(() => {});
+      updateJobTraceUrl(
+        job.id,
+        job.workerId,
+        job.leaseGeneration,
+        traceUrl,
+      ).catch(() => {});
     }
   }
 
@@ -106,7 +111,7 @@ async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<vo
   });
 
   if (job.jobType === 'setup_pr') {
-    await processSetupPrJob({ id: job.id, projectId: job.projectId });
+    await processSetupPrJob(job, signal);
     return;
   }
 
@@ -133,9 +138,21 @@ async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<vo
       // and DO NOT rethrow, so the poller completes the job rather than requeuing it
       // and re-running over a now-terminal incident.
       const safeMessage = message.replace(/https:\/\/[^@]+@/g, 'https://***@');
-      await updateGroupStatus(errorJob.errorGroupId, errorJob.projectId, 'needs_human', {
-        reason: buildReason('worker_runtime_error', `Fix job error: ${safeMessage}`),
-      }).catch(() => {});
+      try {
+        await updateGroupStatus(
+          errorJob.errorGroupId,
+          errorJob.projectId,
+          'needs_human',
+          { reason: buildReason('worker_runtime_error', `Fix job error: ${safeMessage}`) },
+          errorJob,
+        );
+      } catch (writeErr: unknown) {
+        // Only lease loss is safe to swallow — a newer owner will re-process the
+        // job. Any other write failure (e.g. transient DB error) must propagate,
+        // or the poller would complete the job and strand the incident in
+        // 'fixing' with no live work.
+        if (!(writeErr instanceof db.LeaseLostError)) throw writeErr;
+      }
       logger.error('Fix job threw — terminated as needs_human', { job_id: errorJob.id, error: safeMessage });
     }
   } else {
@@ -149,12 +166,25 @@ async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<vo
  */
 export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: string }, signal: AbortSignal): Promise<void> {
   const jobStart = Date.now();
-  await updateGroupStatus(job.errorGroupId, job.projectId, 'analyzing');
   checkAbort(signal);
 
-  // Fetch real data
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+
+  // A reclaimed investigate job may have committed its durable outcome before
+  // losing the lease at the final queue-completion boundary. Adopt that outcome
+  // rather than resetting the incident and repeating delivery work.
+  if (!['new', 'queued', 'analyzing'].includes(group.status)) {
+    logger.info('Investigation outcome already committed; adopting existing state', {
+      job_id: job.id,
+      error_group_id: job.errorGroupId,
+      status: group.status,
+    });
+    return;
+  }
+
+  await updateGroupStatus(job.errorGroupId, job.projectId, 'analyzing', undefined, job);
+  checkAbort(signal);
 
   const event = group.sample_event_id
     ? await db.getErrorEvent(group.sample_event_id, job.projectId)
@@ -174,7 +204,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
         remediation:
           'Add the `crossorigin` attribute to your <script> tags (with CORS headers on the script host) so the browser exposes real stack traces, and throw/reject Error objects rather than strings so the SDK can capture a stack.',
       },
-    });
+    }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
     logger.info('Investigation: needs_human (no app frames, pre-clone short-circuit)', {
@@ -200,7 +230,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
         reason_message: 'ANTHROPIC_API_KEY environment variable is not set',
         remediation: 'Set the ANTHROPIC_API_KEY environment variable with a valid Anthropic API key',
       },
-    });
+    }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
     return;
@@ -246,7 +276,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
           ? 'Set the GITHUB_TOKEN environment variable with repo scope'
           : 'Ensure GITHUB_TOKEN has read access to the repository',
       },
-    });
+    }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
     return;
@@ -291,6 +321,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
       resolvedStackTrace: resolvedStack ?? event?.stack_trace_resolved ?? null,
       breadcrumbs: event?.breadcrumbs ?? '[]',
     }, repoDir);
+    checkAbort(signal);
 
     logger.info('Investigation result', {
       job_id: job.id,
@@ -312,7 +343,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
           reason_message: triage.reason ?? 'Error classified as unfixable by investigation',
           remediation: triage.remediation ?? 'Review the error manually',
         },
-      });
+      }, job);
       jobsFailed++;
       logger.warn('Investigation: needs_human (unfixable)', {
         job_id: job.id, duration_ms: durationMs,
@@ -323,7 +354,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
-      });
+      }, job);
       jobsProcessed++;
       logger.info('Investigation: auto-triggering fix', {
         job_id: job.id, fix_job_id: fixJobId, duration_ms: durationMs,
@@ -334,7 +365,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
-      });
+      }, job);
       jobsProcessed++;
       logger.info('Investigation: investigated (awaiting user)', {
         job_id: job.id, confidence: triage.confidence, duration_ms: durationMs,
@@ -415,7 +446,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
         `Failed to clone repository: ${message}`,
       ),
-    });
+    }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
     return;
@@ -486,7 +517,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
 
     checkAbort(signal);
 
-    const repoUrl = `https://github.com/${project.github_repo}.git`;
+    const repoUrl = buildRepoUrl(project.github_repo);
 
     const result = await runPipeline({
       jobId: job.id,
@@ -506,6 +537,8 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       githubRepo: project.github_repo,
       defaultBranch: project.default_branch,
       githubToken,
+      abortSignal: signal,
+      assertLeaseOwned: () => db.assertJobLease(job),
       replay: replay ? {
         id: replay.id,
         sessionId: replay.session_id,
@@ -523,6 +556,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         guidance: job.guidance ?? undefined,
       } : undefined,
     });
+    checkAbort(signal);
 
     const durationMs = Date.now() - jobStart;
 
@@ -531,7 +565,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         confidence: result.confidence,
         pr_url: result.pr_url,
         pr_number: result.pr_number,
-      });
+      }, job);
       jobsProcessed++;
       logger.info('Fix job completed: pr_created', {
         job_id: job.id, duration_ms: durationMs, pr_url: result.pr_url,
@@ -542,7 +576,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
         reason: result.reason ?? buildReason('worker_runtime_error', 'Fix pipeline failed without a reason'),
         confidence: result.confidence,
-      });
+      }, job);
       jobsFailed++;
       logger.warn('Fix job completed: needs_human (writeup preserved)', {
         job_id: job.id, duration_ms: durationMs, reason_code: result.reason?.reason_code, confidence: result.confidence,

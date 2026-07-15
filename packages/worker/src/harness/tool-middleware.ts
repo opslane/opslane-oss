@@ -1,5 +1,5 @@
-import type { Sandbox } from 'e2b';
 import type { ToolCall, ToolResult, AgentState, ToolMiddleware } from './types.js';
+import type { SandboxRuntime } from './sandbox-runtime.js';
 
 const TEST_COMMAND_PATTERNS = [/\bnpm test\b/, /\bvitest\b/, /\bjest\b/, /\bpytest\b/, /\bpnpm test\b/];
 const TEST_FAILURE_PATTERNS = [/fail/i, /error/i, /Exit code: [^0]/];
@@ -14,7 +14,7 @@ const DANGEROUS_COMMAND_PATTERNS = [
   /\bscp\b/,
 ];
 
-export function createDefaultMiddleware(sandbox?: Sandbox): ToolMiddleware {
+export function createDefaultMiddleware(sandbox?: SandboxRuntime): ToolMiddleware {
   return {
     async preTool(call: ToolCall, state: AgentState) {
       // Block dangerous bash commands

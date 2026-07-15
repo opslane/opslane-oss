@@ -53,8 +53,10 @@ describe('getErrorEvent', () => {
     });
     const event = await getErrorEvent('e1', 'p1');
     expect(event).toEqual(expect.objectContaining({
-      id: 'e1', release: 'v1.0.0', session_id: 'sess-1',
+      id: 'e1', breadcrumbs: '[]', context: '{}', release: 'v1.0.0', session_id: 'sess-1',
     }));
+    expect(mockQuery.mock.calls[0][0]).toContain('breadcrumbs::text AS breadcrumbs');
+    expect(mockQuery.mock.calls[0][0]).toContain('context::text AS context');
     expect(mockQuery.mock.calls[0][1]).toEqual(['e1', 'p1']);
   });
 });

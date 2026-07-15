@@ -27,7 +27,10 @@ vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
   setWorkerId: vi.fn(),
 }));
-vi.mock('../repo-clone.js', () => ({ cloneRepo: vi.fn() }));
+vi.mock('../repo-clone.js', () => ({
+  cloneRepo: vi.fn(),
+  buildRepoUrl: vi.fn((githubRepo: string) => `https://github.com/${githubRepo}.git`),
+}));
 vi.mock('../minio-client.js', () => ({ fetchObject: vi.fn(), getMinIOConfig: vi.fn(() => null) }));
 vi.mock('../investigate.js', () => ({ investigateError: vi.fn() }));
 vi.mock('../pipeline.js', () => ({ runPipeline: vi.fn() }));
@@ -60,12 +63,14 @@ const mockRunPipeline = vi.mocked(runPipeline);
 function makeJob(): ClaimedJob & { errorGroupId: string } {
   return {
     id: 'job-1',
+    workerId: 'worker-1',
     errorGroupId: 'grp-1',
     sourceId: null,
     projectId: 'proj-1',
     jobType: 'investigate',
     attempts: 0,
     guidance: null,
+    leaseGeneration: '1',
   };
 }
 
@@ -149,6 +154,16 @@ describe('processInvestigateJob — pre-clone guard for stackless errors', () =>
     expect(mockCloneRepo).not.toHaveBeenCalled();
     expect(unfixableCall()).toBeDefined();
   });
+
+  it('adopts an already-started fix instead of re-running a recovered investigation', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({ status: 'fixing' }));
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+
+    expect(mockUpdateGroupStatus).not.toHaveBeenCalled();
+    expect(mockGetErrorEvent).not.toHaveBeenCalled();
+    expect(mockCloneRepo).not.toHaveBeenCalled();
+  });
 });
 
 describe('processFixJob — preserves writeup on failure (no revert/null)', () => {
@@ -174,7 +189,17 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
   });
 
   function fixJob(): ClaimedJob & { errorGroupId: string } {
-    return { id: 'j1', errorGroupId: 'g1', sourceId: null, projectId: 'p1', jobType: 'fix', attempts: 0, guidance: null };
+    return {
+      id: 'j1',
+      workerId: 'worker-1',
+      errorGroupId: 'g1',
+      sourceId: null,
+      projectId: 'p1',
+      jobType: 'fix',
+      attempts: 0,
+      guidance: null,
+      leaseGeneration: '1',
+    };
   }
 
   it('terminates as needs_human with all reason fields + confidence when the fix is below floor', async () => {

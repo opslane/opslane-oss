@@ -5,7 +5,8 @@
  * extracting what the user saw, the failure moment, and UX impact.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient } from './anthropic-client.js';
 import type { VisualAnalysisOutput } from './harness/types.js';
 
 export type { VisualAnalysisOutput } from './harness/types.js';
@@ -29,7 +30,7 @@ export async function runVisualAnalysis(
   const apiKey = process.env['ANTHROPIC_API_KEY'];
   if (!apiKey) return null;
 
-  const client = new Anthropic({ apiKey });
+  const client = createAnthropicClient(apiKey);
 
   const imageBlocks: Anthropic.ImageBlockParam[] = input.screenshots.map((s) => ({
     type: 'image' as const,

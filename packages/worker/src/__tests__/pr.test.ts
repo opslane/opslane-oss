@@ -1,6 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createServer } from 'node:http';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { PRInput, GitHubClient, ReplayInput } from '../pr.js';
-import { createPR, sanitize, buildPRBody } from '../pr.js';
+import {
+  createGitHubClient,
+  createPR,
+  sanitize,
+  buildPRBody,
+  getGitHubClientOptions,
+} from '../pr.js';
 
 const VALID_DIFF = `--- a/src/app.ts
 +++ b/src/app.ts
@@ -143,6 +150,86 @@ describe('createPR', () => {
     expect(result.status).toBe('failed');
     if (result.status === 'failed') {
       expect(result.reason.reason_code).toBe('repo_access_denied');
+    }
+  });
+});
+
+describe('GitHub client configuration', () => {
+  const originalBaseUrl = process.env['OPSLANE_GITHUB_API_URL'];
+
+  afterEach(() => {
+    if (originalBaseUrl === undefined) delete process.env['OPSLANE_GITHUB_API_URL'];
+    else process.env['OPSLANE_GITHUB_API_URL'] = originalBaseUrl;
+  });
+
+  it('uses GitHub.com defaults when no API override is configured', () => {
+    delete process.env['OPSLANE_GITHUB_API_URL'];
+    expect(getGitHubClientOptions('test-token')).toEqual({ auth: 'test-token' });
+  });
+
+  it('routes Octokit through a recording protocol-compatible endpoint', () => {
+    process.env['OPSLANE_GITHUB_API_URL'] = 'http://127.0.0.1:9199/api/v3';
+    expect(getGitHubClientOptions('test-token')).toEqual({
+      auth: 'test-token',
+      baseUrl: 'http://127.0.0.1:9199/api/v3',
+    });
+  });
+
+  it('sends the real Octokit pull-request schema to the configured endpoint', async () => {
+    const requests: Array<{ method?: string; url?: string; authorization?: string; body: unknown }> = [];
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer) => chunks.push(chunk));
+      request.on('end', () => {
+        requests.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.authorization,
+          body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+        });
+        response.writeHead(201, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+          html_url: 'https://example.test/octocat/hello-world/pull/42',
+          number: 42,
+        }));
+      });
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Recorder did not bind to TCP');
+      process.env['OPSLANE_GITHUB_API_URL'] = `http://127.0.0.1:${address.port}`;
+
+      const client = createGitHubClient('test-token');
+      expect(client).not.toBeNull();
+      await expect(client!.createPullRequest({
+        owner: 'octocat',
+        repo: 'hello-world',
+        title: 'Fix the deterministic fixture',
+        body: 'Recorded body',
+        head: 'opslane/fix-fixture',
+        base: 'main',
+      })).resolves.toEqual({
+        url: 'https://example.test/octocat/hello-world/pull/42',
+        number: 42,
+      });
+
+      expect(requests).toEqual([{
+        method: 'POST',
+        url: '/repos/octocat/hello-world/pulls',
+        authorization: 'token test-token',
+        body: {
+          title: 'Fix the deterministic fixture',
+          body: 'Recorded body',
+          head: 'opslane/fix-fixture',
+          base: 'main',
+        },
+      }]);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
     }
   });
 });

@@ -1,9 +1,10 @@
 import type { SetupPrStatus } from '@opslane/shared';
-import { cloneRepo, gitCommitAndPush, validateDiffPaths } from './repo-clone.js';
+import { buildRepoUrl, cloneRepo, gitCommitAndPush, validateDiffPaths } from './repo-clone.js';
 import { createGitHubClient } from './pr.js';
 import { getInstallationToken } from './github-app.js';
 import { runAgentSetup } from './setup-agent.js';
 import * as db from './db.js';
+import type { ClaimedJob } from './db.js';
 
 const SETUP_BRANCH = 'opslane/setup';
 
@@ -30,6 +31,7 @@ export interface SetupPrDeps {
     title: string;
     body: string;
   }): Promise<{ url: string; number: number }>;
+  assertLeaseOwned(): Promise<void>;
   record(projectId: string, status: SetupPrStatus, fields?: { pr_url?: string; pr_number?: number; error?: string }): Promise<void>;
 }
 
@@ -41,6 +43,7 @@ export interface SetupPrJob {
 }
 
 export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ status: SetupPrStatus }> {
+  await d.assertLeaseOwned();
   const project = await d.getProject(job.projectId);
   if (!project?.github_repo) {
     await d.record(job.projectId, 'failed', { error: 'Project has no github_repo configured' });
@@ -63,7 +66,7 @@ export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ sta
 
   let cleanup = async (): Promise<void> => {};
   try {
-    const repoUrl = `https://github.com/${project.github_repo}.git`;
+    const repoUrl = buildRepoUrl(project.github_repo);
     const agent = await d.runAgentSetup({
       repoUrl,
       defaultBranch: project.default_branch,
@@ -92,7 +95,9 @@ export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ sta
     cleanup = cloneResult.cleanup;
 
     const repoDir = cloneResult.repoDir;
+    await d.assertLeaseOwned();
     await d.commitAndPush(repoDir, SETUP_BRANCH, 'chore: install Opslane SDK', agent.diff);
+    await d.assertLeaseOwned();
     const pr = await d.createPr(token, {
       repo: project.github_repo,
       base: project.default_branch,
@@ -126,7 +131,10 @@ function setupPrBody(): string {
 }
 
 /** Thin wrapper wiring real deps for the poller. */
-export async function processSetupPrJob(job: { id: string; projectId: string }): Promise<void> {
+export async function processSetupPrJob(
+  job: ClaimedJob,
+  signal: AbortSignal,
+): Promise<void> {
   await runSetupPr(
     {
       jobId: job.id,
@@ -172,7 +180,12 @@ export async function processSetupPrJob(job: { id: string; projectId: string }):
           base: params.base,
         });
       },
-      record: (projectId, status, fields) => db.recordSetupPrResult(projectId, status, fields),
+      assertLeaseOwned: async () => {
+        if (signal.aborted) throw new db.LeaseLostError(job.id);
+        await db.assertJobLease(job);
+      },
+      record: (projectId, status, fields) =>
+        db.recordSetupPrResult(projectId, status, fields, job),
     },
   );
 }

@@ -40,6 +40,11 @@ Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in i
 | `REPLAY_STORE_ENDPOINT` / `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` / `REPLAY_STORE_BUCKET` | for replay analysis | Reading stored replays |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | legacy aliases | Worker-side fallback names for the same settings |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` / `LANGFUSE_PROJECT_ID` | no | Optional LLM tracing |
+| `ANTHROPIC_BASE_URL` | no (Anthropic default) | Alternate Claude API endpoint; used by the hermetic test harness's fake model server |
+| `OPSLANE_SANDBOX_BACKEND` | no (`e2b`) | Fix-verification sandbox backend; `local` is only for trusted reliability fixtures and also requires `OPSLANE_RELIABILITY_HARNESS=1` |
+| `OPSLANE_RELIABILITY_HARNESS` | no | Explicit guard required before the non-isolating local sandbox test transport can run |
+| `OPSLANE_GITHUB_URL` | no (`https://github.com`) | Alternate git host for clones; used by tests and self-hosted git |
+| `OPSLANE_GITHUB_API_URL` | no (GitHub default) | Alternate GitHub REST API base URL for PR creation |
 
 The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHROPIC_API_KEY`, `E2B_API_KEY`, and `GITHUB_TOKEN` — jobs then end in explicit `needs_human` states rather than crashing.
 
