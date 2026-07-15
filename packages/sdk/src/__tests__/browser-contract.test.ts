@@ -107,6 +107,7 @@ describe.skipIf(!playwrightAvailable)('SDK browser contract', () => {
                   apiKey: 'sk-test-browser',
                   flushInterval: 200,
                   maxBatchSize: 1,
+                  replay: { enabled: false },
                 });`
               );
             }

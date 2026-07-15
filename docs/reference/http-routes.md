@@ -28,9 +28,12 @@ These are curated tables, not a stability contract — the API is early-stage an
 | POST | `/api/v1/events` | yes | Ingest an error event |
 | POST | `/api/v1/replays/init` | yes | Begin a replay upload |
 | POST | `/api/v1/replays/{replayID}/complete` | yes | Finish a replay upload |
+| POST | `/api/v1/replays/{replayID}/fail` | yes | Record a replay upload failure |
+| POST | `/api/v1/sessions/init` | yes | Register a session; returns the recording kill switch |
+| POST | `/api/v1/sessions/{sessionID}/chunks/upload-url` | yes | Size-capped presigned POST policy for one chunk |
+| POST | `/api/v1/sessions/{sessionID}/chunks/{seq}/commit` | yes | Acknowledge an uploaded chunk exists |
+| POST | `/api/v1/sessions/{sessionID}/chunks/{seq}/inline` | yes | Keepalive tail flush on tab close (at most 64KB) |
 | POST | `/api/v1/sourcemaps` | no (build-time upload) | Upload source maps |
-
-> Known gap: the SDK also calls `POST /api/v1/replays/{replayID}/fail`, which is **not registered** — tracked as [#13](https://github.com/opslane/opslane-oss/issues/13). The drift check carries this as an explicit allowlisted exception until the bug is fixed.
 
 ## Session (dashboard/CLI)
 

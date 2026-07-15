@@ -951,6 +951,23 @@ func (q *Queries) ReplayBelongsToProject(ctx context.Context, replayID, projectI
 	return exists, err
 }
 
+// FailReplay marks a pending replay terminally failed. Project-scoped.
+func (q *Queries) FailReplay(ctx context.Context, replayID, projectID, reason string) error {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE session_replays
+		    SET status = 'failed'
+		  WHERE id = $1 AND project_id = $2 AND status = 'pending'`,
+		replayID, projectID,
+	)
+	if err != nil {
+		return fmt.Errorf("fail replay: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		slog.Warn("fail replay matched no pending row", "replay_id", replayID, "reason", reason)
+	}
+	return nil
+}
+
 // CompleteReplay atomically inserts artifacts and updates replay status.
 // Amendment #11: wrapped in pgx transaction for atomicity.
 func (q *Queries) CompleteReplay(ctx context.Context, replayID string, signals string,

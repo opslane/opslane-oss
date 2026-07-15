@@ -149,6 +149,8 @@ export async function flushEvents(): Promise<void> {
             ingest = undefined;
           }
 
+          // Retained until Batch 2 migrates the dashboard and worker readers
+          // from session_replays onto chunk-stream pointers (design v4-6).
           void uploadReplayForTrigger({
             triggerType: queued.replayTrigger,
             errorType: event.error.type,

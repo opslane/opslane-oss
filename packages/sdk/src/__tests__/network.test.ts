@@ -4,6 +4,7 @@ import {
   unpatchFetch,
   patchXHR,
   unpatchXHR,
+  sdkFetch,
 } from '../network';
 import { clearBreadcrumbs, getBreadcrumbs } from '../breadcrumbs';
 import { loadConfig, resetConfig } from '../config';
@@ -115,6 +116,15 @@ describe('Network Interceptor', () => {
       unpatchFetch();
 
       expect(globalThis.fetch).toBe(originalFetch);
+    });
+
+    it('bypasses telemetry and breadcrumbs for SDK-owned storage traffic', async () => {
+      const originalFetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+      globalThis.fetch = originalFetch;
+      patchFetch();
+      await sdkFetch('https://storage.example.com/chunk', { method: 'POST' });
+      expect(originalFetch).toHaveBeenCalledTimes(1);
+      expect(getBreadcrumbs()).toHaveLength(0);
     });
 
     it('should never throw even if breadcrumb adding fails', async () => {

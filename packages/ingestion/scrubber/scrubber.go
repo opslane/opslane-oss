@@ -1,0 +1,122 @@
+// Package scrubber redacts stored session chunks before they become readable.
+package scrubber
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/opslane/opslane/packages/ingestion/compress"
+	"github.com/opslane/opslane/packages/ingestion/db"
+	"github.com/opslane/opslane/packages/ingestion/masking"
+	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
+)
+
+const (
+	batchSize         = 20
+	defaultInterval   = 15 * time.Second
+	defaultMaxInflate = 20 << 20
+	scrubTimeout      = 30 * time.Second
+)
+
+// Scrubber processes committed, unscrubbed chunks in bounded batches.
+type Scrubber struct {
+	Q               *db.Queries
+	MinIO           *minioPkg.Client
+	MaxInflateBytes int64
+}
+
+// Start runs scrub passes until ctx is cancelled.
+func (s *Scrubber) Start(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultInterval
+	}
+	if s.MaxInflateBytes <= 0 {
+		s.MaxInflateBytes = defaultMaxInflate
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scrubbed, failed, err := s.RunOnce(ctx)
+			if err != nil {
+				slog.Error("chunk scrub pass failed", "error", err)
+			} else if scrubbed > 0 || failed > 0 {
+				slog.Info("chunk scrub pass", "scrubbed", scrubbed, "failed", failed)
+			}
+		}
+	}
+}
+
+// RunOnce claims and processes one batch. A failed chunk remains unreadable.
+func (s *Scrubber) RunOnce(ctx context.Context) (scrubbed, failed int, err error) {
+	if s.Q == nil || s.MinIO == nil {
+		return 0, 0, errors.New("scrubber dependencies are not configured")
+	}
+	if s.MaxInflateBytes <= 0 {
+		s.MaxInflateBytes = defaultMaxInflate
+	}
+
+	chunks, err := s.Q.ClaimUnscrubbedChunks(ctx, batchSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, chunk := range chunks {
+		chunkCtx, cancel := context.WithTimeout(ctx, scrubTimeout)
+		scrubErr := s.scrubOne(chunkCtx, chunk)
+		cancel()
+		if scrubErr != nil {
+			failed++
+			slog.Warn("chunk scrub failed", "session_id", chunk.SessionID, "seq", chunk.Seq, "error", scrubErr)
+			if markErr := s.Q.MarkChunkScrubFailed(ctx, chunk.SessionID, chunk.ProjectID, chunk.Seq, scrubErr.Error()); markErr != nil {
+				slog.Error("recording scrub failure failed", "error", markErr)
+			}
+			continue
+		}
+		scrubbed++
+	}
+	return scrubbed, failed, nil
+}
+
+func (s *Scrubber) scrubOne(ctx context.Context, chunk db.ChunkRef) error {
+	size, err := s.MinIO.StatObject(ctx, chunk.ObjectKey)
+	if err != nil {
+		return fmt.Errorf("stat chunk: %w", err)
+	}
+	if size > s.MaxInflateBytes {
+		_ = s.MinIO.RemoveObject(ctx, chunk.ObjectKey)
+		return errors.New("compressed chunk exceeds inflate ceiling")
+	}
+
+	raw, err := s.MinIO.GetObject(ctx, chunk.ObjectKey)
+	if err != nil {
+		return fmt.Errorf("read chunk: %w", err)
+	}
+	plain, err := compress.InflateLimited(bytes.NewReader(raw), s.MaxInflateBytes)
+	if err != nil {
+		if errors.Is(err, compress.ErrTooLarge) {
+			_ = s.MinIO.RemoveObject(ctx, chunk.ObjectKey)
+		}
+		return err
+	}
+	if !json.Valid(plain) {
+		_ = s.MinIO.RemoveObject(ctx, chunk.ObjectKey)
+		return errors.New("chunk is not valid JSON")
+	}
+
+	regz, err := compress.Deflate(masking.RedactRecording(plain))
+	if err != nil {
+		return err
+	}
+	if err := s.MinIO.PutObject(ctx, chunk.ObjectKey, regz, "application/gzip"); err != nil {
+		return fmt.Errorf("store scrubbed chunk: %w", err)
+	}
+	return s.Q.MarkChunkScrubbed(ctx, chunk.SessionID, chunk.ProjectID, chunk.Seq)
+}

@@ -44,7 +44,8 @@ const DEFAULTS: Omit<SdkConfig, 'endpoint' | 'apiKey' | 'release'> = {
   flushInterval: 5_000,
   maxBatchSize: 10,
   debug: false,
-  replayEnabled: false,
+  // BREAKING in 1.0: recording is always-on unless explicitly opted out.
+  replayEnabled: true,
   sampleRate: 1,
   errorThrottleMs: 1000,
 };

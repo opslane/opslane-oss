@@ -59,6 +59,11 @@ describe.skipIf(!playwrightAvailable)('rrweb replay capture (real browser)', () 
              .end(JSON.stringify({ event_id: 'evt_test', group_id: 'grp_test', error_group_id: 'grp_test' }));
           return;
         }
+        if (url === '/api/v1/sessions/init') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+             .end(JSON.stringify({ recording: true, chunk_interval_ms: 30000, max_chunk_bytes: 5242880 }));
+          return;
+        }
         if (url === '/api/v1/replays/init') {
           try { initBody = JSON.parse(body); } catch { initBody = null; }
           res.writeHead(200, { 'Content-Type': 'application/json' })

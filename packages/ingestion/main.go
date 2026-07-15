@@ -11,6 +11,8 @@ import (
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
+	"github.com/opslane/opslane/packages/ingestion/retention"
+	"github.com/opslane/opslane/packages/ingestion/scrubber"
 )
 
 func main() {
@@ -117,6 +119,19 @@ func main() {
 			}
 		}
 	}()
+
+	// Raw chunks are fail-closed until this pass overwrites them with redacted
+	// bytes and stamps scrubbed_at. Every replica runs a scrubber; claims use
+	// FOR UPDATE SKIP LOCKED to avoid duplicate work.
+	if minioClient != nil {
+		s := &scrubber.Scrubber{Q: queries, MinIO: minioClient}
+		go s.Start(context.Background(), 15*time.Second)
+		slog.Info("chunk scrubber started")
+
+		sweeper := &retention.Sweeper{Q: queries, MinIO: minioClient}
+		go sweeper.Start(context.Background(), time.Hour)
+		slog.Info("retention sweeper started")
+	}
 
 	slog.Info("Opslane ingestion starting", "port", port)
 	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), r); err != nil {

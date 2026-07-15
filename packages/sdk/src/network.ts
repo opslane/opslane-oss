@@ -1,10 +1,17 @@
 import type { Breadcrumb } from '@opslane/shared';
 import { addBreadcrumb } from './breadcrumbs';
 import { getConfig } from './config';
+import { currentClickId, emitTelemetry, nextRequestId } from './telemetry';
 
 // -- Fetch interceptor --
 
 let originalFetch: typeof globalThis.fetch | null = null;
+
+/** Executes SDK-owned traffic without generating app network telemetry. */
+export function sdkFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const implementation = originalFetch ?? globalThis.fetch;
+  return implementation.call(globalThis, input, init);
+}
 
 function isSdkEndpoint(url: string): boolean {
   try {
@@ -49,8 +56,20 @@ export function patchFetch(): void {
       return orig.call(globalThis, input, init);
     }
 
+    const requestId = nextRequestId('f');
+    emitTelemetry({
+      kind: 'request_start',
+      requestId,
+      clickId: currentClickId(),
+      method,
+      url,
+      at: Date.now(),
+    });
+
     try {
       const response = await orig.call(globalThis, input, init);
+
+      emitTelemetry({ kind: 'request_end', requestId, status: response.status, at: Date.now() });
 
       try {
         const crumb: Breadcrumb = {
@@ -72,6 +91,7 @@ export function patchFetch(): void {
 
       return response;
     } catch (error: unknown) {
+      emitTelemetry({ kind: 'request_end', requestId, status: 0, at: Date.now() });
       try {
         const crumb: Breadcrumb = {
           type: 'fetch',
@@ -104,10 +124,12 @@ export function unpatchFetch(): void {
 // -- XMLHttpRequest interceptor --
 
 let originalXHROpen: typeof XMLHttpRequest.prototype.open | null = null;
+let originalXHRSend: typeof XMLHttpRequest.prototype.send | null = null;
 
 interface XHRWithOpslane extends XMLHttpRequest {
   _opslaneMethod?: string;
   _opslaneUrl?: string;
+  _opslaneRequestId?: string;
 }
 
 export function patchXHR(): void {
@@ -153,10 +175,44 @@ export function patchXHR(): void {
     // XHR.open has overloaded signatures; targeted cast to forward variadic args
     (origOpen as (...args: unknown[]) => void).apply(this, [method, url, ...rest]);
   };
+
+  originalXHRSend = XMLHttpRequest.prototype.send;
+  const origSend = originalXHRSend;
+  XMLHttpRequest.prototype.send = function (
+    this: XHRWithOpslane,
+    ...args: Parameters<XMLHttpRequest['send']>
+  ): void {
+    try {
+      const url = this._opslaneUrl || '';
+      if (url && !isSdkEndpoint(url)) {
+        const requestId = nextRequestId('x');
+        this._opslaneRequestId = requestId;
+        emitTelemetry({
+          kind: 'request_start',
+          requestId,
+          clickId: currentClickId(),
+          method: this._opslaneMethod || 'GET',
+          url,
+          at: Date.now(),
+        });
+        this.addEventListener('loadend', () => {
+          emitTelemetry({ kind: 'request_end', requestId, status: this.status, at: Date.now() });
+        }, { once: true });
+      }
+    } catch {
+      // SDK must never throw.
+    }
+    return origSend.apply(this, args);
+  };
 }
 
 export function unpatchXHR(): void {
-  if (!originalXHROpen) return;
-  XMLHttpRequest.prototype.open = originalXHROpen;
-  originalXHROpen = null;
+  if (originalXHROpen) {
+    XMLHttpRequest.prototype.open = originalXHROpen;
+    originalXHROpen = null;
+  }
+  if (originalXHRSend) {
+    XMLHttpRequest.prototype.send = originalXHRSend;
+    originalXHRSend = null;
+  }
 }

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventType, type eventWithTime } from '@rrweb/types';
-import type { ErrorEventPayload } from '@opslane/shared';
-import { addBreadcrumb, clearBreadcrumbs } from '../breadcrumbs';
+import { clearBreadcrumbs } from '../breadcrumbs';
 import { loadConfig, resetConfig } from '../config';
-import { enqueueEvent, flushEvents, _resetQueue } from '../transport';
-import { _resetThrottle } from '../throttle';
+import { clearUser, setUser } from '../core';
+import { emitTelemetry } from '../telemetry';
+import { _rehydrateFromStorage, peekChunkSeq, resetSessionId } from '../session';
 import {
   _resetReplayState,
   snapshotRrwebEvents,
@@ -27,6 +27,8 @@ const rrwebState = vi.hoisted(() => {
     options: undefined as unknown,
     stop: vi.fn(),
     record: vi.fn(),
+    takeFullSnapshot: vi.fn(),
+    addCustomEvent: vi.fn(),
   };
   state.record.mockImplementation((options: unknown) => {
     state.options = options;
@@ -35,19 +37,23 @@ const rrwebState = vi.hoisted(() => {
   return state;
 });
 
-vi.mock('rrweb', () => ({
-  record: rrwebState.record,
+const chunkMocks = vi.hoisted(() => ({
+  reset: vi.fn(),
+  uploadChunk: vi.fn(),
+  flushInline: vi.fn(),
 }));
 
-function installRecordMock(): void {
-  rrwebState.options = undefined;
-  rrwebState.stop.mockClear();
-  rrwebState.record.mockReset();
-  rrwebState.record.mockImplementation((options: unknown) => {
-    rrwebState.options = options;
-    return rrwebState.stop;
-  });
-}
+vi.mock('rrweb', () => ({
+  record: rrwebState.record,
+  takeFullSnapshot: rrwebState.takeFullSnapshot,
+  addCustomEvent: rrwebState.addCustomEvent,
+}));
+
+vi.mock('../chunk-upload', () => ({
+  _resetChunkUploadState: chunkMocks.reset,
+  uploadChunk: chunkMocks.uploadChunk,
+  flushInline: chunkMocks.flushInline,
+}));
 
 function recordOptions(): RecordOptions {
   expect(rrwebState.options).toBeTruthy();
@@ -55,109 +61,136 @@ function recordOptions(): RecordOptions {
 }
 
 function emit(event: eventWithTime, isCheckout?: boolean): void {
-  const options = recordOptions();
-  expect(typeof options.emit).toBe('function');
-  options.emit?.(event, isCheckout);
+  recordOptions().emit?.(event, isCheckout);
 }
 
 function fullSnapshot(timestamp: number): eventWithTime {
   return {
     type: EventType.FullSnapshot,
     timestamp,
-    data: {
-      node: { id: 1, type: 0, childNodes: [] },
-      initialOffset: { top: 0, left: 0 },
-    },
+    data: { node: { id: 1, type: 0, childNodes: [] }, initialOffset: { top: 0, left: 0 } },
   } as unknown as eventWithTime;
 }
 
-function customEvent(timestamp: number, payload: Record<string, unknown> = {}): eventWithTime {
+function meta(timestamp: number): eventWithTime {
   return {
-    type: EventType.Custom,
+    type: EventType.Meta,
     timestamp,
-    data: {
-      tag: 'opslane.test',
-      payload,
-    },
+    data: { href: 'https://example.test/', width: 1280, height: 720 },
   } as eventWithTime;
 }
 
-function makeEvent(overrides?: Partial<ErrorEventPayload>): ErrorEventPayload {
+function incremental(timestamp: number, text = ''): eventWithTime {
   return {
-    timestamp: new Date().toISOString(),
-    error: {
-      type: 'TypeError',
-      message: 'Cannot read properties of null',
-      stack: 'TypeError: Cannot read properties of null\n at UserCard.vue:8:20',
-    },
-    breadcrumbs: [],
-    context: {
-      url: 'http://localhost:4173/user',
-      user_agent: 'vitest',
-    },
-    sdk_version: '0.2.0',
-    ...overrides,
-  };
+    type: EventType.IncrementalSnapshot,
+    timestamp,
+    data: { source: 2, text },
+  } as unknown as eventWithTime;
 }
 
 async function drainMicrotasks(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
 }
 
-async function waitForFetchCallCount(count: number): Promise<void> {
-  for (let i = 0; i < 20; i += 1) {
-    if (fetchMockCallCount() >= count) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-}
-
-function fetchMockCallCount(): number {
-  return vi.mocked(globalThis.fetch).mock.calls.length;
-}
-
-describe('rrweb replay capture', () => {
+describe('continuous chunked recording', () => {
   const fetchMock = vi.fn();
 
   beforeEach(() => {
-    installRecordMock();
-    _resetQueue();
-    _resetThrottle();
     _resetReplayState();
+    clearUser();
+    sessionStorage.clear();
+    resetSessionId();
     clearBreadcrumbs();
     resetConfig();
+    loadConfig({ apiKey: 'key-abc', endpoint: 'https://ingest.example.com', replay: { enabled: true } });
     fetchMock.mockReset();
-    globalThis.fetch = fetchMock;
-    window.history.replaceState({}, '', '/');
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    chunkMocks.uploadChunk.mockReset().mockResolvedValue(true);
+    chunkMocks.flushInline.mockReset().mockResolvedValue(true);
+    chunkMocks.reset.mockClear();
+    rrwebState.options = undefined;
+    rrwebState.stop.mockClear();
+    rrwebState.takeFullSnapshot.mockClear();
+    rrwebState.addCustomEvent.mockClear();
+    rrwebState.record.mockReset().mockImplementation((options: unknown) => {
+      rrwebState.options = options;
+      return rrwebState.stop;
+    });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
   });
 
   afterEach(() => {
     stopReplayCapture();
-    _resetQueue();
-    _resetReplayState();
-    clearBreadcrumbs();
     resetConfig();
+    sessionStorage.clear();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it('does not start rrweb when replay is disabled', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc' });
-
+  async function startEnabled(): Promise<void> {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ recording: true, chunk_interval_ms: 30_000, max_chunk_bytes: 5_242_880 }),
+    });
     await startReplayCapture();
+    await drainMicrotasks();
+  }
 
-    expect(rrwebState.record).not.toHaveBeenCalled();
-    expect(snapshotRrwebEvents()).toEqual([]);
+  it('registers the session before recording', async () => {
+    await startEnabled();
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/sessions/init');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      session_id: expect.any(String),
+      started_at: expect.any(String),
+    });
+    expect(fetchMock.mock.invocationCallOrder[0]).toBeLessThan(rrwebState.record.mock.invocationCallOrder[0]);
   });
 
-  it('lazy-loads and starts rrweb with fixed C4 masking options', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
+  it('registers the latest identity when it changes during initial session registration', async () => {
+    let resolveInitial!: (value: { ok: boolean; json: () => Promise<{ recording: boolean }> }) => void;
+    fetchMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveInitial = resolve; }))
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ recording: true }) });
 
+    const starting = startReplayCapture();
+    await drainMicrotasks();
+    const firstID = (JSON.parse(fetchMock.mock.calls[0][1].body) as { session_id: string }).session_id;
+    setUser({ id: 'alice' });
+    resolveInitial({ ok: true, json: async () => ({ recording: true }) });
+    await starting;
+
+    const initCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes('/sessions/init'));
+    expect(initCalls).toHaveLength(2);
+    const latestID = (JSON.parse(initCalls[1][1].body) as { session_id: string }).session_id;
+    expect(latestID).not.toBe(firstID);
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    emit(fullSnapshot(31_000), true);
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledWith(latestID, 0, expect.any(Array), true);
+  });
+
+  it('does not start rrweb when disabled, unsupported, or killed server-side', async () => {
+    resetConfig();
+    loadConfig({ apiKey: 'k', endpoint: 'https://ingest.example.com', replay: { enabled: false } });
     await startReplayCapture();
+    expect(rrwebState.record).not.toHaveBeenCalled();
 
-    expect(rrwebState.record).toHaveBeenCalledTimes(1);
+    resetConfig();
+    loadConfig({ apiKey: 'k', endpoint: 'https://ingest.example.com', replay: { enabled: true } });
+    vi.stubGlobal('CompressionStream', undefined);
+    await startReplayCapture();
+    expect(rrwebState.record).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ recording: false }) });
+    await startReplayCapture();
+    expect(rrwebState.record).not.toHaveBeenCalled();
+  });
+
+  it('configures checkout snapshots and masking', async () => {
+    await startEnabled();
     expect(recordOptions()).toMatchObject({
       checkoutEveryNms: 30_000,
       maskAllInputs: true,
@@ -167,171 +200,191 @@ describe('rrweb replay capture', () => {
     });
   });
 
-  it('keeps two rrweb windows and preserves a full snapshot at the start', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
-    await startReplayCapture();
-
+  it('cuts independently playable chunks on checkout boundaries', async () => {
+    await startEnabled();
+    emit(meta(999), false);
     emit(fullSnapshot(1_000), true);
-    emit(customEvent(1_100, { phase: 'first-window' }));
+    emit(incremental(1_500));
+    emit(meta(30_999), true);
     emit(fullSnapshot(31_000), true);
-    emit(customEvent(31_100, { phase: 'second-window' }));
+    emit(incremental(31_500));
+    emit(meta(60_999), true);
+    emit(fullSnapshot(61_000), true);
+    await drainMicrotasks();
 
-    const events = snapshotRrwebEvents();
-    expect(events).toHaveLength(4);
-    expect(events[0]?.type).toBe(EventType.FullSnapshot);
-    expect(events[2]?.type).toBe(EventType.FullSnapshot);
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledTimes(2);
+    expect(chunkMocks.uploadChunk.mock.calls.map((call) => call[1])).toEqual([0, 1]);
+    for (const call of chunkMocks.uploadChunk.mock.calls) {
+      expect((call[2] as eventWithTime[])[0].type).toBe(EventType.FullSnapshot);
+      expect(call[3]).toBe(true);
+    }
   });
 
-  it('drops the older window whole when the combined recording exceeds the SDK byte cap', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
-    await startReplayCapture();
-
+  it('does not upload an empty chunk on the first checkout', async () => {
+    await startEnabled();
     emit(fullSnapshot(1_000), true);
-    emit(customEvent(1_100, { body: 'x'.repeat(2 * 1024 * 1024) }));
-    emit(fullSnapshot(31_000), true);
-    emit(customEvent(31_100, { phase: 'survives' }));
-
-    const events = snapshotRrwebEvents();
-    expect(events).toHaveLength(2);
-    expect(events[0]?.timestamp).toBe(31_000);
-    expect(events[0]?.type).toBe(EventType.FullSnapshot);
-    expect(events[1]?.timestamp).toBe(31_100);
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk).not.toHaveBeenCalled();
   });
 
-  it('uploads recording.json and completes with breadcrumb-derived C4 signals', async () => {
-    vi.spyOn(Date, 'now').mockReturnValue(1_717_000_045_000);
-    window.history.replaceState({}, '', '/dashboard?token=secret#access_token=abc');
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
-    await startReplayCapture();
-    emit(fullSnapshot(1_717_000_000_000), true);
-    emit(customEvent(1_717_000_001_000, { click: 'submit' }));
-    addBreadcrumb({
-      type: 'console',
-      timestamp: new Date().toISOString(),
-      category: 'console',
-      level: 'error',
-      message: 'render failed',
-    });
-    addBreadcrumb({
-      type: 'fetch',
-      timestamp: new Date().toISOString(),
-      category: 'http',
-      level: 'error',
-      message: 'POST /api/users failed',
-      data: { method: 'POST', url: 'https://api.example.com/users?token=secret', status_code: 500 },
-    });
+  it('resumes the sequence counter after a reload', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    emit(fullSnapshot(31_000), true);
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk.mock.calls[0][1]).toBe(0);
+
+    stopReplayCapture();
+    resetSessionId();
+    _rehydrateFromStorage();
+    chunkMocks.uploadChunk.mockClear();
+    await startEnabled();
+    emit(fullSnapshot(60_000), true);
+    emit(incremental(60_500));
+    emit(fullSnapshot(90_000), true);
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk.mock.calls[0][1]).toBe(1);
+  });
+
+  it('forces a checkout before a raw chunk exceeds the signed cap', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500, 'x'.repeat(21 * 1024 * 1024)));
+    expect(rrwebState.takeFullSnapshot).toHaveBeenCalledWith(true);
+  });
+
+  it('stops when the server signals stop mid-session', async () => {
+    await startEnabled();
+    chunkMocks.uploadChunk.mockResolvedValue('stop');
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    emit(fullSnapshot(31_000), true);
+    await drainMicrotasks();
+    expect(rrwebState.stop).toHaveBeenCalled();
+  });
+
+  it('flushes inline when the page becomes hidden', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await drainMicrotasks();
+    expect(chunkMocks.flushInline).toHaveBeenCalledWith(expect.any(String), 0, expect.any(Array));
+    expect(rrwebState.takeFullSnapshot).toHaveBeenCalledWith(true);
+  });
+
+  it('falls back to the normal uploader when the inline tail cannot land', async () => {
+    await startEnabled();
+    chunkMocks.flushInline.mockResolvedValueOnce(false);
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await drainMicrotasks();
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledWith(expect.any(String), 0, expect.any(Array), true);
+  });
+
+  it('registers a new session when identity changes', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ recording: true }) });
+    setUser({ id: 'alice' });
+    await drainMicrotasks();
+    const initCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes('/sessions/init'));
+    expect(initCalls).toHaveLength(2);
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledTimes(1);
+    expect(rrwebState.takeFullSnapshot).toHaveBeenCalledWith(true);
+  });
+
+  it('closes the old identity with its next seq without advancing the new session', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
+    emit(fullSnapshot(31_000), true); // old session seq 0
+    emit(incremental(31_500));
+    await drainMicrotasks();
+    chunkMocks.uploadChunk.mockClear();
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ recording: true }) });
+
+    setUser({ id: 'alice' });
+    await drainMicrotasks();
+
+    expect(chunkMocks.uploadChunk.mock.calls[0]?.[1]).toBe(1);
+    expect(peekChunkSeq()).toBe(0);
+  });
+
+  it('rotates idle capture without mixing old events into the new session', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-14T12:00:00Z'));
+    await startEnabled();
+    const firstInit = JSON.parse(fetchMock.mock.calls[0][1].body) as { session_id: string };
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500, 'old-session'));
+
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ recording: true }) });
+    vi.setSystemTime(new Date('2026-07-14T12:31:00Z'));
+    emit(incremental(2_000, 'idle-boundary'));
+    await drainMicrotasks();
+
+    const initCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes('/sessions/init'));
+    expect(initCalls).toHaveLength(2);
+    const secondInit = JSON.parse(initCalls[1][1].body) as { session_id: string };
+    expect(secondInit.session_id).not.toBe(firstInit.session_id);
+    expect(chunkMocks.uploadChunk).toHaveBeenCalledWith(
+      firstInit.session_id,
+      0,
+      expect.arrayContaining([expect.objectContaining({ timestamp: 1_500 })]),
+      true,
+    );
+
+    // Incrementals emitted while registration/snapshot rotation is incomplete
+    // cannot form an independently playable chunk and must be discarded.
+    emit(incremental(2_500, 'before-snapshot'));
+    emit(fullSnapshot(3_000), true);
+    emit(incremental(3_500, 'new-session'));
+    emit(fullSnapshot(33_000), true);
+    await drainMicrotasks();
+
+    const newSessionCall = chunkMocks.uploadChunk.mock.calls.find((call) => call[0] === secondInit.session_id);
+    expect(newSessionCall?.[1]).toBe(0);
+    expect((newSessionCall?.[2] as eventWithTime[])[0].type).toBe(EventType.FullSnapshot);
+    expect(JSON.stringify(newSessionCall?.[2])).not.toContain('before-snapshot');
+    vi.useRealTimers();
+  });
+
+  it('routes telemetry into rrweb custom events', async () => {
+    await startEnabled();
+    emitTelemetry({ kind: 'click', clickId: 'c_1', selector: '#buy', cursor: 'pointer', at: 1 });
+    expect(rrwebState.addCustomEvent).toHaveBeenCalledWith(
+      'opslane.telemetry',
+      expect.objectContaining({ kind: 'click', selector: '#buy' }),
+    );
+  });
+
+  it('retains the legacy error-triggered upload until Batch 2', async () => {
+    await startEnabled();
+    emit(fullSnapshot(1_000), true);
+    emit(incremental(1_500));
     fetchMock
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        replay_id: 'replay-1',
-        upload_url: 'https://s3.example.com/upload',
-        upload_headers: { 'x-amz-meta-test': '1' },
-      }), { status: 201 }))
-      .mockResolvedValueOnce(new Response('', { status: 200 }))
-      .mockResolvedValueOnce(new Response('', { status: 200 }));
-
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ replay_id: 'replay-1', upload_url: 'https://storage.example.com/replay', upload_headers: {} }),
+      })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true });
     await uploadReplayForTrigger({
       triggerType: 'uncaught_error',
-      errorType: 'TypeError',
-      errorMessage: 'Cannot read properties of null',
+      errorType: 'Error',
+      errorMessage: 'boom',
       eventId: 'event-1',
-      errorGroupId: 'group-1',
     });
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-
-    const initCall = fetchMock.mock.calls[0];
-    expect(String(initCall?.[0])).toBe('https://ingest.example.com/api/v1/replays/init');
-    const initBody = JSON.parse(String(initCall?.[1]?.body || '{}'));
-    expect(initBody).toEqual({
-      session_id: expect.any(String),
-      error_event_id: 'event-1',
-      error_group_id: 'group-1',
-      trigger_type: 'uncaught_error',
-      page_url: 'http://localhost:3000/dashboard',
-      started_at: '2024-05-29T16:26:40.000Z',
-      ended_at: '2024-05-29T16:27:25.000Z',
-    });
-    expect(initBody).not.toHaveProperty('masking_profile');
-    expect(initBody).not.toHaveProperty('content_type');
-
-    const uploadCall = fetchMock.mock.calls[1];
-    expect(String(uploadCall?.[0])).toBe('https://s3.example.com/upload');
-    expect(uploadCall?.[1]?.method).toBe('PUT');
-    expect(uploadCall?.[1]?.headers).toMatchObject({
-      'Content-Type': 'application/json',
-      'x-amz-meta-test': '1',
-    });
-    const recording = JSON.parse(String(uploadCall?.[1]?.body || '{}'));
-    expect(recording.events).toHaveLength(2);
-    expect(recording.events[0].type).toBe(EventType.FullSnapshot);
-    expect(recording.meta).toEqual({
-      sdk_version: expect.any(String),
-      page_url: 'http://localhost:3000/dashboard',
-      started_at: 1_717_000_000_000,
-      ended_at: 1_717_000_045_000,
-      crash_timestamp: 1_717_000_045_000,
-    });
-
-    const completeCall = fetchMock.mock.calls[2];
-    expect(String(completeCall?.[0])).toBe('https://ingest.example.com/api/v1/replays/replay-1/complete');
-    const completeBody = JSON.parse(String(completeCall?.[1]?.body || '{}'));
-    expect(completeBody).not.toHaveProperty('artifacts');
-    expect(completeBody).not.toHaveProperty('content_type');
-    expect(completeBody).toMatchObject({
-      size_bytes: expect.any(Number),
-      signals: {
-        console: {
-          error_count: 1,
-          warning_count: 0,
-          error_messages: ['render failed'],
-          warning_messages: [],
-        },
-        network: {
-          anomaly_count: 1,
-          anomalies: [{
-            type: 'fetch',
-            method: 'POST',
-            url: 'https://api.example.com/users?token=secret',
-            status_code: 500,
-            message: 'POST /api/users failed',
-          }],
-        },
-      },
-    });
-  });
-
-  it('uploads replay for uncaught_error trigger after event ingestion', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
-    await startReplayCapture();
-    emit(fullSnapshot(1_717_000_000_000), true);
-    fetchMock
-      .mockResolvedValueOnce(new Response(JSON.stringify({ event_id: 'event-1', error_group_id: 'group-1' }), { status: 202 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ replay_id: 'replay-1', upload_url: 'https://s3.example.com/upload', upload_headers: {} }), { status: 201 }))
-      .mockResolvedValueOnce(new Response('', { status: 200 }))
-      .mockResolvedValueOnce(new Response('', { status: 200 }));
-
-    enqueueEvent(makeEvent(), 'uncaught_error');
-    await flushEvents();
-    await drainMicrotasks();
-    await waitForFetchCallCount(4);
-
-    const calls = fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(calls).toContain('https://ingest.example.com/api/v1/events');
-    expect(calls).toContain('https://ingest.example.com/api/v1/replays/init');
-    expect(calls).toContain('https://ingest.example.com/api/v1/replays/replay-1/complete');
-  });
-
-  it('does not upload replay for non-triggered events', async () => {
-    loadConfig({ endpoint: 'https://ingest.example.com', apiKey: 'key-abc', replay: { enabled: true } });
-    await startReplayCapture();
-    emit(fullSnapshot(1_717_000_000_000), true);
-    fetchMock.mockResolvedValueOnce(new Response('{}', { status: 202 }));
-
-    enqueueEvent(makeEvent());
-    await flushEvents();
-
-    const calls = fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(calls).toContain('https://ingest.example.com/api/v1/events');
-    expect(calls).not.toContain('https://ingest.example.com/api/v1/replays/init');
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls).toContain('https://ingest.example.com/api/v1/replays/init');
+    expect(urls).toContain('https://storage.example.com/replay');
+    expect(urls).toContain('https://ingest.example.com/api/v1/replays/replay-1/complete');
+    expect(snapshotRrwebEvents()[0].type).toBe(EventType.FullSnapshot);
   });
 });
