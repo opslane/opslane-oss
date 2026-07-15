@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { createE2BSandbox } = vi.hoisted(() => ({
@@ -82,6 +85,27 @@ describe('createSandboxRuntime', () => {
     expect(envResult.stdout.trim()).toBe('||||||');
 
     await sandbox.kill();
+  });
+
+  it('preserves host file URLs when virtual temporary paths are rewritten', async () => {
+    process.env['OPSLANE_SANDBOX_BACKEND'] = 'local';
+    process.env['OPSLANE_RELIABILITY_HARNESS'] = '1';
+    const hostTmp = await mkdtemp('/tmp/opslane-host-fixture-');
+    const fixturePath = join(hostTmp, 'fixture.txt');
+    await writeFile(fixturePath, 'host fixture\n', 'utf8');
+    const fixtureUrl = pathToFileURL(fixturePath).href;
+    const sandbox = await createSandboxRuntime();
+
+    try {
+      const result = await sandbox.commands.run(
+        `node -e 'const { readFileSync } = require("node:fs"); process.stdout.write(readFileSync(new URL(process.argv[1]), "utf8"))' '${fixtureUrl}'`,
+      );
+
+      expect(result.stdout).toBe('host fixture\n');
+    } finally {
+      await sandbox.kill();
+      await rm(hostTmp, { recursive: true, force: true });
+    }
   });
 
   it('rejects non-zero exits and timeouts like the remote command transport', async () => {

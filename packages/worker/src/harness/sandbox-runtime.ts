@@ -102,9 +102,25 @@ async function createLocalSandboxRuntime(): Promise<SandboxRuntime> {
     return mapped;
   };
 
-  const rewriteCommand = (command: string): string => command
-    .replaceAll(VIRTUAL_TMP, localTmp)
-    .replaceAll(VIRTUAL_HOME, home);
+  const rewriteCommand = (command: string): string => {
+    // Fixture repositories are passed as host file:// URLs. Preserve those URLs
+    // while translating virtual sandbox paths; on Linux both live under /tmp,
+    // so a blind replacement redirects git to a nonexistent path inside root.
+    const hostFileUrls: string[] = [];
+    const protectedCommand = command.replace(/file:\/\/[^\s'"]+/g, (url) => {
+      const placeholder = `__OPSLANE_HOST_FILE_URL_${hostFileUrls.length}__`;
+      hostFileUrls.push(url);
+      return placeholder;
+    });
+
+    let rewritten = protectedCommand
+      .replaceAll(VIRTUAL_TMP, localTmp)
+      .replaceAll(VIRTUAL_HOME, home);
+    for (const [index, url] of hostFileUrls.entries()) {
+      rewritten = rewritten.replaceAll(`__OPSLANE_HOST_FILE_URL_${index}__`, url);
+    }
+    return rewritten;
+  };
 
   const commandEnv = (): Record<string, string> => {
     const env: Record<string, string> = {};
