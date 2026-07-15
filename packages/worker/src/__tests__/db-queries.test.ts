@@ -116,7 +116,18 @@ describe('claimJob friction scheduling fields', () => {
     const job = await claimJob('worker-1', 30_000);
 
     expect(job).toEqual(expect.objectContaining({ sessionId: 's1', triggeredBy: 'auto' }));
-    expect(mockQuery.mock.calls[0][0]).toContain("WHEN job_type = 'session_analysis' THEN 2");
+    // Scheduling policy (issue #28): error_fix first, capped analysis, lane alternation.
+    expect(mockQuery.mock.calls[0][0]).toContain("WHEN job_type = 'error_fix' THEN 0");
+    expect(mockQuery.mock.calls[0][0]).toContain("AND job_type = 'session_analysis'");
+    expect(mockQuery.mock.calls[0][0]).toContain('< $3');
+    // Cap defaults to 2 when SESSION_ANALYSIS_MAX_CONCURRENT is unset.
+    expect(mockQuery.mock.calls[0][1]).toEqual(['worker-1', 30, 2]);
+  });
+
+  it('passes an explicit session_analysis cap through to the claim query', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await claimJob('worker-1', 30_000, 0);
+    expect(mockQuery.mock.calls[0][1]).toEqual(['worker-1', 30, 0]);
   });
 });
 

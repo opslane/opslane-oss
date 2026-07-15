@@ -76,11 +76,37 @@ export async function assertJobLease(lease: JobLease): Promise<void> {
   if ((result.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
 }
 
-/** Claims the oldest pending job using FOR UPDATE SKIP LOCKED.
- * Priority: error_fix first, interactive work next, session analysis last. */
+/** Default fleet-wide ceiling on concurrently claimed session_analysis jobs. */
+const DEFAULT_SESSION_ANALYSIS_CAP = 2;
+
+function sessionAnalysisCapFromEnv(): number {
+  const raw = process.env['SESSION_ANALYSIS_MAX_CONCURRENT'];
+  if (raw === undefined || raw === '') return DEFAULT_SESSION_ANALYSIS_CAP;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_SESSION_ANALYSIS_CAP;
+}
+
+/** Claims one pending job using FOR UPDATE SKIP LOCKED (issue #28 scheduling).
+ *
+ * Policy, in order:
+ * 1. error_fix always wins — rare, human-facing work is never queued behind
+ *    background analysis.
+ * 2. session_analysis is capped: it is claimable only while fewer than
+ *    `sessionAnalysisCap` analysis jobs hold a live lease. The count is read
+ *    outside the row lock, so concurrent claimers can briefly overshoot the
+ *    cap by at most the worker-fleet size — a soft cap by design.
+ * 3. Within the remaining work, the analysis lane and the interactive lane
+ *    (investigate/fix/setup_pr) alternate: analysis is preferred only when
+ *    its most recent claim is older than the interactive lane's. A fix
+ *    backlog therefore cannot starve analysis, and an analysis backlog
+ *    cannot starve fixes, without any scheduler state outside the jobs table.
+ *
+ * Lease and terminal-status semantics are untouched: only the candidate
+ * selection changed. */
 export async function claimJob(
   workerId: string,
-  leaseDurationMs: number
+  leaseDurationMs: number,
+  sessionAnalysisCap: number = sessionAnalysisCapFromEnv()
 ): Promise<ClaimedJob | null> {
   const db = getPool();
   const result = await db.query<{
@@ -106,10 +132,21 @@ export async function claimJob(
      WHERE id = (
        SELECT id FROM error_group_jobs
        WHERE status = 'pending'
+         AND (job_type <> 'session_analysis'
+              OR (SELECT COUNT(*) FROM error_group_jobs
+                   WHERE status = 'claimed'
+                     AND job_type = 'session_analysis'
+                     AND lease_expires_at > now()) < $3)
        ORDER BY CASE
          WHEN job_type = 'error_fix' THEN 0
-         WHEN job_type = 'session_analysis' THEN 2
-         ELSE 1
+         WHEN job_type = 'session_analysis'
+              AND COALESCE((SELECT MAX(claimed_at) FROM error_group_jobs
+                             WHERE job_type = 'session_analysis'), 'epoch'::timestamptz)
+                < COALESCE((SELECT MAX(claimed_at) FROM error_group_jobs
+                             WHERE job_type <> 'session_analysis'), 'epoch'::timestamptz)
+           THEN 1
+         WHEN job_type <> 'session_analysis' THEN 2
+         ELSE 3
        END, created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED
@@ -117,7 +154,7 @@ export async function claimJob(
      RETURNING id, error_group_id, source_id, project_id, job_type, attempts, guidance,
                worker_id, lease_generation::text AS lease_generation,
                triggered_by, session_id`,
-    [workerId, leaseDurationMs / 1000]
+    [workerId, leaseDurationMs / 1000, sessionAnalysisCap]
   );
 
   const row = result.rows[0];
