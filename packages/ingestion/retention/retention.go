@@ -27,14 +27,19 @@ type Sweeper struct {
 	MinIO *minioPkg.Client
 }
 
+// resolveInterval picks the tick interval for Start. Only a non-positive
+// interval is overridden; deletionGrace is a floor on how long a session waits
+// before purge (see SessionsReadyForPurge) and must not bound the tick rate.
+func resolveInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultInterval
+	}
+	return interval
+}
+
 // Start closes idle sessions and sweeps expired sessions until cancellation.
 func (s *Sweeper) Start(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = defaultInterval
-	}
-	if interval > deletionGrace {
-		interval = deletionGrace
-	}
+	interval = resolveInterval(interval)
 	s.runPass(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

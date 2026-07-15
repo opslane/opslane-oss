@@ -70,7 +70,11 @@ func TestChunkObjectKey_IsDeterministicAndSorted(t *testing.T) {
 	}
 }
 
-func TestChunkUploadURL_RejectsOversizeDeclaration(t *testing.T) {
+// Storage is optional (main.go leaves Dependencies.MinIO nil when
+// REPLAY_STORE_ENDPOINT is unset), so the nil guard must win before any
+// request validation. The oversize-declaration 413 itself is asserted by the
+// integration test of the same name.
+func TestChunkUploadURL_NoMinIOReturns503(t *testing.T) {
 	deps := &Dependencies{}
 	body := `{"seq":0,"size_bytes":` + strconv.FormatInt(maxChunkBytes+1, 10) + `,"has_full_snapshot":true}`
 	req := httptest.NewRequest("POST", "/api/v1/sessions/sess_abcdefgh/chunks/upload-url", strings.NewReader(body))

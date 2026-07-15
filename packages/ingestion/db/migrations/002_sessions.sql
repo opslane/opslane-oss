@@ -125,10 +125,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_end_user_started
 CREATE INDEX IF NOT EXISTS idx_sessions_project_started
   ON sessions(project_id, started_at);
 
--- Retention sweep: find expiry candidates without scanning live recordings.
-CREATE INDEX IF NOT EXISTS idx_sessions_retention
+-- Retention sweep: find expiry candidates. The predicate must match
+-- SessionsToDelete's WHERE exactly -- Postgres only uses a partial index when
+-- the query predicate implies the index predicate, and status <> 'deleting'
+-- does not imply status <> 'recording'.
+DROP INDEX IF EXISTS idx_sessions_retention;
+CREATE INDEX IF NOT EXISTS idx_sessions_retention_not_deleting
   ON sessions(started_at)
-  WHERE status <> 'recording';
+  WHERE status <> 'deleting';
+
+-- Purge sweep: SessionsReadyForPurge orders by deletion_started_at. 'deleting'
+-- is transient, so the partial predicate keeps this index tiny.
+CREATE INDEX IF NOT EXISTS idx_sessions_purge
+  ON sessions(deletion_started_at)
+  WHERE status = 'deleting';
 
 -- Revisit deleted-session prefixes forever. A storage POST accepted just
 -- before policy expiry may finish after the first retention pass.
