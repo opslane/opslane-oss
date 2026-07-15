@@ -51,6 +51,9 @@ These are curated tables, not a stability contract — the API is early-stage an
 | POST | `/api/v1/environments/{envID}/api-keys` | Create ingest key |
 | GET | `/api/v1/projects/{projectID}/api-keys` | List ingest keys |
 | GET | `/api/v1/projects/{projectID}/replays/{replayID}` | Fetch a replay |
+| GET | `/api/v1/projects/{projectID}/sessions` | List sessions with filters and keyset pagination |
+| GET | `/api/v1/projects/{projectID}/sessions/{sessionID}` | Session detail and scrubbed chunk manifest |
+| GET | `/api/v1/projects/{projectID}/sessions/{sessionID}/chunks/{seq}` | Fetch one decoded, re-redacted scrubbed chunk |
 | GET | `/api/v1/projects/{projectID}/incidents/{incidentID}/affected-users` | Affected users |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/fix` | Trigger fix from an `investigated` analysis |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/resolve` | Resolve incident |
@@ -75,6 +78,12 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/api/v1/projects/{projectID}/event-count` | Event count stats |
 | GET | `/api/v1/projects/{projectID}/incidents` | List incidents |
 | GET | `/api/v1/projects/{projectID}/incidents/{incidentID}` | Incident detail |
+
+## Internal service reads
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| GET | `/internal/v1/projects/{projectID}/sessions/{sessionID}/chunks/{seq}` | `X-Internal-Token` | Worker fetch of one decoded, re-redacted scrubbed chunk |
 
 ## Catch-all
 

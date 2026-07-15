@@ -13,7 +13,11 @@ const fullPageRoutes = ['login', 'register', 'setup', 'auth-callback'];
 const isFullPage = computed(() => fullPageRoutes.includes(route.name as string));
 
 function navLinkClass(routeName: string): string {
-  const isActive = route.name === routeName;
+  const detailRoutes: Record<string, string[]> = {
+    accounts: ['account-detail'],
+    sessions: ['session-detail'],
+  };
+  const isActive = route.name === routeName || (detailRoutes[routeName]?.includes(route.name as string) ?? false);
   return isActive
     ? 'text-sm text-teal border-b-2 border-teal pb-[14px]'
     : 'text-sm text-text-muted hover:text-text pb-[14px] border-b-2 border-transparent';
@@ -124,6 +128,9 @@ watch(
         </router-link>
         <router-link to="/accounts" :class="navLinkClass('accounts')">
           Accounts
+        </router-link>
+        <router-link to="/sessions" :class="navLinkClass('sessions')">
+          Sessions
         </router-link>
         <router-link to="/settings" :class="navLinkClass('settings')">
           Settings

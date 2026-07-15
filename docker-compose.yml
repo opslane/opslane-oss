@@ -64,6 +64,7 @@ services:
       GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-defender-dev}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+      INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,6 +83,7 @@ services:
     environment:
       DATABASE_URL: postgres://opslane:opslane_dev@postgres:5432/opslane
       INGESTION_BASE_URL: http://ingestion:8080
+      INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       E2B_API_KEY: ${E2B_API_KEY:-}

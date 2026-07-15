@@ -439,6 +439,87 @@ export async function getReplayForGroup(errorGroupId: string, projectId: string)
   return rows[0] ?? null;
 }
 
+export interface SessionPointer {
+  session_id: string;
+  error_at: string;
+}
+
+/** Resolves pointer identity independently from chunk readiness. */
+export async function getSessionPointerForGroup(
+  errorGroupId: string,
+  projectId: string,
+): Promise<SessionPointer | null> {
+  const pool = getPool();
+  const { rows } = await pool.query<{ session_id: string; error_at: Date | string }>(
+    `SELECT ee.session_id, ee.timestamp AS error_at
+       FROM error_events ee
+       JOIN sessions s ON s.id = ee.session_id AND s.project_id = $2
+      WHERE ee.error_group_id = $1
+        AND ee.project_id = $2
+        AND ee.session_id IS NOT NULL
+        AND s.status <> 'deleting'
+      ORDER BY ee.created_at DESC, ee.id DESC
+      LIMIT 1`,
+    [errorGroupId, projectId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    session_id: row.session_id,
+    error_at: row.error_at instanceof Date ? row.error_at.toISOString() : row.error_at,
+  };
+}
+
+export interface SessionChunkMeta {
+  seq: number;
+  size_bytes: number | null;
+  decoded_size_bytes: number | null;
+  has_full_snapshot: boolean;
+  first_event_ms: number | null;
+  last_event_ms: number | null;
+}
+
+function nullableNumber(value: string | number | null): number | null {
+  if (value == null) return null;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+/** Returns only scrubbed chunks belonging to the requested project/session. */
+export async function getPlayableChunkMetas(
+  sessionId: string,
+  projectId: string,
+): Promise<SessionChunkMeta[]> {
+  const pool = getPool();
+  const { rows } = await pool.query<{
+    seq: number;
+    size_bytes: string | number | null;
+    decoded_size_bytes: string | number | null;
+    has_full_snapshot: boolean;
+    first_event_ms: string | number | null;
+    last_event_ms: string | number | null;
+  }>(
+    `SELECT c.seq, c.size_bytes, c.decoded_size_bytes, c.has_full_snapshot,
+            c.first_event_ms, c.last_event_ms
+       FROM session_chunks c
+       JOIN sessions s ON s.id = c.session_id
+      WHERE c.session_id = $1
+        AND s.project_id = $2
+        AND s.status <> 'deleting'
+        AND c.scrubbed_at IS NOT NULL
+      ORDER BY c.seq ASC`,
+    [sessionId, projectId],
+  );
+  return rows.map((row) => ({
+    seq: row.seq,
+    size_bytes: nullableNumber(row.size_bytes),
+    decoded_size_bytes: nullableNumber(row.decoded_size_bytes),
+    has_full_snapshot: row.has_full_snapshot,
+    first_event_ms: nullableNumber(row.first_event_ms),
+    last_event_ms: nullableNumber(row.last_event_ms),
+  }));
+}
+
 export interface ReplayArtifactData {
   id: string;
   kind: string;

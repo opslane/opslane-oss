@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import type { Incident, AffectedUser } from '../types/api';
 import { getIncident, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
@@ -7,6 +7,7 @@ import { getProjectId, statusBadgeClass, safeUrl, formatDate, formatAbsolute } f
 import PipelineIndicator from '../components/PipelineIndicator.vue';
 import ReplayPlayer from '../components/ReplayPlayer.vue';
 import type { eventWithTime } from '@rrweb/types';
+import { useSessionPlayback } from '../composables/useSessionPlayback';
 
 const route = useRoute();
 const incidentId = route.params['id'] as string;
@@ -17,6 +18,24 @@ const projectId = ref('');
 const replay = ref<ReplayRecording | null>(null);
 const replayLoading = ref(false);
 const replayError = ref<string | null>(null);
+
+const pointerSessionId = computed(() => incident.value?.session_pointer?.session_id ?? '');
+const pointerErrorAt = computed(() => incident.value?.session_pointer?.error_at);
+const {
+  state: sessionReplayState,
+  events: sessionReplayEvents,
+  seekMs: sessionReplaySeekMs,
+  missingChunks: sessionMissingChunks,
+  approximate: sessionReplayApproximate,
+  pollAttempt: sessionPollAttempt,
+  pollsRemaining: sessionPollsRemaining,
+  terminalUnavailable: sessionTerminalUnavailable,
+  error: sessionReplayError,
+  stopPolling: stopSessionPolling,
+} = useSessionPlayback(projectId, pointerSessionId, {
+  errorAt: pointerErrorAt,
+  windowed: true,
+});
 
 // Tabs
 const activeTab = ref<'overview' | 'affected-users'>('overview');
@@ -39,6 +58,7 @@ async function loadAffectedUsers() {
 
 async function loadReplay() {
   const id = incident.value?.replay_id;
+  if (incident.value?.session_pointer && !sessionTerminalUnavailable.value) return;
   if (!id || replay.value || replayLoading.value) return;
   replayLoading.value = true;
   replayError.value = null;
@@ -50,6 +70,10 @@ async function loadReplay() {
     replayLoading.value = false;
   }
 }
+
+watch(sessionTerminalUnavailable, (unavailable) => {
+  if (unavailable) void loadReplay();
+});
 
 // Find Fix form state
 const guidance = ref('');
@@ -106,7 +130,10 @@ function stopFixPolling() {
   }
 }
 
-onUnmounted(() => stopFixPolling());
+onUnmounted(() => {
+  stopFixPolling();
+  stopSessionPolling();
+});
 
 function switchTab(tab: 'overview' | 'affected-users') {
   activeTab.value = tab;
@@ -262,16 +289,41 @@ onMounted(async () => {
       <!-- Overview Tab -->
       <div v-if="activeTab === 'overview'" class="space-y-6">
         <!-- Replay -->
-        <div v-if="incident.replay_id" class="p-4 bg-surface border border-border rounded-lg space-y-2">
+        <div v-if="incident.session_pointer || incident.replay_id" class="p-4 bg-surface border border-border rounded-lg space-y-2">
           <p class="text-xs font-medium text-text-muted uppercase tracking-wide">Session Replay</p>
-          <div v-if="replayLoading" class="text-sm text-text-muted">Loading replay...</div>
-          <div v-else-if="replayError" class="text-sm text-red-500">Replay unavailable: {{ replayError }}</div>
-          <ReplayPlayer
-            v-else-if="replay && replay.events && replay.events.length"
-            :events="(replay.events as eventWithTime[])"
-            :crash-timestamp="replay.meta?.crash_timestamp"
-          />
-          <div v-else class="text-sm text-text-muted">Replay recorded but empty.</div>
+          <template v-if="incident.session_pointer && !sessionTerminalUnavailable">
+            <div v-if="sessionReplayState === 'loading'" class="text-sm text-text-muted">Loading replay...</div>
+            <div v-else-if="sessionReplayState === 'processing'" class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber">
+              Recording is processing. Checking again shortly (attempt {{ sessionPollAttempt }}/24, {{ sessionPollsRemaining }} remaining).
+            </div>
+            <div v-else-if="sessionReplayState === 'error'" class="text-sm text-red-500">Replay unavailable: {{ sessionReplayError }}</div>
+            <template v-else-if="sessionReplayState === 'ready' || sessionReplayState === 'partial'">
+              <div v-if="sessionReplayState === 'partial'" class="text-sm text-amber">
+                {{ sessionMissingChunks.missing }} of {{ sessionMissingChunks.total }} chunks unavailable.
+              </div>
+              <div v-if="sessionReplayApproximate" class="text-sm text-amber">Playback position is approximate.</div>
+              <ReplayPlayer :events="sessionReplayEvents" :crash-timestamp="sessionReplaySeekMs" />
+              <router-link
+                :to="{
+                  name: 'session-detail',
+                  params: { sessionId: incident.session_pointer.session_id },
+                  query: { t: Date.parse(incident.session_pointer.error_at) },
+                }"
+                class="inline-flex text-sm text-teal hover:underline"
+              >Open full session &rarr;</router-link>
+            </template>
+          </template>
+          <template v-else-if="incident.replay_id">
+            <div v-if="replayLoading" class="text-sm text-text-muted">Loading replay...</div>
+            <div v-else-if="replayError" class="text-sm text-red-500">Replay unavailable: {{ replayError }}</div>
+            <ReplayPlayer
+              v-else-if="replay && replay.events && replay.events.length"
+              :events="(replay.events as eventWithTime[])"
+              :crash-timestamp="replay.meta?.crash_timestamp"
+            />
+            <div v-else class="text-sm text-text-muted">Replay recorded but empty.</div>
+          </template>
+          <div v-else class="text-sm text-text-muted">Session recording is no longer available.</div>
         </div>
         <div v-else class="text-sm text-text-faint">No replay captured for this error.</div>
 
