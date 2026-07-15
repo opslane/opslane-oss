@@ -12,6 +12,32 @@ describe('deriveSelector', () => {
     expect(deriveSelector(document.querySelector('button'))).toBe('#checkout');
   });
 
+  // The attribute value is page-controlled. Escaping the quote but not the
+  // backslash lets a value ending in a backslash close the string early: the
+  // emitted selector then no longer denotes the element it was derived from.
+  it('emits a valid selector when the attribute value contains a backslash', () => {
+    const raw = 'a\\"b';
+    document.body.innerHTML = '<button>Buy</button>';
+    const el = document.querySelector('button')!;
+    el.setAttribute('data-testid', raw);
+
+    const selector = deriveSelector(el);
+
+    expect(() => document.querySelector(selector)).not.toThrow();
+    expect(document.querySelector(selector)).toBe(el);
+  });
+
+  it('emits a valid selector for a value ending in a backslash', () => {
+    document.body.innerHTML = '<button>Buy</button>';
+    const el = document.querySelector('button')!;
+    el.setAttribute('data-testid', 'trailing\\');
+
+    const selector = deriveSelector(el);
+
+    expect(() => document.querySelector(selector)).not.toThrow();
+    expect(document.querySelector(selector)).toBe(el);
+  });
+
   it('rejects hash-like ids and falls back to a path', () => {
     document.body.innerHTML = '<div><button id="a1b2c3d4e5f6a1b2c3d4">Buy</button></div>';
     const selector = deriveSelector(document.querySelector('button'));

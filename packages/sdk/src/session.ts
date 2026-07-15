@@ -28,15 +28,22 @@ export interface SessionRotation {
 
 let state: SessionState | null = null;
 
+// A session id is a bearer of evidence: anyone who can guess a live id can
+// reserve a chunk seq against it with the project's public SDK key. It must not
+// be predictable, so Math.random (xorshift128+, recoverable from a few outputs)
+// is not an acceptable source.
 function newId(): string {
   try {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID();
     }
   } catch {
-    // randomUUID needs a secure context; fall through.
+    // randomUUID is restricted to secure contexts. getRandomValues is not, so
+    // an http:// origin still gets a CSPRNG rather than a guessable id.
   }
-  return `sess_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `sess_${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
 function readStorage(): SessionState | null {

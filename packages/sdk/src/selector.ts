@@ -43,7 +43,10 @@ export function deriveSelector(element: Element | null): string {
     for (const attr of ALLOWED_ATTRS) {
       const value = element.getAttribute(attr);
       if (value && !isHashLike(value)) {
-        return `[${attr}="${value.replace(/"/g, '\\"')}"]`.slice(0, MAX_LENGTH);
+        // Backslash first: escaping the quote first would then escape the
+        // backslash we just added, letting a value ending in \ close the string.
+        const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return `[${attr}="${escaped}"]`.slice(0, MAX_LENGTH);
       }
     }
 
