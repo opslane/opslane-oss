@@ -8,7 +8,10 @@ export type ErrorGroupStatus =
   | 'needs_human'
   | 'resolved'
   | 'merged'
-  | 'archived';
+  | 'archived'
+  | 'candidate'
+  | 'awaiting_approval'
+  | 'insight';
 
 export type ConfidenceLevel = 'high' | 'medium' | 'low';
 
@@ -21,6 +24,7 @@ export interface NeedsHumanReason {
 export interface Incident {
   id: string;
   project_id: string;
+  kind: 'error' | 'friction';
   fingerprint: string;
   title: string;
   status: ErrorGroupStatus;

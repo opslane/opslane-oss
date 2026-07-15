@@ -71,6 +71,7 @@ export interface PRInput {
   } | null;
   errorType?: string;
   errorMessage?: string;
+  kind?: 'error' | 'friction';
 }
 
 export type PRResult =
@@ -264,7 +265,9 @@ export function buildPRBody(input: PRInput): string {
   const replayLink = buildReplayLink(input.errorGroupId, input.projectId);
 
   return [
-    `## 🛡️ Opslane fixed ${sanitizeInline(input.title, 120)}`,
+    input.kind === 'friction'
+      ? `## 💡 Opslane suggestion: ${sanitizeInline(input.title, 120)}`
+      : `## 🛡️ Opslane fixed ${sanitizeInline(input.title, 120)}`,
     buildHumanSummary(input),
     '### The fix',
     buildFixLine(input, files),
@@ -396,7 +399,9 @@ export async function createPR(
     const pr = await client.createPullRequest({
       owner,
       repo,
-      title: `[Opslane] Fix: ${input.title}`,
+      title: input.kind === 'friction'
+        ? `[Opslane] Suggestion: ${input.title}`
+        : `[Opslane] Fix: ${input.title}`,
       body: prBody,
       head: input.branchName,
       base: input.defaultBranch,

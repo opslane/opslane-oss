@@ -19,6 +19,11 @@ import { initTracing, shutdownTracing, withJobTrace, getActiveTraceId, buildLang
 import { runVisualAnalysis, type VisualAnalysisOutput } from './visual-analysis.js';
 import { buildReplayEvidenceFromRecording } from './replay-evidence.js';
 import { hasNoAppFrames } from './harness/stack-trace-utils.js';
+import { gatherFrictionEvidence } from './friction/friction-evidence.js';
+import { investigateFriction } from './friction/investigate-friction.js';
+import { readChunksBounded } from './friction/chunk-reader.js';
+import { analyzeSession, RULE_VERSION } from './friction/analyzer.js';
+import { writeFrictionSignals } from './friction/persist.js';
 
 /**
  * Maps the raw DB/SDK replay_signals JSON (nested, snake_case) to the flat camelCase
@@ -86,7 +91,7 @@ async function processJob(job: ClaimedJob, signal: AbortSignal): Promise<void> {
   await withJobTrace(job.id, job.errorGroupId ?? job.sourceId ?? 'unknown', job.projectId, () => processJobInner(job, signal));
 }
 
-async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<void> {
+export async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<void> {
   // Fire-and-forget: persist Langfuse trace URL on the job row
   const traceId = getActiveTraceId();
   if (traceId) {
@@ -107,6 +112,12 @@ async function processJobInner(job: ClaimedJob, signal: AbortSignal): Promise<vo
 
   if (job.jobType === 'setup_pr') {
     await processSetupPrJob({ id: job.id, projectId: job.projectId });
+    return;
+  }
+
+  if (job.jobType === 'session_analysis') {
+    if (!job.sessionId) throw new Error(`Job ${job.id} missing session_id`);
+    await processSessionAnalysisJob(job as ClaimedJob & { sessionId: string }, signal);
     return;
   }
 
@@ -155,6 +166,11 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
   // Fetch real data
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+
+  if (group.kind === 'friction') {
+    await processFrictionInvestigateJob(job, group, signal);
+    return;
+  }
 
   const event = group.sample_event_id
     ? await db.getErrorEvent(group.sample_event_id, job.projectId)
@@ -347,6 +363,133 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
   lastJobAt = new Date().toISOString();
 }
 
+export async function processFrictionInvestigateJob(
+  job: ClaimedJob & { errorGroupId: string },
+  group: db.ErrorGroupData,
+  signal: AbortSignal,
+): Promise<void> {
+  checkAbort(signal);
+  const apiKey = process.env['ANTHROPIC_API_KEY'];
+  if (!apiKey) {
+    await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: {
+        reason_code: 'missing_llm_key',
+        reason_message: 'ANTHROPIC_API_KEY environment variable is not set',
+        remediation: 'Set ANTHROPIC_API_KEY so the friction incident can be classified against the codebase',
+      },
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    return;
+  }
+
+  const project = await db.getProject(job.projectId);
+  if (!project) throw new Error(`Project ${job.projectId} not found`);
+
+  let githubToken: string | undefined;
+  const installInfo = await db.getProjectGitHubInstallation(job.projectId);
+  if (installInfo?.installationId) {
+    try {
+      githubToken = await getInstallationToken(installInfo.installationId);
+    } catch (error: unknown) {
+      logger.error('Failed to get GitHub installation token', {
+        project_id: job.projectId,
+        error: String(error),
+      });
+    }
+  }
+  githubToken ??= process.env['GITHUB_TOKEN'];
+  checkAbort(signal);
+
+  let clone: Awaited<ReturnType<typeof cloneRepo>>;
+  try {
+    clone = await cloneRepo({
+      githubRepo: project.github_repo,
+      defaultBranch: project.default_branch,
+      jobId: job.id,
+      githubToken,
+    });
+  } catch (error: unknown) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const message = raw.replace(/https:\/\/[^@]+@/g, 'https://***@');
+    await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
+      reason: buildReason(
+        raw.includes('GITHUB_TOKEN') ? 'missing_github_token' : 'repo_access_denied',
+        `Failed to clone repository: ${message}`,
+      ),
+    });
+    jobsFailed++;
+    lastJobAt = new Date().toISOString();
+    return;
+  }
+
+  try {
+    const evidence = await gatherFrictionEvidence(job.errorGroupId, job.projectId);
+    checkAbort(signal);
+    const result = await investigateFriction(apiKey, group, evidence, clone.repoDir);
+    checkAbort(signal);
+    if (result.codeCause) {
+      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+        rootCause: result.reason,
+        suggestedMitigation: result.remediation,
+        confidence: result.confidence,
+      });
+      logger.info('Friction investigation: awaiting human approval', {
+        job_id: job.id,
+        confidence: result.confidence,
+      });
+    } else {
+      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'insight', {
+        rootCause: result.reason,
+        confidence: result.confidence,
+      });
+      logger.info('Friction investigation: recorded insight', {
+        job_id: job.id,
+        confidence: result.confidence,
+      });
+    }
+    jobsProcessed++;
+    lastJobAt = new Date().toISOString();
+  } finally {
+    await clone.cleanup();
+  }
+}
+
+export async function processSessionAnalysisJob(
+  job: ClaimedJob & { sessionId: string },
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    const session = await db.getSessionForAnalysis(job.sessionId, job.projectId);
+    if (!session) throw new Error(`Session ${job.sessionId} not found`);
+    await db.setSessionAnalysisStatus(job.sessionId, job.projectId, 'analyzing');
+    checkAbort(signal);
+    const chunks = await db.getScrubbedChunksForSession(job.sessionId, job.projectId);
+    const read = await readChunksBounded(chunks);
+    checkAbort(signal);
+    const signals = analyzeSession(read.envelopes);
+    await writeFrictionSignals(session, signals, RULE_VERSION);
+    await db.setSessionAnalysisStatus(job.sessionId, job.projectId, 'analyzed', RULE_VERSION);
+    if (read.truncated) {
+      logger.warn('Session analysis completed from bounded prefix', {
+        job_id: job.id,
+        session_id: job.sessionId,
+        inflated_bytes: read.inflatedBytes,
+        chunk_count: read.envelopes.length,
+      });
+    }
+    jobsProcessed++;
+    lastJobAt = new Date().toISOString();
+  } catch (error: unknown) {
+    try {
+      await db.setSessionAnalysisStatus(job.sessionId, job.projectId, 'analysis_failed');
+    } catch {
+      // Preserve the original analyzer/chunk failure for the poller's retry path.
+    }
+    throw error;
+  }
+}
+
 /**
  * Fix job: loads investigation context, runs the full agent fix pipeline,
  * and creates a PR or reverts to investigated on failure.
@@ -358,6 +501,12 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   // Fetch real data
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+
+  if (group.kind === 'friction' && job.triggeredBy !== 'human') {
+    await updateGroupStatus(job.errorGroupId, job.projectId, 'awaiting_approval');
+    logger.warn('Refused non-human friction fix job', { job_id: job.id });
+    return;
+  }
 
   const event = group.sample_event_id
     ? await db.getErrorEvent(group.sample_event_id, job.projectId)
@@ -487,6 +636,9 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
     checkAbort(signal);
 
     const repoUrl = `https://github.com/${project.github_repo}.git`;
+    const frictionEvidence = group.kind === 'friction'
+      ? await gatherFrictionEvidence(job.errorGroupId, job.projectId)
+      : null;
 
     const result = await runPipeline({
       jobId: job.id,
@@ -506,6 +658,14 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       githubRepo: project.github_repo,
       defaultBranch: project.default_branch,
       githubToken,
+      kind: group.kind,
+      frictionEvidence: frictionEvidence
+        ? JSON.stringify({
+            signals: frictionEvidence.signals,
+            timeline: frictionEvidence.timeline,
+            truncated: frictionEvidence.truncated,
+          })
+        : undefined,
       replay: replay ? {
         id: replay.id,
         sessionId: replay.session_id,

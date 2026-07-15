@@ -14,21 +14,26 @@ const steps: { key: ErrorGroupStatus; label: string }[] = [
 ];
 
 const statusIndex: Record<ErrorGroupStatus, number> = {
+  candidate: -1,
   new: 0,
   queued: 1,
   analyzing: 2,
   investigated: 3,
   fixing: 4,
+  awaiting_approval: 5,
   pr_created: 5,
   needs_human: 5,
+  insight: 5,
   resolved: 5,
   merged: 5,
   archived: 5,
 };
 
 const terminalLabels: Partial<Record<ErrorGroupStatus, string>> = {
+  awaiting_approval: 'Awaiting approval',
   pr_created: 'PR Created',
   needs_human: 'Needs Human',
+  insight: 'Insight',
   resolved: 'Resolved',
   merged: 'Merged',
   archived: 'Archived',

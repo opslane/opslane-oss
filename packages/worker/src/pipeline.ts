@@ -27,6 +27,8 @@ export interface PipelineInput {
   defaultBranch: string;
   githubToken?: string;
   replay?: ReplayInput | null;
+  kind?: 'error' | 'friction';
+  frictionEvidence?: string;
   /** Pre-computed investigation results. When set, agent skips internal triage. */
   investigation?: {
     rootCause: string;
@@ -62,6 +64,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     githubToken: input.githubToken,
     repoPath: input.repoPath,
     investigation: input.investigation,
+    frictionEvidence: input.frictionEvidence,
   });
 
   if (fixResult.status === 'needs_human') {
@@ -148,6 +151,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       visualAnalysis: input.visualAnalysis,
       errorType: input.errorType,
       errorMessage: input.errorMessage,
+      kind: input.kind,
     }, input.githubToken ? () => createGitHubClient(input.githubToken) : undefined),
   );
 

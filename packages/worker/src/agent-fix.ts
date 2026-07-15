@@ -31,6 +31,7 @@ export interface AgentFixInput {
   maxTurns?: number;
   budgetUsd?: number;
   model?: string;
+  frictionEvidence?: string;
   /** Shell commands to run after clone+install, before agent starts (e.g. apply bug patch for eval). */
   setupCommands?: string[];
   /** Local repo clone path. When set, investigation uses codebase-aware classification instead of blind triage. */
@@ -904,6 +905,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
             stackTrace: input.stackTrace,
             diff,
             stackTraceFiles,
+            frictionEvidence: input.frictionEvidence,
           }),
         );
 

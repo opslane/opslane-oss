@@ -46,7 +46,7 @@ function addLineNumbers(content: string): string {
 }
 
 /** read_file tool: read a source file from the repo with line numbers. */
-async function executeReadFile(
+export async function executeReadFile(
   repoPath: string,
   input: Record<string, unknown>,
 ): Promise<string> {
@@ -70,7 +70,7 @@ async function executeReadFile(
 }
 
 /** search tool: grep for patterns in the repo, excluding node_modules/.git/dist. */
-async function executeSearch(
+export async function executeSearch(
   repoPath: string,
   input: Record<string, unknown>,
 ): Promise<string> {
@@ -119,7 +119,7 @@ async function executeSearch(
 }
 
 /** list_files tool: list directory entries in the repo. */
-async function executeListFiles(
+export async function executeListFiles(
   repoPath: string,
   input: Record<string, unknown>,
 ): Promise<string> {

@@ -86,7 +86,11 @@ export type ErrorGroupStatus =
   | 'needs_human'
   | 'resolved'
   | 'merged'
-  | 'archived';
+  | 'archived'
+  // Friction lifecycle (epic #31 Batch 3, design v4-4/v4-10):
+  | 'candidate' // Adjudication pending; hidden from every list/read API.
+  | 'awaiting_approval' // Code cause found; parked for a human; fix-eligible.
+  | 'insight'; // No code cause; terminal; never becomes a PR.
 
 // === Reason contract for needs_human ===
 
@@ -126,9 +130,13 @@ export type ConfidenceLevel = 'high' | 'medium' | 'low';
 
 // === Incident (read API response) ===
 
+export type IncidentKind = 'error' | 'friction';
+export type FrictionSignalType = 'rage_click' | 'dead_click' | 'form_abandon';
+
 export interface Incident {
   id: string;
   project_id: string;
+  kind: IncidentKind;
   fingerprint: string;
   title: string;
   status: ErrorGroupStatus;
@@ -190,7 +198,33 @@ export interface Account {
   last_seen: string;
 }
 
-export type JobType = 'error_fix' | 'investigate' | 'fix' | 'setup_pr';
+export type JobType = 'error_fix' | 'investigate' | 'fix' | 'setup_pr' | 'session_analysis';
+
+// === Session chunk wire format ===
+// Keep wire-compatible with packages/sdk/src/telemetry.ts and
+// packages/sdk/src/chunk-upload.ts. The SDK intentionally keeps local types to
+// avoid taking a dependency on this package.
+
+export type SessionTelemetryEvent =
+  | { kind: 'click'; clickId: string; selector: string; cursor: string; at: number }
+  | { kind: 'request_start'; requestId: string; clickId: string | null; method: string; url: string; at: number }
+  | { kind: 'request_end'; requestId: string; status: number; at: number }
+  | { kind: 'form_submit'; selector: string; at: number };
+
+/**
+ * Decompressed `session_chunks` object body. `events` are raw rrweb
+ * `eventWithTime` entries; telemetry rides as rrweb custom events (top-level
+ * `type === 5`, `data.tag === 'opslane.telemetry'`, and `data.payload` matches
+ * {@link SessionTelemetryEvent}).
+ */
+export interface SessionChunkEnvelope {
+  events: unknown[];
+  meta: {
+    sdk_version: string;
+    has_full_snapshot: boolean;
+    chunked_at: number;
+  };
+}
 
 /** Status of the one-time "install Opslane SDK" PR for a project. */
 export type SetupPrStatus =

@@ -27,6 +27,8 @@ function makeJob(overrides?: Partial<ClaimedJob>): ClaimedJob {
     jobType: 'investigate',
     attempts: 0,
     guidance: null,
+    triggeredBy: null,
+    sessionId: null,
     ...overrides,
   };
 }

@@ -1,5 +1,7 @@
 import { deriveSelector } from './selector';
 
+// Wire-compatible mirror: shared/src/types.ts exports SessionTelemetryEvent.
+// Keep both unions in sync; the browser SDK intentionally does not depend on shared.
 export type TelemetryEvent =
   | { kind: 'click'; clickId: string; selector: string; cursor: string; at: number }
   | { kind: 'request_start'; requestId: string; clickId: string | null; method: string; url: string; at: number }

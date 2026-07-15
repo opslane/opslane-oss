@@ -29,10 +29,12 @@ export interface ClaimedJob {
   jobType: JobType;
   attempts: number;
   guidance: string | null;
+  triggeredBy: 'auto' | 'human' | null;
+  sessionId: string | null;
 }
 
 /** Claims the oldest pending job using FOR UPDATE SKIP LOCKED.
- *  Priority: error_fix jobs first, then other job types. */
+ * Priority: error_fix first, interactive work next, session analysis last. */
 export async function claimJob(
   workerId: string,
   leaseDurationMs: number
@@ -46,6 +48,8 @@ export async function claimJob(
     job_type: JobType;
     attempts: number;
     guidance: string | null;
+    triggered_by: 'auto' | 'human' | null;
+    session_id: string | null;
   }>(
     `UPDATE error_group_jobs
      SET status = 'claimed',
@@ -56,11 +60,16 @@ export async function claimJob(
      WHERE id = (
        SELECT id FROM error_group_jobs
        WHERE status = 'pending'
-       ORDER BY CASE WHEN job_type = 'error_fix' THEN 0 ELSE 1 END, created_at ASC
+       ORDER BY CASE
+         WHEN job_type = 'error_fix' THEN 0
+         WHEN job_type = 'session_analysis' THEN 2
+         ELSE 1
+       END, created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED
      )
-     RETURNING id, error_group_id, source_id, project_id, job_type, attempts, guidance`,
+     RETURNING id, error_group_id, source_id, project_id, job_type, attempts,
+               guidance, triggered_by, session_id`,
     [workerId, leaseDurationMs / 1000]
   );
 
@@ -75,6 +84,8 @@ export async function claimJob(
     jobType: row.job_type,
     attempts: row.attempts,
     guidance: row.guidance,
+    triggeredBy: row.triggered_by,
+    sessionId: row.session_id,
   };
 }
 
@@ -154,6 +165,7 @@ export async function requeueStaleJobs(): Promise<number> {
   const db = getPool();
   const result = await db.query<{
     error_group_id: string | null;
+    session_id: string | null;
     project_id: string;
     job_type: JobType;
     status: string;
@@ -182,7 +194,7 @@ export async function requeueStaleJobs(): Promise<number> {
          END,
          updated_at = now()
      WHERE status = 'claimed' AND lease_expires_at < now()
-     RETURNING error_group_id, project_id, job_type, status`
+     RETURNING error_group_id, session_id, project_id, job_type, status`
   );
 
   // Reconcile any FIX job that just dead-lettered: its error group is stuck in
@@ -202,6 +214,18 @@ export async function requeueStaleJobs(): Promise<number> {
             'Re-run the fix from the incident, or review manually — the worker could not hold a lease long enough to finish.',
         },
       }).catch(() => {});
+    }
+    if (
+      row.status === 'dead_letter' &&
+      row.job_type === 'session_analysis' &&
+      row.session_id
+    ) {
+      await db.query(
+        `UPDATE sessions
+         SET status = 'analysis_failed'
+         WHERE id = $1 AND project_id = $2`,
+        [row.session_id, row.project_id],
+      ).catch(() => {});
     }
   }
 
@@ -334,12 +358,17 @@ export interface ErrorGroupData {
   sample_event_id: string;
   occurrence_count: number;
   status: string;
+  kind: 'error' | 'friction';
+  signal_type: string | null;
+  element_selector: string | null;
+  page_url_normalized: string | null;
 }
 
 export async function getErrorGroup(groupId: string, projectId: string): Promise<ErrorGroupData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ErrorGroupData>(
-    `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status
+    `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status,
+            kind, signal_type, element_selector, page_url_normalized
      FROM error_groups WHERE id = $1 AND project_id = $2`,
     [groupId, projectId],
   );
@@ -485,7 +514,7 @@ export async function getSourceMaps(projectId: string, release: string): Promise
 export async function updateGroupInvestigation(
   errorGroupId: string,
   projectId: string,
-  status: 'investigated' | 'fixing' | 'needs_human',
+  status: 'investigated' | 'fixing' | 'needs_human' | 'insight' | 'awaiting_approval',
   fields: {
     rootCause?: string;
     suggestedMitigation?: string;
@@ -562,8 +591,8 @@ export async function updateGroupAndCreateFixJob(
       ]
     );
     const result = await client.query<{ id: string }>(
-      `INSERT INTO error_group_jobs (error_group_id, project_id, job_type)
-       VALUES ($1, $2, 'fix')
+      `INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
+       VALUES ($1, $2, 'fix', 'auto')
        RETURNING id`,
       [errorGroupId, projectId]
     );
@@ -575,6 +604,97 @@ export async function updateGroupAndCreateFixJob(
   } finally {
     client.release();
   }
+}
+
+export interface FrictionSignalRow {
+  id: string;
+  session_id: string;
+  signal_type: 'rage_click' | 'dead_click' | 'form_abandon';
+  fingerprint: string;
+  element_selector: string | null;
+  page_url_normalized: string;
+  occurred_at: string;
+  occurrence_count: number;
+  rule_version: number;
+}
+
+export async function getFrictionSignalsForGroup(
+  errorGroupId: string,
+  projectId: string,
+): Promise<FrictionSignalRow[]> {
+  const db = getPool();
+  const { rows } = await db.query<FrictionSignalRow>(
+    `SELECT id, session_id, signal_type, fingerprint, element_selector,
+            page_url_normalized, occurred_at, occurrence_count, rule_version
+     FROM friction_signals
+     WHERE incident_id = $1 AND project_id = $2
+       AND superseded_by IS NULL AND retracted_at IS NULL
+     ORDER BY occurred_at ASC`,
+    [errorGroupId, projectId],
+  );
+  return rows;
+}
+
+export interface SessionChunkRow {
+  session_id: string;
+  seq: number;
+  object_key: string;
+  size_bytes: number | null;
+  has_full_snapshot: boolean;
+}
+
+/** Only server-scrubbed, committed chunks are eligible for worker reads. */
+export async function getScrubbedChunksForSession(
+  sessionId: string,
+  projectId: string,
+): Promise<SessionChunkRow[]> {
+  const db = getPool();
+  const { rows } = await db.query<SessionChunkRow>(
+    `SELECT session_id, seq, object_key, size_bytes, has_full_snapshot
+     FROM session_chunks
+     WHERE session_id = $1 AND project_id = $2 AND scrubbed_at IS NOT NULL
+     ORDER BY seq ASC`,
+    [sessionId, projectId],
+  );
+  return rows;
+}
+
+export interface SessionRow {
+  id: string;
+  project_id: string;
+  environment_id: string;
+  end_user_id: string | null;
+  status: string;
+}
+
+export async function getSessionForAnalysis(
+  sessionId: string,
+  projectId: string,
+): Promise<SessionRow | null> {
+  const db = getPool();
+  const { rows } = await db.query<SessionRow>(
+    `SELECT id, project_id, environment_id, end_user_id, status
+     FROM sessions
+     WHERE id = $1 AND project_id = $2`,
+    [sessionId, projectId],
+  );
+  return rows[0] ?? null;
+}
+
+export async function setSessionAnalysisStatus(
+  sessionId: string,
+  projectId: string,
+  status: 'analyzing' | 'analyzed' | 'analysis_failed',
+  ruleVersion?: number,
+): Promise<void> {
+  const db = getPool();
+  await db.query(
+    `UPDATE sessions
+     SET status = $3,
+         analyzer_rule_version = COALESCE($4, analyzer_rule_version)
+     WHERE id = $1 AND project_id = $2`,
+    [sessionId, projectId, status, ruleVersion ?? null],
+  );
 }
 
 /**

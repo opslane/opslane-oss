@@ -18,9 +18,9 @@ import (
 // indicating a potential token theft. All tokens in the family are revoked.
 var ErrTokenReuse = errors.New("refresh token reuse detected")
 
-// ErrNotInvestigated is returned when TriggerFixJob is called on an error group
-// that is not in the 'investigated' state.
-var ErrNotInvestigated = errors.New("incident not in investigated state")
+// ErrNotInvestigated is returned when TriggerFixJob is called on an incident
+// that is not in the fix-triggerable state for its kind.
+var ErrNotInvestigated = errors.New("incident not in a fix-triggerable state")
 
 // ErrNoGithubRepo indicates the project has no repo configured for a setup PR.
 var ErrNoGithubRepo = errors.New("project has no github_repo")
@@ -237,6 +237,7 @@ type ErrorGroup struct {
 	OccurrenceCount     int
 	AffectedUsersCount  int
 	Status              string
+	Kind                string
 	ReasonCode          *string
 	ReasonMessage       *string
 	Remediation         *string
@@ -244,6 +245,9 @@ type ErrorGroup struct {
 	PrURL               *string
 	RootCause           *string
 	SuggestedMitigation *string
+	SignalType          *string
+	ElementSelector     *string
+	PageURLNormalized   *string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	MergedAt            *time.Time
@@ -490,16 +494,17 @@ type ErrorGroupFilters struct {
 // ListErrorGroups returns error groups for a project with optional filters. Tenant-scoped.
 func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters *ErrorGroupFilters) ([]ErrorGroup, error) {
 	query := `SELECT DISTINCT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
-		        eg.occurrence_count, eg.affected_users_count, eg.status,
+		        eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
 		        eg.reason_code, eg.reason_message, eg.remediation,
 		        eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
+		        eg.signal_type, eg.element_selector, eg.page_url_normalized,
 		        eg.created_at, eg.updated_at,
 		        eg.merged_at, eg.resolved_at, eg.archived_at
 		 FROM error_groups eg`
 
 	args := []interface{}{projectID}
 	argIdx := 2
-	wheres := []string{fmt.Sprintf("eg.project_id = $1")}
+	wheres := []string{"eg.project_id = $1", "eg.status <> 'candidate'"}
 
 	needsJoin := filters != nil && (filters.AccountID != "" || filters.EndUserID != "")
 	if needsJoin {
@@ -539,9 +544,10 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		var g ErrorGroup
 		err := rows.Scan(
 			&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status,
+			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
 			&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 			&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
+			&g.SignalType, &g.ElementSelector, &g.PageURLNormalized,
 			&g.CreatedAt, &g.UpdatedAt,
 			&g.MergedAt, &g.ResolvedAt, &g.ArchivedAt,
 		)
@@ -678,19 +684,21 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 	var g ErrorGroup
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, project_id, fingerprint, title, first_seen, last_seen,
-		        occurrence_count, affected_users_count, status,
+		        occurrence_count, affected_users_count, status, kind,
 		        reason_code, reason_message, remediation,
 		        confidence, pr_url, root_cause, suggested_mitigation,
+		        signal_type, element_selector, page_url_normalized,
 		        created_at, updated_at,
 		        merged_at, resolved_at, archived_at
 		 FROM error_groups
-		 WHERE id = $1 AND project_id = $2`,
+		 WHERE id = $1 AND project_id = $2 AND status <> 'candidate'`,
 		groupID, projectID,
 	).Scan(
 		&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status,
+		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
 		&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 		&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
+		&g.SignalType, &g.ElementSelector, &g.PageURLNormalized,
 		&g.CreatedAt, &g.UpdatedAt,
 		&g.MergedAt, &g.ResolvedAt, &g.ArchivedAt,
 	)
@@ -724,8 +732,9 @@ func (q *Queries) GetLatestJobTraceURL(ctx context.Context, projectID, errorGrou
 	return traceURL, nil
 }
 
-// TriggerFixJob atomically transitions an error group from 'investigated' to 'fixing'
-// and creates a fix job. Returns the new job ID or an error. Tenant-scoped.
+// TriggerFixJob atomically transitions an incident from its kind-specific
+// fix-triggerable state to 'fixing' and creates a human-triggered fix job.
+// Returns the new job ID or an error. Tenant-scoped.
 func (q *Queries) TriggerFixJob(ctx context.Context, projectID, groupID, guidance string) (string, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -738,7 +747,12 @@ func (q *Queries) TriggerFixJob(ctx context.Context, projectID, groupID, guidanc
 	err = tx.QueryRow(ctx,
 		`UPDATE error_groups
 		 SET status = 'fixing', updated_at = now()
-		 WHERE id = $1 AND project_id = $2 AND status = 'investigated'
+		 WHERE id = $1 AND project_id = $2
+		   AND (
+		     (kind = 'error' AND status = 'investigated')
+		     OR
+		     (kind = 'friction' AND status = 'awaiting_approval')
+		   )
 		 RETURNING id`,
 		groupID, projectID,
 	).Scan(&id)
@@ -752,8 +766,8 @@ func (q *Queries) TriggerFixJob(ctx context.Context, projectID, groupID, guidanc
 	// Create fix job
 	var jobID string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, guidance)
-		 VALUES ($1, $2, 'fix', $3)
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, guidance, triggered_by)
+		 VALUES ($1, $2, 'fix', $3, 'human')
 		 RETURNING id`,
 		groupID, projectID, nilIfEmpty(guidance),
 	).Scan(&jobID)
@@ -1139,11 +1153,14 @@ func (q *Queries) ArchiveErrorGroup(ctx context.Context, projectID, groupID stri
 	return nil
 }
 
-// UnarchiveErrorGroup transitions an error group from archived back to investigated. Tenant-scoped.
+// UnarchiveErrorGroup transitions an archived incident to a conservative,
+// kind-safe state. Tenant-scoped.
 func (q *Queries) UnarchiveErrorGroup(ctx context.Context, projectID, groupID string) error {
 	ct, err := q.pool.Exec(ctx,
 		`UPDATE error_groups
-		 SET status = 'investigated', archived_at = NULL, updated_at = now()
+		 SET status = CASE WHEN kind = 'friction' THEN 'insight'::error_group_status
+		                   ELSE 'investigated'::error_group_status END,
+		     archived_at = NULL, updated_at = now()
 		 WHERE id = $1 AND project_id = $2 AND status = 'archived'`,
 		groupID, projectID,
 	)
