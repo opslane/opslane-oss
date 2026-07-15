@@ -27,6 +27,7 @@ const keylessWorkerRunning = process.env['E2E_WORKER_NO_KEY'] === '1';
 const playwrightAvailable = await isPlaywrightAvailable();
 
 const VUE_FIXTURE = resolve(__dirname, '../test-fixtures/vue-app');
+const REACT_FIXTURE = resolve(__dirname, '../test-fixtures/react-app');
 
 async function pollIncidentMatching(
   tenant: TestTenant,
@@ -95,6 +96,65 @@ describe.skipIf(hasLLMKey || !keylessWorkerRunning || !playwrightAvailable)(
         expect(terminal.reason?.reason_code).toBe('missing_llm_key');
         expect(terminal.reason?.reason_message).toBeTruthy();
         expect(terminal.reason?.remediation).toBeTruthy();
+      } finally {
+        await page.close();
+      }
+    }, 180_000);
+  }
+);
+
+describe.skipIf(hasLLMKey || !keylessWorkerRunning || !playwrightAvailable)(
+  'browser smoke: React error to needs_human',
+  () => {
+    let tenant: TestTenant;
+    let fixture: FixtureServer;
+    let browser: import('@playwright/test').Browser;
+
+    beforeAll(async () => {
+      tenant = await seedTenant();
+      const react = (await import('@vitejs/plugin-react')).default;
+      fixture = await startFixture({
+        fixtureDir: REACT_FIXTURE,
+        apiKey: tenant.apiKey,
+        ingestionUrl: getConfig().ingestionUrl,
+        entryPattern: /\/main\.tsx$/,
+        plugins: [react()],
+      });
+      const { chromium } = await import('@playwright/test');
+      browser = await chromium.launch();
+    }, 60_000);
+
+    afterAll(async () => {
+      await browser?.close();
+      await fixture?.close();
+      if (tenant) await cleanupTenant(tenant.orgId);
+      await closePool();
+    });
+
+    it('React error-boundary error reaches needs_human with missing_llm_key', async () => {
+      const page = await browser.newPage();
+      try {
+        await page.goto(fixture.url);
+        await page.click('[data-testid="nav-profile"]');
+        await page.click('[data-testid="load-profile-btn"]');
+        await page.waitForSelector('[data-testid="boundary-fallback"]');
+
+        const incident = await pollIncidentMatching(
+          tenant,
+          (candidate) => {
+            const title = candidate.title.toLowerCase();
+            return title.includes('displayname') || title.includes('null');
+          }
+        );
+        const terminal = await pollUntilTerminal(
+          tenant.apiKey,
+          tenant.projectId,
+          incident.id,
+          ['needs_human'],
+          90_000
+        );
+        expect(terminal.status).toBe('needs_human');
+        expect(terminal.reason?.reason_code).toBe('missing_llm_key');
       } finally {
         await page.close();
       }
