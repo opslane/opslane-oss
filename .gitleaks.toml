@@ -9,6 +9,10 @@ description = "Synthetic credentials used to verify secret masking and authentic
 paths = [
   '''packages/ingestion/db/agent_session_test\.go''',
   '''packages/ingestion/masking/masking_test\.go''',
+  # The chunk scrubber's fixtures must look like real keys -- the tests assert
+  # a Stripe-shaped token does not survive redaction, so a token gitleaks
+  # ignores would prove nothing.
+  '''packages/ingestion/scrubber/scrubber_test\.go''',
   '''packages/sdk/src/__tests__/scrub\.test\.ts''',
   '''test-e2e/error-to-pr\.test\.ts''',
   '''test-e2e/replay-contract\.test\.ts''',
