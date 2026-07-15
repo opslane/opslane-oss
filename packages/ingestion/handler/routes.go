@@ -58,6 +58,13 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 	// GitHub webhook (unauthenticated — uses HMAC signature verification)
 	r.Post("/api/v1/github/webhook", deps.HandleWebhook)
 
+	// Internal service read (worker -> ingestion). The shared implementation
+	// applies the same scrub gate and redact-on-read policy as dashboard reads.
+	r.With(RequireInternalToken).Get("/internal/v1/projects/{projectID}/sessions/{sessionID}/chunks/{seq}",
+		func(w http.ResponseWriter, r *http.Request) {
+			deps.serveChunk(w, r, chi.URLParam(r, "projectID"))
+		})
+
 	r.Route("/api/v1", func(r chi.Router) {
 		// SDK endpoints (authenticated by API key, rate-limited per project).
 		// Browser endpoints (events, replays) are also origin-gated. Sourcemaps are
@@ -102,6 +109,10 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents/{incidentID}", deps.GetIncident)
 		// === Project D: replay retrieval (project-scoped, dashboard JWT auth) ===
 		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/replays/{replayID}", deps.GetReplay)
+		// Always-on session browsing and bounded chunk playback.
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions", deps.ListSessionsEndpoint)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions/{sessionID}", deps.GetSessionEndpoint)
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions/{sessionID}/chunks/{seq}", deps.GetSessionChunk)
 		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/incidents/{incidentID}/affected-users", deps.ListAffectedUsers)
 		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/fix", deps.TriggerFix)
 		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/resolve", deps.ResolveIncident)

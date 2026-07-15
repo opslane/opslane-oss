@@ -2,7 +2,7 @@ import type { ErrorEventPayload } from '@opslane/shared';
 import { getConfig } from './config';
 import { buildUserContext, getCurrentUser } from './core';
 import type { ReplayTriggerType } from './replay';
-import { uploadReplayForTrigger } from './replay';
+import { flushReplayBufferForError } from './replay';
 import { scrubEvent } from './scrub';
 import { shouldThrottle } from './throttle';
 
@@ -13,17 +13,6 @@ export type IngestPayload = ErrorEventPayload;
 interface QueuedEvent {
   payload: IngestPayload;
   replayTrigger?: ReplayTriggerType;
-}
-
-interface EventIngestResponse {
-  event_id?: string;
-  group_id?: string;        // C1: ingestion returns this; same value as error_group_id
-  error_group_id?: string;
-}
-
-/** C1: prefer error_group_id, fall back to group_id (decouples deploy ordering with D). */
-export function resolveGroupId(r: EventIngestResponse | undefined): string | undefined {
-  return r?.error_group_id ?? r?.group_id;
 }
 
 let queue: QueuedEvent[] = [];
@@ -142,22 +131,7 @@ export async function flushEvents(): Promise<void> {
         }
 
         if (queued.replayTrigger && config.replayEnabled && 'error' in event) {
-          let ingest: EventIngestResponse | undefined;
-          try {
-            ingest = await response.json();
-          } catch {
-            ingest = undefined;
-          }
-
-          // Retained until Batch 2 migrates the dashboard and worker readers
-          // from session_replays onto chunk-stream pointers (design v4-6).
-          void uploadReplayForTrigger({
-            triggerType: queued.replayTrigger,
-            errorType: event.error.type,
-            errorMessage: event.error.message,
-            eventId: ingest?.event_id,
-            errorGroupId: resolveGroupId(ingest),
-          });
+          flushReplayBufferForError();
         }
       } catch {
         failed.push(queued);

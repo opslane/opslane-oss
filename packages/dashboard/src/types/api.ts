@@ -38,6 +38,66 @@ export interface Incident {
   archived_at?: string;
   trace_url?: string;
   replay_id?: string; // Project D: rrweb replay correlation
+  session_pointer?: {
+    session_id: string;
+    error_at: string;
+  };
+}
+
+// === Session replay browsing ===
+
+export type SessionStatus =
+  | 'recording'
+  | 'closed'
+  | 'analyzing'
+  | 'analyzed'
+  | 'analysis_failed'
+  | 'deleting';
+
+export interface SessionEndUser {
+  id: string;
+  external_user_id?: string | null;
+  email?: string | null;
+  external_account_id?: string | null;
+  account_name?: string | null;
+}
+
+export interface SessionSummary {
+  id: string;
+  started_at: string;
+  last_chunk_at?: string | null;
+  status: SessionStatus;
+  chunk_count: number;
+  playable_chunk_count: number;
+  bytes_stored: number;
+  page_url?: string | null;
+  end_user?: SessionEndUser | null;
+}
+
+export interface SessionChunkMeta {
+  seq: number;
+  size_bytes?: number | null;
+  decoded_size_bytes?: number | null;
+  has_full_snapshot: boolean;
+  first_event_ms?: number | null;
+  last_event_ms?: number | null;
+}
+
+export interface SessionDetail extends SessionSummary {
+  chunks: SessionChunkMeta[];
+}
+
+export interface SessionListResponse {
+  sessions: SessionSummary[];
+  next_cursor?: string | null;
+}
+
+export interface SessionFilters {
+  end_user_id?: string;
+  account_id?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
 }
 
 // === B2B types ===

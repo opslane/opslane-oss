@@ -12,6 +12,8 @@ import {
   getErrorEvent,
   getProject,
   getReplayForGroup,
+  getSessionPointerForGroup,
+  getPlayableChunkMetas,
   getReplayArtifacts,
   getSourceMaps,
   requeueStaleJobs,
@@ -91,6 +93,50 @@ describe('getReplayForGroup', () => {
     expect(replay?.id).toBe('r1');
     // Verify query uses projectId scope
     expect(mockQuery.mock.calls[0][1]).toContain('p1');
+  });
+});
+
+describe('session replay pointer queries', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('resolves the newest session pointer with event time and project scope', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ session_id: 'sess-1', error_at: new Date('2026-07-15T12:00:00Z') }],
+    });
+
+    const pointer = await getSessionPointerForGroup('g1', 'p1');
+
+    expect(pointer).toEqual({ session_id: 'sess-1', error_at: '2026-07-15T12:00:00.000Z' });
+    expect(mockQuery.mock.calls[0][1]).toEqual(['g1', 'p1']);
+    expect(mockQuery.mock.calls[0][0]).toContain('ee.timestamp AS error_at');
+    expect(mockQuery.mock.calls[0][0]).not.toContain('scrubbed_at');
+  });
+
+  it('returns scrubbed chunk metadata in sequence order and normalizes bigint strings', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        seq: 2,
+        size_bytes: '1234',
+        decoded_size_bytes: '5678',
+        has_full_snapshot: true,
+        first_event_ms: '1700000000000',
+        last_event_ms: '1700000005000',
+      }],
+    });
+
+    const chunks = await getPlayableChunkMetas('sess-1', 'p1');
+
+    expect(chunks).toEqual([{
+      seq: 2,
+      size_bytes: 1234,
+      decoded_size_bytes: 5678,
+      has_full_snapshot: true,
+      first_event_ms: 1700000000000,
+      last_event_ms: 1700000005000,
+    }]);
+    expect(mockQuery.mock.calls[0][1]).toEqual(['sess-1', 'p1']);
+    expect(mockQuery.mock.calls[0][0]).toContain('c.scrubbed_at IS NOT NULL');
+    expect(mockQuery.mock.calls[0][0]).toContain('ORDER BY c.seq ASC');
   });
 });
 

@@ -17,6 +17,17 @@ export function sortedReplayEvents(events: eventWithTime[]): eventWithTime[] {
   return [...events].sort((a, b) => a.timestamp - b.timestamp);
 }
 
+/** Old recordings omitted rrweb's viewport Meta event, producing a 0x0 iframe. */
+export function ensureReplayMeta(events: eventWithTime[]): eventWithTime[] {
+  if (events.length === 0 || events.some((event) => event.type === 4)) return events;
+  const synthetic = {
+    type: 4,
+    data: { width: 1280, height: 720 },
+    timestamp: events[0].timestamp,
+  } as eventWithTime;
+  return [synthetic, ...events];
+}
+
 export function replayDurationMs(events: eventWithTime[]): number {
   if (!events || events.length < 2) return 0;
   return Math.max(0, events[events.length - 1].timestamp - events[0].timestamp);

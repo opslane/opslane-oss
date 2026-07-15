@@ -19,6 +19,8 @@ export const router = createRouter({
     { path: '/incidents/:id', name: 'incident', component: IncidentDetail },
     { path: '/accounts', name: 'accounts', component: AccountsList },
     { path: '/accounts/:accountId', name: 'account-detail', component: AccountDetail },
+    { path: '/sessions', name: 'sessions', component: () => import('./views/SessionsList.vue') },
+    { path: '/sessions/:sessionId', name: 'session-detail', component: () => import('./views/SessionDetail.vue') },
     { path: '/settings', name: 'settings', component: Settings },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
