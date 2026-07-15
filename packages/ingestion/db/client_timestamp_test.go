@@ -113,7 +113,8 @@ func TestInsertErrorEventAndGroup_ZeroEventTimeFallsBackToServerTime(t *testing.
 }
 
 // A late-arriving older event (offline buffer flush) must not move last_seen
-// backwards on the group or the affected-user junction.
+// backwards, and must pull first_seen back to the true earliest occurrence,
+// on both the group and the affected-user junction.
 func TestInsertErrorEventAndGroup_LastSeenDoesNotRegress(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -142,30 +143,36 @@ func TestInsertErrorEventAndGroup_LastSeenDoesNotRegress(t *testing.T) {
 	first := ingest(newer)
 	ingest(older) // out-of-order late delivery
 
-	var lastSeen time.Time
+	var firstSeen, lastSeen time.Time
 	var occurrences int
 	if err := pool.QueryRow(ctx,
-		`SELECT last_seen, occurrence_count FROM error_groups WHERE id = $1`, first.GroupID,
-	).Scan(&lastSeen, &occurrences); err != nil {
+		`SELECT first_seen, last_seen, occurrence_count FROM error_groups WHERE id = $1`, first.GroupID,
+	).Scan(&firstSeen, &lastSeen, &occurrences); err != nil {
 		t.Fatalf("query group: %v", err)
 	}
 	if !lastSeen.Equal(newer) {
 		t.Errorf("group last_seen regressed to %v, want %v", lastSeen, newer)
 	}
+	if !firstSeen.Equal(older) {
+		t.Errorf("group first_seen = %v, want the true earliest occurrence %v", firstSeen, older)
+	}
 	if occurrences != 2 {
 		t.Errorf("occurrence_count = %d, want 2", occurrences)
 	}
 
-	var junctionLastSeen time.Time
+	var junctionFirstSeen, junctionLastSeen time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT eau.last_seen FROM error_group_affected_users eau
+		`SELECT eau.first_seen, eau.last_seen FROM error_group_affected_users eau
 		  JOIN end_users eu ON eu.id = eau.end_user_id
 		 WHERE eau.error_group_id = $1 AND eu.external_user_id = 'user-1'`,
 		first.GroupID,
-	).Scan(&junctionLastSeen); err != nil {
+	).Scan(&junctionFirstSeen, &junctionLastSeen); err != nil {
 		t.Fatalf("query junction: %v", err)
 	}
 	if !junctionLastSeen.Equal(newer) {
 		t.Errorf("junction last_seen regressed to %v, want %v", junctionLastSeen, newer)
+	}
+	if !junctionFirstSeen.Equal(older) {
+		t.Errorf("junction first_seen = %v, want the true earliest occurrence %v", junctionFirstSeen, older)
 	}
 }

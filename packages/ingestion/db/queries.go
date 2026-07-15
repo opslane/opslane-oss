@@ -365,7 +365,8 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id)
 		 VALUES ($1, $2, $3, $4, $4, 1, $5)
 		 ON CONFLICT (project_id, fingerprint) DO UPDATE
-		   SET last_seen = GREATEST(error_groups.last_seen, $4),
+		   SET first_seen = LEAST(error_groups.first_seen, $4),
+		       last_seen = GREATEST(error_groups.last_seen, $4),
 		       occurrence_count = error_groups.occurrence_count + 1,
 		       sample_event_id = $5,
 		       updated_at = now()
@@ -417,7 +418,8 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 			`INSERT INTO error_group_affected_users (error_group_id, end_user_id, first_seen, last_seen, occurrence_count)
 			 VALUES ($1, $2, $3, $3, 1)
 			 ON CONFLICT (error_group_id, end_user_id) DO UPDATE
-			   SET last_seen = GREATEST(error_group_affected_users.last_seen, $3),
+			   SET first_seen = LEAST(error_group_affected_users.first_seen, $3),
+			       last_seen = GREATEST(error_group_affected_users.last_seen, $3),
 			       occurrence_count = error_group_affected_users.occurrence_count + 1`,
 			groupID, endUserDBID, eventTime,
 		)
