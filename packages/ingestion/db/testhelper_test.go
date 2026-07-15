@@ -46,7 +46,9 @@ func cleanupTenant(t *testing.T, pool *pgxpool.Pool, orgID string) {
 	queries := []string{
 		`DELETE FROM error_group_jobs WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM error_events WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+		`DELETE FROM error_group_affected_users WHERE error_group_id IN (SELECT id FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1))`,
 		`DELETE FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+		`DELETE FROM end_users WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM environment_api_keys WHERE environment_id IN (SELECT e.id FROM environments e JOIN projects p ON e.project_id = p.id WHERE p.org_id = $1)`,
 		`DELETE FROM environments WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM projects WHERE org_id = $1`,

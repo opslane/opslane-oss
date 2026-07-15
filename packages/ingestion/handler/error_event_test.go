@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -453,5 +454,40 @@ func TestIngest_RedactsBreadcrumbsAndContextBeforePersist(t *testing.T) {
 	}
 	if !strings.Contains(ctx, "a@b.com") {
 		t.Errorf("redaction clobbered end-user email: %s", ctx)
+	}
+}
+
+// Issue #27: the client-supplied event timestamp must be persisted as
+// error_events.timestamp instead of server arrival time.
+func TestIngestEvent_PersistsClientTimestamp(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+
+	clientTime := time.Now().UTC().Add(-90 * time.Second).Truncate(time.Millisecond)
+	body := `{"timestamp":"` + clientTime.Format(time.RFC3339Nano) +
+		`","error":{"type":"TypeError","message":"stale event","stack":"at a (src/a.ts:1:1)"}}`
+	req := httptest.NewRequest("POST", "/api/v1/events", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", rawKey)
+
+	w := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d (%s)", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var stored time.Time
+	if err := pool.QueryRow(context.Background(),
+		`SELECT "timestamp" FROM error_events WHERE id = $1`, resp["event_id"],
+	).Scan(&stored); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if !stored.Equal(clientTime) {
+		t.Errorf("error_events.timestamp = %v, want client time %v", stored, clientTime)
 	}
 }
