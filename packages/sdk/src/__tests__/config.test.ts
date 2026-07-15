@@ -27,7 +27,7 @@ describe('SDK Config', () => {
       flushInterval: 5_000,
       maxBatchSize: 10,
       debug: false,
-      replayEnabled: false,
+      replayEnabled: true,
       sampleRate: 1,
       errorThrottleMs: 1000,
       beforeSend: undefined,
@@ -78,6 +78,24 @@ describe('SDK Config', () => {
 
     const config = getConfig();
     expect(config.replayEnabled).toBe(true);
+  });
+
+  describe('replay default (design v4-15)', () => {
+    it('defaults replay to enabled when absent or empty', () => {
+      loadConfig({ apiKey: 'k' });
+      expect(getConfig().replayEnabled).toBe(true);
+      resetConfig();
+      loadConfig({ apiKey: 'k', replay: {} });
+      expect(getConfig().replayEnabled).toBe(true);
+    });
+
+    it('honours explicit opt-out and opt-in', () => {
+      loadConfig({ apiKey: 'k', replay: { enabled: false } });
+      expect(getConfig().replayEnabled).toBe(false);
+      resetConfig();
+      loadConfig({ apiKey: 'k', replay: { enabled: true } });
+      expect(getConfig().replayEnabled).toBe(true);
+    });
   });
 
   it('should throw if getConfig called before loadConfig', () => {

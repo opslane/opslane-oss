@@ -7,6 +7,7 @@ vi.mock('../core', () => ({
   captureException: vi.fn(),
   setUser: vi.fn(),
   clearUser: vi.fn(),
+  onIdentityChange: vi.fn(),
 }));
 
 vi.mock('../console', () => ({
@@ -33,6 +34,11 @@ vi.mock('../replay', () => ({
   stopReplayCapture: vi.fn(),
 }));
 
+vi.mock('../telemetry', () => ({
+  installInteractionTelemetry: vi.fn(),
+  uninstallInteractionTelemetry: vi.fn(),
+}));
+
 import { init, destroy } from '../index';
 import { loadConfig, resetConfig } from '../config';
 import * as core from '../core';
@@ -40,6 +46,7 @@ import * as consolePatcher from '../console';
 import * as network from '../network';
 import * as transport from '../transport';
 import * as replay from '../replay';
+import * as telemetry from '../telemetry';
 
 describe('SDK Public API', () => {
   afterEach(() => {
@@ -58,6 +65,7 @@ describe('SDK Public API', () => {
     expect(consolePatcher.patchConsole).toHaveBeenCalledTimes(1);
     expect(network.patchFetch).toHaveBeenCalledTimes(1);
     expect(network.patchXHR).toHaveBeenCalledTimes(1);
+    expect(telemetry.installInteractionTelemetry).toHaveBeenCalledTimes(1);
     expect(transport.startTransport).toHaveBeenCalledTimes(1);
     expect(replay.startReplayCapture).toHaveBeenCalledTimes(1);
   });
@@ -74,6 +82,7 @@ describe('SDK Public API', () => {
     expect(consolePatcher.unpatchConsole).toHaveBeenCalledTimes(1);
     expect(network.unpatchFetch).toHaveBeenCalledTimes(1);
     expect(network.unpatchXHR).toHaveBeenCalledTimes(1);
+    expect(telemetry.uninstallInteractionTelemetry).toHaveBeenCalledTimes(1);
     expect(transport.stopTransport).toHaveBeenCalledTimes(1);
     expect(replay.stopReplayCapture).toHaveBeenCalledTimes(1);
   });

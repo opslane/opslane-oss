@@ -1,12 +1,13 @@
 import type { SdkInitOptions } from './config';
 import { loadConfig, resetConfig } from './config';
-import { captureException, installGlobalHandlers, uninstallGlobalHandlers, setUser, clearUser } from './core';
+import { captureException, installGlobalHandlers, onIdentityChange, uninstallGlobalHandlers, setUser, clearUser } from './core';
 import { patchConsole, unpatchConsole } from './console';
 import { patchFetch, unpatchFetch, patchXHR, unpatchXHR } from './network';
 import { startTransport, stopTransport } from './transport';
 import { clearBreadcrumbs } from './breadcrumbs';
 import { startReplayCapture, stopReplayCapture } from './replay';
 import { ensureSessionID } from './session.js';
+import { installInteractionTelemetry, uninstallInteractionTelemetry } from './telemetry';
 
 export { opslaneVuePlugin } from './vue';
 export type { SdkInitOptions } from './config';
@@ -37,6 +38,7 @@ export function init(options: SdkInitOptions): void {
   safeCall(patchConsole);
   safeCall(patchFetch);
   safeCall(patchXHR);
+  safeCall(installInteractionTelemetry);
   safeCall(startTransport);
   safeCall(ensureSessionID);
   safeCall(() => { void startReplayCapture().catch(() => {}); });
@@ -50,9 +52,11 @@ export function destroy(): void {
   safeCall(unpatchConsole);
   safeCall(unpatchFetch);
   safeCall(unpatchXHR);
+  safeCall(uninstallInteractionTelemetry);
   safeCall(stopTransport);
   safeCall(stopReplayCapture);
   safeCall(clearBreadcrumbs);
+  safeCall(() => onIdentityChange(null));
   safeCall(clearUser);
   safeCall(resetConfig);
 }

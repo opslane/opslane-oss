@@ -2,7 +2,7 @@ import type { ErrorEventPayload, Breadcrumb } from '@opslane/shared';
 import { getConfig } from './config';
 import { addBreadcrumb, getBreadcrumbs } from './breadcrumbs';
 import { enqueueEvent } from './transport';
-import { getSessionId } from './session.js';
+import { getSessionId, getSessionProgress, setSessionUser, type SessionProgress } from './session.js';
 import { SDK_VERSION } from './version';
 
 let installed = false;
@@ -17,13 +17,32 @@ interface UserIdentity {
 
 let currentUser: UserIdentity | null = null;
 
+type IdentityListener = (newSessionID: string, previous: SessionProgress) => void;
+let identityListener: IdentityListener | null = null;
+
+export function onIdentityChange(listener: IdentityListener | null): void {
+  identityListener = listener;
+}
+
+function rotateForIdentity(userId: string | null): void {
+  const previous = getSessionProgress();
+  if (!setSessionUser(userId)) return;
+  try {
+    identityListener?.(getSessionId(), previous);
+  } catch {
+    // SDK must never throw.
+  }
+}
+
 export function setUser(user: UserIdentity): void {
   if (!user.id) return;
   currentUser = user;
+  rotateForIdentity(user.id);
 }
 
 export function clearUser(): void {
   currentUser = null;
+  rotateForIdentity(null);
 }
 
 export function getCurrentUser(): UserIdentity | null {
