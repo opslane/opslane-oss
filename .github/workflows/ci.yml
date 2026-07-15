@@ -33,6 +33,24 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://opslane:opslane_dev@localhost:5432/opslane?sslmode=disable
+      # Object storage. Without these, every test touching storage calls t.Skip
+      # and the package still reports "ok" -- 30 tests, including the #47 and
+      # #48 regression guards, silently never run.
+      REPLAY_STORE_ENDPOINT: http://localhost:9012
+      REPLAY_STORE_PUBLIC_ENDPOINT: http://localhost:9012
+      REPLAY_STORE_ACCESS_KEY: minio
+      REPLAY_STORE_SECRET_KEY: minio12345
+      REPLAY_STORE_BUCKET: opslane-replays
+      REPLAY_STORE_REGION: us-east-1
+      # error_event_test.go's testMinIO helper reads the worker's MINIO_*
+      # naming rather than ingestion's REPLAY_STORE_*. The split is deliberate
+      # (see packages/worker); both names are set so neither side skips.
+      MINIO_ENDPOINT: http://localhost:9012
+      MINIO_PUBLIC_ENDPOINT: http://localhost:9012
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio12345
+      MINIO_BUCKET: opslane-replays
+      MINIO_REGION: us-east-1
     defaults:
       run:
         working-directory: packages/ingestion
@@ -44,11 +62,30 @@ jobs:
         with:
           go-version-file: packages/ingestion/go.mod
           cache-dependency-path: packages/ingestion/go.sum
+      # Compose rather than a service container, for two reasons: a service
+      # container cannot override the image's command (MinIO needs "server
+      # /data"), and TestAnonymousGetIsForbidden guards the bucket policy that
+      # compose's minio-setup applies. A bare bucket is private by default, so
+      # without minio-setup that test would pass without ever exercising the
+      # `mc anonymous set none` line it exists to protect.
+      # minio defines no healthcheck, so `up --wait` would return as soon as the
+      # container is running rather than serving. minio-setup's own
+      # `until mc alias set ...` loop is the real readiness gate, and `run --rm`
+      # propagates its exit code -- `up` would swallow a failed policy apply.
+      - name: Start object storage
+        working-directory: .
+        run: |
+          docker compose up -d minio
+          docker compose run --rm minio-setup
       - name: Apply migrations
         run: MIGRATION_DIR=db/migrations ../../scripts/run-migrations.sh
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - name: Test (fails on unexpected skips)
+        run: |
+          set -o pipefail
+          go test ./... -v 2>&1 | tee /tmp/go-test.log
+          ../../scripts/check-go-skips.mjs /tmp/go-test.log
 
   js:
     name: JS build and test
