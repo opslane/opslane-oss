@@ -304,6 +304,30 @@ describeDb('db.ts integration tests', () => {
       ]);
     });
 
+    it('enforces the cap under truly concurrent claimers (no overshoot)', async () => {
+      for (let i = 0; i < 3; i++) {
+        await seedAnalysisJob();
+        await sleep(5);
+      }
+      for (let i = 0; i < 3; i++) {
+        await seedTypedJob('fix');
+        await sleep(5);
+      }
+
+      // Six workers poll at the same instant with cap 1. Without serialized
+      // admission they would all see zero running analysis jobs and overshoot.
+      const claims = await Promise.all(
+        Array.from({ length: 6 }, (_, i) => claimJob(`cw${i}`, 600_000, 1))
+      );
+
+      const byType = claims
+        .filter((c): c is NonNullable<typeof c> => c !== null)
+        .map((c) => c.jobType);
+      expect(byType.filter((t) => t === 'session_analysis')).toHaveLength(1);
+      expect(byType.filter((t) => t === 'fix')).toHaveLength(3);
+      expect(claims.filter((c) => c === null)).toHaveLength(2);
+    });
+
     it('completing an analysis job releases its cap slot', async () => {
       await seedAnalysisJob();
       await sleep(5);

@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock pg module
+// Mock pg module. claimJob checks out a client for its advisory-locked
+// transaction; route the client's queries through the same mock so tests can
+// assert on the claim SQL.
 const mockQuery = vi.fn();
+const mockClient = { query: mockQuery, release: vi.fn() };
 vi.mock('pg', () => ({
-  default: { Pool: vi.fn(() => ({ query: mockQuery, end: vi.fn() })) },
-  Pool: vi.fn(() => ({ query: mockQuery, end: vi.fn() })),
+  default: { Pool: vi.fn(() => ({ query: mockQuery, connect: vi.fn(async () => mockClient), end: vi.fn() })) },
+  Pool: vi.fn(() => ({ query: mockQuery, connect: vi.fn(async () => mockClient), end: vi.fn() })),
 }));
 
 import {
@@ -106,28 +109,41 @@ describe('claimJob friction scheduling fields', () => {
   beforeEach(() => mockQuery.mockReset());
 
   it('demotes session analysis and returns receipts/session identity', async () => {
+    // Transaction sequence: BEGIN, advisory lock, UPDATE, COMMIT.
+    mockQuery.mockResolvedValueOnce({}); // BEGIN
+    mockQuery.mockResolvedValueOnce({}); // pg_advisory_xact_lock
     mockQuery.mockResolvedValueOnce({ rows: [{
       id: 'j1', error_group_id: null, source_id: null, project_id: 'p1',
       job_type: 'session_analysis', attempts: 0, guidance: null,
       worker_id: 'worker-1', lease_generation: '1',
       triggered_by: 'auto', session_id: 's1',
     }] });
+    mockQuery.mockResolvedValueOnce({}); // COMMIT
 
     const job = await claimJob('worker-1', 30_000);
 
     expect(job).toEqual(expect.objectContaining({ sessionId: 's1', triggeredBy: 'auto' }));
-    // Scheduling policy (issue #28): error_fix first, capped analysis, lane alternation.
-    expect(mockQuery.mock.calls[0][0]).toContain("WHEN job_type = 'error_fix' THEN 0");
-    expect(mockQuery.mock.calls[0][0]).toContain("AND job_type = 'session_analysis'");
-    expect(mockQuery.mock.calls[0][0]).toContain('< $3');
+    // Serialized admission (issue #28): the claim runs under an advisory lock.
+    expect(mockQuery.mock.calls[0][0]).toBe('BEGIN');
+    expect(mockQuery.mock.calls[1][0]).toContain('pg_advisory_xact_lock');
+    // Scheduling policy: error_fix first, capped analysis, lane alternation.
+    const claimSql = mockQuery.mock.calls[2][0] as string;
+    expect(claimSql).toContain("WHEN job_type = 'error_fix' THEN 0");
+    expect(claimSql).toContain("AND job_type = 'session_analysis'");
+    expect(claimSql).toContain('< $3');
     // Cap defaults to 2 when SESSION_ANALYSIS_MAX_CONCURRENT is unset.
-    expect(mockQuery.mock.calls[0][1]).toEqual(['worker-1', 30, 2]);
+    expect(mockQuery.mock.calls[2][1]).toEqual(['worker-1', 30, 2]);
+    expect(mockQuery.mock.calls[3][0]).toBe('COMMIT');
+    expect(mockClient.release).toHaveBeenCalled();
   });
 
   it('passes an explicit session_analysis cap through to the claim query', async () => {
+    mockQuery.mockResolvedValueOnce({}); // BEGIN
+    mockQuery.mockResolvedValueOnce({}); // advisory lock
     mockQuery.mockResolvedValueOnce({ rows: [] });
+    mockQuery.mockResolvedValueOnce({}); // COMMIT
     await claimJob('worker-1', 30_000, 0);
-    expect(mockQuery.mock.calls[0][1]).toEqual(['worker-1', 30, 0]);
+    expect(mockQuery.mock.calls[2][1]).toEqual(['worker-1', 30, 0]);
   });
 });
 
