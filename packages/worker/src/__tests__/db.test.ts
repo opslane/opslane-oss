@@ -419,6 +419,7 @@ describeDb('db.ts integration tests', () => {
         leaseGeneration: staleGeneration,
         projectId: testProjectId,
         errorGroupId,
+        sessionId: null,
       };
       const currentLease = {
         ...staleLease,

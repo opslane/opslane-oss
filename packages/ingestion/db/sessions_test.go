@@ -240,7 +240,7 @@ func TestClaimUnscrubbedChunks_OnlyReturnsUploadedAndUnscrubbed(t *testing.T) {
 	); err != nil {
 		t.Fatalf("age test chunks: %v", err)
 	}
-	if err := q.MarkChunkScrubbed(ctx, sid, projectID, 2); err != nil {
+	if err := q.MarkChunkScrubbed(ctx, sid, projectID, 2, nil, nil, 0); err != nil {
 		t.Fatalf("mark scrubbed: %v", err)
 	}
 
@@ -365,6 +365,10 @@ func TestClaimTombstonesForStorageSweep_DoesNotDuplicateAcrossReplicas(t *testin
 	sid := newSessionID(t)
 	if err := q.InsertSession(ctx, sid, projectID, envID, nil, time.Now(), "https://a"); err != nil {
 		t.Fatalf("insert session: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE sessions SET started_at = now() - interval '100 days' WHERE id = $1`, sid); err != nil {
+		t.Fatalf("age session: %v", err)
 	}
 	if err := q.MarkSessionDeleting(ctx, sid, projectID); err != nil {
 		t.Fatalf("mark deleting: %v", err)

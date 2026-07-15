@@ -64,10 +64,13 @@ services:
       GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-defender-dev}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+      INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
     depends_on:
       postgres:
         condition: service_healthy
       minio-setup:
+        condition: service_completed_successfully
+      migrate:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
@@ -82,6 +85,7 @@ services:
     environment:
       DATABASE_URL: ${OPSLANE_COMPOSE_DATABASE_URL:-postgres://opslane:opslane_dev@postgres:5432/opslane}
       INGESTION_BASE_URL: http://ingestion:8080
+      INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
@@ -106,6 +110,8 @@ services:
         condition: service_healthy
       ingestion:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:8081/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 10s

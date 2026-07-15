@@ -1,3 +1,6 @@
+-- Fence worker claims after the session and friction schema additions.
+-- Migrations are re-applied on every boot, so all statements are idempotent.
+
 ALTER TABLE error_group_jobs
   ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0;
 

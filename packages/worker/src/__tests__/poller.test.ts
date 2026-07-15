@@ -37,6 +37,8 @@ function makeJob(overrides?: Partial<ClaimedJob>): ClaimedJob {
     attempts: 0,
     guidance: null,
     leaseGeneration: '1',
+    triggeredBy: null,
+    sessionId: null,
     ...overrides,
   };
 }

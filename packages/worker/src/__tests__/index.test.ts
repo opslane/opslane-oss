@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ClaimedJob, ErrorGroupData, ErrorEventData, ProjectData } from '../db.js';
 
 // index.ts is the worker entrypoint: it imports the whole world and calls main()
@@ -7,6 +7,7 @@ import type { ClaimedJob, ErrorGroupData, ErrorEventData, ProjectData } from '..
 // boot here. The ONE module we deliberately leave real is harness/stack-trace-utils
 // (hasNoAppFrames) — that's the decision under test.
 vi.mock('../db.js', () => ({
+  LeaseLostError: class LeaseLostError extends Error {},
   getErrorGroup: vi.fn(),
   getErrorEvent: vi.fn(),
   getProject: vi.fn(),
@@ -16,12 +17,19 @@ vi.mock('../db.js', () => ({
   updateGroupAndCreateFixJob: vi.fn(),
   getGroupInvestigation: vi.fn(),
   getReplayForGroup: vi.fn(),
+  getSessionPointerForGroup: vi.fn(),
+  getPlayableChunkMetas: vi.fn(),
   getReplayArtifacts: vi.fn(),
   getSourceMaps: vi.fn(),
   requeueStaleJobs: vi.fn(),
   resolveSilentMergedGroups: vi.fn(),
   updateJobTraceUrl: vi.fn(),
   closePool: vi.fn(),
+  getFrictionSignalsForGroup: vi.fn(),
+  getScrubbedChunksForSession: vi.fn(),
+  getSessionForAnalysis: vi.fn(),
+  setSessionAnalysisStatus: vi.fn(),
+  assertJobLease: vi.fn(),
 }));
 vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
@@ -47,11 +55,21 @@ vi.mock('../tracing.js', () => ({
   buildLangfuseTraceUrl: vi.fn(() => null),
 }));
 vi.mock('../visual-analysis.js', () => ({ runVisualAnalysis: vi.fn() }));
+vi.mock('../friction/friction-evidence.js', () => ({ gatherFrictionEvidence: vi.fn() }));
+vi.mock('../friction/investigate-friction.js', () => ({ investigateFriction: vi.fn() }));
+vi.mock('../friction/chunk-reader.js', () => ({ readChunksBounded: vi.fn() }));
+vi.mock('../friction/analyzer.js', () => ({ analyzeSession: vi.fn(), RULE_VERSION: 1 }));
+vi.mock('../friction/persist.js', () => ({ writeFrictionSignals: vi.fn() }));
 
 const db = await import('../db.js');
 const { cloneRepo } = await import('../repo-clone.js');
 const { runPipeline } = await import('../pipeline.js');
-const { processInvestigateJob, processFixJob } = await import('../index.js');
+const { processJobInner, processInvestigateJob, processFixJob, processSessionAnalysisJob } = await import('../index.js');
+const { gatherFrictionEvidence } = await import('../friction/friction-evidence.js');
+const { investigateFriction } = await import('../friction/investigate-friction.js');
+const { readChunksBounded } = await import('../friction/chunk-reader.js');
+const { analyzeSession } = await import('../friction/analyzer.js');
+const { writeFrictionSignals } = await import('../friction/persist.js');
 
 const mockGetErrorGroup = vi.mocked(db.getErrorGroup);
 const mockGetErrorEvent = vi.mocked(db.getErrorEvent);
@@ -59,6 +77,8 @@ const mockGetProject = vi.mocked(db.getProject);
 const mockUpdateGroupStatus = vi.mocked(db.updateGroupStatus);
 const mockCloneRepo = vi.mocked(cloneRepo);
 const mockRunPipeline = vi.mocked(runPipeline);
+const mockGetSessionPointerForGroup = vi.mocked(db.getSessionPointerForGroup);
+const mockGetPlayableChunkMetas = vi.mocked(db.getPlayableChunkMetas);
 
 function makeJob(): ClaimedJob & { errorGroupId: string } {
   return {
@@ -71,6 +91,8 @@ function makeJob(): ClaimedJob & { errorGroupId: string } {
     attempts: 0,
     guidance: null,
     leaseGeneration: '1',
+    triggeredBy: null,
+    sessionId: null,
   };
 }
 
@@ -82,6 +104,10 @@ function makeGroup(overrides?: Partial<ErrorGroupData>): ErrorGroupData {
     sample_event_id: 'evt-1',
     occurrence_count: 3,
     status: 'queued',
+    kind: 'error',
+    signal_type: null,
+    element_selector: null,
+    page_url_normalized: null,
     ...overrides,
   };
 }
@@ -110,6 +136,7 @@ function unfixableCall() {
 describe('processInvestigateJob — pre-clone guard for stackless errors', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSessionPointerForGroup.mockResolvedValue(null);
   });
 
   it('short-circuits a stackless event to needs_human WITHOUT cloning the repo', async () => {
@@ -169,6 +196,8 @@ describe('processInvestigateJob — pre-clone guard for stackless errors', () =>
 describe('processFixJob — preserves writeup on failure (no revert/null)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSessionPointerForGroup.mockResolvedValue(null);
+    mockGetPlayableChunkMetas.mockResolvedValue([]);
     mockGetErrorGroup.mockResolvedValue({
       id: 'g1', title: 'Null deref', fingerprint: 'fp', sample_event_id: 'e1',
       occurrence_count: 3, status: 'fixing',
@@ -199,8 +228,16 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
       attempts: 0,
       guidance: null,
       leaseGeneration: '1',
+      triggeredBy: null,
+      sessionId: null,
     };
   }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env['INGESTION_BASE_URL'];
+    delete process.env['INTERNAL_READ_TOKEN'];
+  });
 
   it('terminates as needs_human with all reason fields + confidence when the fix is below floor', async () => {
     mockRunPipeline.mockResolvedValue({
@@ -234,5 +271,162 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     const call = mockUpdateGroupStatus.mock.calls.find((c) => c[2] === 'pr_created');
     expect(call).toBeTruthy();
     expect(call![3]?.pr_url).toBe('https://github.com/org/app/pull/7');
+  });
+
+  it('prefers session-pointer evidence fetched through ingestion', async () => {
+    const errorAt = '2026-07-15T12:00:00.000Z';
+    const errorAtMs = Date.parse(errorAt);
+    mockGetSessionPointerForGroup.mockResolvedValue({ session_id: 'sess/a', error_at: errorAt });
+    mockGetPlayableChunkMetas.mockResolvedValue([{
+      seq: 3,
+      size_bytes: 100,
+      decoded_size_bytes: 500,
+      has_full_snapshot: true,
+      first_event_ms: errorAtMs - 1_000,
+      last_event_ms: errorAtMs + 1_000,
+    }]);
+    process.env['INGESTION_BASE_URL'] = 'http://ingestion:8080';
+    process.env['INTERNAL_READ_TOKEN'] = 'secret';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ events: [
+      { type: 2, timestamp: errorAtMs - 500, data: { node: {
+        type: 0, id: 1, childNodes: [{
+          type: 2, tagName: 'button', id: 2,
+          childNodes: [{ type: 3, id: 3, textContent: 'Save profile' }],
+        }],
+      } } },
+      { type: 3, timestamp: errorAtMs - 100, data: { source: 2, type: 2, id: 2 } },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    mockRunPipeline.mockResolvedValue({
+      status: 'pr_created', confidence: 'high', pr_url: 'https://github.com/org/app/pull/8', pr_number: 8,
+    });
+
+    await processFixJob(fixJob(), new AbortController().signal);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      'http://ingestion:8080/internal/v1/projects/p1/sessions/sess%2Fa/chunks/3',
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual({ headers: { 'X-Internal-Token': 'secret' } });
+    const pipelineInput = mockRunPipeline.mock.calls[0]?.[0];
+    expect(pipelineInput?.visualAnalysis?.failureMoment).toContain('Save profile');
+  });
+});
+
+describe('friction worker path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env['ANTHROPIC_API_KEY'] = 'test-key';
+    mockGetErrorGroup.mockResolvedValue(makeGroup({
+      kind: 'friction',
+      status: 'candidate',
+      sample_event_id: '',
+      signal_type: 'dead_click',
+      element_selector: '[data-testid="save"]',
+      page_url_normalized: 'https://app.example.com/settings',
+    }));
+    mockGetProject.mockResolvedValue({
+      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main',
+    });
+    vi.mocked(db.getProjectGitHubInstallation).mockResolvedValue(null);
+    mockCloneRepo.mockResolvedValue({ repoDir: '/tmp/repo', cleanup: vi.fn() } as never);
+    vi.mocked(gatherFrictionEvidence).mockResolvedValue({ signals: [], timeline: '', truncated: false });
+  });
+
+  it('skips error-only guards and never auto-fixes a code-caused friction incident', async () => {
+    vi.mocked(investigateFriction).mockResolvedValue({
+      codeCause: true, confidence: 'high', reason: 'save handler is disconnected', remediation: 'wire the handler',
+    });
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+
+    expect(mockGetErrorEvent).not.toHaveBeenCalled();
+    expect(db.getReplayForGroup).not.toHaveBeenCalled();
+    expect(db.getSourceMaps).not.toHaveBeenCalled();
+    expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
+    expect(db.updateGroupInvestigation).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'awaiting_approval', expect.objectContaining({ confidence: 'high' }),
+      makeJob(),
+    );
+  });
+
+  it('records friction without a code cause as an insight', async () => {
+    vi.mocked(investigateFriction).mockResolvedValue({
+      codeCause: false, confidence: 'medium', reason: 'The workflow is confusing but functional.',
+    });
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+
+    expect(db.updateGroupInvestigation).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'insight', expect.objectContaining({ rootCause: expect.any(String) }),
+      makeJob(),
+    );
+    expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
+  });
+
+  it('refuses a non-human friction fix before cloning or running the pipeline', async () => {
+    const job = { ...makeJob(), jobType: 'fix' as const, triggeredBy: 'auto' as const };
+
+    await processFixJob(job, new AbortController().signal);
+
+    expect(mockUpdateGroupStatus).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'awaiting_approval', undefined, job,
+    );
+    expect(mockCloneRepo).not.toHaveBeenCalled();
+    expect(mockRunPipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe('session_analysis handler', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const job: ClaimedJob & { sessionId: string } = {
+    id: 'analysis-1', workerId: 'worker-1', leaseGeneration: '1',
+    errorGroupId: null, sourceId: null, projectId: 'proj-1',
+    jobType: 'session_analysis', attempts: 0, guidance: null, triggeredBy: 'auto', sessionId: 'session-1',
+  };
+
+  it('dispatches before the error-group-required guard', async () => {
+    vi.mocked(db.getSessionForAnalysis).mockResolvedValue({
+      id: 'session-1', project_id: 'proj-1', environment_id: 'env-1', end_user_id: null, status: 'closed',
+    });
+    vi.mocked(db.getScrubbedChunksForSession).mockResolvedValue([]);
+    vi.mocked(readChunksBounded).mockResolvedValue({ envelopes: [], inflatedBytes: 0, truncated: false });
+    vi.mocked(analyzeSession).mockReturnValue([]);
+
+    await expect(processJobInner(job, new AbortController().signal)).resolves.toBeUndefined();
+    expect(writeFrictionSignals).toHaveBeenCalled();
+  });
+
+  it('analyzes scrubbed chunks, persists signals, and marks the session analyzed', async () => {
+    const session = {
+      id: 'session-1', project_id: 'proj-1', environment_id: 'env-1', end_user_id: null, status: 'closed',
+    };
+    vi.mocked(db.getSessionForAnalysis).mockResolvedValue(session);
+    vi.mocked(db.getScrubbedChunksForSession).mockResolvedValue([]);
+    vi.mocked(readChunksBounded).mockResolvedValue({ envelopes: [], inflatedBytes: 0, truncated: false });
+    vi.mocked(analyzeSession).mockReturnValue([]);
+
+    await processSessionAnalysisJob(job, new AbortController().signal);
+
+    expect(db.setSessionAnalysisStatus).toHaveBeenNthCalledWith(1, 'session-1', 'proj-1', 'analyzing', undefined, job);
+    expect(db.assertJobLease).toHaveBeenCalledWith(job);
+    expect(writeFrictionSignals).toHaveBeenCalledWith(session, [], 1);
+    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analyzed', 1, job);
+    expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
+  });
+
+  it('marks analysis_failed and rethrows corrupt chunk failures', async () => {
+    vi.mocked(db.getSessionForAnalysis).mockResolvedValue({
+      id: 'session-1', project_id: 'proj-1', environment_id: 'env-1', end_user_id: null, status: 'closed',
+    });
+    vi.mocked(db.getScrubbedChunksForSession).mockResolvedValue([]);
+    vi.mocked(readChunksBounded).mockRejectedValue(new Error('corrupt gzip'));
+
+    await expect(processSessionAnalysisJob(job, new AbortController().signal)).rejects.toThrow('corrupt gzip');
+    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith(
+      'session-1', 'proj-1', 'analysis_failed', undefined, job,
+    );
   });
 });

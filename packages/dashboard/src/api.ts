@@ -1,7 +1,9 @@
 import type {
   Incident, AffectedUser, Account, IncidentFilters,
   GitHubConfig, GitHubAppStatus, GitHubRepo, SetupPrStatus,
+  SessionDetail, SessionFilters, SessionListResponse,
 } from './types/api';
+import type { ChunkEnvelope } from './components/session-replay';
 
 const BASE = '/api/v1';
 
@@ -76,6 +78,16 @@ async function doRefresh(): Promise<boolean> {
 
 // === Shared auth-aware fetch core ===
 
+export class APIError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'APIError';
+  }
+}
+
 async function fetchWithAuth<T>(path: string, options: RequestInit = {}): Promise<T> {
   const doFetch = (): Promise<Response> =>
     fetch(`${BASE}${path}`, { ...options, credentials: 'include' });
@@ -95,7 +107,7 @@ async function fetchWithAuth<T>(path: string, options: RequestInit = {}): Promis
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`API ${res.status}: ${body || res.statusText}`);
+    throw new APIError(res.status, `API ${res.status}: ${body || res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
@@ -295,6 +307,38 @@ export function getIncident(
 
 export function getReplay(projectId: string, replayId: string): Promise<ReplayRecording> {
   return fetchJSON<ReplayRecording>(`/projects/${projectId}/replays/${replayId}`);
+}
+
+export function listSessions(
+  projectId: string,
+  filters?: SessionFilters,
+  cursor?: string,
+): Promise<SessionListResponse> {
+  const params = new URLSearchParams();
+  if (filters?.end_user_id) params.set('end_user_id', filters.end_user_id);
+  if (filters?.account_id) params.set('account_id', filters.account_id);
+  if (filters?.from) params.set('from', filters.from);
+  if (filters?.to) params.set('to', filters.to);
+  if (filters?.limit !== undefined) params.set('limit', String(filters.limit));
+  if (cursor) params.set('cursor', cursor);
+  const qs = params.toString();
+  return fetchJSON<SessionListResponse>(
+    `/projects/${projectId}/sessions${qs ? `?${qs}` : ''}`,
+  );
+}
+
+export function getSession(projectId: string, sessionId: string): Promise<SessionDetail> {
+  return fetchJSON<SessionDetail>(`/projects/${projectId}/sessions/${sessionId}`);
+}
+
+export function getSessionChunk(
+  projectId: string,
+  sessionId: string,
+  seq: number,
+): Promise<ChunkEnvelope> {
+  return fetchJSON<ChunkEnvelope>(
+    `/projects/${projectId}/sessions/${sessionId}/chunks/${seq}`,
+  );
 }
 
 export function listAffectedUsers(

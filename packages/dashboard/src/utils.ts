@@ -24,6 +24,7 @@ export function getProjectId(): string {
 
 export function statusBadgeClass(status: ErrorGroupStatus): string {
   switch (status) {
+    case 'insight':
     case 'resolved':
       return 'bg-green-500/10 text-green';
     case 'merged':
@@ -34,6 +35,7 @@ export function statusBadgeClass(status: ErrorGroupStatus): string {
     case 'analyzing':
     case 'queued':
       return 'bg-indigo-500/10 text-indigo';
+    case 'awaiting_approval':
     case 'investigated':
       return 'bg-teal-500/10 text-teal';
     case 'fixing':

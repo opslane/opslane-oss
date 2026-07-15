@@ -12,9 +12,16 @@ import {
   getErrorEvent,
   getProject,
   getReplayForGroup,
+  getSessionPointerForGroup,
+  getPlayableChunkMetas,
   getReplayArtifacts,
   getSourceMaps,
   requeueStaleJobs,
+  getFrictionSignalsForGroup,
+  getScrubbedChunksForSession,
+  getSessionForAnalysis,
+  setSessionAnalysisStatus,
+  claimJob,
 } from '../db.js';
 
 describe('getErrorGroup', () => {
@@ -25,10 +32,14 @@ describe('getErrorGroup', () => {
       rows: [{
         id: 'g1', title: 'TypeError: x', fingerprint: 'abc123',
         sample_event_id: 'e1', occurrence_count: 5, status: 'analyzing',
+        kind: 'friction', signal_type: 'dead_click', element_selector: '#save',
+        page_url_normalized: 'https://example.com/settings',
       }],
     });
     const group = await getErrorGroup('g1', 'p1');
     expect(group).toEqual(expect.objectContaining({ id: 'g1', title: 'TypeError: x' }));
+    expect(group?.kind).toBe('friction');
+    expect(mockQuery.mock.calls[0][0]).toContain('kind');
     // Verify both groupId and projectId are passed as params
     expect(mockQuery.mock.calls[0][1]).toEqual(['g1', 'p1']);
   });
@@ -37,6 +48,75 @@ describe('getErrorGroup', () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
     const group = await getErrorGroup('nonexistent', 'p1');
     expect(group).toBeNull();
+  });
+});
+
+describe('friction and session queries', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('loads live friction signals with incident and tenant scope', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await getFrictionSignalsForGroup('g1', 'p1');
+    expect(mockQuery.mock.calls[0][0]).toContain('incident_id = $1 AND project_id = $2');
+    expect(mockQuery.mock.calls[0][1]).toEqual(['g1', 'p1']);
+  });
+
+  it('loads only scrubbed chunks in sequence order', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await getScrubbedChunksForSession('s1', 'p1');
+    expect(mockQuery.mock.calls[0][0]).toContain('scrubbed_at IS NOT NULL');
+    expect(mockQuery.mock.calls[0][1]).toEqual(['s1', 'p1']);
+  });
+
+  it('loads the session analysis identity and status', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{
+      id: 's1', project_id: 'p1', environment_id: 'e1', end_user_id: null, status: 'closed',
+    }] });
+    const session = await getSessionForAnalysis('s1', 'p1');
+    expect(session?.environment_id).toBe('e1');
+    expect(mockQuery.mock.calls[0][0]).toContain('end_user_id, status');
+  });
+
+  it('updates analysis status and optional rule version with tenant scope', async () => {
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    await setSessionAnalysisStatus('s1', 'p1', 'analyzed', 1);
+    expect(mockQuery.mock.calls[0][1]).toEqual(['s1', 'p1', 'analyzed', 1]);
+  });
+
+  it('fences session status writes to the current session lease', async () => {
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 's1' }] });
+    await setSessionAnalysisStatus('s1', 'p1', 'analyzed', 1, {
+      id: 'j1',
+      workerId: 'worker-1',
+      leaseGeneration: '7',
+      projectId: 'p1',
+      errorGroupId: null,
+      sessionId: 's1',
+    });
+
+    expect(mockQuery.mock.calls[0][0]).toContain('lease_generation = $7::bigint');
+    expect(mockQuery.mock.calls[0][0]).toContain('session_id IS NOT DISTINCT FROM $1');
+    expect(mockQuery.mock.calls[0][1]).toEqual([
+      's1', 'p1', 'analyzed', 1, 'j1', 'worker-1', '7', null,
+    ]);
+  });
+});
+
+describe('claimJob friction scheduling fields', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('demotes session analysis and returns receipts/session identity', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{
+      id: 'j1', error_group_id: null, source_id: null, project_id: 'p1',
+      job_type: 'session_analysis', attempts: 0, guidance: null,
+      worker_id: 'worker-1', lease_generation: '1',
+      triggered_by: 'auto', session_id: 's1',
+    }] });
+
+    const job = await claimJob('worker-1', 30_000);
+
+    expect(job).toEqual(expect.objectContaining({ sessionId: 's1', triggeredBy: 'auto' }));
+    expect(mockQuery.mock.calls[0][0]).toContain("WHEN job_type = 'session_analysis' THEN 2");
   });
 });
 
@@ -93,6 +173,50 @@ describe('getReplayForGroup', () => {
     expect(replay?.id).toBe('r1');
     // Verify query uses projectId scope
     expect(mockQuery.mock.calls[0][1]).toContain('p1');
+  });
+});
+
+describe('session replay pointer queries', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('resolves the newest session pointer with event time and project scope', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ session_id: 'sess-1', error_at: new Date('2026-07-15T12:00:00Z') }],
+    });
+
+    const pointer = await getSessionPointerForGroup('g1', 'p1');
+
+    expect(pointer).toEqual({ session_id: 'sess-1', error_at: '2026-07-15T12:00:00.000Z' });
+    expect(mockQuery.mock.calls[0][1]).toEqual(['g1', 'p1']);
+    expect(mockQuery.mock.calls[0][0]).toContain('ee.timestamp AS error_at');
+    expect(mockQuery.mock.calls[0][0]).not.toContain('scrubbed_at');
+  });
+
+  it('returns scrubbed chunk metadata in sequence order and normalizes bigint strings', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        seq: 2,
+        size_bytes: '1234',
+        decoded_size_bytes: '5678',
+        has_full_snapshot: true,
+        first_event_ms: '1700000000000',
+        last_event_ms: '1700000005000',
+      }],
+    });
+
+    const chunks = await getPlayableChunkMetas('sess-1', 'p1');
+
+    expect(chunks).toEqual([{
+      seq: 2,
+      size_bytes: 1234,
+      decoded_size_bytes: 5678,
+      has_full_snapshot: true,
+      first_event_ms: 1700000000000,
+      last_event_ms: 1700000005000,
+    }]);
+    expect(mockQuery.mock.calls[0][1]).toEqual(['sess-1', 'p1']);
+    expect(mockQuery.mock.calls[0][0]).toContain('c.scrubbed_at IS NOT NULL');
+    expect(mockQuery.mock.calls[0][0]).toContain('ORDER BY c.seq ASC');
   });
 });
 
@@ -172,5 +296,21 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
       (c) => typeof c[0] === 'string' && c[0].includes('UPDATE error_groups'),
     );
     expect(statusCall).toBeUndefined();
+  });
+
+  it('marks a dead-lettered session analysis as analysis_failed', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{
+        error_group_id: null, session_id: 's1', project_id: 'p1',
+        job_type: 'session_analysis', status: 'dead_letter',
+      }],
+    });
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await requeueStaleJobs();
+
+    const update = mockQuery.mock.calls.find((call) => String(call[0]).includes('UPDATE sessions'));
+    expect(update?.[1]).toEqual(['s1', 'p1']);
   });
 });

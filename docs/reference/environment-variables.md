@@ -20,6 +20,7 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `REPLAY_STORE_ENDPOINT` / `REPLAY_STORE_PUBLIC_ENDPOINT` | for replays | S3-compatible endpoint (internal / browser-visible) |
 | `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` | for replays | Storage credentials |
 | `REPLAY_STORE_BUCKET` / `REPLAY_STORE_REGION` | for replays | Bucket and region |
+| `INTERNAL_READ_TOKEN` | for worker replay evidence | Shared secret guarding worker-to-ingestion chunk reads. Unset disables the internal endpoint. |
 | `VERSION` | no | Reported by `/health` |
 
 Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in its test code, not runtime configuration.
@@ -29,6 +30,8 @@ Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in i
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | yes (hard exit without it) | Postgres connection string |
+| `INGESTION_BASE_URL` | for session replay evidence | Base URL used to fetch decoded, re-redacted session chunks from ingestion |
+| `INTERNAL_READ_TOKEN` | for session replay evidence | Shared secret sent to ingestion as `X-Internal-Token` |
 | `ANTHROPIC_API_KEY` | for investigation | Claude API access; missing → `missing_llm_key` outcomes |
 | `E2B_API_KEY` | for verification | Sandbox where fixes are tested |
 | `GITHUB_TOKEN` | one of the two GitHub modes | PAT for clone + PR |
@@ -54,4 +57,3 @@ The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHR
 | --- | --- |
 | `ALLOW_REGISTRATION` | Read by nothing; there is no self-serve registration path (sign-in is GitHub OAuth). |
 | `ENCRYPTION_KEY` | Read by nothing except a sandbox scrub list; at-rest token encryption is not implemented (see [trust](../architecture/trust.md#honest-gaps-current-state)). |
-| `INGESTION_BASE_URL` | Set for the worker in Compose, but no worker code reads it — the worker talks to Postgres and storage directly. |

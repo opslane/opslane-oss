@@ -30,6 +30,8 @@ export interface PipelineInput {
   /** Authoritative lease check immediately before irreversible provider writes. */
   assertLeaseOwned?: () => Promise<void>;
   replay?: ReplayInput | null;
+  kind?: 'error' | 'friction';
+  frictionEvidence?: string;
   /** Pre-computed investigation results. When set, agent skips internal triage. */
   investigation?: {
     rootCause: string;
@@ -66,6 +68,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     repoPath: input.repoPath,
     investigation: input.investigation,
     abortSignal: input.abortSignal,
+    frictionEvidence: input.frictionEvidence,
   });
 
   if (fixResult.status === 'needs_human') {
@@ -154,6 +157,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       visualAnalysis: input.visualAnalysis,
       errorType: input.errorType,
       errorMessage: input.errorMessage,
+      kind: input.kind,
     }, input.githubToken ? () => createGitHubClient(input.githubToken) : undefined),
   );
 

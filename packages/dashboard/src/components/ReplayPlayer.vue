@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref, watch } from 'vue';
 import { Replayer } from 'rrweb';
 import type { eventWithTime } from '@rrweb/types';
 import 'rrweb/dist/style.css';
-import { crashSeekMs, formatTime, replayDurationMs, sortedReplayEvents } from './replay-utils';
+import { crashSeekMs, ensureReplayMeta, formatTime, replayDurationMs, sortedReplayEvents } from './replay-utils';
 
 const props = defineProps<{
   events: eventWithTime[];
@@ -25,7 +25,7 @@ function buildPlayer() {
   if (!containerRef.value || !props.events || props.events.length === 0) return;
   containerRef.value.innerHTML = '';
 
-  const events = sortedReplayEvents(props.events);
+  const events = ensureReplayMeta(sortedReplayEvents(props.events));
   const r = new Replayer(events, {
     root: containerRef.value,
     skipInactive: false,

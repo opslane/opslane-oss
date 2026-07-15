@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -203,5 +203,24 @@ describe('gitCommitAndPush', () => {
     await expect(
       gitCommitAndPush(workDir, 'opslane/fix-bad', 'fix: nope', badDiff),
     ).rejects.toThrow('git apply failed');
+  });
+});
+
+// These inputs are rejected before any git process runs, so no network/git is needed.
+describe('cloneRepo input validation (git argument-injection guard)', () => {
+  const base = { githubRepo: 'owner/repo', defaultBranch: 'main', jobId: 'j1', githubToken: 'tok' };
+
+  it('rejects a branch that could be parsed as a git option', async () => {
+    await expect(
+      cloneRepo({ ...base, defaultBranch: '--upload-pack=touch /tmp/pwned' }),
+    ).rejects.toThrow(/unsafe branch name/);
+  });
+
+  it('rejects a branch containing whitespace', async () => {
+    await expect(cloneRepo({ ...base, defaultBranch: 'main foo' })).rejects.toThrow(/unsafe branch name/);
+  });
+
+  it('rejects a repo that is not owner/name', async () => {
+    await expect(cloneRepo({ ...base, githubRepo: '--foo' })).rejects.toThrow(/unsafe repository name/);
   });
 });

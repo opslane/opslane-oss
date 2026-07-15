@@ -50,6 +50,7 @@ export interface DiffJudgeInput {
   stackTrace: string;
   diff: string;
   stackTraceFiles: string[];
+  frictionEvidence?: string;
 }
 
 export async function judgeDiff(
@@ -78,6 +79,12 @@ ${input.stackTrace.slice(0, 3000)}
 </untrusted_data>
 
 Files referenced in stack trace: ${input.stackTraceFiles.join(', ') || 'none detected'}
+
+${input.frictionEvidence ? `## Friction Evidence (what the user experienced)
+<untrusted_data>
+${input.frictionEvidence.slice(0, 5000)}
+</untrusted_data>
+` : ''}
 
 ## Agent's Generated Diff
 <untrusted_data>

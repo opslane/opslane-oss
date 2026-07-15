@@ -1,14 +1,16 @@
+import { gzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   cleanupTenant,
   closePool,
   getConfig,
+  getPool,
   seedTenant,
   seedUserWithJWT,
   type TestTenant,
 } from './helpers.js';
 
-describe('replay contract', () => {
+describe('session replay pointer contract', () => {
   let tenant: TestTenant;
   let jwt: string;
 
@@ -18,98 +20,160 @@ describe('replay contract', () => {
   });
 
   afterAll(async () => {
+    // sessions reference environments without ON DELETE CASCADE; the shared
+    // pre-Batch-2 tenant cleanup does not know about them yet.
+    await getPool().query(`DELETE FROM sessions WHERE project_id = $1`, [tenant.projectId]);
     await cleanupTenant(tenant.orgId);
     await closePool();
   });
 
-  it('ingests, correlates, retrieves, redacts, and exposes replay_id', async () => {
+  it('resolves an early error to a committed chunk and serves it through the scrubbed read path', async () => {
     const { ingestionUrl } = getConfig();
+    const sessionId = 'e2e_replay_session';
+    const errorAt = new Date().toISOString();
+
+    const sessionInit = await fetch(`${ingestionUrl}/api/v1/sessions/init`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
+      body: JSON.stringify({
+        session_id: sessionId,
+        started_at: errorAt,
+        page_url: 'https://app.example.com/profile?secret=query',
+      }),
+    });
+    expect(sessionInit.status).toBe(200);
+    expect((await sessionInit.json()).recording).toBe(true);
 
     const ingest = await fetch(`${ingestionUrl}/api/v1/events`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
       body: JSON.stringify({
-        error: { type: 'TypeError', message: 'replay-contract', stack: 'at a (src/a.ts:1:1)' },
+        timestamp: errorAt,
+        error: { type: 'TypeError', message: 'session-pointer-contract', stack: 'at a (src/a.ts:1:1)' },
         breadcrumbs: [],
         context: {},
-        session_id: 'e2e-replay-sess',
+        session_id: sessionId,
       }),
     });
     expect(ingest.status).toBe(202);
-    const ev = await ingest.json();
-    expect(ev.error_group_id).toBe(ev.group_id);
+    const event = await ingest.json() as { event_id: string; error_group_id: string; group_id: string };
+    expect(event.error_group_id).toBe(event.group_id);
 
+    // Pointer identity is available before the first chunk is readable.
+    const incidentBeforeChunk = await fetch(
+      `${ingestionUrl}/api/v1/projects/${tenant.projectId}/incidents/${event.error_group_id}`,
+      { headers: { Authorization: `Bearer ${jwt}` } },
+    );
+    expect(incidentBeforeChunk.status).toBe(200);
+    const pointerBody = await incidentBeforeChunk.json() as {
+      session_pointer?: { session_id: string; error_at: string };
+      replay_id?: string;
+    };
+    expect(pointerBody.session_pointer?.session_id).toBe(sessionId);
+    // The public pointer is RFC3339 second precision; the source event may
+    // carry milliseconds.
+    expect(Math.abs(Date.parse(pointerBody.session_pointer?.error_at ?? '') - Date.parse(errorAt))).toBeLessThan(1_000);
+    expect(pointerBody.replay_id).toBeUndefined();
+
+    const errorAtMs = Date.parse(errorAt);
+    const secret = 'ghp_e2eplantedsecret123';
+    const recording = JSON.stringify({
+      events: [
+        { type: 4, timestamp: errorAtMs - 1_000, data: { width: 1280, height: 720 } },
+        { type: 2, timestamp: errorAtMs - 1_000, data: { note: secret } },
+        { type: 3, timestamp: errorAtMs, data: { source: 5 } },
+      ],
+      meta: { sdk_version: 'e2e', has_full_snapshot: true, chunked_at: errorAtMs },
+    });
+    const compressed = gzipSync(recording);
+
+    // Mirror the SDK's normal early-error flush: reserve, multipart upload, commit.
+    const policy = await fetch(
+      `${ingestionUrl}/api/v1/sessions/${sessionId}/chunks/upload-url`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
+        body: JSON.stringify({ seq: 0, size_bytes: compressed.byteLength, has_full_snapshot: true }),
+      },
+    );
+    expect(policy.status).toBe(200);
+    const policyBody = await policy.json() as { upload_url: string; form_data: Record<string, string> };
+    const form = new FormData();
+    for (const [key, value] of Object.entries(policyBody.form_data)) form.append(key, value);
+    form.append('file', new Blob([compressed], { type: 'application/gzip' }));
+    const upload = await fetch(policyBody.upload_url, { method: 'POST', body: form });
+    expect(upload.ok).toBe(true);
+
+    const commit = await fetch(`${ingestionUrl}/api/v1/sessions/${sessionId}/chunks/0/commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
+      body: '{}',
+    });
+    expect(commit.status).toBe(200);
+
+    const db = getPool();
+    const committed = await db.query<{
+      size_bytes: string;
+      has_full_snapshot: boolean;
+      retain_until: Date | null;
+    }>(
+      `SELECT c.size_bytes, c.has_full_snapshot, s.retain_until
+         FROM session_chunks c
+         JOIN sessions s ON s.id = c.session_id
+        WHERE c.session_id = $1 AND c.seq = 0`,
+      [sessionId],
+    );
+    expect(Number(committed.rows[0]?.size_bytes)).toBe(compressed.byteLength);
+    expect(committed.rows[0]?.has_full_snapshot).toBe(true);
+    expect(committed.rows[0]?.retain_until).toBeTruthy();
+
+    // The scrubber contract is covered in its own package. Mark this committed
+    // object readable deterministically so this E2E focuses on pointer/read APIs.
+    await db.query(
+      `UPDATE session_chunks
+          SET scrubbed_at = now(), first_event_ms = $3, last_event_ms = $4, decoded_size_bytes = $5
+        WHERE session_id = $1 AND seq = $2`,
+      [sessionId, 0, errorAtMs - 1_000, errorAtMs, Buffer.byteLength(recording)],
+    );
+
+    const session = await fetch(
+      `${ingestionUrl}/api/v1/projects/${tenant.projectId}/sessions/${sessionId}`,
+      { headers: { Authorization: `Bearer ${jwt}` } },
+    );
+    expect(session.status).toBe(200);
+    const sessionBody = await session.json() as {
+      playable_chunk_count: number;
+      chunks: Array<{ seq: number; first_event_ms: number; last_event_ms: number }>;
+    };
+    expect(sessionBody.playable_chunk_count).toBe(1);
+    expect(sessionBody.chunks).toEqual([
+      expect.objectContaining({ seq: 0, first_event_ms: errorAtMs - 1_000, last_event_ms: errorAtMs }),
+    ]);
+
+    const chunk = await fetch(
+      `${ingestionUrl}/api/v1/projects/${tenant.projectId}/sessions/${sessionId}/chunks/0`,
+      { headers: { Authorization: `Bearer ${jwt}` } },
+    );
+    expect(chunk.status).toBe(200);
+    const chunkText = await chunk.text();
+    expect(chunkText).not.toContain(secret);
+    const decoded = JSON.parse(chunkText) as { events: Array<{ type: number }> };
+    expect(decoded.events.slice(0, 2).map((item) => item.type)).toEqual([4, 2]);
+  });
+
+  it('keeps the legacy one-shot init route alive for older SDKs', async () => {
+    const { ingestionUrl } = getConfig();
     const init = await fetch(`${ingestionUrl}/api/v1/replays/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
       body: JSON.stringify({
-        session_id: 'e2e-replay-sess',
-        error_event_id: ev.event_id,
+        session_id: 'legacy_sdk_session',
         trigger_type: 'error',
       }),
     });
     expect(init.status).toBe(201);
-    const { replay_id: replayId, upload_url: uploadUrl } = await init.json();
-
-    const secret = 'ghp_e2eplantedsecret123';
-    const recording = JSON.stringify({
-      events: [
-        { type: 4, timestamp: 1000, data: {} },
-        { type: 2, timestamp: 1000, data: { note: secret } },
-        { type: 3, timestamp: 4000, data: { source: 5 } },
-      ],
-      meta: { crash_timestamp: 4000, page_url: 'https://app.example.com' },
-    });
-    const upload = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: recording,
-    });
-    expect(upload.ok).toBe(true);
-
-    const complete = await fetch(`${ingestionUrl}/api/v1/replays/${replayId}/complete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key': tenant.apiKey },
-      body: JSON.stringify({ signals: {}, artifacts: [] }),
-    });
-    expect(complete.status).toBe(200);
-
-    const get = await fetch(`${ingestionUrl}/api/v1/projects/${tenant.projectId}/replays/${replayId}`, {
-      headers: { Authorization: `Bearer ${jwt}` },
-    });
-    expect(get.status).toBe(200);
-    const body = await get.text();
-    expect(body).not.toContain(secret);
-    expect(JSON.parse(body).events.length).toBe(3);
-
-    // Defense in depth: the presigned upload URL is still valid after completion.
-    // Re-upload unredacted bytes, then confirm the read path redacts them anyway.
-    const reuploadSecret = 'ghp_e2ereuploadsecret456';
-    const reupload = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        events: [{ type: 2, timestamp: 1000, data: { note: reuploadSecret } }],
-        meta: {},
-      }),
-    });
-    expect(reupload.ok).toBe(true);
-    const getAfterReupload = await fetch(
-      `${ingestionUrl}/api/v1/projects/${tenant.projectId}/replays/${replayId}`,
-      { headers: { Authorization: `Bearer ${jwt}` } }
-    );
-    expect(getAfterReupload.status).toBe(200);
-    expect(await getAfterReupload.text()).not.toContain(reuploadSecret);
-
-    const sdkGet = await fetch(`${ingestionUrl}/api/v1/projects/${tenant.projectId}/replays/${replayId}`, {
-      headers: { 'X-API-Key': tenant.apiKey },
-    });
-    expect(sdkGet.status).not.toBe(200);
-
-    const inc = await fetch(`${ingestionUrl}/api/v1/projects/${tenant.projectId}/incidents/${ev.error_group_id}`, {
-      headers: { Authorization: `Bearer ${jwt}` },
-    });
-    expect(inc.status).toBe(200);
-    expect((await inc.json()).replay_id).toBe(replayId);
+    const body = await init.json() as { replay_id?: string; upload_url?: string };
+    expect(body.replay_id).toEqual(expect.any(String));
+    expect(body.upload_url).toEqual(expect.any(String));
   });
 });
