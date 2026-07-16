@@ -78,6 +78,7 @@ async function cleanupTestData(): Promise<void> {
   await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
+  await testPool.query(`DELETE FROM sessions WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM environments WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM projects WHERE id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM orgs WHERE id = $1`, [testOrgId]);
@@ -194,6 +195,166 @@ describeDb('db.ts integration tests', () => {
       const job = await claimJob('worker-1', 60_000);
       expect(job).not.toBeNull();
       expect(job!.id).toBe(pendingJobId);
+    });
+  });
+
+  describe('fair scheduling and per-type caps (issue #28)', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    async function seedSession(): Promise<string> {
+      const envResult = await testPool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [testProjectId, `env-${crypto.randomUUID()}`]
+      );
+      const sessionId = `sess-${crypto.randomUUID()}`;
+      await testPool.query(
+        `INSERT INTO sessions (id, project_id, environment_id, started_at)
+         VALUES ($1, $2, $3, now())`,
+        [sessionId, testProjectId, envResult.rows[0]!.id]
+      );
+      return sessionId;
+    }
+
+    async function seedAnalysisJob(): Promise<string> {
+      const sessionId = await seedSession();
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO error_group_jobs (project_id, status, job_type, session_id)
+         VALUES ($1, 'pending', 'session_analysis', $2) RETURNING id`,
+        [testProjectId, sessionId]
+      );
+      return res.rows[0]!.id;
+    }
+
+    async function seedTypedJob(jobType: 'fix' | 'error_fix' | 'investigate'): Promise<string> {
+      const { jobId } = await seedErrorGroupAndJob();
+      await testPool.query(
+        `UPDATE error_group_jobs SET job_type = $2 WHERE id = $1`,
+        [jobId, jobType]
+      );
+      return jobId;
+    }
+
+    it('caps concurrently claimed session_analysis jobs', async () => {
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+
+      const first = await claimJob('w1', 60_000, 2);
+      const second = await claimJob('w2', 60_000, 2);
+      expect(first?.jobType).toBe('session_analysis');
+      expect(second?.jobType).toBe('session_analysis');
+
+      // Third pending analysis job exists, but the cap is reached.
+      const third = await claimJob('w3', 60_000, 2);
+      expect(third).toBeNull();
+    });
+
+    it('a cap of zero blocks session_analysis claims entirely', async () => {
+      await seedAnalysisJob();
+      const claim = await claimJob('w1', 60_000, 0);
+      expect(claim).toBeNull();
+    });
+
+    it('a fresh error_fix is claimed immediately during an analysis flood', async () => {
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+
+      // Analysis flood in progress: two claimed (at cap), one still pending.
+      await claimJob('w1', 60_000, 2);
+      await claimJob('w2', 60_000, 2);
+
+      const fixJobId = await seedTypedJob('error_fix');
+      const next = await claimJob('w3', 60_000, 2);
+      expect(next?.id).toBe(fixJobId);
+    });
+
+    it('error_fix outranks a pending analysis backlog from a cold start too', async () => {
+      await seedAnalysisJob();
+      await sleep(5);
+      const fixJobId = await seedTypedJob('error_fix');
+      const first = await claimJob('w1', 60_000, 2);
+      expect(first?.id).toBe(fixJobId);
+    });
+
+    it('session_analysis makes progress under a fix backlog, up to its cap', async () => {
+      for (let i = 0; i < 5; i++) {
+        await seedTypedJob('fix');
+        await sleep(5);
+      }
+      for (let i = 0; i < 3; i++) {
+        await seedAnalysisJob();
+        await sleep(5);
+      }
+
+      // Long leases: claimed jobs stay running for the whole test, so the
+      // sequence shows lane alternation and then the cap binding.
+      const types: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const job = await claimJob(`w${i}`, 600_000, 2);
+        expect(job).not.toBeNull();
+        types.push(job!.jobType);
+      }
+      expect(types).toEqual([
+        'fix', 'session_analysis', 'fix', 'session_analysis', 'fix', 'fix',
+      ]);
+    });
+
+    it('enforces the cap under truly concurrent claimers (no overshoot)', async () => {
+      for (let i = 0; i < 3; i++) {
+        await seedAnalysisJob();
+        await sleep(5);
+      }
+      for (let i = 0; i < 3; i++) {
+        await seedTypedJob('fix');
+        await sleep(5);
+      }
+
+      // Six workers poll at the same instant with cap 1. Without serialized
+      // admission they would all see zero running analysis jobs and overshoot.
+      const claims = await Promise.all(
+        Array.from({ length: 6 }, (_, i) => claimJob(`cw${i}`, 600_000, 1))
+      );
+
+      const byType = claims
+        .filter((c): c is NonNullable<typeof c> => c !== null)
+        .map((c) => c.jobType);
+      expect(byType.filter((t) => t === 'session_analysis')).toHaveLength(1);
+      expect(byType.filter((t) => t === 'fix')).toHaveLength(3);
+      expect(claims.filter((c) => c === null)).toHaveLength(2);
+    });
+
+    it('completing an analysis job releases its cap slot', async () => {
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedAnalysisJob();
+      await sleep(5);
+      await seedTypedJob('fix');
+
+      // Cold start: both lanes tie, so the interactive lane goes first.
+      const f1 = await claimJob('w1', 600_000, 2);
+      expect(f1?.jobType).toBe('fix');
+
+      const a1 = await claimJob('w2', 600_000, 2);
+      const a2 = await claimJob('w3', 600_000, 2);
+      expect(a1?.jobType).toBe('session_analysis');
+      expect(a2?.jobType).toBe('session_analysis');
+
+      // At cap with only analysis pending: nothing is claimable.
+      const blocked = await claimJob('w4', 600_000, 2);
+      expect(blocked).toBeNull();
+
+      // Completion releases a slot; the pending analysis job is claimable again.
+      const completed = await completeJob(a1!.id, 'w2', a1!.leaseGeneration);
+      expect(completed).toBe(true);
+      const a3 = await claimJob('w5', 600_000, 2);
+      expect(a3?.jobType).toBe('session_analysis');
     });
   });
 
