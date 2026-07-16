@@ -169,6 +169,9 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # The friction e2e gate runs the worker's session-analysis pipeline
+      # in-process (issue #56), so the built worker package must exist.
+      - run: pnpm --filter @opslane/shared --filter @opslane/worker build
       - name: Assert the LLM key is absent
         run: |
           if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -187,6 +190,12 @@ jobs:
           DATABASE_URL: postgres://opslane:opslane_dev@localhost:5434/opslane
           INGESTION_URL: http://localhost:8082
           E2E_WORKER_NO_KEY: "1"
+          # Friction gate (issue #56): host-reachable MinIO for the in-process
+          # chunk read; the injected adjudicator keeps this lane keyless.
+          MINIO_ENDPOINT: http://localhost:9012
+          MINIO_ACCESS_KEY: minio
+          MINIO_SECRET_KEY: minio12345
+          MINIO_BUCKET: opslane-replays
         run: >
           pnpm --filter @opslane/test-e2e exec vitest run
           --reporter=default --reporter=json
