@@ -1087,55 +1087,106 @@ func (q *Queries) UpdateErrorGroupStatus(ctx context.Context, u StatusUpdate) er
 
 // === Resolution lifecycle ===
 
+// PRTransition identifies the incident and project changed by a pull-request
+// lifecycle transition. A zero value means no matching pr_created incident.
+type PRTransition struct {
+	ErrorGroupID string
+	ProjectID    string
+}
+
+// Assumption for both transitions: github_repo + pr_number + status='pr_created'
+// is unique in practice. If multiple projects share the same repo, only one
+// arbitrary match is updated. At pilot scale (3-4 partners) this is acceptable;
+// revisit if multi-project-per-repo is needed.
+const transitionOnPRMergeSQL = `UPDATE error_groups eg
+	 SET status = 'merged', merged_at = now(), updated_at = now()
+	 FROM projects p
+	 WHERE eg.project_id = p.id
+	   AND p.github_repo = $1
+	   AND eg.pr_number = $2
+	   AND eg.status = 'pr_created'
+	 RETURNING eg.id, eg.project_id`
+
+const transitionOnPRCloseSQL = `UPDATE error_groups eg
+	 SET status = 'investigated', pr_url = NULL, pr_number = NULL, updated_at = now()
+	 FROM projects p
+	 WHERE eg.project_id = p.id
+	   AND p.github_repo = $1
+	   AND eg.pr_number = $2
+	   AND eg.status = 'pr_created'
+	 RETURNING eg.id, eg.project_id`
+
+const insertPROutcomeSQL = `INSERT INTO pr_outcomes
+	    (error_group_id, project_id, pr_number, outcome, github_delivery_id, occurred_at)
+	 VALUES ($1, $2, $3, $4, $5, now())
+	 ON CONFLICT (github_delivery_id) DO NOTHING`
+
 // TransitionOnPRMerge transitions an error group from pr_created to merged.
-// Matches by github_repo (owner/repo) + pr_number. Returns the group ID or empty string if no match.
-// Assumption: github_repo + pr_number + status='pr_created' is unique in practice.
-// If multiple projects share the same repo, only one arbitrary match is updated.
-// At pilot scale (3-4 partners) this is acceptable; revisit if multi-project-per-repo is needed.
-func (q *Queries) TransitionOnPRMerge(ctx context.Context, githubRepo string, prNumber int) (string, error) {
-	var groupID string
-	err := q.pool.QueryRow(ctx,
-		`UPDATE error_groups eg
-		 SET status = 'merged', merged_at = now(), updated_at = now()
-		 FROM projects p
-		 WHERE eg.project_id = p.id
-		   AND p.github_repo = $1
-		   AND eg.pr_number = $2
-		   AND eg.status = 'pr_created'
-		 RETURNING eg.id`,
-		githubRepo, prNumber,
-	).Scan(&groupID)
-	if err == pgx.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("transition on PR merge: %w", err)
-	}
-	return groupID, nil
+// Matches by github_repo (owner/repo) + pr_number. Returns the changed group and
+// project IDs, or a zero-value PRTransition if no incident matches.
+func (q *Queries) TransitionOnPRMerge(ctx context.Context, githubRepo string, prNumber int) (PRTransition, error) {
+	return scanPRTransition(q.pool.QueryRow(ctx, transitionOnPRMergeSQL, githubRepo, prNumber), "merge")
 }
 
 // TransitionOnPRClose transitions an error group from pr_created back to investigated
 // when a PR is closed without merging. Clears PR fields.
-func (q *Queries) TransitionOnPRClose(ctx context.Context, githubRepo string, prNumber int) (string, error) {
-	var groupID string
-	err := q.pool.QueryRow(ctx,
-		`UPDATE error_groups eg
-		 SET status = 'investigated', pr_url = NULL, pr_number = NULL, updated_at = now()
-		 FROM projects p
-		 WHERE eg.project_id = p.id
-		   AND p.github_repo = $1
-		   AND eg.pr_number = $2
-		   AND eg.status = 'pr_created'
-		 RETURNING eg.id`,
-		githubRepo, prNumber,
-	).Scan(&groupID)
+func (q *Queries) TransitionOnPRClose(ctx context.Context, githubRepo string, prNumber int) (PRTransition, error) {
+	return scanPRTransition(q.pool.QueryRow(ctx, transitionOnPRCloseSQL, githubRepo, prNumber), "close")
+}
+
+func scanPRTransition(row pgx.Row, action string) (PRTransition, error) {
+	var result PRTransition
+	err := row.Scan(&result.ErrorGroupID, &result.ProjectID)
 	if err == pgx.ErrNoRows {
-		return "", nil
+		return PRTransition{}, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("transition on PR close: %w", err)
+		return PRTransition{}, fmt.Errorf("transition on PR %s: %w", action, err)
 	}
-	return groupID, nil
+	return result, nil
+}
+
+// RecordPRLifecycleEvent transitions the matching pr_created incident and inserts
+// its immutable pr_outcomes receipt in ONE transaction. outcome must be "merged"
+// or "closed". Atomicity matters: if the receipt insert fails, the transition
+// rolls back too, so a webhook redelivery can repair the partial failure instead
+// of hitting no_match with the receipt permanently lost (004_friction.sql
+// documents the receipts log as loss-free under redelivery). The delivery ID is
+// the receipt idempotency key for duplicate deliveries.
+func (q *Queries) RecordPRLifecycleEvent(ctx context.Context, githubRepo string, prNumber int, outcome, githubDeliveryID string) (PRTransition, error) {
+	var transitionSQL string
+	switch outcome {
+	case "merged":
+		transitionSQL = transitionOnPRMergeSQL
+	case "closed":
+		transitionSQL = transitionOnPRCloseSQL
+	default:
+		return PRTransition{}, fmt.Errorf("record PR lifecycle event: unknown outcome %q", outcome)
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return PRTransition{}, fmt.Errorf("begin PR lifecycle tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	result, err := scanPRTransition(tx.QueryRow(ctx, transitionSQL, githubRepo, prNumber), outcome)
+	if err != nil {
+		return PRTransition{}, err
+	}
+	if result.ErrorGroupID == "" {
+		return PRTransition{}, nil
+	}
+
+	if _, err := tx.Exec(ctx, insertPROutcomeSQL,
+		result.ErrorGroupID, result.ProjectID, prNumber, outcome, githubDeliveryID,
+	); err != nil {
+		return PRTransition{}, fmt.Errorf("insert PR outcome receipt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PRTransition{}, fmt.Errorf("commit PR lifecycle tx: %w", err)
+	}
+	return result, nil
 }
 
 // ResolveErrorGroup manually transitions an error group to resolved.

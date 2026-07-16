@@ -71,36 +71,32 @@ func (d *Dependencies) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	repo := event.Repository.FullName
 	prNumber := event.PullRequest.Number
-
-	if event.PullRequest.Merged {
-		groupID, err := d.Queries.TransitionOnPRMerge(r.Context(), repo, prNumber)
-		if err != nil {
-			slog.Error("webhook: transition on PR merge failed", "repo", repo, "pr", prNumber, "error", err)
-			writeJSONError(w, http.StatusInternalServerError, "failed to process merge event")
-			return
-		}
-		status := "processed"
-		if groupID == "" {
-			status = "no_match"
-		}
-		slog.Info("webhook: PR merged", "repo", repo, "pr", prNumber, "group_id", groupID, "status", status)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": status, "action": "merged", "group_id": groupID})
-	} else {
-		groupID, err := d.Queries.TransitionOnPRClose(r.Context(), repo, prNumber)
-		if err != nil {
-			slog.Error("webhook: transition on PR close failed", "repo", repo, "pr", prNumber, "error", err)
-			writeJSONError(w, http.StatusInternalServerError, "failed to process close event")
-			return
-		}
-		status := "processed"
-		if groupID == "" {
-			status = "no_match"
-		}
-		slog.Info("webhook: PR closed without merge", "repo", repo, "pr", prNumber, "group_id", groupID, "status", status)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": status, "action": "closed", "group_id": groupID})
+	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	if deliveryID == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing X-GitHub-Delivery header")
+		return
 	}
+
+	outcome := "closed"
+	if event.PullRequest.Merged {
+		outcome = "merged"
+	}
+
+	// Transition + receipt insert are one transaction: a partial failure rolls
+	// both back so a redelivery can complete them together.
+	transition, err := d.Queries.RecordPRLifecycleEvent(r.Context(), repo, prNumber, outcome, deliveryID)
+	if err != nil {
+		slog.Error("webhook: record PR lifecycle event failed", "repo", repo, "pr", prNumber, "outcome", outcome, "delivery_id", deliveryID, "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to process "+outcome+" event")
+		return
+	}
+	status := "processed"
+	if transition.ErrorGroupID == "" {
+		status = "no_match"
+	}
+	slog.Info("webhook: PR "+outcome, "repo", repo, "pr", prNumber, "group_id", transition.ErrorGroupID, "status", status)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": status, "action": outcome, "group_id": transition.ErrorGroupID})
 }
 
 // verifyWebhookSignature validates the X-Hub-Signature-256 header.
