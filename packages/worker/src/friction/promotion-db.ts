@@ -31,6 +31,8 @@ export async function claimSignalsForAdjudication(
 export interface FoldTarget {
   errorGroupId: string;
   status: string;
+  title: string;
+  secondsAway: number;
 }
 
 /** Finds the fold target for a signal: the nearest same-session error event
@@ -44,8 +46,14 @@ export async function findFoldTarget(
   sessionId: string,
   occurredAt: string,
 ): Promise<FoldTarget | null> {
-  const { rows } = await client.query<{ error_group_id: string; status: string }>(
-    `SELECT eg.id AS error_group_id, eg.status
+  const { rows } = await client.query<{
+    error_group_id: string;
+    status: string;
+    title: string;
+    seconds_away: number;
+  }>(
+    `SELECT eg.id AS error_group_id, eg.status, eg.title,
+            abs(extract(epoch FROM (ee."timestamp" - $3::timestamptz)))::float8 AS seconds_away
        FROM error_events ee
        JOIN error_groups eg ON eg.id = ee.error_group_id
       WHERE ee.session_id = $2
@@ -59,7 +67,36 @@ export async function findFoldTarget(
     [projectId, sessionId, occurredAt],
   );
   const row = rows[0];
-  return row ? { errorGroupId: row.error_group_id, status: row.status } : null;
+  return row
+    ? {
+        errorGroupId: row.error_group_id,
+        status: row.status,
+        title: row.title,
+        secondsAway: row.seconds_away,
+      }
+    : null;
+}
+
+/** Ids and total session-level occurrences of the signals a bucket
+ * adjudication would claim: pending, active, identified, in-window. */
+export async function listEligibleSignals(
+  client: pg.PoolClient,
+  tuple: Pick<BucketTuple, 'projectId' | 'environmentId' | 'fingerprint'>,
+): Promise<{ ids: string[]; totalOccurrences: number }> {
+  const { rows } = await client.query<{ id: string; occurrence_count: number }>(
+    `SELECT id, occurrence_count
+     FROM friction_signals
+     WHERE project_id = $1 AND environment_id = $2 AND fingerprint = $3
+       AND adjudication_status = 'pending'
+       AND end_user_id IS NOT NULL
+       AND retracted_at IS NULL AND superseded_by IS NULL
+       AND occurred_at > now() - interval '7 days'`,
+    [tuple.projectId, tuple.environmentId, tuple.fingerprint],
+  );
+  return {
+    ids: rows.map((r) => r.id),
+    totalOccurrences: rows.reduce((sum, r) => sum + r.occurrence_count, 0),
+  };
 }
 
 /** Row shape consumed by the fold path (matches friction_signals columns). */

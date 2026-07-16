@@ -132,9 +132,12 @@ async function cleanup(): Promise<void> {
   await pool.query(`DELETE FROM end_users WHERE project_id = $1`, [projectId]);
 }
 
+import { purgeStaleTenants } from './tenant-purge.js';
+
 describeDb('bucket promotion integration', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: DATABASE_URL });
+    await purgeStaleTenants(pool, 'b4-bucket-test');
     const org = await pool.query<{ id: string }>(
       `INSERT INTO orgs (name) VALUES ('b4-bucket-test') RETURNING id`
     );

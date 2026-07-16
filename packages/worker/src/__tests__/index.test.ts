@@ -60,6 +60,10 @@ vi.mock('../friction/investigate-friction.js', () => ({ investigateFriction: vi.
 vi.mock('../friction/chunk-reader.js', () => ({ readChunksBounded: vi.fn() }));
 vi.mock('../friction/analyzer.js', () => ({ analyzeSession: vi.fn(), RULE_VERSION: 1 }));
 vi.mock('../friction/persist.js', () => ({ writeFrictionSignals: vi.fn() }));
+vi.mock('../friction/promotion.js', () => ({ processFrictionOutcomes: vi.fn() }));
+vi.mock('../friction/adjudicator.js', () => ({
+  createAnthropicAdjudicator: vi.fn(() => ({ modelId: 'real', promptVersion: 1, adjudicate: vi.fn() })),
+}));
 
 const db = await import('../db.js');
 const { cloneRepo } = await import('../repo-clone.js');
@@ -70,6 +74,7 @@ const { investigateFriction } = await import('../friction/investigate-friction.j
 const { readChunksBounded } = await import('../friction/chunk-reader.js');
 const { analyzeSession } = await import('../friction/analyzer.js');
 const { writeFrictionSignals } = await import('../friction/persist.js');
+const { processFrictionOutcomes } = await import('../friction/promotion.js');
 
 const mockGetErrorGroup = vi.mocked(db.getErrorGroup);
 const mockGetErrorEvent = vi.mocked(db.getErrorEvent);
@@ -415,6 +420,52 @@ describe('session_analysis handler', () => {
     expect(writeFrictionSignals).toHaveBeenCalledWith(session, [], 1);
     expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analyzed', 1, job);
     expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
+  });
+
+  it('runs friction adjudication after signal persistence when a key is set', async () => {
+    const session = {
+      id: 'session-1', project_id: 'proj-1', environment_id: 'env-1', end_user_id: null, status: 'closed',
+    };
+    vi.mocked(db.getSessionForAnalysis).mockResolvedValue(session);
+    vi.mocked(db.getScrubbedChunksForSession).mockResolvedValue([]);
+    vi.mocked(readChunksBounded).mockResolvedValue({ envelopes: [], inflatedBytes: 0, truncated: false });
+    vi.mocked(analyzeSession).mockReturnValue([]);
+    const prevKey = process.env['ANTHROPIC_API_KEY'];
+    process.env['ANTHROPIC_API_KEY'] = 'test-key';
+    try {
+      await processSessionAnalysisJob(job, new AbortController().signal);
+    } finally {
+      if (prevKey === undefined) delete process.env['ANTHROPIC_API_KEY'];
+      else process.env['ANTHROPIC_API_KEY'] = prevKey;
+    }
+    expect(processFrictionOutcomes).toHaveBeenCalledWith(
+      session,
+      'analysis-1',
+      expect.objectContaining({ modelId: 'real' }),
+    );
+    // Ordering: adjudication runs after persistence, before 'analyzed'.
+    expect(vi.mocked(writeFrictionSignals).mock.invocationCallOrder[0]!).toBeLessThan(
+      vi.mocked(processFrictionOutcomes).mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it('skips friction adjudication without a key (keyless mode) and still analyzes', async () => {
+    const session = {
+      id: 'session-1', project_id: 'proj-1', environment_id: 'env-1', end_user_id: null, status: 'closed',
+    };
+    vi.mocked(db.getSessionForAnalysis).mockResolvedValue(session);
+    vi.mocked(db.getScrubbedChunksForSession).mockResolvedValue([]);
+    vi.mocked(readChunksBounded).mockResolvedValue({ envelopes: [], inflatedBytes: 0, truncated: false });
+    vi.mocked(analyzeSession).mockReturnValue([]);
+    const prevKey = process.env['ANTHROPIC_API_KEY'];
+    delete process.env['ANTHROPIC_API_KEY'];
+    try {
+      await processSessionAnalysisJob(job, new AbortController().signal);
+    } finally {
+      if (prevKey !== undefined) process.env['ANTHROPIC_API_KEY'] = prevKey;
+    }
+    expect(processFrictionOutcomes).not.toHaveBeenCalled();
+    expect(db.setSessionAnalysisStatus).toHaveBeenLastCalledWith('session-1', 'proj-1', 'analyzed', 1, job);
   });
 
   it('marks analysis_failed and rethrows corrupt chunk failures', async () => {
