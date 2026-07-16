@@ -469,6 +469,18 @@ export async function resolveSilentMergedGroups(): Promise<string[]> {
          WHERE error_group_id = error_groups.id
            AND created_at > error_groups.merged_at
        )
+       -- Ongoing linked friction blocks silence resolution (issue #56):
+       -- an incident with active accepted friction after the merge is not
+       -- silent even when no new error events arrive.
+       AND NOT EXISTS (
+         SELECT 1
+         FROM friction_signals fs
+         WHERE fs.incident_id = error_groups.id
+           AND fs.adjudication_status = 'accepted'
+           AND fs.retracted_at IS NULL
+           AND fs.superseded_by IS NULL
+           AND fs.occurred_at > error_groups.merged_at
+       )
      RETURNING id`
   );
   return result.rows.map(r => r.id);

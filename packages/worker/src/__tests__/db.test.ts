@@ -6,6 +6,7 @@ import {
   completeJob,
   failJob,
   requeueStaleJobs,
+  resolveSilentMergedGroups,
   updateGroupStatus,
   updateGroupInvestigation,
   updateGroupAndCreateFixJob,
@@ -75,6 +76,7 @@ async function seedErrorGroupAndJob(overrides?: {
 
 async function cleanupTestData(): Promise<void> {
   // Delete in reverse FK order
+  await testPool.query(`DELETE FROM friction_signals WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
@@ -131,6 +133,7 @@ describeDb('db.ts integration tests', () => {
 
   beforeEach(async () => {
     // Clean only jobs and error groups between tests, keep tenant
+    await testPool.query(`DELETE FROM friction_signals WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
@@ -355,6 +358,85 @@ describeDb('db.ts integration tests', () => {
       expect(completed).toBe(true);
       const a3 = await claimJob('w5', 600_000, 2);
       expect(a3?.jobType).toBe('session_analysis');
+    });
+  });
+
+  describe('resolveSilentMergedGroups (friction-aware, issue #56)', () => {
+    async function seedMergedGroup(): Promise<string> {
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status, merged_at)
+         VALUES ($1, $2, 'Merged Error', now() - interval '3 days', now() - interval '2 days',
+                 'merged', now() - interval '2 days')
+         RETURNING id`,
+        [testProjectId, `fp-${crypto.randomUUID()}`]
+      );
+      return res.rows[0]!.id;
+    }
+
+    async function seedLinkedSignal(groupId: string, opts: {
+      status: string;
+      occurredAt: string;
+      retracted?: boolean;
+    }): Promise<void> {
+      const envRes = await testPool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [testProjectId, `env-${crypto.randomUUID()}`]
+      );
+      const sessionId = `sess-${crypto.randomUUID()}`;
+      await testPool.query(
+        `INSERT INTO sessions (id, project_id, environment_id, started_at)
+         VALUES ($1, $2, $3, now() - interval '1 day')`,
+        [sessionId, testProjectId, envRes.rows[0]!.id]
+      );
+      await testPool.query(
+        `INSERT INTO friction_signals
+           (session_id, project_id, environment_id, rule_version, signal_type,
+            fingerprint, page_url_normalized, occurred_at, adjudication_status,
+            incident_id, retracted_at)
+         VALUES ($1, $2, $3, 1, 'rage_click', $4, '/x', $5, $6, $7, $8)`,
+        [
+          sessionId,
+          testProjectId,
+          envRes.rows[0]!.id,
+          `fp-${crypto.randomUUID()}`,
+          opts.occurredAt,
+          opts.status,
+          groupId,
+          opts.retracted ? new Date() : null,
+        ]
+      );
+    }
+
+    const afterMerge = () => new Date(Date.now() - 1 * 3600 * 1000).toISOString();
+    const beforeMerge = () => new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+
+    it('resolves a truly silent merged group', async () => {
+      const groupId = await seedMergedGroup();
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
+    });
+
+    it('does not resolve when active accepted linked friction occurred after merged_at', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: afterMerge() });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).not.toContain(groupId);
+    });
+
+    it('resolves when linked friction predates the merge', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: beforeMerge() });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
+    });
+
+    it('resolves when post-merge linked friction is rejected or retracted', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'rejected', occurredAt: afterMerge() });
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: afterMerge(), retracted: true });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
     });
   });
 
