@@ -33,7 +33,7 @@ docker compose config --quiet
 - Shared types or workspace metadata: run `pnpm -r build` and affected tests.
 - CLI: run `pnpm --filter @opslane/cli build` and `pnpm --filter @opslane/cli test`.
 - Compose or health checks: validate config, start services, and inspect health. Build any affected Compose image after Dockerfile changes.
-- Pipeline changes require a live smoke: apply migrations, run `scripts/seed-e2e.sql`, rebuild ingestion and worker, send an event to `http://localhost:8082/api/v1/events`, and confirm the job reaches its expected terminal state. Use `test-fixtures/vue-app` for browser fixtures.
+- Pipeline changes require a live smoke: apply migrations, run `scripts/seed-e2e.sql`, rebuild ingestion and worker, send an event to `http://localhost:8082/api/v1/events`, and confirm the job reaches its expected terminal state. Use `test-fixtures/vue-app` or `test-fixtures/react-app` for browser fixtures.
 
 ## Cross-cutting conventions
 
