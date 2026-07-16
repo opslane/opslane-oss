@@ -251,6 +251,9 @@ func (q *Queries) AdminOverviewData(ctx context.Context) (*AdminOverview, error)
 // AdminRecentJobs intentionally returns jobs across all tenants. The caller must
 // validate status/jobType against the public allowlists before calling.
 func (q *Queries) AdminRecentJobs(ctx context.Context, limit int, status, jobType string) ([]AdminJob, error) {
+	// The handler clamps limit too; bound it here as well so the slice
+	// allocation and query LIMIT can never depend on an unchecked caller.
+	limit = max(1, min(limit, 200))
 	rows, err := q.pool.Query(ctx, `
 		SELECT
 			j.id, coalesce(p.name, ''), j.job_type, j.status::text, j.attempts, j.created_at,

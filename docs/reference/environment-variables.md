@@ -57,4 +57,5 @@ The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHR
 | Variable | Status |
 | --- | --- |
 | `ALLOW_REGISTRATION` | Read by nothing; there is no self-serve registration path (sign-in is GitHub OAuth). |
+| `OPSLANE_ADMIN_EMAILS` | Host-side name that docker-compose.yml maps into the ingestion service's `ADMIN_EMAILS`; consumed by Compose interpolation, not read by code directly. |
 | `ENCRYPTION_KEY` | Read by nothing except a sandbox scrub list; at-rest token encryption is not implemented (see [trust](../architecture/trust.md#honest-gaps-current-state)). |
