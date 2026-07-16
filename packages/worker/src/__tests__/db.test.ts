@@ -135,6 +135,113 @@ describeDb('db.ts integration tests', () => {
     await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
   });
 
+  describe('group lifecycle timestamps', () => {
+    const reason = {
+      reason_code: 'worker_runtime_error' as const,
+      reason_message: 'The worker could not complete the incident',
+      remediation: 'Review the incident manually',
+    };
+
+    it('stamps PR creation and retains it across later status changes', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/42',
+        pr_number: 42,
+      });
+      const stamped = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(stamped.rows[0]?.pr_created_at).toBeInstanceOf(Date);
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'analyzing');
+      const retained = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(retained.rows[0]?.pr_created_at).toEqual(stamped.rows[0]?.pr_created_at);
+    });
+
+    it('stamps needs-human status updates and retains the timestamp later', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'needs_human', { reason });
+      const stamped = await testPool.query<{ needs_human_at: Date | null }>(
+        `SELECT needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(stamped.rows[0]?.needs_human_at).toBeInstanceOf(Date);
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'queued');
+      const retained = await testPool.query<{ needs_human_at: Date | null }>(
+        `SELECT needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(retained.rows[0]?.needs_human_at).toEqual(stamped.rows[0]?.needs_human_at);
+    });
+
+    it('stamps needs-human investigation results', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupInvestigation(errorGroupId, testProjectId, 'needs_human', {
+        rootCause: 'External dependency failed',
+        reason,
+      });
+
+      const result = await testPool.query<{
+        status: string;
+        needs_human_at: Date | null;
+      }>(
+        `SELECT status, needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(result.rows[0]?.status).toBe('needs_human');
+      expect(result.rows[0]?.needs_human_at).toBeInstanceOf(Date);
+    });
+
+    it('does not move pr_created_at when the same status is written again', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/43',
+        pr_number: 43,
+      });
+      const first = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+
+      // Retried terminal writes happen under the at-least-once job model; they
+      // must not drag the stamp forward and inflate windowed admin metrics.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/43',
+        pr_number: 43,
+      });
+      const second = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(second.rows[0]?.pr_created_at).toEqual(first.rows[0]?.pr_created_at);
+    });
+
+    it('stamps pr_created_at through investigation updates', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupInvestigation(errorGroupId, testProjectId, 'pr_created', {
+        rootCause: 'Fix PR opened after investigation',
+      });
+
+      const result = await testPool.query<{ status: string; pr_created_at: Date | null }>(
+        `SELECT status, pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(result.rows[0]?.status).toBe('pr_created');
+      expect(result.rows[0]?.pr_created_at).toBeInstanceOf(Date);
+    });
+  });
+
   describe('claimJob', () => {
     it('should claim a pending job and set claimed status', async () => {
       const { jobId } = await seedErrorGroupAndJob();
