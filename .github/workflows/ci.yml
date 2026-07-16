@@ -172,6 +172,8 @@ jobs:
       # The friction e2e gate runs the worker's session-analysis pipeline
       # in-process (issue #56), so the built worker package must exist.
       - run: pnpm --filter @opslane/shared --filter @opslane/worker build
+      - name: Install Playwright chromium (browser smoke)
+        run: pnpm --filter @opslane/test-e2e exec playwright install --with-deps chromium
       - name: Assert the LLM key is absent
         run: |
           if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -204,7 +206,13 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "15"
+          E2E_MIN_TESTS: "27"
+          # The browser smoke suites must be collected AND pass by name, so a
+          # future edit cannot drop them while keeping the total count intact.
+          E2E_REQUIRED_PATTERNS: |
+            ^browser smoke: Vue error to needs_human >
+            ^browser smoke: React error to needs_human >
+            ^browser smoke: rage click to friction signal >
         run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
       - name: Token-leak scan over logs and public HTTP surfaces
         run: |

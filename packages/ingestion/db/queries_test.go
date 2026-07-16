@@ -199,28 +199,28 @@ func TestTransitionOnPRMergeAndClose(t *testing.T) {
 	}
 
 	// Wrong repo/PR: no transition, no error.
-	if id, err := q.TransitionOnPRMerge(ctx, "org/other-repo", 7); err != nil || id != "" {
-		t.Fatalf("TransitionOnPRMerge(wrong repo) = (%q, %v), want empty", id, err)
+	if result, err := q.TransitionOnPRMerge(ctx, "org/other-repo", 7); err != nil || result != (db.PRTransition{}) {
+		t.Fatalf("TransitionOnPRMerge(wrong repo) = (%+v, %v), want empty", result, err)
 	}
-	if id, err := q.TransitionOnPRMerge(ctx, "org/pr-lifecycle", 999); err != nil || id != "" {
-		t.Fatalf("TransitionOnPRMerge(wrong PR) = (%q, %v), want empty", id, err)
+	if result, err := q.TransitionOnPRMerge(ctx, "org/pr-lifecycle", 999); err != nil || result != (db.PRTransition{}) {
+		t.Fatalf("TransitionOnPRMerge(wrong PR) = (%+v, %v), want empty", result, err)
 	}
 
 	// Matching merge transitions to merged.
-	id, err := q.TransitionOnPRMerge(ctx, "org/pr-lifecycle", 7)
+	result, err := q.TransitionOnPRMerge(ctx, "org/pr-lifecycle", 7)
 	if err != nil {
 		t.Fatalf("TransitionOnPRMerge: %v", err)
 	}
-	if id != groupID {
-		t.Fatalf("TransitionOnPRMerge returned %q, want %q", id, groupID)
+	if result != (db.PRTransition{ErrorGroupID: groupID, ProjectID: projID}) {
+		t.Fatalf("TransitionOnPRMerge returned %+v, want group %q and project %q", result, groupID, projID)
 	}
 	if got := groupStatus(t, pool, groupID); got != "merged" {
 		t.Fatalf("group status = %q, want merged", got)
 	}
 
 	// A merged group is terminal for the PR lifecycle: close is a no-op.
-	if id, err := q.TransitionOnPRClose(ctx, "org/pr-lifecycle", 7); err != nil || id != "" {
-		t.Fatalf("TransitionOnPRClose after merge = (%q, %v), want empty", id, err)
+	if result, err := q.TransitionOnPRClose(ctx, "org/pr-lifecycle", 7); err != nil || result != (db.PRTransition{}) {
+		t.Fatalf("TransitionOnPRClose after merge = (%+v, %v), want empty", result, err)
 	}
 }
 
@@ -242,12 +242,12 @@ func TestTransitionOnPRClose_RevertsToInvestigated(t *testing.T) {
 		t.Fatalf("set pr_number: %v", err)
 	}
 
-	id, err := q.TransitionOnPRClose(ctx, "org/pr-close", 3)
+	result, err := q.TransitionOnPRClose(ctx, "org/pr-close", 3)
 	if err != nil {
 		t.Fatalf("TransitionOnPRClose: %v", err)
 	}
-	if id != groupID {
-		t.Fatalf("TransitionOnPRClose returned %q, want %q", id, groupID)
+	if result != (db.PRTransition{ErrorGroupID: groupID, ProjectID: projID}) {
+		t.Fatalf("TransitionOnPRClose returned %+v, want group %q and project %q", result, groupID, projID)
 	}
 	if got := groupStatus(t, pool, groupID); got != "investigated" {
 		t.Fatalf("group status = %q, want investigated", got)

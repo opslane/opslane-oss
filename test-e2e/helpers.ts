@@ -330,6 +330,102 @@ export async function seedUserWithJWT(orgId: string): Promise<{ userId: string; 
 }
 
 // ---------------------------------------------------------------------------
+// Session / friction helpers (browser smoke)
+// ---------------------------------------------------------------------------
+
+/** Polls until the project has a session (created by SDK /sessions/init). */
+export async function pollSessionForProject(
+  projectId: string,
+  timeoutMs = 30_000
+): Promise<string> {
+  const db = getPool();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { rows } = await db.query<{ id: string }>(
+      `SELECT id FROM sessions WHERE project_id = $1 ORDER BY started_at DESC LIMIT 1`,
+      [projectId]
+    );
+    if (rows[0]) return rows[0].id;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`No session appeared for project ${projectId} within ${timeoutMs}ms`);
+}
+
+/** Polls until at least one chunk for the session is scrubbed (analyzable).
+ * Scrubber cadence: eligible 30s after upload, swept every 15s — expect ~45-60s. */
+export async function pollScrubbedChunk(
+  sessionId: string,
+  timeoutMs = 120_000
+): Promise<void> {
+  const db = getPool();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { rows } = await db.query(
+      `SELECT 1 FROM session_chunks WHERE session_id = $1 AND scrubbed_at IS NOT NULL LIMIT 1`,
+      [sessionId]
+    );
+    if (rows.length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  throw new Error(`No scrubbed chunk for session ${sessionId} within ${timeoutMs}ms`);
+}
+
+/** Batch 3 gap: the product does not yet auto-create session_analysis jobs.
+ * Delete this helper when automatic scheduling lands. */
+export async function insertSessionAnalysisJob(
+  projectId: string,
+  sessionId: string
+): Promise<void> {
+  const db = getPool();
+  await db.query(
+    `INSERT INTO error_group_jobs (project_id, session_id, job_type, status, triggered_by)
+     VALUES ($1, $2, 'session_analysis', 'pending', 'auto')`,
+    [projectId, sessionId]
+  );
+}
+
+/** Polls sessions.status until it reaches one of the given values. */
+export async function pollSessionStatus(
+  sessionId: string,
+  statuses: string[],
+  timeoutMs = 60_000
+): Promise<string> {
+  const db = getPool();
+  const deadline = Date.now() + timeoutMs;
+  let last = '';
+  while (Date.now() < deadline) {
+    const { rows } = await db.query<{ status: string }>(
+      `SELECT status FROM sessions WHERE id = $1`,
+      [sessionId]
+    );
+    last = rows[0]?.status ?? '(missing)';
+    if (statuses.includes(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  throw new Error(`Session ${sessionId} stuck at '${last}' after ${timeoutMs}ms`);
+}
+
+export interface FrictionSignalRow {
+  signal_type: string;
+  element_selector: string | null;
+  occurrence_count: number;
+}
+
+/** Active (non-retracted, non-superseded) friction signals for a session. */
+export async function getActiveFrictionSignals(
+  sessionId: string
+): Promise<FrictionSignalRow[]> {
+  const db = getPool();
+  const { rows } = await db.query<FrictionSignalRow>(
+    `SELECT signal_type, element_selector, occurrence_count
+       FROM friction_signals
+      WHERE session_id = $1 AND retracted_at IS NULL AND superseded_by IS NULL`,
+    [sessionId]
+  );
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
@@ -351,6 +447,11 @@ export async function cleanupTenant(orgId: string): Promise<void> {
 
   await db.query(
     `DELETE FROM error_group_jobs WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+    [orgId]
+  );
+  // Sessions cascade to session_chunks and friction_signals.
+  await db.query(
+    `DELETE FROM sessions WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]
   );
   await db.query(

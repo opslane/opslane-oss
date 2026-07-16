@@ -1,0 +1,173 @@
+package db_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/opslane/opslane/packages/ingestion/db"
+)
+
+func TestAdminOverviewHourlyBucketsAreZeroFilledAndBoundarySafe(t *testing.T) {
+	admin := testPool(t)
+	psql := findPsql(t)
+	pool, dsn := disposableDB(t, admin)
+	for _, file := range migrationFiles(t) {
+		if err := applyMigration(t, psql, dsn, file); err != nil {
+			t.Fatalf("apply migration %s: %v", file, err)
+		}
+	}
+	q := db.New(pool)
+	ctx := context.Background()
+
+	org, err := q.CreateOrg(ctx, "admin-overview-"+fmt.Sprint(time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, pool, org.ID) })
+	repo := "example/admin-overview"
+	project, err := q.CreateProject(ctx, org.ID, "Admin Overview", &repo)
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	env, err := q.CreateEnvironment(ctx, project.ID, "production")
+	if err != nil {
+		t.Fatalf("create environment: %v", err)
+	}
+
+	before, err := q.AdminOverviewData(ctx)
+	if err != nil {
+		t.Fatalf("admin overview before inserts: %v", err)
+	}
+	if len(before.Events.Hourly) != 48 {
+		t.Fatalf("got %d hourly buckets, want 48", len(before.Events.Hourly))
+	}
+	for i := 1; i < len(before.Events.Hourly); i++ {
+		if before.Events.Hourly[i].Hour.Sub(before.Events.Hourly[i-1].Hour) != time.Hour {
+			t.Fatalf("buckets %d and %d are not one hour apart", i-1, i)
+		}
+	}
+	for _, bucket := range before.Events.Hourly {
+		if bucket.Count != 0 {
+			t.Fatalf("empty database bucket %s count = %d, want 0", bucket.Hour, bucket.Count)
+		}
+	}
+
+	currentHour := time.Now().UTC().Truncate(time.Hour)
+	createdTimes := []time.Time{currentHour, currentHour.Add(-time.Hour), currentHour.Add(-3 * time.Hour)}
+	for i, createdAt := range createdTimes {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO error_events
+				(project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, created_at)
+			VALUES ($1, $2, $3, 'AdminTest', $4, 'stack', $3)`,
+			project.ID, env.ID, createdAt, fmt.Sprintf("admin event %d", i)); err != nil {
+			t.Fatalf("insert event %d: %v", i, err)
+		}
+	}
+
+	after, err := q.AdminOverviewData(ctx)
+	if err != nil {
+		t.Fatalf("admin overview after inserts: %v", err)
+	}
+	if len(after.Events.Hourly) != 48 {
+		t.Fatalf("got %d hourly buckets after inserts, want 48", len(after.Events.Hourly))
+	}
+	beforeCounts := make(map[int64]int64, len(before.Events.Hourly))
+	for _, bucket := range before.Events.Hourly {
+		beforeCounts[bucket.Hour.Unix()] = bucket.Count
+	}
+	for _, createdAt := range createdTimes {
+		var got *db.AdminHourlyEventBucket
+		for i := range after.Events.Hourly {
+			if after.Events.Hourly[i].Hour.Equal(createdAt) {
+				got = &after.Events.Hourly[i]
+				break
+			}
+		}
+		if got == nil {
+			t.Fatalf("missing bucket at %s", createdAt)
+		}
+		if delta := got.Count - beforeCounts[createdAt.Unix()]; delta != 1 {
+			t.Fatalf("bucket %s delta = %d, want 1", createdAt, delta)
+		}
+	}
+	// The deliberately skipped -2h bucket proves gaps remain present.
+	gap := currentHour.Add(-2 * time.Hour)
+	if _, ok := beforeCounts[gap.Unix()]; !ok {
+		t.Fatalf("missing zero-fill gap bucket at %s", gap)
+	}
+	for _, bucket := range after.Events.Hourly {
+		if bucket.Hour.Equal(gap) && bucket.Count != 0 {
+			t.Fatalf("gap bucket %s count = %d, want 0", gap, bucket.Count)
+		}
+	}
+}
+
+func TestAdminRecentJobsDurationAndNullableIncident(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+
+	org, err := q.CreateOrg(ctx, "admin-jobs-"+fmt.Sprint(time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, pool, org.ID) })
+	repo := "example/admin-jobs"
+	project, err := q.CreateProject(ctx, org.ID, "Admin Jobs", &repo)
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	ids := make(map[string]string)
+	for _, tc := range []struct {
+		name   string
+		status string
+		setup  string
+	}{
+		{name: "pending", status: "pending", setup: "created_at = now() - interval '10 minutes'"},
+		{name: "claimed", status: "claimed", setup: "claimed_at = now() - interval '30 seconds', lease_expires_at = now() + interval '1 minute', worker_id = 'admin-test-worker'"},
+		{name: "completed", status: "completed", setup: "claimed_at = now() - interval '2 minutes', updated_at = now() - interval '1 minute'"},
+	} {
+		query := `INSERT INTO error_group_jobs (project_id, job_type, status) VALUES ($1, 'setup_pr', $2) RETURNING id`
+		var id string
+		if err := pool.QueryRow(ctx, query, project.ID, tc.status).Scan(&id); err != nil {
+			t.Fatalf("insert %s job: %v", tc.name, err)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE error_group_jobs SET "+tc.setup+" WHERE id = $1", id); err != nil {
+			t.Fatalf("configure %s job: %v", tc.name, err)
+		}
+		ids[tc.name] = id
+	}
+
+	jobs, err := q.AdminRecentJobs(ctx, 200, "", "setup_pr")
+	if err != nil {
+		t.Fatalf("admin recent jobs: %v", err)
+	}
+	found := make(map[string]db.AdminJob)
+	for _, job := range jobs {
+		for name, id := range ids {
+			if job.ID == id {
+				found[name] = job
+			}
+		}
+	}
+	if len(found) != len(ids) {
+		t.Fatalf("found %d test jobs, want %d", len(found), len(ids))
+	}
+	if found["pending"].DurationSeconds != nil {
+		t.Errorf("pending duration = %v, want nil", *found["pending"].DurationSeconds)
+	}
+	if duration := found["claimed"].DurationSeconds; duration == nil || *duration < 29 || *duration > 40 {
+		t.Errorf("claimed duration = %v, want about 30 seconds", duration)
+	}
+	if duration := found["completed"].DurationSeconds; duration == nil || *duration < 59 || *duration > 61 {
+		t.Errorf("completed duration = %v, want 60 seconds", duration)
+	}
+	for name, job := range found {
+		if job.ProjectName != project.Name || job.IncidentTitle != nil || job.PRURL != nil {
+			t.Errorf("%s nullable-incident job fields = %+v", name, job)
+		}
+	}
+}

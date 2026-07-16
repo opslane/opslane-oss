@@ -23,6 +23,7 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `INTERNAL_READ_TOKEN` | for worker replay evidence | Shared secret guarding worker-to-ingestion chunk reads. Unset disables the internal endpoint. |
 | `SESSION_IDLE_CLOSE_MINUTES` | no (30) | Idle minutes before a recording session closes and its `session_analysis` job is enqueued (friction detection producer) |
 | `RETENTION_SWEEP_INTERVAL_SECONDS` | no (3600) | How often the retention sweeper runs (session close + expiry pass) |
+| `ADMIN_EMAILS` | no | Comma-separated operator email allowlist for the cross-tenant admin dashboard. Empty disables the admin API. Docker Compose maps it from the host-side `OPSLANE_ADMIN_EMAILS`. |
 | `VERSION` | no | Reported by `/health` |
 
 Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in its test code, not runtime configuration.
@@ -59,4 +60,5 @@ The worker starts with only `DATABASE_URL` and logs a warning for missing `ANTHR
 | Variable | Status |
 | --- | --- |
 | `ALLOW_REGISTRATION` | Read by nothing; there is no self-serve registration path (sign-in is GitHub OAuth). |
+| `OPSLANE_ADMIN_EMAILS` | Host-side name that docker-compose.yml maps into the ingestion service's `ADMIN_EMAILS`; consumed by Compose interpolation, not read by code directly. |
 | `ENCRYPTION_KEY` | Read by nothing except a sandbox scrub list; at-rest token encryption is not implemented (see [trust](../architecture/trust.md#honest-gaps-current-state)). |

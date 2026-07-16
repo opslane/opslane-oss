@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { getMe, clearAuth, isAuthenticated, listProjects, type AuthUser, type Project } from './api';
+import { routeNeedsProject } from './route-project';
 
 const route = useRoute();
 const router = useRouter();
@@ -27,6 +28,9 @@ function navLinkClass(routeName: string): string {
 const showProjectPrompt = ref(false);
 const promptProjects = ref<Project[]>([]);
 const promptSelectedId = ref('');
+const shouldShowProjectPrompt = computed(
+  () => showProjectPrompt.value && routeNeedsProject(route.name),
+);
 
 async function loadUser(): Promise<void> {
   if (!isAuthenticated()) return;
@@ -40,6 +44,7 @@ async function loadUser(): Promise<void> {
 async function checkProject(): Promise<void> {
   if (!isAuthenticated()) return;
   if (fullPageRoutes.includes(route.name as string)) return;
+  if (!routeNeedsProject(route.name)) return;
 
   const pid = localStorage.getItem('opslane_project_id');
   if (pid) {
@@ -135,6 +140,9 @@ watch(
         <router-link to="/settings" :class="navLinkClass('settings')">
           Settings
         </router-link>
+        <router-link v-if="user?.is_admin" to="/admin" :class="navLinkClass('admin')">
+          Admin
+        </router-link>
         <span class="w-px h-5 bg-border"></span>
         <span v-if="user" class="text-sm text-text-muted" v-text="user.email"></span>
         <button
@@ -149,7 +157,7 @@ watch(
 
     <!-- Project selection prompt -->
     <div
-      v-if="showProjectPrompt && !isFullPage"
+      v-if="shouldShowProjectPrompt && !isFullPage"
       class="max-w-lg mx-auto mt-12 bg-surface rounded-md border border-border p-8"
     >
       <h2 class="text-base font-medium text-text mb-2">Select a project</h2>
@@ -184,7 +192,7 @@ watch(
     </div>
 
     <main
-      v-if="!showProjectPrompt"
+      v-if="!shouldShowProjectPrompt"
       :class="!isFullPage ? 'max-w-7xl mx-auto px-6 py-8' : ''"
     >
       <router-view :key="$route.fullPath" />

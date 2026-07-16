@@ -85,6 +85,10 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateSession).Get("/auth/verify", deps.AuthVerify)
 		r.With(deps.AuthenticateSession).Post("/auth/logout", deps.Logout)
 
+		// Cross-tenant operator observability. RequireAdmin deliberately returns 404.
+		r.With(deps.AuthenticateSession, deps.RequireAdmin).Get("/admin/overview", deps.AdminOverview)
+		r.With(deps.AuthenticateSession, deps.RequireAdmin).Get("/admin/jobs", deps.AdminJobs)
+
 		// Onboarding
 		r.With(deps.AuthenticateSession).Post("/onboarding/setup", deps.OnboardingSetup)
 

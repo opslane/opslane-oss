@@ -25,7 +25,60 @@ import {
   getSessionForAnalysis,
   setSessionAnalysisStatus,
   claimJob,
+  updateGroupStatus,
+  updateGroupInvestigation,
 } from '../db.js';
+
+describe('group lifecycle timestamp queries', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('stamps PR-created and needs-human transitions without clearing prior timestamps', async () => {
+    mockQuery.mockResolvedValue({ rowCount: 1, rows: [{ id: 'g1' }] });
+
+    await updateGroupStatus('g1', 'p1', 'pr_created');
+    await updateGroupStatus('g1', 'p1', 'needs_human', {
+      reason: {
+        reason_code: 'missing_llm_key',
+        reason_message: 'API key not configured',
+        remediation: 'Configure the worker API key',
+      },
+    });
+
+    for (const call of mockQuery.mock.calls) {
+      const query = String(call[0]);
+      expect(query).toContain("WHEN $3::error_group_status = 'pr_created'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'pr_created' THEN now()");
+      expect(query).toContain('ELSE pr_created_at');
+      expect(query).toContain("WHEN $3::error_group_status = 'needs_human'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'needs_human' THEN now()");
+      expect(query).toContain('ELSE needs_human_at');
+    }
+    expect(mockQuery.mock.calls[0]?.[1]?.[2]).toBe('pr_created');
+    expect(mockQuery.mock.calls[1]?.[1]?.[2]).toBe('needs_human');
+  });
+
+  it('stamps needs-human investigation results without clearing lifecycle timestamps', async () => {
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'g1' }] });
+
+    await updateGroupInvestigation('g1', 'p1', 'needs_human', {
+      rootCause: 'External dependency failed',
+      reason: {
+        reason_code: 'worker_runtime_error',
+        reason_message: 'The investigation could not complete',
+        remediation: 'Review the incident manually',
+      },
+    });
+
+    const query = String(mockQuery.mock.calls[0]?.[0]);
+    expect(query).toContain("WHEN $3::error_group_status = 'pr_created'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'pr_created' THEN now()");
+    expect(query).toContain('ELSE pr_created_at');
+    expect(query).toContain("WHEN $3::error_group_status = 'needs_human'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'needs_human' THEN now()");
+    expect(query).toContain('ELSE needs_human_at');
+    expect(mockQuery.mock.calls[0]?.[1]?.[2]).toBe('needs_human');
+  });
+});
 
 describe('getErrorGroup', () => {
   beforeEach(() => mockQuery.mockReset());

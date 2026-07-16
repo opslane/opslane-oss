@@ -5,6 +5,7 @@ import AsyncLoader from './components/AsyncLoader.vue';
 import WatcherBug from './components/WatcherBug.vue';
 import FetchUser from './components/FetchUser.vue';
 import FrictionLab from './components/FrictionLab.vue';
+import DeadEnd from './components/DeadEnd.vue';
 import type { User } from './types';
 
 const currentView = ref<string>('home');
@@ -20,6 +21,7 @@ const buggyUser: User = { id: 1, username: 'alice', profile: null };
       <button data-testid="nav-watcher" @click="currentView = 'watcher'">WatcherBug</button>
       <button data-testid="nav-fetch" @click="currentView = 'fetch'">FetchUser</button>
       <button data-testid="nav-friction" @click="currentView = 'friction'">FrictionLab</button>
+      <button data-testid="nav-dead" @click="currentView = 'dead'">DeadEnd</button>
     </nav>
     <main>
       <p v-if="currentView === 'home'">Select a bug to trigger</p>
@@ -28,6 +30,7 @@ const buggyUser: User = { id: 1, username: 'alice', profile: null };
       <WatcherBug v-if="currentView === 'watcher'" />
       <FetchUser v-if="currentView === 'fetch'" />
       <FrictionLab v-if="currentView === 'friction'" />
+      <DeadEnd v-if="currentView === 'dead'" />
     </main>
   </div>
 </template>
