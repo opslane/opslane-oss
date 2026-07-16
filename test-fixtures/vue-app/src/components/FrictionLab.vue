@@ -17,7 +17,6 @@ import { setUser } from '@opslane/sdk';
 const runId = ref(`dogfood-${new Date().toISOString().slice(0, 10)}`);
 const syntheticUser = ref('batch4-user-1');
 const users = ['batch4-user-1', 'batch4-user-2', 'batch4-user-3', 'batch4-user-4', 'batch4-user-5'];
-const rageClicks = ref(0);
 const stepperStep = ref(0);
 const stepperBusy = ref(false);
 
@@ -26,9 +25,9 @@ function applyUser(): void {
 }
 
 function deadClick(): void {
-  // Intentionally inert: no navigation, no request, no visible change beyond
-  // the counter (which the operator uses to count their own clicks).
-  rageClicks.value += 1;
+  // Intentionally and TOTALLY inert. The analyzer treats any DOM mutation
+  // within 1s of a click as "answered" (the page responded), so even a
+  // click counter would disqualify the rage signal. Nothing may change here.
 }
 
 async function stepperNext(): Promise<void> {
@@ -63,7 +62,6 @@ async function stepperNext(): Promise<void> {
       <button data-testid="friction-rage-target" @click="deadClick">
         Complete purchase
       </button>
-      <p data-testid="friction-rage-count">Clicks this session: {{ rageClicks }}</p>
       <p>Click it three times fast — nothing will happen. That is the point.</p>
     </fieldset>
 
