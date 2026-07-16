@@ -380,15 +380,29 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
       });
     } else if (triage.fixable && triage.confidence === 'high') {
       // High confidence fixable → auto-trigger fix (atomic transaction)
-      const fixJobId = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+      const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
       }, job);
-      jobsProcessed++;
-      logger.info('Investigation: auto-triggering fix', {
-        job_id: job.id, fix_job_id: fixJobId, duration_ms: durationMs,
-      });
+      if (fixResult.created) {
+        jobsProcessed++;
+        logger.info('Investigation: auto-triggering fix', {
+          job_id: job.id, fix_job_id: fixResult.fixJobId, duration_ms: durationMs,
+        });
+      } else {
+        // Defense-in-depth refusal (kind gate): park the result for a human
+        // instead of silently dropping the investigation.
+        await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
+          rootCause: triage.reason,
+          suggestedMitigation: triage.remediation,
+          confidence: triage.confidence,
+        }, job);
+        jobsProcessed++;
+        logger.warn('Investigation: automatic fix refused by kind gate', {
+          job_id: job.id, reason: fixResult.reason, duration_ms: durationMs,
+        });
+      }
     } else {
       // Medium/low confidence → investigated, wait for user
       await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {

@@ -363,6 +363,52 @@ describeDb('db.ts integration tests', () => {
     });
   });
 
+  describe('automatic fix creation kind gate (issue #56)', () => {
+    it('refuses automatic fix creation for friction incidents (typed no-transition result)', async () => {
+      const groupRes = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status, kind)
+         VALUES ($1, $2, 'Friction incident', now(), now(), 'analyzing', 'friction')
+         RETURNING id`,
+        [testProjectId, `fp-${crypto.randomUUID()}`]
+      );
+      const groupId = groupRes.rows[0]!.id;
+      await testPool.query(
+        `INSERT INTO error_group_jobs (error_group_id, project_id, job_type)
+         VALUES ($1, $2, 'investigate')`,
+        [groupId, testProjectId]
+      );
+      const claim = await claimJob('gate-worker', 60_000);
+      const lease = {
+        id: claim!.id,
+        workerId: 'gate-worker',
+        leaseGeneration: claim!.leaseGeneration,
+        projectId: testProjectId,
+        errorGroupId: groupId,
+        sessionId: null,
+      };
+
+      const result = await updateGroupAndCreateFixJob(
+        groupId,
+        testProjectId,
+        { rootCause: 'code cause', confidence: 'high' },
+        lease
+      );
+      expect(result).toEqual({ created: false, reason: 'kind_not_error' });
+
+      const group = (await testPool.query(
+        `SELECT status FROM error_groups WHERE id = $1`, [groupId]
+      )).rows[0]!;
+      expect(group.status).toBe('analyzing');
+      const fixJobs = await testPool.query(
+        `SELECT count(*)::int AS n FROM error_group_jobs
+         WHERE error_group_id = $1 AND job_type IN ('fix', 'error_fix')`,
+        [groupId]
+      );
+      expect(fixJobs.rows[0]!.n).toBe(0);
+    });
+  });
+
   describe('dead-letter reconciliation for session_analysis (issue #56)', () => {
     async function seedEnvAndSession(): Promise<{ envId: string; sessionId: string }> {
       const envRes = await testPool.query<{ id: string }>(
@@ -949,13 +995,13 @@ describeDb('db.ts integration tests', () => {
       );
       expect(staleFixCount.rows[0]?.count).toBe('0');
 
-      const fixJobId = await updateGroupAndCreateFixJob(
+      const fixResult = await updateGroupAndCreateFixJob(
         errorGroupId,
         testProjectId,
         { rootCause: 'current result', confidence: 'high' },
         currentLease,
       );
-      expect(fixJobId).toEqual(expect.any(String));
+      expect(fixResult).toEqual({ created: true, fixJobId: expect.any(String) });
       const final = await testPool.query<{
         status: string;
         root_cause: string | null;

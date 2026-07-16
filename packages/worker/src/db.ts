@@ -898,6 +898,14 @@ export async function updateGroupInvestigation(
  * Creates a fix job for an error group. Used when investigation has high
  * confidence and auto-triggers a fix.
  */
+/** Result of an automatic investigate→fix transition attempt. Friction
+ * incidents are refused at this layer (issue #56 defense in depth): even a
+ * future caller that skips the route-level kind check cannot auto-create a
+ * fix job for kind='friction'. */
+export type FixJobResult =
+  | { created: true; fixJobId: string }
+  | { created: false; reason: 'kind_not_error' };
+
 export async function updateGroupAndCreateFixJob(
   errorGroupId: string,
   projectId: string,
@@ -907,7 +915,7 @@ export async function updateGroupAndCreateFixJob(
     confidence?: ConfidenceLevel;
   },
   lease: JobLease,
-): Promise<string> {
+): Promise<FixJobResult> {
   const db = getPool();
   const client = await db.connect();
   try {
@@ -933,8 +941,8 @@ export async function updateGroupAndCreateFixJob(
     );
     if ((owned.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
 
-    const group = await client.query<{ status: string }>(
-      `SELECT status
+    const group = await client.query<{ status: string; kind: string }>(
+      `SELECT status, kind
        FROM error_groups
        WHERE id = $1 AND project_id = $2
        FOR UPDATE`,
@@ -942,6 +950,11 @@ export async function updateGroupAndCreateFixJob(
     );
     if ((group.rowCount ?? 0) !== 1) {
       throw new Error(`Cannot create fix job: group ${errorGroupId} was not found`);
+    }
+    if (group.rows[0]!.kind !== 'error') {
+      // Typed no-transition result: nothing changed, nothing enqueued.
+      await client.query('COMMIT');
+      return { created: false, reason: 'kind_not_error' };
     }
 
     const existingFix = await client.query<{ id: string }>(
@@ -966,7 +979,7 @@ export async function updateGroupAndCreateFixJob(
         [errorGroupId, projectId],
       );
       await client.query('COMMIT');
-      return existingFix.rows[0].id;
+      return { created: true, fixJobId: existingFix.rows[0].id };
     }
 
     const groupUpdate = await client.query(
@@ -997,7 +1010,7 @@ export async function updateGroupAndCreateFixJob(
       [errorGroupId, projectId]
     );
     await client.query('COMMIT');
-    return result.rows[0]!.id;
+    return { created: true, fixJobId: result.rows[0]!.id };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
