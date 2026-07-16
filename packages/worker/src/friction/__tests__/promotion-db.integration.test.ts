@@ -1,0 +1,275 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import pg from 'pg';
+import { getPool, closePool } from '../../db.js';
+import {
+  claimSignalsForAdjudication,
+  findFoldTarget,
+} from '../promotion-db.js';
+
+const DATABASE_URL = process.env['DATABASE_URL'];
+const describeDb = DATABASE_URL ? describe : describe.skip;
+
+let pool: pg.Pool;
+let projectId: string;
+let environmentId: string;
+let orgId: string;
+
+async function seedTenant(): Promise<void> {
+  const org = await pool.query<{ id: string }>(
+    `INSERT INTO orgs (name) VALUES ('b4-promotion-test') RETURNING id`
+  );
+  orgId = org.rows[0]!.id;
+  const proj = await pool.query<{ id: string }>(
+    `INSERT INTO projects (org_id, name, github_repo, default_branch)
+     VALUES ($1, 'b4-project', 'octocat/hello', 'main') RETURNING id`,
+    [orgId]
+  );
+  projectId = proj.rows[0]!.id;
+  const env = await pool.query<{ id: string }>(
+    `INSERT INTO environments (project_id, name) VALUES ($1, 'production') RETURNING id`,
+    [projectId]
+  );
+  environmentId = env.rows[0]!.id;
+}
+
+export interface SeededSignal {
+  id: string;
+  sessionId: string;
+}
+
+async function seedSession(id?: string): Promise<string> {
+  const sessionId = id ?? `sess-${crypto.randomUUID()}`;
+  await pool.query(
+    `INSERT INTO sessions (id, project_id, environment_id, started_at)
+     VALUES ($1, $2, $3, now() - interval '10 minutes')
+     ON CONFLICT (id) DO NOTHING`,
+    [sessionId, projectId, environmentId]
+  );
+  return sessionId;
+}
+
+async function seedEndUser(externalId: string): Promise<string> {
+  const res = await pool.query<{ id: string }>(
+    `INSERT INTO end_users (project_id, external_user_id, first_seen, last_seen)
+     VALUES ($1, $2, now(), now())
+     ON CONFLICT (project_id, external_user_id) DO UPDATE SET last_seen = now()
+     RETURNING id`,
+    [projectId, externalId]
+  );
+  return res.rows[0]!.id;
+}
+
+async function seedSignal(opts: {
+  sessionId?: string;
+  fingerprint?: string;
+  occurredAt?: string;
+  endUserId?: string | null;
+  status?: string;
+}): Promise<SeededSignal> {
+  const sessionId = opts.sessionId ?? (await seedSession());
+  const res = await pool.query<{ id: string }>(
+    `INSERT INTO friction_signals
+       (session_id, project_id, environment_id, end_user_id, rule_version,
+        signal_type, fingerprint, page_url_normalized, occurred_at, adjudication_status)
+     VALUES ($1, $2, $3, $4, 1, 'rage_click', $5, '/checkout', $6, $7)
+     RETURNING id`,
+    [
+      sessionId,
+      projectId,
+      environmentId,
+      opts.endUserId ?? null,
+      opts.fingerprint ?? 'fp-rage-checkout',
+      opts.occurredAt ?? new Date().toISOString(),
+      opts.status ?? 'pending',
+    ]
+  );
+  return { id: res.rows[0]!.id, sessionId };
+}
+
+async function seedErrorGroupWithEvent(opts: {
+  sessionId: string;
+  eventAt: string;
+  status?: string;
+  kind?: string;
+  fingerprint?: string;
+}): Promise<{ groupId: string; eventId: string }> {
+  const group = await pool.query<{ id: string }>(
+    `INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, status, kind)
+     VALUES ($1, $2, 'Test Error', $3, $3, $4::error_group_status, $5)
+     RETURNING id`,
+    [
+      projectId,
+      opts.fingerprint ?? `fp-err-${crypto.randomUUID()}`,
+      opts.eventAt,
+      opts.status ?? 'queued',
+      opts.kind ?? 'error',
+    ]
+  );
+  const event = await pool.query<{ id: string }>(
+    `INSERT INTO error_events
+       (project_id, environment_id, timestamp, error_type, error_message,
+        stack_trace_raw, breadcrumbs, context, session_id, error_group_id)
+     VALUES ($1, $2, $3, 'TypeError', 'boom', '', '[]'::jsonb, '{}'::jsonb, $4, $5)
+     RETURNING id`,
+    [projectId, environmentId, opts.eventAt, opts.sessionId, group.rows[0]!.id]
+  );
+  return { groupId: group.rows[0]!.id, eventId: event.rows[0]!.id };
+}
+
+async function seedAnalysisJob(sessionId: string): Promise<string> {
+  const res = await pool.query<{ id: string }>(
+    `INSERT INTO error_group_jobs (project_id, status, job_type, session_id)
+     VALUES ($1, 'claimed', 'session_analysis', $2) RETURNING id`,
+    [projectId, sessionId]
+  );
+  return res.rows[0]!.id;
+}
+
+async function cleanup(): Promise<void> {
+  await pool.query(`DELETE FROM friction_adjudication_generations WHERE project_id = $1`, [projectId]);
+  await pool.query(`UPDATE error_groups SET representative_signal_id = NULL WHERE project_id = $1`, [projectId]);
+  await pool.query(`DELETE FROM friction_signals WHERE project_id = $1`, [projectId]);
+  await pool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [projectId]);
+  await pool.query(`DELETE FROM error_events WHERE project_id = $1`, [projectId]);
+  await pool.query(
+    `DELETE FROM error_group_affected_users WHERE error_group_id IN
+       (SELECT id FROM error_groups WHERE project_id = $1)`,
+    [projectId]
+  );
+  await pool.query(`DELETE FROM error_groups WHERE project_id = $1`, [projectId]);
+  await pool.query(`DELETE FROM sessions WHERE project_id = $1`, [projectId]);
+  await pool.query(`DELETE FROM end_users WHERE project_id = $1`, [projectId]);
+}
+
+describeDb('promotion-db integration', () => {
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: DATABASE_URL });
+    await seedTenant();
+  });
+
+  afterAll(async () => {
+    await cleanup();
+    await pool.query(`DELETE FROM environments WHERE project_id = $1`, [projectId]);
+    await pool.query(`DELETE FROM projects WHERE id = $1`, [projectId]);
+    await pool.query(`DELETE FROM orgs WHERE id = $1`, [orgId]);
+    await pool.end();
+    await closePool();
+  });
+
+  beforeEach(async () => {
+    await cleanup();
+  });
+
+  describe('claimSignalsForAdjudication', () => {
+    it('claims pending signals and increments attempts', async () => {
+      const s1 = await seedSignal({});
+      const s2 = await seedSignal({ fingerprint: 'fp-other' });
+      const jobId = await seedAnalysisJob(s1.sessionId);
+
+      const client = await getPool().connect();
+      try {
+        const claimed = await claimSignalsForAdjudication(client, [s1.id, s2.id], jobId);
+        expect(claimed).toBe(2);
+      } finally {
+        client.release();
+      }
+
+      const rows = await pool.query(
+        `SELECT adjudication_job_id, adjudication_attempts FROM friction_signals
+         WHERE id = ANY($1::uuid[])`,
+        [[s1.id, s2.id]]
+      );
+      for (const row of rows.rows) {
+        expect(row.adjudication_job_id).toBe(jobId);
+        expect(row.adjudication_attempts).toBe(1);
+      }
+    });
+
+    it('only touches pending rows', async () => {
+      const accepted = await seedSignal({ status: 'accepted' });
+      const rejected = await seedSignal({ status: 'rejected', fingerprint: 'fp-b' });
+      const pending = await seedSignal({ fingerprint: 'fp-c' });
+      const jobId = await seedAnalysisJob(pending.sessionId);
+
+      const client = await getPool().connect();
+      try {
+        const claimed = await claimSignalsForAdjudication(
+          client,
+          [accepted.id, rejected.id, pending.id],
+          jobId
+        );
+        expect(claimed).toBe(1);
+      } finally {
+        client.release();
+      }
+
+      const untouched = await pool.query(
+        `SELECT adjudication_attempts FROM friction_signals WHERE id = ANY($1::uuid[])`,
+        [[accepted.id, rejected.id]]
+      );
+      for (const row of untouched.rows) expect(row.adjudication_attempts).toBe(0);
+    });
+  });
+
+  describe('findFoldTarget', () => {
+    const T0 = new Date('2026-07-15T12:00:00.000Z');
+    const at = (deltaSeconds: number) =>
+      new Date(T0.getTime() + deltaSeconds * 1000).toISOString();
+
+    async function target(sessionId: string, occurredAt: string) {
+      const client = await getPool().connect();
+      try {
+        return await findFoldTarget(client, projectId, sessionId, occurredAt);
+      } finally {
+        client.release();
+      }
+    }
+
+    it.each([-30, 0, 30])('window is inclusive at %ds', async (delta) => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(delta) });
+      const found = await target(sessionId, at(0));
+      expect(found?.errorGroupId).toBe(groupId);
+    });
+
+    it.each([-31, 31])('outside the window at %ds finds nothing', async (delta) => {
+      const sessionId = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(delta) });
+      expect(await target(sessionId, at(0))).toBeNull();
+    });
+
+    it('chooses the nearest error and breaks ties deterministically', async () => {
+      const sessionId = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(-20) });
+      const { groupId: nearest } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const found = await target(sessionId, at(0));
+      expect(found?.errorGroupId).toBe(nearest);
+    });
+
+    it('skips archived groups and other sessions', async () => {
+      const sessionId = await seedSession();
+      const otherSession = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(1), status: 'archived' });
+      await seedErrorGroupWithEvent({ sessionId: otherSession, eventAt: at(0) });
+      expect(await target(sessionId, at(0))).toBeNull();
+    });
+
+    it('returns terminal non-archived targets (resolved/merged)', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId,
+        eventAt: at(2),
+        status: 'resolved',
+      });
+      const found = await target(sessionId, at(0));
+      expect(found?.errorGroupId).toBe(groupId);
+      expect(found?.status).toBe('resolved');
+    });
+
+    it('never folds into friction incidents', async () => {
+      const sessionId = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(0), kind: 'friction' });
+      expect(await target(sessionId, at(0))).toBeNull();
+    });
+  });
+});
