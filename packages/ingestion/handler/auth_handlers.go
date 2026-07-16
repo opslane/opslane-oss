@@ -154,10 +154,11 @@ type tokenResponse struct {
 }
 
 type userJSON struct {
-	ID    string `json:"id"`
-	OrgID string `json:"org_id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
+	ID      string `json:"id"`
+	OrgID   string `json:"org_id"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	IsAdmin bool   `json:"is_admin"`
 }
 
 // issueTokenPair creates a JWT + refresh token and stores the refresh token hash.
@@ -186,10 +187,11 @@ func (d *Dependencies) issueTokenPair(w http.ResponseWriter, r *http.Request, us
 		RefreshToken: rawRefresh,
 		ExpiresIn:    int(auth.DefaultAccessTokenTTL.Seconds()),
 		User: userJSON{
-			ID:    userID,
-			OrgID: orgID,
-			Email: email,
-			Name:  name,
+			ID:      userID,
+			OrgID:   orgID,
+			Email:   email,
+			Name:    name,
+			IsAdmin: d.isAdminEmail(email),
 		},
 	})
 }
@@ -219,10 +221,11 @@ func (d *Dependencies) issueTokenPairCookie(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(map[string]any{
 		"expires_in": int(auth.DefaultAccessTokenTTL.Seconds()),
 		"user": userJSON{
-			ID:    userID,
-			OrgID: orgID,
-			Email: email,
-			Name:  name,
+			ID:      userID,
+			OrgID:   orgID,
+			Email:   email,
+			Name:    name,
+			IsAdmin: d.isAdminEmail(email),
 		},
 	})
 }
@@ -309,10 +312,11 @@ func (d *Dependencies) AuthMe(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(userJSON{
-		ID:    user.ID,
-		OrgID: user.OrgID,
-		Email: user.Email,
-		Name:  user.Name,
+		ID:      user.ID,
+		OrgID:   user.OrgID,
+		Email:   user.Email,
+		Name:    user.Name,
+		IsAdmin: d.isAdminEmail(user.Email),
 	})
 }
 

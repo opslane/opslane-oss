@@ -96,6 +96,7 @@ func main() {
 		GitHubAppPrivateKey:   githubAppPrivateKey,
 		GitHubAppSlug:         githubAppSlug,
 		DashboardOrigin:       dashboardOrigin,
+		AdminEmails:           handler.ParseAdminEmails(os.Getenv("ADMIN_EMAILS")),
 	}
 	r := handler.NewRouterWithPool(deps, pool)
 

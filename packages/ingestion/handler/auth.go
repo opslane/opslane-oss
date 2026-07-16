@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -67,6 +68,52 @@ type Dependencies struct {
 	GitHubAppPrivateKey   []byte // PEM-encoded RSA private key
 	GitHubAppSlug         string
 	DashboardOrigin       string // e.g. "http://localhost:3000"
+	AdminEmails           map[string]struct{}
+}
+
+// ParseAdminEmails normalizes the comma-separated ADMIN_EMAILS allowlist.
+// An empty result disables all admin-only routes.
+func ParseAdminEmails(value string) map[string]struct{} {
+	emails := make(map[string]struct{})
+	for _, email := range strings.Split(value, ",") {
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email != "" {
+			emails[email] = struct{}{}
+		}
+	}
+	return emails
+}
+
+func (d *Dependencies) isAdminEmail(email string) bool {
+	if len(d.AdminEmails) == 0 {
+		return false
+	}
+	_, ok := d.AdminEmails[strings.ToLower(strings.TrimSpace(email))]
+	return ok
+}
+
+// RequireAdmin hides the cross-tenant operator surface from normal users.
+// It must run after AuthenticateSession so ctxUserID is trustworthy.
+// A DB failure is a 500, not a 404: the client treats 404 as "not an admin"
+// and would silently evict a real operator on a transient database blip.
+func (d *Dependencies) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(d.AdminEmails) == 0 {
+			writeJSONError(w, http.StatusNotFound, "not found")
+			return
+		}
+		user, err := d.Queries.GetUserByID(r.Context(), UserIDFromCtx(r.Context()))
+		if err != nil {
+			slog.Error("admin: load user for allowlist check failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if user == nil || !d.isAdminEmail(user.Email) {
+			writeJSONError(w, http.StatusNotFound, "not found")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // AuthenticateSDK resolves environment API key -> environment -> project -> org.
