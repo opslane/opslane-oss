@@ -47,12 +47,20 @@ func TestCloseIdleSessions_EnqueuesSessionAnalysis(t *testing.T) {
 	seedSession("close-idle-2", 45)
 	seedSession("close-active", 1)
 
-	closed, err := q.CloseIdleSessions(ctx, 30)
-	if err != nil {
+	// CloseIdleSessions is global; on a shared DB other tenants' sessions may
+	// close too. Assert only this tenant's observable effects.
+	if _, err := q.CloseIdleSessions(ctx, 30); err != nil {
 		t.Fatalf("CloseIdleSessions: %v", err)
 	}
-	if closed != 2 {
-		t.Fatalf("closed = %d, want 2", closed)
+	var closedMine int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE project_id = $1 AND status = 'closed'`,
+		proj.ID,
+	).Scan(&closedMine); err != nil {
+		t.Fatalf("count closed: %v", err)
+	}
+	if closedMine != 2 {
+		t.Fatalf("closed sessions in tenant = %d, want 2", closedMine)
 	}
 
 	var jobs int
@@ -82,13 +90,9 @@ func TestCloseIdleSessions_EnqueuesSessionAnalysis(t *testing.T) {
 		t.Errorf("active session must not be closed or enqueued, got %d jobs", activeJobs)
 	}
 
-	// A second pass is a no-op: sessions already closed, no duplicate jobs.
-	closedAgain, err := q.CloseIdleSessions(ctx, 30)
-	if err != nil {
+	// A second pass is a no-op for this tenant: no duplicate jobs.
+	if _, err := q.CloseIdleSessions(ctx, 30); err != nil {
 		t.Fatalf("CloseIdleSessions second pass: %v", err)
-	}
-	if closedAgain != 0 {
-		t.Errorf("second pass closed %d, want 0", closedAgain)
 	}
 	err = pool.QueryRow(ctx,
 		`SELECT count(*) FROM error_group_jobs
