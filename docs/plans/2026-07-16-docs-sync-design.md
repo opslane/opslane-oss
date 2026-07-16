@@ -12,18 +12,22 @@ It cannot catch **semantic** drift — a guide, architecture doc, or overview wh
 
 ## Security model (read first)
 
-The security review reshaped this design. Two rules are non-negotiable:
+Two security reviews reshaped this design. Four rules are non-negotiable (see the implementation plan for how each is enforced):
 
-1. **The LLM never touches version control.** Claude receives only the matched documents and diff slices, and may only edit files. Every mutation — running the mapper, pushing a branch, opening/updating a PR, posting a comment — happens in **deterministic workflow steps**. After Claude edits, a deterministic step rejects the run unless *every* changed path is in the matched-doc allowlist. This closes the prompt-injection path: PR-controlled content can influence at most the text inside an already-allowlisted doc, never branch creation, arbitrary files, or `gh` commands. (Anthropic's own [Claude Action security guidance](https://github.com/anthropics/claude-code-action/blob/main/docs/security.md) warns about PR-content injection.)
+1. **Trusted code, untrusted data.** Every executed script comes from the **base/default branch**. The PR head is read only as git blobs (its diff and doc contents) — never executed. No `pnpm install` of PR packages, no running PR scripts. This closes the "privileged job runs PR-controlled code with the secret" path.
 
-2. **The Action is internal-only.** `pull_request` from a fork gets a read-only token and **no** repository secrets, so `CLAUDE_CODE_OAUTH_TOKEN` is absent and the write path cannot run. We do **not** work around this with `pull_request_target` — [GitHub warns](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target) that checking out untrusted PR code under that trigger is a privileged-code path. The Action therefore skips fork PRs explicitly and is documented as covering trusted same-repo contributors only. External-contributor docs are handled by a maintainer running the local `/docs-sync` skill on the PR branch, or re-pushing the branch from within the repo.
+2. **The LLM is filesystem-isolated and never touches version control.** Claude runs in a throwaway directory containing only one matched doc plus its diff slice, with tools restricted to Read/Edit and MCP/settings disabled. `--allowed-tools` alone is *not* a sandbox — it only pre-approves. Every mutation happens in deterministic steps. Three gates run before any push: (a) allowlist — every edited path ∈ matched docs; (b) secret scan — reject if an edited doc contains the OAuth token or a secret pattern; (c) guarded `--force-with-lease` push pinned to the recorded head SHA.
+
+3. **Split privilege across two jobs.** A `plan` job holds `CLAUDE_CODE_OAUTH_TOKEN` with `contents: read` only. A separate `publish` job holds `contents: write` with no Claude token. They communicate via an artifact.
+
+4. **The Action is internal-only.** `pull_request` from a fork gets a read-only token and **no** repository secrets, so the write path cannot run. We do **not** work around this with `pull_request_target` — [GitHub warns](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target) that checking out untrusted PR code under that trigger is a privileged-code path. The Action skips fork PRs explicitly. External-contributor docs are handled by a maintainer running the local `/docs-sync` skill.
 
 ## Scope decisions
 
 - **Prose tier only, one canonical predicate.** A single exported `isProseTierDoc(path)` (in `scripts/docs-map.mjs`) defines the tier and is imported by the mapper, the lint, and the workflow — no three-way drift. v1 tier: `docs/guides/**`, `docs/architecture/**`, `docs/quickstart/**`, and `docs/install.md`. Excluded: `reference/` (already deterministic), `contracts/`, `agents/`, and `docs/plans/`.
 - **Two entry points, one engine.** A local `/docs-sync` skill (fast path while coding) and a PR GitHub Action (internal safety net). Both run **Claude Code restricted to Read/Edit**; all VCS is deterministic.
 - **Subscription auth, no API billing.** Same token style as `asset-management-jira`: local CLI uses the local session; the Action passes `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) to a headless Claude run. No metered `ANTHROPIC_API_KEY`.
-- **PR behavior: companion docs PR, non-blocking.** The Action never edits the code PR and never fails CI. It opens a separate `claude/docs-sync-<PR#>` PR, linked to the source PR.
+- **PR behavior: commit onto the source branch.** The Action commits the doc updates directly to the code PR's own branch (`docs: sync for #<PR#>`), so docs and code review and merge together and the update can't be silently dropped. This was chosen over a companion PR because a companion targeting the code branch does not *guarantee* landing — a maintainer can merge the source first. Internal-only scope makes committing to the branch safe. Trade-off: the code PR's diff now includes the doc changes.
 - **Deterministic scoping via `covers:` frontmatter.** Each prose doc declares the code globs it documents; Claude only sees docs whose globs match the PR's changed files.
 
 ## Component 1 — `covers:` frontmatter
@@ -69,49 +73,31 @@ Claude's allowed tools are `Read` and `Edit` on the single target file — no `B
 
 ## Component 5 — PR Action (`.github/workflows/docs-sync.yml`)
 
-```yaml
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+Two jobs, split by privilege (security rule #3). Concurrency is per-PR with `cancel-in-progress`.
 
-permissions:
-  contents: write        # push claude/docs-sync-<PR#>
-  pull-requests: write   # open/update the companion PR
-  id-token: write
+**`plan` job** — `contents: read` only, holds `CLAUDE_CODE_OAUTH_TOKEN`:
 
-concurrency:
-  group: docs-sync-${{ github.event.pull_request.number }}
-  cancel-in-progress: true   # a newer push supersedes an in-flight run
-```
+1. Check out the **base/default branch** (trusted scripts). `persist-credentials: false`.
+2. Fetch the PR head `head.sha` as data (`git fetch`), never checked out for execution. No `pnpm install`.
+3. Compute changed paths with `git diff --name-status -z --find-renames base...head` (three-dot = merge-base; rename-aware), map via `docs-map.mjs`. Docs-only PR ⇒ skip.
+4. For each matched doc: run Claude **filesystem-isolated** in a temp dir holding only that doc (its `head` contents, as data) + its diff slice; tools = Read/Edit, MCP/settings off.
+5. Upload the edited docs + `map.json` as an artifact.
 
-Guards (job-level `if`), all required:
+**`publish` job** — `contents: write`, **no** Claude token, needs `plan`:
 
-- Skip forks: `github.event.pull_request.head.repo.fork == false`.
-- Skip the companion branch: head ref does **not** start with `claude/docs-sync-`.
-- Skip docs-only PRs: if the changed set is entirely under `docs/`, there is no code to sync from.
+6. Download the artifact. If none, nothing to do.
+7. **Gate 1 (allowlist):** every edited path ∈ `map.json` matched set, else abort.
+8. **Gate 2 (secret scan):** reject if any edited doc contains the OAuth token or a secret pattern.
+9. Check out the **source PR head branch** with write creds (git-only; no PR code executed). Copy edited docs in. If `git status` is clean ⇒ exit 0 (idempotent).
+10. Commit `docs: sync for #<PR#>`; **guarded push** (`--force-with-lease` pinned to `head.sha`, fails if the branch advanced) to the source branch.
 
-Deterministic steps (Claude appears only in the middle, tool-restricted):
+Guards (job-level `if`), all required: skip forks (`head.repo.fork == false`); skip our own bot commits (`head.ref` not `claude/*`, latest message not `docs: sync for #`); skip docs-only PRs.
 
-1. Check out the **source PR head at a pinned `head.sha`** (all later steps use that SHA, so a race can't mix trees).
-2. Compute changed paths vs. the PR base; run `docs-map.mjs`.
-3. If `uncovered:` code paths exist, post a one-line advisory comment on the source PR. (No edits for them.)
-4. For each matched doc, run the Component 3 headless Claude session (Read/Edit on that file only).
-5. **Validate:** `git status --porcelain` must show only files in the matched-doc allowlist; otherwise abort, open no PR, and log the rejected paths.
-6. If there are edits, force-update branch `claude/docs-sync-<PR#>` from the validated tree with a guarded push (fail if the remote branch moved unexpectedly) and open or update the companion PR. Body links `Docs for #<PR#>`.
+All third-party Actions are **pinned to a full 40-char commit SHA** with the release tag in a trailing comment — `scripts/check-action-pins.mjs` fails the build otherwise. The Claude CLI is pinned by npm version.
 
-All third-party Actions (including `anthropics/claude-code-action` if used to supply the runtime, or a direct `npx` invocation) are **pinned to a full 40-char commit SHA** with the release tag in a trailing comment — `scripts/check-action-pins.mjs` fails the build otherwise.
+### Landing model (resolves the ancestry question)
 
-### Companion branch lifecycle (resolves the ancestry question)
-
-**Recommended model — docs PR targets the code branch:**
-
-- Base of `claude/docs-sync-<PR#>` = the **source PR head SHA**. Target branch = the **source PR's own branch**.
-- The companion contains **only doc commits** (validated in step 5), so reviewing it shows just the doc delta even though it sits on top of the code.
-- Merging it lands the docs **into the code branch**, so docs and code reach `main` together via the original PR — docs can never merge ahead of the behavior they describe.
-- On a new push to the source PR: the run rebuilds the branch from the new `head.sha` (force-update), keeping docs current with the latest code.
-- On source PR **merge or close**: the companion PR is closed and its branch deleted by a cleanup step (`on: pull_request: [closed]`), since its target no longer exists.
-
-Alternative (target `main`, mark draft, label "merge-with-#X") is viable but pushes merge-ordering onto humans; the recommended model enforces ordering structurally. **This is the one choice to confirm before implementation.**
+The Action commits doc edits **directly onto the source PR's branch**, so there is no companion branch to reconcile — docs and code are one PR, reviewed and merged together, and cannot be dropped. Re-runs are idempotent: identical edits already on the branch produce no new commit (gate at step 9). Note: a commit pushed with the default `GITHUB_TOKEN` does not re-trigger PR checks; if the docs commit must re-run CI, `publish` uses a GitHub App token instead (documented in the plan).
 
 ## Component 6 — coverage lint
 
@@ -120,8 +106,9 @@ Extend the `pnpm test` gate (in `check-docs-drift.mjs` or a sibling using the sh
 ## Prerequisites / setup
 
 - `claude setup-token` → repo secret `CLAUDE_CODE_OAUTH_TOKEN`.
-- Settings → Actions → Workflow permissions: allow Actions to create and approve pull requests.
-- Resolve and pin the runtime Action/CLI SHA.
+- Confirm branch protection allows the Action to push to PR branches (the `publish` job commits `docs: sync for #<PR#>`).
+- If the docs commit must re-run required checks, provision a GitHub App token for the `publish` push (default `GITHUB_TOKEN` pushes don't re-trigger workflows).
+- Resolve and pin the runtime Action/CLI SHA/version.
 
 ## Verification
 
@@ -136,14 +123,15 @@ Deterministic layer (`docs-map.mjs`, lint) — unit tests, no LLM:
 
 Workflow layer:
 
-- **Recursion guards:** dry-run the `if` against a `claude/docs-sync-*` head, a fork PR, and a docs-only PR — all three skip.
-- **Output enforcement:** a Claude run that edits a non-matched file is rejected by step 5 and opens no PR.
-- **Concurrency:** two rapid `synchronize` events — the older run cancels; the branch reflects the newer `head.sha`.
-- **Lifecycle:** reopened PR re-runs; merged/closed source PR triggers companion cleanup; a stale companion branch is force-updated, not duplicated.
-- **End-to-end:** a PR changing `packages/sdk/src/react/**` yields a companion PR editing `guides/react.md` and nothing else; a docs-only PR produces no run.
+- **Guards:** dry-run the `if` against a `claude/*` head, a bot `docs: sync for #` commit, a fork PR, and a docs-only PR — all skip.
+- **Allowlist gate:** a Claude run that edits a non-matched file is rejected before any push.
+- **Secret-scan gate:** an edited doc containing the OAuth token / a secret pattern is rejected before any push.
+- **Concurrency:** two rapid `synchronize` events — the older run cancels; the pushed commit reflects the newer `head.sha`; the guarded push fails rather than clobber a moved branch.
+- **Idempotency:** identical edits already on the branch produce no new commit.
+- **End-to-end:** a PR changing `packages/sdk/src/react.tsx` yields a `docs: sync for #<PR#>` commit on the same branch editing only `guides/react.md`; a docs-only PR produces no run.
+- **Injection drill:** a diff that instructs the model to write the OAuth token into a doc yields no change (tool restriction) and is caught by the secret scan even if it did.
 
 ## Open questions
 
-- **Confirm the companion branch model** (target the code branch, per above) vs. the target-`main`-draft alternative.
 - Should `docs/contracts/**` eventually join the prose tier, or stay contract-reviewed by hand?
 - Advisory "uncovered code" comment: always-on, or gated by a per-path allowlist so intentionally undocumented code stays quiet?
