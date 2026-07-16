@@ -1,5 +1,6 @@
 import pg from 'pg';
 import type { ErrorGroupStatus, NeedsHumanReason, ConfidenceLevel, JobType, SetupPrStatus } from '@opslane/shared';
+import { reconcileDeadLetteredSessionAnalysis } from './friction/dead-letter.js';
 
 const { Pool } = pg;
 
@@ -245,36 +246,56 @@ export async function failJob(
   leaseGeneration: string,
   error: string
 ): Promise<boolean> {
-  const db = getPool();
-  const result = await db.query(
-    `UPDATE error_group_jobs
-     SET attempts = attempts + 1,
-         last_error = $4,
-         status = CASE
-           WHEN attempts + 1 >= max_attempts THEN 'dead_letter'::job_status
-           ELSE 'pending'::job_status
-         END,
-         worker_id = CASE
-           WHEN attempts + 1 >= max_attempts THEN worker_id
-           ELSE NULL
-         END,
-         claimed_at = CASE
-           WHEN attempts + 1 >= max_attempts THEN claimed_at
-           ELSE NULL
-         END,
-         lease_expires_at = CASE
-           WHEN attempts + 1 >= max_attempts THEN lease_expires_at
-           ELSE NULL
-         END,
-         updated_at = now()
-     WHERE id = $1
-       AND worker_id = $2
-       AND lease_generation = $3::bigint
-       AND status = 'claimed'
-       AND lease_expires_at > now()`,
-    [jobId, workerId, leaseGeneration, error]
-  );
-  return (result.rowCount ?? 0) > 0;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query<{
+      status: string;
+      job_type: JobType;
+      project_id: string;
+    }>(
+      `UPDATE error_group_jobs
+       SET attempts = attempts + 1,
+           last_error = $4,
+           status = CASE
+             WHEN attempts + 1 >= max_attempts THEN 'dead_letter'::job_status
+             ELSE 'pending'::job_status
+           END,
+           worker_id = CASE
+             WHEN attempts + 1 >= max_attempts THEN worker_id
+             ELSE NULL
+           END,
+           claimed_at = CASE
+             WHEN attempts + 1 >= max_attempts THEN claimed_at
+             ELSE NULL
+           END,
+           lease_expires_at = CASE
+             WHEN attempts + 1 >= max_attempts THEN lease_expires_at
+             ELSE NULL
+           END,
+           updated_at = now()
+       WHERE id = $1
+         AND worker_id = $2
+         AND lease_generation = $3::bigint
+         AND status = 'claimed'
+         AND lease_expires_at > now()
+       RETURNING status, job_type, project_id`,
+      [jobId, workerId, leaseGeneration, error]
+    );
+    const row = result.rows[0];
+    // Dead-lettered session analysis must not strand its claimed signals or
+    // block the in-flight generation slot; reconcile in the SAME transaction.
+    if (row && row.status === 'dead_letter' && row.job_type === 'session_analysis') {
+      await reconcileDeadLetteredSessionAnalysis(client, jobId, row.project_id);
+    }
+    await client.query('COMMIT');
+    return row !== undefined;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -282,45 +303,80 @@ export async function failJob(
  * Resets to 'pending' for retry, or 'dead_letter' at max_attempts.
  */
 export async function requeueStaleJobs(): Promise<number> {
-  const db = getPool();
-  const result = await db.query<{
+  const client = await getPool().connect();
+  let rows: Array<{
+    id: string;
     error_group_id: string | null;
     session_id: string | null;
     project_id: string;
     job_type: JobType;
     status: string;
-  }>(
-    `UPDATE error_group_jobs
-     SET attempts = attempts + 1,
-         status = CASE
-           WHEN attempts + 1 >= max_attempts THEN 'dead_letter'::job_status
-           ELSE 'pending'::job_status
-         END,
-         last_error = CASE
-           WHEN attempts + 1 >= max_attempts THEN 'dead-lettered by reaper: lease expired ' || (attempts + 1) || ' times'
-           ELSE 'reaper: lease expired (attempt ' || (attempts + 1) || ')'
-         END,
-         worker_id = CASE
-           WHEN attempts + 1 >= max_attempts THEN worker_id
-           ELSE NULL
-         END,
-         claimed_at = CASE
-           WHEN attempts + 1 >= max_attempts THEN claimed_at
-           ELSE NULL
-         END,
-         lease_expires_at = CASE
-           WHEN attempts + 1 >= max_attempts THEN lease_expires_at
-           ELSE NULL
-         END,
-         updated_at = now()
-     WHERE status = 'claimed' AND lease_expires_at < now()
-     RETURNING error_group_id, session_id, project_id, job_type, status`
-  );
+  }>;
+  try {
+    await client.query('BEGIN');
+    const result = await client.query<{
+      id: string;
+      error_group_id: string | null;
+      session_id: string | null;
+      project_id: string;
+      job_type: JobType;
+      status: string;
+    }>(
+      `UPDATE error_group_jobs
+       SET attempts = attempts + 1,
+           status = CASE
+             WHEN attempts + 1 >= max_attempts THEN 'dead_letter'::job_status
+             ELSE 'pending'::job_status
+           END,
+           last_error = CASE
+             WHEN attempts + 1 >= max_attempts THEN 'dead-lettered by reaper: lease expired ' || (attempts + 1) || ' times'
+             ELSE 'reaper: lease expired (attempt ' || (attempts + 1) || ')'
+           END,
+           worker_id = CASE
+             WHEN attempts + 1 >= max_attempts THEN worker_id
+             ELSE NULL
+           END,
+           claimed_at = CASE
+             WHEN attempts + 1 >= max_attempts THEN claimed_at
+             ELSE NULL
+           END,
+           lease_expires_at = CASE
+             WHEN attempts + 1 >= max_attempts THEN lease_expires_at
+             ELSE NULL
+           END,
+           updated_at = now()
+       WHERE status = 'claimed' AND lease_expires_at < now()
+       RETURNING id, error_group_id, session_id, project_id, job_type, status`
+    );
+    rows = result.rows;
+
+    // Dead-lettered session analysis: flip claimed pending signals and the
+    // owning generation to unchecked, upsert the diagnostic, and mark the
+    // session failed — atomically with the job flip (issue #56).
+    for (const row of rows) {
+      if (row.status === 'dead_letter' && row.job_type === 'session_analysis') {
+        await reconcileDeadLetteredSessionAnalysis(client, row.id, row.project_id);
+        if (row.session_id) {
+          await client.query(
+            `UPDATE sessions SET status = 'analysis_failed' WHERE id = $1 AND project_id = $2`,
+            [row.session_id, row.project_id],
+          );
+        }
+      }
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 
   // Reconcile any FIX job that just dead-lettered: its error group is stuck in
   // 'fixing' and will never resolve on its own. Terminate it as needs_human with a
   // complete reason so the incident doesn't hang (and the writeup is preserved).
-  for (const row of result.rows) {
+  // Best-effort post-commit, matching prior behavior for the error pipeline.
+  for (const row of rows) {
     if (
       row.status === 'dead_letter' &&
       (row.job_type === 'fix' || row.job_type === 'error_fix') &&
@@ -335,21 +391,9 @@ export async function requeueStaleJobs(): Promise<number> {
         },
       }).catch(() => {});
     }
-    if (
-      row.status === 'dead_letter' &&
-      row.job_type === 'session_analysis' &&
-      row.session_id
-    ) {
-      await db.query(
-        `UPDATE sessions
-         SET status = 'analysis_failed'
-         WHERE id = $1 AND project_id = $2`,
-        [row.session_id, row.project_id],
-      ).catch(() => {});
-    }
   }
 
-  return result.rowCount ?? 0;
+  return rows.length;
 }
 
 /** Stores the Langfuse trace URL on a job row (fire-and-forget). */
