@@ -150,6 +150,27 @@ func (q *Queries) CommitChunk(ctx context.Context, sessionID, projectID string, 
 		return fmt.Errorf("update session rollup: %w", err)
 	}
 
+	// Late-chunk re-analysis (issue #56, design v4-5 whole-session truth): a
+	// chunk landing after the session already closed/analyzed would otherwise
+	// be dropped forever — the close-time producer only fires once. Re-enqueue
+	// analysis unless a live session_analysis job already covers it.
+	_, err = tx.Exec(ctx,
+		`INSERT INTO error_group_jobs (project_id, job_type, session_id)
+		 SELECT s.project_id, 'session_analysis', s.id
+		   FROM sessions s
+		  WHERE s.id = $1 AND s.project_id = $2
+		    AND s.status IN ('closed', 'analyzed', 'analysis_failed')
+		    AND NOT EXISTS (
+		      SELECT 1 FROM error_group_jobs j
+		       WHERE j.session_id = s.id
+		         AND j.job_type = 'session_analysis'
+		         AND j.status IN ('pending', 'claimed'))`,
+		sessionID, projectID,
+	)
+	if err != nil {
+		return fmt.Errorf("re-enqueue late-chunk analysis: %w", err)
+	}
+
 	return tx.Commit(ctx)
 }
 
