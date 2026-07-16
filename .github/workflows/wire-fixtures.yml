@@ -2,8 +2,10 @@ name: Wire fixtures
 
 # SECURITY: pull_request_target runs the workflow and scripts from the trusted
 # base branch. A PR therefore cannot weaken this gate by editing the workflow or
-# checker in the same PR. This job only reads the PR's Git metadata. Never check
-# out or execute the PR head in this workflow: this trigger has elevated trust.
+# checker in the same PR. This job reads only PR metadata: the checker asks the
+# GitHub API for the PR's changed-file list (names + status). The PR head is
+# never fetched, checked out, or executed, so no untrusted code enters this
+# privileged context. Keep it that way: this trigger has elevated trust.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -11,6 +13,7 @@ on:
 permissions:
   contents: read
   statuses: write
+  pull-requests: read
 
 jobs:
   publish-wire-fixture-status:
@@ -38,19 +41,13 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0
-      - name: Fetch PR head commit (metadata only; never checked out)
-        if: ${{ !contains(github.event.pull_request.labels.*.name, 'contract-change') }}
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
       - name: Evaluate wire-fixture immutability
         id: policy
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'contract-change') }}
         continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: node scripts/check-wire-fixtures.mjs
       - name: Publish final required status on PR head
         if: ${{ always() }}
