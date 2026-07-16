@@ -4,6 +4,9 @@ import { getPool, closePool } from '../../db.js';
 import {
   claimSignalsForAdjudication,
   findFoldTarget,
+  applyFoldOutcome,
+  recomputeIncidentImpact,
+  type FoldSignal,
 } from '../promotion-db.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'];
@@ -270,6 +273,265 @@ describeDb('promotion-db integration', () => {
       const sessionId = await seedSession();
       await seedErrorGroupWithEvent({ sessionId, eventAt: at(0), kind: 'friction' });
       expect(await target(sessionId, at(0))).toBeNull();
+    });
+  });
+
+  describe('applyFoldOutcome', () => {
+    const T0 = new Date('2026-07-15T12:00:00.000Z');
+    const at = (deltaSeconds: number) =>
+      new Date(T0.getTime() + deltaSeconds * 1000).toISOString();
+    const META = { modelId: 'stub-model', promptVersion: 1, jobId: '' };
+
+    async function loadSignalRow(signalId: string): Promise<FoldSignal> {
+      const { rows } = await pool.query(
+        `SELECT id, project_id, environment_id, end_user_id, session_id, fingerprint,
+                occurred_at::text AS occurred_at
+         FROM friction_signals WHERE id = $1`,
+        [signalId]
+      );
+      return rows[0] as FoldSignal;
+    }
+
+    async function groupState(groupId: string) {
+      const { rows } = await pool.query(
+        `SELECT status, occurrence_count, affected_users_count, last_seen::text AS last_seen
+         FROM error_groups WHERE id = $1`,
+        [groupId]
+      );
+      return rows[0]!;
+    }
+
+    it('accepted verdict attaches once with impact, audit, and a 90-day session pin', async () => {
+      const sessionId = await seedSession();
+      const endUserId = await seedEndUser('fold-user-1');
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0), endUserId });
+      const before = await groupState(groupId);
+
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'real friction' },
+        meta: META,
+      });
+      expect(outcome).toBe('attached');
+
+      const sig = (await pool.query(
+        `SELECT adjudication_status, adjudication_scope, adjudication_model,
+                adjudication_prompt_version, adjudication_reason, incident_id, adjudicated_at
+         FROM friction_signals WHERE id = $1`,
+        [seeded.id]
+      )).rows[0]!;
+      expect(sig.adjudication_status).toBe('accepted');
+      expect(sig.adjudication_scope).toBe('fold');
+      expect(sig.adjudication_model).toBe('stub-model');
+      expect(sig.adjudication_prompt_version).toBe(1);
+      expect(sig.incident_id).toBe(groupId);
+      expect(sig.adjudicated_at).toBeTruthy();
+
+      const after = await groupState(groupId);
+      expect(after.occurrence_count).toBe(before.occurrence_count + 1);
+      expect(after.affected_users_count).toBe(1);
+      expect(after.status).toBe(before.status);
+
+      const junction = (await pool.query(
+        `SELECT occurrence_count FROM error_group_affected_users
+         WHERE error_group_id = $1 AND end_user_id = $2`,
+        [groupId, endUserId]
+      )).rows[0]!;
+      expect(junction.occurrence_count).toBe(1);
+
+      const session = (await pool.query(
+        `SELECT retain_until, started_at FROM sessions WHERE id = $1`,
+        [sessionId]
+      )).rows[0]!;
+      const expectedPin = new Date(session.started_at).getTime() + 90 * 24 * 3600 * 1000;
+      expect(new Date(session.retain_until).getTime()).toBe(expectedPin);
+    });
+
+    it('is idempotent: a second call is a no-op', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0) });
+      const signal = await loadSignalRow(seeded.id);
+
+      expect(
+        await applyFoldOutcome({ signal, verdict: { accepted: true, reason: 'r' }, meta: META })
+      ).toBe('attached');
+      const afterFirst = await groupState(groupId);
+      expect(
+        await applyFoldOutcome({ signal, verdict: { accepted: true, reason: 'r' }, meta: META })
+      ).toBe('noop');
+      const afterSecond = await groupState(groupId);
+      expect(afterSecond.occurrence_count).toBe(afterFirst.occurrence_count);
+    });
+
+    it('rejected verdict persists audit only', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0) });
+      const before = await groupState(groupId);
+
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: false, reason: 'detector noise' },
+        meta: META,
+      });
+      expect(outcome).toBe('rejected');
+
+      const sig = (await pool.query(
+        `SELECT adjudication_status, incident_id FROM friction_signals WHERE id = $1`,
+        [seeded.id]
+      )).rows[0]!;
+      expect(sig.adjudication_status).toBe('rejected');
+      expect(sig.incident_id).toBeNull();
+      expect((await groupState(groupId)).occurrence_count).toBe(before.occurrence_count);
+    });
+
+    it('terminal targets keep their status and gain no job', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId,
+        eventAt: at(5),
+        status: 'resolved',
+      });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0) });
+
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'r' },
+        meta: META,
+      });
+      expect(outcome).toBe('attached');
+
+      const after = await groupState(groupId);
+      expect(after.status).toBe('resolved');
+      const jobs = await pool.query(
+        `SELECT count(*)::int AS n FROM error_group_jobs WHERE error_group_id = $1`,
+        [groupId]
+      );
+      expect(jobs.rows[0]!.n).toBe(0);
+    });
+
+    it('accepted signal with no fold target is a noop (falls to the bucket path)', async () => {
+      const sessionId = await seedSession();
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0) });
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'r' },
+        meta: META,
+      });
+      expect(outcome).toBe('no_target');
+      const sig = (await pool.query(
+        `SELECT adjudication_status, incident_id FROM friction_signals WHERE id = $1`,
+        [seeded.id]
+      )).rows[0]!;
+      // Verdict persists so the bucket path can inherit it without a new call.
+      expect(sig.adjudication_status).toBe('accepted');
+      expect(sig.incident_id).toBeNull();
+    });
+
+    it('resumes an accepted-but-unattached signal after a crash', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0), status: 'accepted' });
+
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'resume' },
+        meta: META,
+      });
+      expect(outcome).toBe('attached');
+      const sig = (await pool.query(
+        `SELECT incident_id FROM friction_signals WHERE id = $1`,
+        [seeded.id]
+      )).rows[0]!;
+      expect(sig.incident_id).toBe(groupId);
+    });
+
+    it.each(['rejected', 'unchecked'])('%s signals are terminal no-ops', async (status) => {
+      const sessionId = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0), status });
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'r' },
+        meta: META,
+      });
+      expect(outcome).toBe('noop');
+    });
+
+    it('retracted and superseded signals never attach', async () => {
+      const sessionId = await seedSession();
+      await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0) });
+      await pool.query(`UPDATE friction_signals SET retracted_at = now() WHERE id = $1`, [
+        seeded.id,
+      ]);
+      const outcome = await applyFoldOutcome({
+        signal: await loadSignalRow(seeded.id),
+        verdict: { accepted: true, reason: 'r' },
+        meta: META,
+      });
+      expect(outcome).toBe('noop');
+    });
+  });
+
+  describe('recomputeIncidentImpact', () => {
+    it('rebuilds impact from active source rows after retraction', async () => {
+      const sessionId = await seedSession();
+      const userA = await seedEndUser('recompute-a');
+      const userB = await seedEndUser('recompute-b');
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId,
+        eventAt: new Date().toISOString(),
+      });
+      const META = { modelId: 'stub-model', promptVersion: 1, jobId: '' };
+
+      const sigA = await seedSignal({ sessionId, occurredAt: new Date().toISOString(), endUserId: userA });
+      const sigB = await seedSignal({
+        sessionId,
+        fingerprint: 'fp-second',
+        occurredAt: new Date().toISOString(),
+        endUserId: userB,
+      });
+      for (const seeded of [sigA, sigB]) {
+        const { rows } = await pool.query(
+          `SELECT id, project_id, environment_id, end_user_id, session_id, fingerprint,
+                  occurred_at::text AS occurred_at FROM friction_signals WHERE id = $1`,
+          [seeded.id]
+        );
+        await applyFoldOutcome({
+          signal: rows[0] as FoldSignal,
+          verdict: { accepted: true, reason: 'r' },
+          meta: META,
+        });
+      }
+
+      // Retract one attached signal, then recompute from source rows.
+      await pool.query(`UPDATE friction_signals SET retracted_at = now() WHERE id = $1`, [
+        sigB.id,
+      ]);
+      const client = await getPool().connect();
+      try {
+        await recomputeIncidentImpact(client, groupId, projectId);
+      } finally {
+        client.release();
+      }
+
+      const group = (await pool.query(
+        `SELECT occurrence_count, affected_users_count FROM error_groups WHERE id = $1`,
+        [groupId]
+      )).rows[0]!;
+      // 1 error event + 1 remaining active signal.
+      expect(group.occurrence_count).toBe(2);
+      expect(group.affected_users_count).toBe(1);
+
+      const junctions = await pool.query(
+        `SELECT end_user_id FROM error_group_affected_users WHERE error_group_id = $1`,
+        [groupId]
+      );
+      expect(junctions.rows).toHaveLength(1);
+      expect(junctions.rows[0]!.end_user_id).toBe(userA);
     });
   });
 });
