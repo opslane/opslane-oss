@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue';
 import type { Incident, IncidentFilters, ErrorGroupStatus } from '../types/api';
 import { listIncidents } from '../api';
 import { getProjectId, statusBadgeClass, formatDate } from '../utils';
+import { kindBadge } from '../components/incident-kind';
 import { useTableSort } from '../composables/useTableSort';
 import FilterBar from '../components/FilterBar.vue';
 
@@ -155,6 +156,9 @@ onUnmounted(() => stopPolling());
             <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
               Title
             </th>
+            <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+              Kind
+            </th>
             <th
               class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
               @click="toggleSort('status')"
@@ -194,6 +198,14 @@ onUnmounted(() => stopPolling());
                 v-text="incident.title"
               >
               </router-link>
+            </td>
+            <td class="py-2.5 px-4">
+              <span
+                class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
+                :class="kindBadge(incident.kind, incident.adjudication_status).class"
+                v-text="kindBadge(incident.kind, incident.adjudication_status).label"
+              >
+              </span>
             </td>
             <td class="py-2.5 px-4">
               <span
