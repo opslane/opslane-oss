@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient } from '../anthropic-client.js';
 import { executeListFiles, executeReadFile, executeSearch } from '../investigate.js';
 import { logger } from '../logger.js';
 import type { ErrorGroupData } from '../db.js';
@@ -65,7 +66,10 @@ export async function investigateFriction(
   evidence: FrictionEvidence | null,
   repoPath: string,
 ): Promise<FrictionInvestigationResult> {
-  const client = new Anthropic({ apiKey });
+  // Shared factory so ANTHROPIC_BASE_URL is honored — investigate.ts already
+  // routes through it; a divergent direct client here would bypass provider
+  // twins and any configured proxy.
+  const client = createAnthropicClient(apiKey);
   const evidenceText = evidence
     ? JSON.stringify({ signals: evidence.signals, timeline: evidence.timeline, truncated: evidence.truncated })
     : 'No folded signal evidence is available; investigate from the incident descriptors only.';

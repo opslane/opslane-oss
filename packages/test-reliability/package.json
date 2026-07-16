@@ -10,10 +10,10 @@
     "test:system": "vitest run --config vitest.system.config.ts"
   },
   "dependencies": {
-    "pg": "^8.13.0"
+    "pg": "^8.22.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.0",
+    "@types/pg": "^8.20.0",
     "typescript": "^5.4.0",
     "vitest": "^3.2.0"
   }

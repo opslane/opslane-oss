@@ -107,6 +107,9 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 
 		// Stats (session or SDK auth — CLI uses API key, dashboard uses JWT)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/event-count", deps.GetEventCountEndpoint)
+		// Fix-stats is dashboard-only (session auth): it backs the autonomy
+		// settings receipts, which no SDK/CLI caller consumes.
+		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/fix-stats", deps.GetFixStatsEndpoint)
 
 		// Incidents (session or SDK auth — CLI uses API key, dashboard uses JWT)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents", deps.ListIncidents)

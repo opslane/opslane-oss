@@ -472,6 +472,12 @@ export async function cleanupTenant(orgId: string): Promise<void> {
     `DELETE FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]
   );
+  // Identified sessions/events create end_users rows that block the projects
+  // delete below (observed in CI teardown after the friction gate landed).
+  await db.query(
+    `DELETE FROM end_users WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+    [orgId]
+  );
   await db.query(
     `DELETE FROM environment_api_keys WHERE environment_id IN (
        SELECT e.id FROM environments e JOIN projects p ON e.project_id = p.id WHERE p.org_id = $1
@@ -484,4 +490,123 @@ export async function cleanupTenant(orgId: string): Promise<void> {
   );
   await db.query(`DELETE FROM projects WHERE org_id = $1`, [orgId]);
   await db.query(`DELETE FROM orgs WHERE id = $1`, [orgId]);
+}
+
+// ---------------------------------------------------------------------------
+// Session chunk helpers (Batch 4 friction e2e)
+// ---------------------------------------------------------------------------
+
+export interface SessionUser {
+  id: string;
+  email?: string;
+}
+
+/** Registers a recording session, optionally bound to an identified user. */
+export async function initSession(
+  apiKey: string,
+  sessionId: string,
+  user?: SessionUser,
+  pageUrl = 'https://app.example.com/checkout'
+): Promise<void> {
+  const { ingestionUrl } = getConfig();
+  const res = await fetch(`${ingestionUrl}/api/v1/sessions/init`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+    body: JSON.stringify({
+      session_id: sessionId,
+      started_at: new Date().toISOString(),
+      page_url: pageUrl,
+      ...(user ? { user } : {}),
+    }),
+  });
+  if (res.status !== 200) {
+    throw new Error(`session init failed: ${res.status} ${await res.text()}`);
+  }
+}
+
+/** Uploads one gzipped chunk through the real policy → MinIO → commit path. */
+export async function uploadChunk(
+  apiKey: string,
+  sessionId: string,
+  seq: number,
+  envelope: { events: unknown[]; meta?: Record<string, unknown> }
+): Promise<void> {
+  const { ingestionUrl } = getConfig();
+  const { gzipSync } = await import('node:zlib');
+  const compressed = gzipSync(JSON.stringify(envelope));
+
+  const policy = await fetch(`${ingestionUrl}/api/v1/sessions/${sessionId}/chunks/upload-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+    body: JSON.stringify({
+      seq,
+      size_bytes: compressed.byteLength,
+      has_full_snapshot: true,
+    }),
+  });
+  if (policy.status !== 200) {
+    throw new Error(`chunk policy failed: ${policy.status} ${await policy.text()}`);
+  }
+  const policyBody = (await policy.json()) as {
+    upload_url: string;
+    form_data: Record<string, string>;
+  };
+  const form = new FormData();
+  for (const [key, value] of Object.entries(policyBody.form_data)) form.append(key, value);
+  form.append('file', new Blob([compressed as unknown as BlobPart], { type: 'application/gzip' }));
+  const upload = await fetch(policyBody.upload_url, { method: 'POST', body: form });
+  if (!upload.ok) {
+    throw new Error(`chunk upload failed: ${upload.status} ${await upload.text()}`);
+  }
+
+  const commit = await fetch(`${ingestionUrl}/api/v1/sessions/${sessionId}/chunks/${seq}/commit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+    body: '{}',
+  });
+  if (commit.status !== 200) {
+    throw new Error(`chunk commit failed: ${commit.status} ${await commit.text()}`);
+  }
+}
+
+/** Waits until the ingestion scrubber has made the session's chunks readable. */
+export async function waitForScrubbedChunks(
+  sessionId: string,
+  expected: number,
+  timeoutMs = 60_000
+): Promise<void> {
+  const db = getPool();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await db.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM session_chunks
+       WHERE session_id = $1 AND scrubbed_at IS NOT NULL`,
+      [sessionId]
+    );
+    if (Number(res.rows[0]!.n) >= expected) return;
+    if (Date.now() > deadline) {
+      throw new Error(`chunks for ${sessionId} not scrubbed within ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/** Creates an additional environment + API key in an existing tenant. */
+export async function seedEnvironment(
+  projectId: string,
+  name: string
+): Promise<{ environmentId: string; apiKey: string }> {
+  const db = getPool();
+  const envResult = await db.query<{ id: string }>(
+    `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+    [projectId, name]
+  );
+  const environmentId = envResult.rows[0]!.id;
+  const rawKey = `def_${crypto.randomUUID()}`;
+  const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
+  await db.query(
+    `INSERT INTO environment_api_keys (environment_id, key_hash, key_prefix) VALUES ($1, $2, $3)`,
+    [environmentId, keyHash, rawKey.slice(0, 12)]
+  );
+  return { environmentId, apiKey: rawKey };
 }

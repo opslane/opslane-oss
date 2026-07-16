@@ -1,10 +1,16 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -163,11 +169,161 @@ func TestAuthenticateSession_ValidTokenAndOrgScope(t *testing.T) {
 	}
 }
 
+func TestUpdateProjectEndpoint_FrictionAutonomy(t *testing.T) {
+	router, q, pool := authTestRouter(t)
+	orgID, projectID, _, _ := seedTenant(t, q)
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, orgID) })
+
+	token, err := auth.SignAccessToken(
+		[]byte(authTestJWTSecret), "autonomy-user", orgID, "autonomy@example.com",
+	)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(
+			http.MethodPatch, "/api/v1/projects/"+projectID, strings.NewReader(body),
+		)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	if response := patch(`{"friction_autonomy":"yolo"}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid autonomy status = %d, want 400: %s", response.Code, response.Body.String())
+	}
+
+	response := patch(`{"friction_autonomy":"auto_fix"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid autonomy status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	var project struct {
+		GithubRepo       *string `json:"github_repo"`
+		FrictionAutonomy string  `json:"friction_autonomy"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&project); err != nil {
+		t.Fatalf("decode project response: %v", err)
+	}
+	if project.FrictionAutonomy != "auto_fix" {
+		t.Fatalf("friction_autonomy = %q, want auto_fix", project.FrictionAutonomy)
+	}
+
+	response = patch(`{"github_repo":"org/other"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("github-only PATCH status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if err := json.NewDecoder(response.Body).Decode(&project); err != nil {
+		t.Fatalf("decode github-only response: %v", err)
+	}
+	if project.FrictionAutonomy != "auto_fix" {
+		t.Fatalf("github-only PATCH reset autonomy to %q", project.FrictionAutonomy)
+	}
+	if project.GithubRepo == nil || *project.GithubRepo != "org/other" {
+		t.Fatalf("github_repo = %v, want org/other", project.GithubRepo)
+	}
+}
+
+func TestGetFixStatsEndpoint_AuthenticatedShape(t *testing.T) {
+	router, q, pool := authTestRouter(t)
+	orgID, projectID, _, _ := seedTenant(t, q)
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, orgID) })
+	path := "/api/v1/projects/" + projectID + "/fix-stats"
+
+	if response := doRequest(router, http.MethodGet, path, nil); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", response.Code)
+	}
+
+	token, err := auth.SignAccessToken(
+		[]byte(authTestJWTSecret), "stats-user", orgID, "stats@example.com",
+	)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	response := doRequest(router, http.MethodGet, path,
+		map[string]string{"Authorization": "Bearer " + token})
+	if response.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+
+	var payload map[string]map[string]int
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode fix stats: %v", err)
+	}
+	for _, kind := range []string{"error", "friction"} {
+		stat, ok := payload[kind]
+		if !ok {
+			t.Fatalf("response missing %q stats: %#v", kind, payload)
+		}
+		for _, field := range []string{
+			"generated_auto", "generated_human",
+			"prs_merged", "prs_closed", "prs_merged_auto", "prs_closed_auto",
+		} {
+			if _, ok := stat[field]; !ok {
+				t.Fatalf("%s stats missing %q: %#v", kind, field, stat)
+			}
+		}
+	}
+}
+
+func TestHandleWebhook_StatusMapping(t *testing.T) {
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "handler-test-secret")
+	router, q, pool := authTestRouter(t)
+	orgID, projectID, _, _ := seedTenant(t, q)
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, orgID) })
+	ctx := context.Background()
+
+	var groupID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, kind, status, pr_number, pr_url)
+		 VALUES ($1, 'fp-webhook-mapping', 'fp-webhook-mapping', now(), now(), 'error', 'pr_created', 77, 'https://github.com/owner/repo/pull/77')
+		 RETURNING id`,
+		projectID,
+	).Scan(&groupID); err != nil {
+		t.Fatalf("insert pr_created group: %v", err)
+	}
+
+	post := func(payload []byte, deliveryID string) map[string]string {
+		t.Helper()
+		mac := hmac.New(sha256.New, []byte("handler-test-secret"))
+		mac.Write(payload)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", bytes.NewReader(payload))
+		req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", deliveryID)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("webhook status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		var body map[string]string
+		if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+			t.Fatalf("decode webhook response: %v", err)
+		}
+		return body
+	}
+
+	merged := []byte(`{"action":"closed","pull_request":{"number":77,"merged":true},"repository":{"full_name":"owner/repo"}}`)
+	if body := post(merged, "mapping-d1"); body["status"] != "processed" || body["action"] != "merged" || body["group_id"] != groupID {
+		t.Fatalf("first delivery = %v, want processed/merged/%s", body, groupID)
+	}
+	if body := post(merged, "mapping-d1"); body["status"] != "duplicate" || body["group_id"] != groupID {
+		t.Fatalf("redelivery = %v, want duplicate", body)
+	}
+	noMatch := []byte(`{"action":"closed","pull_request":{"number":9999,"merged":false},"repository":{"full_name":"owner/repo"}}`)
+	if body := post(noMatch, "mapping-d2"); body["status"] != "no_match" || body["action"] != "closed" {
+		t.Fatalf("unknown PR = %v, want no_match/closed", body)
+	}
+}
+
 // cleanupTenantHandler mirrors db_test.cleanupTenant for handler tests.
 func cleanupTenantHandler(t *testing.T, pool *pgxpool.Pool, orgID string) {
 	t.Helper()
 	ctx := context.Background()
 	for _, q := range []string{
+		`DELETE FROM pr_outcomes WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM error_group_jobs WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM error_events WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,

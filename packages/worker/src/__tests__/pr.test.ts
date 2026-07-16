@@ -255,6 +255,13 @@ describe('buildPRBody', () => {
     expect(body).not.toContain('Opslane fixed');
   });
 
+  it('marks friction as unverified against the original friction', () => {
+    const body = buildPRBody(makeInput({ kind: 'friction' }));
+
+    expect(body).toContain('friction itself was not re-verified');
+    expect(body).not.toContain('**Confidence:** High · ✅ Tests passing');
+  });
+
   it('uses the explicit human summary as a header-free lede', () => {
     const body = buildPRBody(makeInput({
       humanSummary: '### The user submitted the form. The app crashed on submit. The fix guards the missing value.',

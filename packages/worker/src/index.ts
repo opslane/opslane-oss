@@ -29,6 +29,15 @@ import { investigateFriction } from './friction/investigate-friction.js';
 import { readChunksBounded } from './friction/chunk-reader.js';
 import { analyzeSession, RULE_VERSION } from './friction/analyzer.js';
 import { writeFrictionSignals } from './friction/persist.js';
+import { processFrictionOutcomes } from './friction/promotion.js';
+import { createAnthropicAdjudicator, type Adjudicator } from './friction/adjudicator.js';
+
+/** Injectable seam: unit tests and the e2e gate substitute a deterministic
+ * adjudicator; production uses the real Anthropic-backed one. */
+let frictionAdjudicatorFactory: (apiKey: string) => Adjudicator = createAnthropicAdjudicator;
+export function setFrictionAdjudicatorFactory(factory: (apiKey: string) => Adjudicator): void {
+  frictionAdjudicatorFactory = factory;
+}
 
 /**
  * Maps the raw DB/SDK replay_signals JSON (nested, snake_case) to the flat camelCase
@@ -371,15 +380,29 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
       });
     } else if (triage.fixable && triage.confidence === 'high') {
       // High confidence fixable → auto-trigger fix (atomic transaction)
-      const fixJobId = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+      const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
       }, job);
-      jobsProcessed++;
-      logger.info('Investigation: auto-triggering fix', {
-        job_id: job.id, fix_job_id: fixJobId, duration_ms: durationMs,
-      });
+      if (fixResult.created) {
+        jobsProcessed++;
+        logger.info('Investigation: auto-triggering fix', {
+          job_id: job.id, fix_job_id: fixResult.fixJobId, duration_ms: durationMs,
+        });
+      } else {
+        // Defense-in-depth refusal (kind gate): park the result for a human
+        // instead of silently dropping the investigation.
+        await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
+          rootCause: triage.reason,
+          suggestedMitigation: triage.remediation,
+          confidence: triage.confidence,
+        }, job);
+        jobsProcessed++;
+        logger.warn('Investigation: automatic fix refused by kind gate', {
+          job_id: job.id, reason: fixResult.reason, duration_ms: durationMs,
+        });
+      }
     } else {
       // Medium/low confidence → investigated, wait for user
       await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
@@ -465,15 +488,47 @@ export async function processFrictionInvestigateJob(
     const result = await investigateFriction(apiKey, group, evidence, clone.repoDir);
     checkAbort(signal);
     if (result.codeCause) {
-      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
-        rootCause: result.reason,
-        suggestedMitigation: result.remediation,
-        confidence: result.confidence,
-      }, job);
-      logger.info('Friction investigation: awaiting human approval', {
-        job_id: job.id,
-        confidence: result.confidence,
-      });
+      // auto_fix_ux shares the code-caused auto-fix path until UX-suggestion
+      // fixes exist; insights remain terminal and never produce a PR.
+      const autonomyAllowsFix = project.friction_autonomy === 'auto_fix'
+        || project.friction_autonomy === 'auto_fix_ux';
+      if (result.confidence === 'high' && autonomyAllowsFix) {
+        // allowFriction is the ladder's explicit opt-in past the kind gate;
+        // refuse-by-default stays intact for every other caller (issue #56).
+        const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+          rootCause: result.reason,
+          suggestedMitigation: result.remediation,
+          confidence: result.confidence,
+        }, job, { allowFriction: true });
+        if (fixResult.created) {
+          logger.info('Friction investigation: auto-triggering fix (autonomy ladder)', {
+            job_id: job.id,
+            fix_job_id: fixResult.fixJobId,
+            autonomy: project.friction_autonomy,
+          });
+        } else {
+          // Never drop the investigation: park it for human approval instead.
+          await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+            rootCause: result.reason,
+            suggestedMitigation: result.remediation,
+            confidence: result.confidence,
+          }, job);
+          logger.warn('Friction investigation: auto-fix refused by kind gate — parked for approval', {
+            job_id: job.id,
+            reason: fixResult.reason,
+          });
+        }
+      } else {
+        await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+          rootCause: result.reason,
+          suggestedMitigation: result.remediation,
+          confidence: result.confidence,
+        }, job);
+        logger.info('Friction investigation: awaiting human approval', {
+          job_id: job.id,
+          confidence: result.confidence,
+        });
+      }
     } else {
       await updateGroupInvestigation(job.errorGroupId, job.projectId, 'insight', {
         rootCause: result.reason,
@@ -506,6 +561,19 @@ export async function processSessionAnalysisJob(
     const signals = analyzeSession(read.envelopes);
     await db.assertJobLease(job);
     await writeFrictionSignals(session, signals, RULE_VERSION);
+    // Batch 4: adjudicate → fold/aggregate before the session is marked
+    // analyzed, so a crash retries the whole ordered pass. Keyless
+    // deployments skip adjudication; signals stay pending and invisible.
+    const adjudicationKey = process.env['ANTHROPIC_API_KEY'];
+    if (adjudicationKey) {
+      checkAbort(signal);
+      await processFrictionOutcomes(session, job.id, frictionAdjudicatorFactory(adjudicationKey));
+    } else {
+      logger.warn('ANTHROPIC_API_KEY unset; friction adjudication skipped, signals stay pending', {
+        job_id: job.id,
+        session_id: job.sessionId,
+      });
+    }
     await db.setSessionAnalysisStatus(job.sessionId, job.projectId, 'analyzed', RULE_VERSION, job);
     if (read.truncated) {
       logger.warn('Session analysis completed from bounded prefix', {
@@ -543,9 +611,17 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
 
   if (group.kind === 'friction' && job.triggeredBy !== 'human') {
-    await updateGroupStatus(job.errorGroupId, job.projectId, 'awaiting_approval', undefined, job);
-    logger.warn('Refused non-human friction fix job', { job_id: job.id });
-    return;
+    // Settings can change after enqueue, so enforce the current project rung
+    // when the job is claimed. Legacy jobs without attribution stay parked.
+    const gateProject = await db.getProject(job.projectId);
+    const autonomy = gateProject?.friction_autonomy ?? 'ask_first';
+    if (job.triggeredBy !== 'auto' || autonomy === 'ask_first') {
+      await updateGroupStatus(job.errorGroupId, job.projectId, 'awaiting_approval', {
+        confidence: group.confidence ?? undefined,
+      }, job);
+      logger.warn('Refused non-human friction fix job', { job_id: job.id, autonomy });
+      return;
+    }
   }
 
   const event = group.sample_event_id
@@ -767,6 +843,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         confidence: result.confidence,
         pr_url: result.pr_url,
         pr_number: result.pr_number,
+        pr_fix_job_id: job.id,
       }, job);
       jobsProcessed++;
       logger.info('Fix job completed: pr_created', {

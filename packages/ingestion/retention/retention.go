@@ -25,6 +25,10 @@ const (
 type Sweeper struct {
 	Q     *db.Queries
 	MinIO *minioPkg.Client
+	// IdleCloseMinutes overrides how long a recording session may sit without
+	// a chunk before it closes (and its session_analysis job is enqueued).
+	// Zero means the 30-minute default.
+	IdleCloseMinutes int
 }
 
 // resolveInterval picks the tick interval for Start. Only a non-positive
@@ -54,7 +58,11 @@ func (s *Sweeper) Start(ctx context.Context, interval time.Duration) {
 }
 
 func (s *Sweeper) runPass(ctx context.Context) {
-	if closed, err := s.Q.CloseIdleSessions(ctx, idleCloseMinutes); err != nil {
+	idleMinutes := s.IdleCloseMinutes
+	if idleMinutes <= 0 {
+		idleMinutes = idleCloseMinutes
+	}
+	if closed, err := s.Q.CloseIdleSessions(ctx, idleMinutes); err != nil {
 		slog.Error("close idle sessions failed", "error", err)
 	} else if closed > 0 {
 		slog.Info("closed idle sessions", "count", closed)
