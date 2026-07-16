@@ -1,5 +1,5 @@
 # Stage 1: Build dashboard (workspace lockfile, reproducible)
-FROM node:22-alpine AS dashboard-builder
+FROM node:26-alpine AS dashboard-builder
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY packages/dashboard/package.json packages/dashboard/
