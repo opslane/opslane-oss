@@ -21,6 +21,7 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` | for replays | Storage credentials |
 | `REPLAY_STORE_BUCKET` / `REPLAY_STORE_REGION` | for replays | Bucket and region |
 | `INTERNAL_READ_TOKEN` | for worker replay evidence | Shared secret guarding worker-to-ingestion chunk reads. Unset disables the internal endpoint. |
+| `ADMIN_EMAILS` | no | Comma-separated operator email allowlist for the cross-tenant admin dashboard. Empty disables the admin API. Docker Compose maps it from the host-side `OPSLANE_ADMIN_EMAILS`. |
 | `VERSION` | no | Reported by `/health` |
 
 Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in its test code, not runtime configuration.
