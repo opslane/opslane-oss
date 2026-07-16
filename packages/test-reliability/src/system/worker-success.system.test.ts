@@ -235,7 +235,7 @@ describe('event-to-pr reliability system tracer', () => {
       project_id: tenant.projectId,
       status: 'pr_created',
       confidence: 'high',
-      pr_url: 'https://github.test/e2e/reliability/pull/42',
+      pr_url: `https://github.test/${githubRepo}/pull/42`,
     });
     expect(await scanReliabilityInvariants(db)).toEqual([]);
 

@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process';
+import { createHmac, randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { dirname, join } from 'node:path';
@@ -24,11 +25,37 @@ export interface FixtureRepository {
   deliveryClone: string;
 }
 
+/** A pull request held by the GitHub twin, created by the real worker. */
+export interface TwinPullRequest {
+  number: number;
+  owner: string;
+  repo: string;
+  title: string;
+  body: string;
+  head: string;
+  base: string;
+  state: 'open' | 'closed';
+  merged: boolean;
+}
+
+export interface ProviderTwinOptions {
+  /** Ingestion base URL that receives signed pull_request webhooks on merge/close. */
+  ingestionUrl?: string;
+  /** Shared HMAC secret — must equal ingestion's GITHUB_WEBHOOK_SECRET. */
+  webhookSecret?: string;
+}
+
 export interface ProviderRecorders {
   anthropicBaseUrl: string;
   githubBaseUrl: string;
   anthropicJournal: RecordedRequest[];
   githubJournal: RecordedRequest[];
+  /** PRs the worker created against the GitHub twin, in creation order. */
+  pullRequests: TwinPullRequest[];
+  /** Merge a twin PR and deliver the signed pull_request webhook to ingestion. */
+  mergePullRequest(number: number, closedAt?: Date): Promise<Response>;
+  /** Close a twin PR unmerged and deliver the signed webhook to ingestion. */
+  closePullRequest(number: number, closedAt?: Date): Promise<Response>;
   close(): Promise<void>;
 }
 
@@ -132,7 +159,7 @@ export async function createFixtureRepository(
   return { remote, deliveryClone };
 }
 
-export async function startProviderRecorders(): Promise<ProviderRecorders> {
+export async function startProviderRecorders(options: ProviderTwinOptions = {}): Promise<ProviderRecorders> {
   const anthropicJournal: RecordedRequest[] = [];
   const anthropicServer = createServer(async (request, response) => {
     const body = await readJsonRequest(request);
@@ -143,7 +170,19 @@ export async function startProviderRecorders(): Promise<ProviderRecorders> {
     });
     const names = toolNames(body);
     let message: Record<string, unknown>;
-    if (names.includes('classify_error')) {
+    if (names.includes('classify_friction')) {
+      message = anthropicMessage(body, [{
+        type: 'tool_use',
+        id: 'tool_classify_friction',
+        name: 'classify_friction',
+        input: {
+          codeCause: true,
+          confidence: 'high',
+          reason: 'The value renderer dereferences missing input, so the control appears dead.',
+          remediation: 'Guard the missing value with a narrow fallback.',
+        },
+      }], 'tool_use');
+    } else if (names.includes('classify_error')) {
       message = anthropicMessage(body, [{
         type: 'tool_use',
         id: 'tool_classify',
@@ -205,6 +244,8 @@ export async function startProviderRecorders(): Promise<ProviderRecorders> {
   const anthropicBaseUrl = await listen(anthropicServer);
 
   const githubJournal: RecordedRequest[] = [];
+  const pullRequests: TwinPullRequest[] = [];
+  let nextPullNumber = 42;
   const githubServer = createServer(async (request, response) => {
     const body = await readJsonRequest(request);
     githubJournal.push({
@@ -212,19 +253,94 @@ export async function startProviderRecorders(): Promise<ProviderRecorders> {
       authorization: request.headers.authorization,
       body,
     });
-    response.writeHead(201, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-      html_url: 'https://github.test/e2e/reliability/pull/42',
-      number: 42,
-    }));
+    // Stateful slice of GitHub's REST API: pulls.create. Response shape from
+    // GitHub's spec — the twin remembers the PR so a later merge/close can
+    // deliver the matching webhook.
+    const pullsMatch = /^\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(request.url ?? '');
+    if (request.method === 'POST' && pullsMatch) {
+      const pull: TwinPullRequest = {
+        number: nextPullNumber++,
+        owner: pullsMatch[1]!,
+        repo: pullsMatch[2]!,
+        title: String(body['title'] ?? ''),
+        body: String(body['body'] ?? ''),
+        head: String(body['head'] ?? ''),
+        base: String(body['base'] ?? ''),
+        state: 'open',
+        merged: false,
+      };
+      pullRequests.push(pull);
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        html_url: `https://github.test/${pull.owner}/${pull.repo}/pull/${pull.number}`,
+        number: pull.number,
+        state: pull.state,
+        title: pull.title,
+      }));
+      return;
+    }
+    // Anything else the worker probes (e.g. repo contents) is absent.
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ message: 'Not Found' }));
   });
   const githubBaseUrl = await listen(githubServer);
+
+  // Deliver a spec-shaped, HMAC-signed pull_request webhook, exactly as GitHub
+  // would. Shapes come from GitHub's webhook spec, not from what ingestion
+  // expects — that's what makes the twin catch bugs instead of confirming them.
+  async function deliverClosed(pull: TwinPullRequest, merged: boolean, closedAt: Date): Promise<Response> {
+    const { ingestionUrl, webhookSecret } = options;
+    if (!ingestionUrl || !webhookSecret) {
+      throw new Error('GitHub twin webhooks need ingestionUrl + webhookSecret in startProviderRecorders options');
+    }
+    pull.state = 'closed';
+    pull.merged = merged;
+    const payload = JSON.stringify({
+      action: 'closed',
+      number: pull.number,
+      pull_request: {
+        number: pull.number,
+        state: 'closed',
+        title: pull.title,
+        merged,
+        merged_at: merged ? closedAt.toISOString() : null,
+        closed_at: closedAt.toISOString(),
+        head: { ref: pull.head },
+        base: { ref: pull.base },
+      },
+      repository: {
+        full_name: `${pull.owner}/${pull.repo}`,
+        name: pull.repo,
+        owner: { login: pull.owner },
+      },
+    });
+    const signature = createHmac('sha256', webhookSecret).update(payload).digest('hex');
+    return fetch(`${ingestionUrl.replace(/\/$/, '')}/api/v1/github/webhook`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': `sha256=${signature}`,
+        'x-github-event': 'pull_request',
+        'x-github-delivery': randomUUID(),
+      },
+      body: payload,
+    });
+  }
+
+  function findPull(number: number): TwinPullRequest {
+    const pull = pullRequests.find((candidate) => candidate.number === number);
+    if (!pull) throw new Error(`GitHub twin has no pull request #${number}`);
+    return pull;
+  }
 
   return {
     anthropicBaseUrl,
     githubBaseUrl,
     anthropicJournal,
     githubJournal,
+    pullRequests,
+    mergePullRequest: (number, closedAt = new Date()) => deliverClosed(findPull(number), true, closedAt),
+    closePullRequest: (number, closedAt = new Date()) => deliverClosed(findPull(number), false, closedAt),
     close: async () => Promise.all([close(anthropicServer), close(githubServer)]).then(() => undefined),
   };
 }
