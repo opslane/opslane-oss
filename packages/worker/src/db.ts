@@ -429,6 +429,7 @@ export async function updateGroupStatus(
     confidence?: ConfidenceLevel;
     pr_url?: string;
     pr_number?: number;
+    pr_fix_job_id?: string;
     reason?: NeedsHumanReason;
   },
   lease?: JobLease,
@@ -452,9 +453,9 @@ export async function updateGroupStatus(
   const ownedCte = lease
     ? `WITH owned AS (
          SELECT id FROM error_group_jobs
-         WHERE id = $10
-           AND worker_id = $11
-           AND lease_generation = $12::bigint
+         WHERE id = $11
+           AND worker_id = $12
+           AND lease_generation = $13::bigint
            AND project_id = $2
            AND error_group_id = $1
            AND status = 'claimed'
@@ -469,9 +470,10 @@ export async function updateGroupStatus(
          confidence = $4,
          pr_url = $5,
          pr_number = $6,
-         reason_code = $7,
-         reason_message = $8,
-         remediation = $9,
+         pr_fix_job_id = COALESCE($7, pr_fix_job_id),
+         reason_code = $8,
+         reason_message = $9,
+         remediation = $10,
          pr_created_at = CASE
            WHEN $3::error_group_status = 'pr_created'
                 AND status IS DISTINCT FROM 'pr_created' THEN now()
@@ -493,6 +495,7 @@ export async function updateGroupStatus(
       fields?.confidence ?? null,
       fields?.pr_url ?? null,
       fields?.pr_number ?? null,
+      fields?.pr_fix_job_id ?? null,
       reason?.reason_code ?? null,
       reason?.reason_message ?? null,
       reason?.remediation ?? null,
@@ -578,13 +581,14 @@ export interface ErrorGroupData {
   signal_type: string | null;
   element_selector: string | null;
   page_url_normalized: string | null;
+  confidence: ConfidenceLevel | null;
 }
 
 export async function getErrorGroup(groupId: string, projectId: string): Promise<ErrorGroupData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ErrorGroupData>(
     `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status,
-            kind, signal_type, element_selector, page_url_normalized
+            kind, signal_type, element_selector, page_url_normalized, confidence
      FROM error_groups WHERE id = $1 AND project_id = $2`,
     [groupId, projectId],
   );
@@ -614,17 +618,20 @@ export async function getErrorEvent(eventId: string, projectId: string): Promise
   return rows[0] ?? null;
 }
 
+export type FrictionAutonomy = 'ask_first' | 'auto_fix' | 'auto_fix_ux';
+
 export interface ProjectData {
   id: string;
   name: string;
   github_repo: string;
   default_branch: string;
+  friction_autonomy: FrictionAutonomy;
 }
 
 export async function getProject(projectId: string): Promise<ProjectData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ProjectData>(
-    `SELECT id, name, github_repo, default_branch
+    `SELECT id, name, github_repo, default_branch, friction_autonomy
      FROM projects WHERE id = $1`,
     [projectId],
   );
@@ -919,9 +926,12 @@ export async function updateGroupInvestigation(
  * confidence and auto-triggers a fix.
  */
 /** Result of an automatic investigate→fix transition attempt. Friction
- * incidents are refused at this layer (issue #56 defense in depth): even a
- * future caller that skips the route-level kind check cannot auto-create a
- * fix job for kind='friction'. */
+ * incidents are refused at this layer by default (issue #56 defense in
+ * depth): even a future caller that skips the route-level kind check cannot
+ * auto-create a fix job for kind='friction'. The one sanctioned exception is
+ * the autonomy ladder (issue #57), which must opt in explicitly via
+ * allowFriction after checking projects.friction_autonomy — and the fix-job
+ * gate in processFixJob re-checks autonomy at claim time as a second layer. */
 export type FixJobResult =
   | { created: true; fixJobId: string }
   | { created: false; reason: 'kind_not_error' };
@@ -935,6 +945,7 @@ export async function updateGroupAndCreateFixJob(
     confidence?: ConfidenceLevel;
   },
   lease: JobLease,
+  opts?: { allowFriction?: boolean },
 ): Promise<FixJobResult> {
   const db = getPool();
   const client = await db.connect();
@@ -971,8 +982,10 @@ export async function updateGroupAndCreateFixJob(
     if ((group.rowCount ?? 0) !== 1) {
       throw new Error(`Cannot create fix job: group ${errorGroupId} was not found`);
     }
-    if (group.rows[0]!.kind !== 'error') {
+    const kind = group.rows[0]!.kind;
+    if (kind !== 'error' && !(kind === 'friction' && opts?.allowFriction)) {
       // Typed no-transition result: nothing changed, nothing enqueued.
+      // Friction passes only via the autonomy ladder's explicit opt-in.
       await client.query('COMMIT');
       return { created: false, reason: 'kind_not_error' };
     }

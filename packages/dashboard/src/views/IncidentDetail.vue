@@ -358,9 +358,9 @@ onMounted(async () => {
           </a>
         </div>
 
-        <!-- Investigation results (investigated, fixing, or preserved on needs_human) -->
+        <!-- Investigation results (investigated, awaiting approval, fixing, or preserved on needs_human) -->
         <div
-          v-if="(incident.status === 'investigated' || incident.status === 'fixing' || incident.status === 'needs_human') && incident.root_cause"
+          v-if="(incident.status === 'investigated' || incident.status === 'awaiting_approval' || incident.status === 'fixing' || incident.status === 'needs_human') && incident.root_cause"
           class="p-4 bg-teal-500/10 border border-teal-500/20 border-l-2 border-l-teal rounded-lg space-y-3"
         >
           <div>
@@ -383,6 +383,25 @@ onMounted(async () => {
           </div>
         </div>
 
+        <!-- Insight card (friction, no code cause — terminal, never a PR; design v4-4) -->
+        <div
+          v-if="incident.status === 'insight'"
+          class="p-4 bg-purple-500/10 border border-purple-500/20 border-l-2 border-l-purple rounded-lg space-y-3"
+        >
+          <p class="text-sm font-medium text-purple">Insight — no code cause</p>
+          <p class="text-xs text-text-muted">
+            Opslane investigated this friction and found no code change that would fix it.
+            No PR will be created; use the findings below to guide a product or UX change.
+          </p>
+          <div v-if="incident.root_cause">
+            <p class="text-xs font-medium text-purple uppercase tracking-wide">What users hit</p>
+            <pre
+              class="mt-1 text-sm bg-surface border border-border p-3 rounded overflow-x-auto whitespace-pre-wrap text-text"
+              v-text="incident.root_cause"
+            ></pre>
+          </div>
+        </div>
+
         <!-- Fix trigger: errors when investigated; friction only when a human
              approval is awaited (awaiting_approval). Insight, candidates, and
              unchecked diagnostics never render fix controls. -->
@@ -390,6 +409,11 @@ onMounted(async () => {
           v-if="fixControlsVisible(incident.kind, incident.status)"
           class="p-4 bg-surface border border-border rounded-lg space-y-3"
         >
+          <p v-if="incident.status === 'awaiting_approval'" class="text-xs text-text-muted">
+            This friction fix has a code cause and is waiting for your approval.
+            It will open a <strong>Suggestion</strong> PR — repo tests must pass,
+            but the friction itself is not re-verified.
+          </p>
           <div>
             <label for="guidance" class="block text-sm font-medium text-text-muted">
               Guide the agent (optional)
@@ -411,7 +435,7 @@ onMounted(async () => {
               @click="handleTriggerFix"
             >
               <span v-if="fixLoading">Triggering...</span>
-              <span v-else>Find Fix</span>
+              <span v-else>{{ incident.status === 'awaiting_approval' ? 'Generate fix' : 'Find Fix' }}</span>
             </button>
             <p
               v-if="fixError"

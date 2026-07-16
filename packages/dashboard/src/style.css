@@ -37,6 +37,7 @@
   --color-green: #4ade80;
   --color-amber: #f5a623;
   --color-red: #ff4d4d;
+  --color-purple: #c084fc; /* insight status */
 
   /* Typography */
   --font-sans: 'DM Sans', system-ui, sans-serif;

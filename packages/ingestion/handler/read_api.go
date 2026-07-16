@@ -95,18 +95,20 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 
 // projectJSON is the JSON representation of a project for the dashboard API.
 type projectJSON struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	GithubRepo *string `json:"github_repo"`
-	CreatedAt  string  `json:"created_at"`
+	ID               string  `json:"id"`
+	Name             string  `json:"name"`
+	GithubRepo       *string `json:"github_repo"`
+	FrictionAutonomy string  `json:"friction_autonomy"`
+	CreatedAt        string  `json:"created_at"`
 }
 
 func toProjectJSON(p db.Project) projectJSON {
 	return projectJSON{
-		ID:         p.ID,
-		Name:       p.Name,
-		GithubRepo: p.GithubRepo,
-		CreatedAt:  p.CreatedAt.Format(time.RFC3339),
+		ID:               p.ID,
+		Name:             p.Name,
+		GithubRepo:       p.GithubRepo,
+		FrictionAutonomy: p.FrictionAutonomy,
+		CreatedAt:        p.CreatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -450,14 +452,27 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
 	var req struct {
-		GithubRepo *string `json:"github_repo"`
+		GithubRepo       *string `json:"github_repo"`
+		FrictionAutonomy *string `json:"friction_autonomy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	project, err := d.Queries.UpdateProject(r.Context(), orgID, projectID, req.GithubRepo)
+	if req.FrictionAutonomy != nil {
+		switch *req.FrictionAutonomy {
+		case "ask_first", "auto_fix", "auto_fix_ux":
+		default:
+			writeJSONError(w, http.StatusBadRequest,
+				"friction_autonomy must be one of ask_first, auto_fix, auto_fix_ux")
+			return
+		}
+	}
+
+	project, err := d.Queries.UpdateProject(
+		r.Context(), orgID, projectID, req.GithubRepo, req.FrictionAutonomy,
+	)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to update project")
 		return
@@ -469,6 +484,24 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(toProjectJSON(*project))
+}
+
+// GetFixStatsEndpoint returns per-kind fix generation and PR outcome counts.
+// GET /api/v1/projects/{projectID}/fix-stats
+func (d *Dependencies) GetFixStatsEndpoint(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !d.verifyProjectAccess(w, r, projectID) {
+		return
+	}
+
+	stats, err := d.Queries.GetFixStats(r.Context(), projectID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to load fix stats")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
 }
 
 // ListEnvironmentsEndpoint returns environments for a project.

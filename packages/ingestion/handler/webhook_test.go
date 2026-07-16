@@ -125,7 +125,7 @@ func TestHandleWebhook_PROutcomeReceipts(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 		}
-		assertWebhookStatus(t, response, "no_match")
+		assertWebhookStatus(t, response, "duplicate")
 
 		var count int
 		if err := pool.QueryRow(context.Background(),

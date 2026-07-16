@@ -19,7 +19,7 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/api/v1/agent/poll/{sessionID}` | none | Agent onboarding poll |
 | GET | `/agent/auth/{sessionID}` | none | Agent onboarding browser auth |
 | GET | `/agent/auth/callback` | none | Agent onboarding callback |
-| POST | `/api/v1/github/webhook` | HMAC | GitHub webhook receiver |
+| POST | `/api/v1/github/webhook` | HMAC | GitHub webhook receiver — requires `X-GitHub-Delivery` (400 without it); responds `processed`, `no_match`, or `duplicate` (idempotent on redelivery) |
 
 ## SDK (X-API-Key)
 
@@ -47,7 +47,8 @@ These are curated tables, not a stability contract — the API is early-stage an
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
 | POST | `/api/v1/projects` | Create project |
-| PATCH | `/api/v1/projects/{projectID}` | Update project |
+| PATCH | `/api/v1/projects/{projectID}` | Update project (partial: omitted/null fields are preserved, so `github_repo` can no longer be cleared here) |
+| GET | `/api/v1/projects/{projectID}/fix-stats` | Per-kind fix generation and PR outcome receipts |
 | GET | `/api/v1/projects/{projectID}/environments` | List environments |
 | POST | `/api/v1/projects/{projectID}/environments` | Create environment |
 | POST | `/api/v1/environments/{envID}/api-keys` | Create ingest key |
@@ -57,7 +58,7 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/api/v1/projects/{projectID}/sessions/{sessionID}` | Session detail and scrubbed chunk manifest |
 | GET | `/api/v1/projects/{projectID}/sessions/{sessionID}/chunks/{seq}` | Fetch one decoded, re-redacted scrubbed chunk |
 | GET | `/api/v1/projects/{projectID}/incidents/{incidentID}/affected-users` | Affected users |
-| POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/fix` | Trigger fix from an `investigated` analysis |
+| POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/fix` | Trigger an eligible error or approved friction fix |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/resolve` | Resolve incident |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/archive` | Archive incident |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/unarchive` | Unarchive incident |

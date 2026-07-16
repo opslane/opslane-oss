@@ -488,15 +488,47 @@ export async function processFrictionInvestigateJob(
     const result = await investigateFriction(apiKey, group, evidence, clone.repoDir);
     checkAbort(signal);
     if (result.codeCause) {
-      await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
-        rootCause: result.reason,
-        suggestedMitigation: result.remediation,
-        confidence: result.confidence,
-      }, job);
-      logger.info('Friction investigation: awaiting human approval', {
-        job_id: job.id,
-        confidence: result.confidence,
-      });
+      // auto_fix_ux shares the code-caused auto-fix path until UX-suggestion
+      // fixes exist; insights remain terminal and never produce a PR.
+      const autonomyAllowsFix = project.friction_autonomy === 'auto_fix'
+        || project.friction_autonomy === 'auto_fix_ux';
+      if (result.confidence === 'high' && autonomyAllowsFix) {
+        // allowFriction is the ladder's explicit opt-in past the kind gate;
+        // refuse-by-default stays intact for every other caller (issue #56).
+        const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+          rootCause: result.reason,
+          suggestedMitigation: result.remediation,
+          confidence: result.confidence,
+        }, job, { allowFriction: true });
+        if (fixResult.created) {
+          logger.info('Friction investigation: auto-triggering fix (autonomy ladder)', {
+            job_id: job.id,
+            fix_job_id: fixResult.fixJobId,
+            autonomy: project.friction_autonomy,
+          });
+        } else {
+          // Never drop the investigation: park it for human approval instead.
+          await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+            rootCause: result.reason,
+            suggestedMitigation: result.remediation,
+            confidence: result.confidence,
+          }, job);
+          logger.warn('Friction investigation: auto-fix refused by kind gate — parked for approval', {
+            job_id: job.id,
+            reason: fixResult.reason,
+          });
+        }
+      } else {
+        await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+          rootCause: result.reason,
+          suggestedMitigation: result.remediation,
+          confidence: result.confidence,
+        }, job);
+        logger.info('Friction investigation: awaiting human approval', {
+          job_id: job.id,
+          confidence: result.confidence,
+        });
+      }
     } else {
       await updateGroupInvestigation(job.errorGroupId, job.projectId, 'insight', {
         rootCause: result.reason,
@@ -579,9 +611,17 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
 
   if (group.kind === 'friction' && job.triggeredBy !== 'human') {
-    await updateGroupStatus(job.errorGroupId, job.projectId, 'awaiting_approval', undefined, job);
-    logger.warn('Refused non-human friction fix job', { job_id: job.id });
-    return;
+    // Settings can change after enqueue, so enforce the current project rung
+    // when the job is claimed. Legacy jobs without attribution stay parked.
+    const gateProject = await db.getProject(job.projectId);
+    const autonomy = gateProject?.friction_autonomy ?? 'ask_first';
+    if (job.triggeredBy !== 'auto' || autonomy === 'ask_first') {
+      await updateGroupStatus(job.errorGroupId, job.projectId, 'awaiting_approval', {
+        confidence: group.confidence ?? undefined,
+      }, job);
+      logger.warn('Refused non-human friction fix job', { job_id: job.id, autonomy });
+      return;
+    }
   }
 
   const event = group.sample_event_id
@@ -803,6 +843,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         confidence: result.confidence,
         pr_url: result.pr_url,
         pr_number: result.pr_number,
+        pr_fix_job_id: job.id,
       }, job);
       jobsProcessed++;
       logger.info('Fix job completed: pr_created', {
