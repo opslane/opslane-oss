@@ -472,6 +472,12 @@ export async function cleanupTenant(orgId: string): Promise<void> {
     `DELETE FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]
   );
+  // Identified sessions/events create end_users rows that block the projects
+  // delete below (observed in CI teardown after the friction gate landed).
+  await db.query(
+    `DELETE FROM end_users WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+    [orgId]
+  );
   await db.query(
     `DELETE FROM environment_api_keys WHERE environment_id IN (
        SELECT e.id FROM environments e JOIN projects p ON e.project_id = p.id WHERE p.org_id = $1
