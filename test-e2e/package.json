@@ -8,11 +8,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "pg": "^8.13.0"
+    "pg": "^8.22.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.40.0",
-    "@types/pg": "^8.11.0",
+    "@playwright/test": "^1.61.1",
+    "@types/pg": "^8.20.0",
     "@vitejs/plugin-react": "^4.3.0",
     "@vitejs/plugin-vue": "^5.0.0",
     "typescript": "^5.4.0",
