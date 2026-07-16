@@ -283,16 +283,19 @@ describe('getSourceMaps', () => {
 });
 
 describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+    // requeueStaleJobs now runs in a transaction (BEGIN → UPDATE ... RETURNING
+    // → reconciliation → COMMIT); default every un-mocked call to empty.
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+  });
 
   it('terminates a dead-lettered fix job group as needs_human (no stuck "fixing")', async () => {
-    // 1st query: the stale-job UPDATE ... RETURNING → one fix job that dead-lettered.
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ error_group_id: 'g1', project_id: 'p1', job_type: 'fix', status: 'dead_letter' }],
+      rows: [{ id: 'j1', error_group_id: 'g1', project_id: 'p1', job_type: 'fix', status: 'dead_letter' }],
     });
-    // 2nd query: updateGroupStatus UPDATE error_groups ... needs_human
-    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     const count = await requeueStaleJobs();
     expect(count).toBe(1);
@@ -308,11 +311,12 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
   });
 
   it('leaves requeued (non-dead-letter) and non-fix dead-letter jobs alone', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 2,
       rows: [
-        { error_group_id: 'g2', project_id: 'p1', job_type: 'fix', status: 'pending' },            // requeued, not dead
-        { error_group_id: 'g3', project_id: 'p1', job_type: 'investigate', status: 'dead_letter' }, // not a fix job
+        { id: 'j2', error_group_id: 'g2', project_id: 'p1', job_type: 'fix', status: 'pending' },            // requeued, not dead
+        { id: 'j3', error_group_id: 'g3', project_id: 'p1', job_type: 'investigate', status: 'dead_letter' }, // not a fix job
       ],
     });
 
@@ -326,14 +330,14 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
   });
 
   it('marks a dead-lettered session analysis as analysis_failed', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 1,
       rows: [{
-        error_group_id: null, session_id: 's1', project_id: 'p1',
+        id: 'j4', error_group_id: null, session_id: 's1', project_id: 'p1',
         job_type: 'session_analysis', status: 'dead_letter',
       }],
     });
-    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     await requeueStaleJobs();
 
