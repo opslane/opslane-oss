@@ -59,7 +59,10 @@ async function stepperNext(): Promise<void> {
 
     <fieldset>
       <legend>Rage target (dead button)</legend>
-      <button data-testid="friction-rage-target" @click="deadClick">
+      <!-- Realistic identity: the SDK derives the signal selector from this
+           element, and the adjudicator (a real model) reads it as evidence.
+           Test-flavored selectors read as synthetic and get rejected. -->
+      <button id="complete-purchase" class="checkout-cta" @click="deadClick">
         Complete purchase
       </button>
       <p>Click it three times fast — nothing will happen. That is the point.</p>
