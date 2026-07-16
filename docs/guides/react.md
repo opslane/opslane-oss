@@ -19,7 +19,7 @@ import { OpslaneErrorBoundary } from '@opslane/sdk/react';
 import App from './App';
 
 init({
-  apiKey: import.meta.env.VITE_OPSLANE_API_KEY,   // NEXT_PUBLIC_OPSLANE_API_KEY on Next.js
+  apiKey: import.meta.env.VITE_OPSLANE_API_KEY,
   endpoint: 'https://your-opslane-instance.example.com', // omit for hosted Opslane
   release: import.meta.env.VITE_OPSLANE_RELEASE,
 });
@@ -30,6 +30,10 @@ createRoot(document.getElementById('root')!).render(
   </OpslaneErrorBoundary>
 );
 ```
+
+This example uses Vite. In Next.js, read `process.env.NEXT_PUBLIC_OPSLANE_API_KEY` and `process.env.NEXT_PUBLIC_OPSLANE_RELEASE` instead.
+
+> **Privacy:** Session recording is on by default since SDK 1.0.0; review [replay privacy and masking](replay-privacy.md) before deploying.
 
 ## What gets caught where
 
@@ -51,5 +55,4 @@ The event should appear in your dashboard (or via the incidents API) within seco
 ## Next
 
 - [Upload source maps](source-maps.md) so stacks resolve to your JSX/TSX sources
-- [Replay privacy](replay-privacy.md) before enabling `replay: { enabled: true }`
 - All init options: [SDK options reference](../reference/sdk-options.md)

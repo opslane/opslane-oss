@@ -66,5 +66,5 @@ docker compose config --quiet
 - Package specifics: `packages/<name>/AGENTS.md` (loads when working in that package)
 - Issue operations and triage: `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`
 - Domain and ADR discovery: `docs/agents/domain.md`
-- Installation and replay privacy: `docs/install.md`, `docs/replay-privacy.md`
+- Installation and replay privacy: `docs/install.md`, `docs/guides/replay-privacy.md`
 - Public contracts: `docs/contracts/`

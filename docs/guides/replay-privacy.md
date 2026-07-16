@@ -1,49 +1,67 @@
 # Replay privacy and masking
 
-Session replay shows you what the user saw and did around an error. It is the most privacy-sensitive feature in the SDK, which is why it is **off by default** and layered with masking. This guide covers how it works, what leaves the browser, and how to control it. (Policy summary: [replay privacy](../replay-privacy.md); data-flow context: [trust](../architecture/trust.md).)
+Session replay shows what a user saw and did around an error. It is the most privacy-sensitive feature in the SDK, and session recording is **on by default since SDK 1.0.0**. This guide explains when recording actually starts, what leaves the browser, how masking works, and how to turn recording off.
 
-## How capture works
+Default-on does not mean every page load produces a stored recording. The browser must support `CompressionStream`, ingestion must have object storage configured, and `/api/v1/sessions/init` must approve recording for the project. If any of those checks fail, the SDK does not create a usable recording.
+
+## How capture and storage work
+
+The current SDK records a continuous rrweb session stream rather than creating a separate replay only when an error occurs:
+
+1. The SDK registers the browser session with `/api/v1/sessions/init`. The server returns whether recording is allowed.
+2. The SDK cuts the stream into independently playable chunks roughly every 30 seconds. When an error is accepted, it also flushes the current chunk so the incident can point into that same session.
+3. The browser gzips each chunk and uploads it directly to private object storage through a size-capped presigned POST policy, then commits the chunk to ingestion.
+4. A server-side scrubber inflates the chunk under a hard size ceiling, redacts it, rewrites the stored object, and sets `scrubbed_at`.
+
+The browser-side masks described below are the protection applied before upload. Server-side scrubbing happens after the raw gzipped chunk reaches object storage, but the raw chunk is fail-closed for application reads: no dashboard, API, or worker read path serves it until scrubbing succeeds and `scrubbed_at` is set. A chunk that never scrubs stays unreadable through the application. This gate does not apply to the storage layer itself — anyone holding the object-storage credentials can read raw chunks directly, so treat those credentials as access to pre-scrub recordings.
+
+Errors refer to the continuous recording with a session pointer; the current SDK does not create `/api/v1/replays/*` one-shot uploads. See the [session replay contract](../contracts/C4-amendments.md) for the exact read and compatibility contracts.
+
+## What is masked in the browser
+
+- **Every input value** (`maskAllInputs: true`): passwords, emails, card fields, search boxes, and other form values render as masked characters.
+- **Text you mark**: add `opslane-mask` to an element whose rendered text should be masked.
+- **Subtrees you exclude**: add `opslane-block` to keep an element and its descendants out of the recording entirely.
+
+```html
+<div class="opslane-mask">alice@example.com</div>
+<section class="opslane-block">Sensitive account details</section>
+```
+
+That is the complete browser-side masking list for replay DOM content. The SDK's text and URL scrubbing for error events and console breadcrumbs does **not** run over the serialized replay DOM before upload.
+
+Masking is not anonymization. A recording may include page URLs and titles, visible page text not marked with `opslane-mask`, click and navigation timing, console signals, and network status metadata. Rendered email addresses, invoices, support tickets, and other personal data are captured as displayed unless you mask or block them.
+
+Separately from the DOM recording: if your application calls `setUser()`, the SDK sends that user's id, email, account id, and account name **unmasked** when it registers the session with `/api/v1/sessions/init`, and ingestion persists them to associate recordings with the person who hit an error. Masking never applies to these fields — if you identify users, say so in your privacy notice.
+
+## Turn recording off
+
+Opt out in one integration:
 
 ```ts
 init({
   apiKey: '...',
-  replay: { enabled: true },   // opt-in — default is false
+  replay: { enabled: false },
 });
 ```
 
-When enabled, the SDK keeps a **rolling in-memory buffer** of DOM events (via rrweb) with ~30-second snapshots. Nothing is uploaded continuously. Only when an error occurs — an uncaught error or an explicit `captureException` — is the buffered window packaged and uploaded, tagged with the trigger type and linked to the error group.
+To stop recording for a whole project without redeploying the application, set `projects.recording_enabled` to `false` through your database or admin tooling. The server then declines new sessions and rejects the next chunk upload for an active session, which tells the SDK to stop its recorder.
 
-## What is masked in a replay, by default
+## Tell your users
 
-- **Every input value** (`maskAllInputs: true`): passwords, emails, card fields, search boxes — all rendered as masked characters in the replay.
-- **Anything you mark**: add the `opslane-mask` class to any element whose *text content* should be masked (account numbers, balances, PII rendered as text):
+Recording user interactions may require an update to your privacy notice. This sample is only a starting point; adapt it to your jurisdiction and have your own counsel review it:
 
-```html
-<div class="opslane-mask">{{ accountNumber }}</div>
-```
+> We record how you interact with this application — pages viewed, clicks, and
+> form interactions — to diagnose errors and fix problems you run into. Values
+> you type into forms are masked before the recording leaves your browser.
+> Recordings are deleted after 30 days.
 
-**And that is the complete list for replay DOM content.** The SDK's text/URL scrubbing (JWTs, `Bearer` tokens, `password`/`secret`-style pairs, URL query strings) applies to **error events and console breadcrumbs** — it does *not* run over the replay's serialized DOM. A token or personal data rendered as visible page text is captured verbatim unless the element carries `opslane-mask`.
+Adjust the retention figure to the project's actual `session_retention_days` value, and if you call `setUser()`, disclose that recordings are linked to the signed-in user. The deletion promise holds for the current chunked-session path; if your deployment still accepts uploads from pre-1.0 SDKs, the [legacy one-shot path below](#retention) has no automated deletion yet — schedule your own cleanup before making this promise.
 
-## How replay data is persisted — read carefully
+## Retention
 
-The upload path matters for privacy:
+Chunked sessions are deleted on a per-project clock. The default is 30 days, configured by `projects.session_retention_days`; deletion removes the Postgres rows and the session's object-storage prefix. Sessions linked as incident evidence can survive the normal window, but every session has a hard 90-day cap. Deleted session IDs are tombstoned and their storage prefixes are swept repeatedly so late uploads cannot recreate retained data.
 
-1. The SDK asks ingestion to start an upload and receives a pre-signed URL.
-2. The browser PUTs the recording **directly to object storage** — at this moment the stored object is exactly what the browser captured.
-3. On the completion call, ingestion reads the object back, runs server-side redaction over the recording, and **rewrites** it.
+The **legacy one-shot replay path** remains available for older SDKs and incidents. It rewrites the object with redacted data only when the upload completes, so an interrupted upload can leave raw data in storage, and those `session_replays` rows currently have no automated retention policy. The current SDK's chunked path does not use it.
 
-If the completion step never happens (tab closed mid-upload, network drop — and note the SDK's failure-report endpoint is currently broken, [#13](https://github.com/opslane/opslane-oss/issues/13)), the un-redacted object remains in storage, and there is no automated retention cleanup. Server-side redaction is a completion-time rewrite, not a gate in front of storage.
-
-## What a replay may still contain
-
-Masking is not anonymization. A replay can include page URLs and titles, visible page text not marked with `opslane-mask`, click/navigation timing, console signals, and network status metadata. If a screen renders personal data as plain text, mask it explicitly or don't enable replay on that flow.
-
-## Scoping and dropping
-
-- **Scope per page load, not per route.** `init` runs once; on a SPA, navigating to `/billing` after an earlier `init({ replay: { enabled: true } })` does **not** stop the recorder. Conditional init only works across full page loads. To stop capture mid-session, call `destroy()` (which tears down replay along with the rest of the SDK) before entering the sensitive flow, and `init` again after leaving it.
-- **Sample:** `sampleRate` applies to events; an event that is dropped uploads no replay.
-- **Last-line veto:** the `beforeSend` hook sees every outgoing error event and can return `null` to drop it entirely.
-
-## Retention — read before enabling in production
-
-Stated plainly, as in the [trust page](../architecture/trust.md#honest-gaps-current-state): **there is currently no automated retention policy.** Replay payloads stay in your object storage and their rows in Postgres until you delete them. Self-hosters enabling replay on sensitive applications should schedule their own cleanup until retention ships.
+For the broader data-flow and remaining security gaps, read the [trust and security model](../architecture/trust.md).

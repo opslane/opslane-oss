@@ -58,7 +58,7 @@ What you can do next depends on which credentials you provide:
 
 3. **Full error-to-PR** additionally needs `ANTHROPIC_API_KEY`, `E2B_API_KEY`, and GitHub credentials with access to a repository the worker may open pull requests against.
 
-SDK installation and configuration are covered in the [install guide](docs/install.md). Replay capture privacy defaults are described in [replay privacy](docs/replay-privacy.md).
+SDK installation and configuration are covered in the [install guide](docs/install.md). Replay capture privacy defaults are described in [replay privacy and masking](docs/guides/replay-privacy.md).
 
 ## Repository layout
 
