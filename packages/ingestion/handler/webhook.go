@@ -58,7 +58,7 @@ func (d *Dependencies) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
 	if deliveryID == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing X-GitHub-Delivery header")
 		return

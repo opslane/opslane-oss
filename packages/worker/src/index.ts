@@ -29,6 +29,15 @@ import { investigateFriction } from './friction/investigate-friction.js';
 import { readChunksBounded } from './friction/chunk-reader.js';
 import { analyzeSession, RULE_VERSION } from './friction/analyzer.js';
 import { writeFrictionSignals } from './friction/persist.js';
+import { processFrictionOutcomes } from './friction/promotion.js';
+import { createAnthropicAdjudicator, type Adjudicator } from './friction/adjudicator.js';
+
+/** Injectable seam: unit tests and the e2e gate substitute a deterministic
+ * adjudicator; production uses the real Anthropic-backed one. */
+let frictionAdjudicatorFactory: (apiKey: string) => Adjudicator = createAnthropicAdjudicator;
+export function setFrictionAdjudicatorFactory(factory: (apiKey: string) => Adjudicator): void {
+  frictionAdjudicatorFactory = factory;
+}
 
 /**
  * Maps the raw DB/SDK replay_signals JSON (nested, snake_case) to the flat camelCase
@@ -371,15 +380,29 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
       });
     } else if (triage.fixable && triage.confidence === 'high') {
       // High confidence fixable → auto-trigger fix (atomic transaction)
-      const fixJobId = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+      const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
       }, job);
-      jobsProcessed++;
-      logger.info('Investigation: auto-triggering fix', {
-        job_id: job.id, fix_job_id: fixJobId, duration_ms: durationMs,
-      });
+      if (fixResult.created) {
+        jobsProcessed++;
+        logger.info('Investigation: auto-triggering fix', {
+          job_id: job.id, fix_job_id: fixResult.fixJobId, duration_ms: durationMs,
+        });
+      } else {
+        // Defense-in-depth refusal (kind gate): park the result for a human
+        // instead of silently dropping the investigation.
+        await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
+          rootCause: triage.reason,
+          suggestedMitigation: triage.remediation,
+          confidence: triage.confidence,
+        }, job);
+        jobsProcessed++;
+        logger.warn('Investigation: automatic fix refused by kind gate', {
+          job_id: job.id, reason: fixResult.reason, duration_ms: durationMs,
+        });
+      }
     } else {
       // Medium/low confidence → investigated, wait for user
       await updateGroupInvestigation(job.errorGroupId, job.projectId, 'investigated', {
@@ -523,6 +546,19 @@ export async function processSessionAnalysisJob(
     const signals = analyzeSession(read.envelopes);
     await db.assertJobLease(job);
     await writeFrictionSignals(session, signals, RULE_VERSION);
+    // Batch 4: adjudicate → fold/aggregate before the session is marked
+    // analyzed, so a crash retries the whole ordered pass. Keyless
+    // deployments skip adjudication; signals stay pending and invisible.
+    const adjudicationKey = process.env['ANTHROPIC_API_KEY'];
+    if (adjudicationKey) {
+      checkAbort(signal);
+      await processFrictionOutcomes(session, job.id, frictionAdjudicatorFactory(adjudicationKey));
+    } else {
+      logger.warn('ANTHROPIC_API_KEY unset; friction adjudication skipped, signals stay pending', {
+        job_id: job.id,
+        session_id: job.sessionId,
+      });
+    }
     await db.setSessionAnalysisStatus(job.sessionId, job.projectId, 'analyzed', RULE_VERSION, job);
     if (read.truncated) {
       logger.warn('Session analysis completed from bounded prefix', {

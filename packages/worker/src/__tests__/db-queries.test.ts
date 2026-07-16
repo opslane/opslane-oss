@@ -25,7 +25,60 @@ import {
   getSessionForAnalysis,
   setSessionAnalysisStatus,
   claimJob,
+  updateGroupStatus,
+  updateGroupInvestigation,
 } from '../db.js';
+
+describe('group lifecycle timestamp queries', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('stamps PR-created and needs-human transitions without clearing prior timestamps', async () => {
+    mockQuery.mockResolvedValue({ rowCount: 1, rows: [{ id: 'g1' }] });
+
+    await updateGroupStatus('g1', 'p1', 'pr_created');
+    await updateGroupStatus('g1', 'p1', 'needs_human', {
+      reason: {
+        reason_code: 'missing_llm_key',
+        reason_message: 'API key not configured',
+        remediation: 'Configure the worker API key',
+      },
+    });
+
+    for (const call of mockQuery.mock.calls) {
+      const query = String(call[0]);
+      expect(query).toContain("WHEN $3::error_group_status = 'pr_created'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'pr_created' THEN now()");
+      expect(query).toContain('ELSE pr_created_at');
+      expect(query).toContain("WHEN $3::error_group_status = 'needs_human'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'needs_human' THEN now()");
+      expect(query).toContain('ELSE needs_human_at');
+    }
+    expect(mockQuery.mock.calls[0]?.[1]?.[2]).toBe('pr_created');
+    expect(mockQuery.mock.calls[1]?.[1]?.[2]).toBe('needs_human');
+  });
+
+  it('stamps needs-human investigation results without clearing lifecycle timestamps', async () => {
+    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'g1' }] });
+
+    await updateGroupInvestigation('g1', 'p1', 'needs_human', {
+      rootCause: 'External dependency failed',
+      reason: {
+        reason_code: 'worker_runtime_error',
+        reason_message: 'The investigation could not complete',
+        remediation: 'Review the incident manually',
+      },
+    });
+
+    const query = String(mockQuery.mock.calls[0]?.[0]);
+    expect(query).toContain("WHEN $3::error_group_status = 'pr_created'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'pr_created' THEN now()");
+    expect(query).toContain('ELSE pr_created_at');
+    expect(query).toContain("WHEN $3::error_group_status = 'needs_human'");
+      expect(query).toContain("AND status IS DISTINCT FROM 'needs_human' THEN now()");
+    expect(query).toContain('ELSE needs_human_at');
+    expect(mockQuery.mock.calls[0]?.[1]?.[2]).toBe('needs_human');
+  });
+});
 
 describe('getErrorGroup', () => {
   beforeEach(() => mockQuery.mockReset());
@@ -284,16 +337,19 @@ describe('getSourceMaps', () => {
 });
 
 describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+    // requeueStaleJobs now runs in a transaction (BEGIN → UPDATE ... RETURNING
+    // → reconciliation → COMMIT); default every un-mocked call to empty.
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+  });
 
   it('terminates a dead-lettered fix job group as needs_human (no stuck "fixing")', async () => {
-    // 1st query: the stale-job UPDATE ... RETURNING → one fix job that dead-lettered.
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ error_group_id: 'g1', project_id: 'p1', job_type: 'fix', status: 'dead_letter' }],
+      rows: [{ id: 'j1', error_group_id: 'g1', project_id: 'p1', job_type: 'fix', status: 'dead_letter' }],
     });
-    // 2nd query: updateGroupStatus UPDATE error_groups ... needs_human
-    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     const count = await requeueStaleJobs();
     expect(count).toBe(1);
@@ -309,11 +365,12 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
   });
 
   it('leaves requeued (non-dead-letter) and non-fix dead-letter jobs alone', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 2,
       rows: [
-        { error_group_id: 'g2', project_id: 'p1', job_type: 'fix', status: 'pending' },            // requeued, not dead
-        { error_group_id: 'g3', project_id: 'p1', job_type: 'investigate', status: 'dead_letter' }, // not a fix job
+        { id: 'j2', error_group_id: 'g2', project_id: 'p1', job_type: 'fix', status: 'pending' },            // requeued, not dead
+        { id: 'j3', error_group_id: 'g3', project_id: 'p1', job_type: 'investigate', status: 'dead_letter' }, // not a fix job
       ],
     });
 
@@ -327,14 +384,14 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
   });
 
   it('marks a dead-lettered session analysis as analysis_failed', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // BEGIN
     mockQuery.mockResolvedValueOnce({
       rowCount: 1,
       rows: [{
-        error_group_id: null, session_id: 's1', project_id: 'p1',
+        id: 'j4', error_group_id: null, session_id: 's1', project_id: 'p1',
         job_type: 'session_analysis', status: 'dead_letter',
       }],
     });
-    mockQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     await requeueStaleJobs();
 

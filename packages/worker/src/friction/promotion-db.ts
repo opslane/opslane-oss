@@ -1,0 +1,708 @@
+import { createHash } from 'node:crypto';
+import type pg from 'pg';
+import { getPool } from '../db.js';
+import type { AdjudicationVerdict } from './adjudicator.js';
+
+/**
+ * DB primitives for Batch 4 fold/promotion (issue #56). Every function takes
+ * a checked-out client so callers control transaction boundaries; the
+ * orchestration in promotion.ts owns BEGIN/COMMIT and advisory locking.
+ */
+
+/** Atomically claims signals for one adjudication attempt: records the owning
+ * session_analysis job and increments the per-signal attempt counter. Only
+ * 'pending' rows are claimable — accepted/rejected/unchecked are terminal for
+ * claiming purposes. Returns how many rows were claimed. */
+export async function claimSignalsForAdjudication(
+  client: pg.PoolClient,
+  signalIds: string[],
+  jobId: string,
+): Promise<number> {
+  const res = await client.query(
+    `UPDATE friction_signals
+     SET adjudication_job_id = $2,
+         adjudication_attempts = adjudication_attempts + 1
+     WHERE id = ANY($1::uuid[]) AND adjudication_status = 'pending'`,
+    [signalIds, jobId],
+  );
+  return res.rowCount ?? 0;
+}
+
+export interface FoldTarget {
+  errorGroupId: string;
+  status: string;
+  title: string;
+  secondsAway: number;
+}
+
+/** Finds the fold target for a signal: the nearest same-session error event
+ * (client time, inclusive ±30s) whose group is a non-archived error incident.
+ * Ties break on event recency distance first, then group id, so retries pick
+ * the same target. Archived groups are permanent dismissals and friction
+ * incidents are never fold targets. */
+export async function findFoldTarget(
+  client: pg.PoolClient,
+  projectId: string,
+  sessionId: string,
+  occurredAt: string,
+): Promise<FoldTarget | null> {
+  const { rows } = await client.query<{
+    error_group_id: string;
+    status: string;
+    title: string;
+    seconds_away: number;
+  }>(
+    `SELECT eg.id AS error_group_id, eg.status, eg.title,
+            abs(extract(epoch FROM (ee."timestamp" - $3::timestamptz)))::float8 AS seconds_away
+       FROM error_events ee
+       JOIN error_groups eg ON eg.id = ee.error_group_id
+      WHERE ee.session_id = $2
+        AND ee.project_id = $1
+        AND eg.kind = 'error'
+        AND eg.status <> 'archived'
+        AND ee."timestamp" BETWEEN $3::timestamptz - interval '30 seconds'
+                                AND $3::timestamptz + interval '30 seconds'
+      ORDER BY abs(extract(epoch FROM (ee."timestamp" - $3::timestamptz))), eg.id
+      LIMIT 1`,
+    [projectId, sessionId, occurredAt],
+  );
+  const row = rows[0];
+  return row
+    ? {
+        errorGroupId: row.error_group_id,
+        status: row.status,
+        title: row.title,
+        secondsAway: row.seconds_away,
+      }
+    : null;
+}
+
+/** Ids and total session-level occurrences of the signals a bucket
+ * adjudication would claim: pending, active, identified, in-window. */
+export async function listEligibleSignals(
+  client: pg.PoolClient,
+  tuple: Pick<BucketTuple, 'projectId' | 'environmentId' | 'fingerprint'>,
+): Promise<{ ids: string[]; totalOccurrences: number }> {
+  const { rows } = await client.query<{ id: string; occurrence_count: number }>(
+    `SELECT id, occurrence_count
+     FROM friction_signals
+     WHERE project_id = $1 AND environment_id = $2 AND fingerprint = $3
+       AND adjudication_status = 'pending'
+       AND end_user_id IS NOT NULL
+       AND retracted_at IS NULL AND superseded_by IS NULL
+       AND occurred_at > now() - interval '7 days'`,
+    [tuple.projectId, tuple.environmentId, tuple.fingerprint],
+  );
+  return {
+    ids: rows.map((r) => r.id),
+    totalOccurrences: rows.reduce((sum, r) => sum + r.occurrence_count, 0),
+  };
+}
+
+/** Row shape consumed by the fold path (matches friction_signals columns). */
+export interface FoldSignal {
+  id: string;
+  project_id: string;
+  environment_id: string;
+  end_user_id: string | null;
+  session_id: string;
+  fingerprint: string;
+  occurred_at: string;
+}
+
+export interface FoldMeta {
+  modelId: string;
+  promptVersion: number;
+  jobId: string;
+}
+
+export type FoldOutcome = 'attached' | 'rejected' | 'no_target' | 'noop';
+
+/** Stable 2×int32 advisory-lock key for a (project, environment, fingerprint)
+ * tuple, shared by fold and bucket paths so they serialize with each other. */
+export function tupleLockKey(
+  projectId: string,
+  environmentId: string,
+  fingerprint: string,
+): [number, number] {
+  const digest = createHash('sha256')
+    .update(`${projectId}:${environmentId}:${fingerprint}`)
+    .digest();
+  return [digest.readInt32BE(0), digest.readInt32BE(4)];
+}
+
+/**
+ * One transaction that persists an eager-fold verdict and applies its visible
+ * outcome atomically (plan: atomic promotion and impact).
+ *
+ * - Serialized per tuple with an advisory transaction lock.
+ * - Re-checks the row under lock: active, not superseded, not attached.
+ * - Idempotent: `incident_id` is the attachment guard; a retry that finds an
+ *   accepted-but-unattached row resumes attachment (crash recovery), while
+ *   rejected/unchecked and accepted-and-attached rows are terminal no-ops.
+ * - Terminal fold behavior (plan D6): impact updates on resolved/merged
+ *   targets without a status change and without enqueueing anything.
+ */
+export async function applyFoldOutcome(opts: {
+  signal: FoldSignal;
+  verdict: AdjudicationVerdict;
+  meta: FoldMeta;
+}): Promise<FoldOutcome> {
+  const { signal, verdict, meta } = opts;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const [k1, k2] = tupleLockKey(signal.project_id, signal.environment_id, signal.fingerprint);
+    await client.query('SELECT pg_advisory_xact_lock($1, $2)', [k1, k2]);
+
+    const { rows } = await client.query<{
+      adjudication_status: string;
+      incident_id: string | null;
+    }>(
+      `SELECT adjudication_status, incident_id
+       FROM friction_signals
+       WHERE id = $1 AND project_id = $2
+         AND retracted_at IS NULL AND superseded_by IS NULL
+       FOR UPDATE`,
+      [signal.id, signal.project_id],
+    );
+    const current = rows[0];
+    if (
+      !current ||
+      current.incident_id !== null ||
+      current.adjudication_status === 'rejected' ||
+      current.adjudication_status === 'unchecked'
+    ) {
+      await client.query('COMMIT');
+      return 'noop';
+    }
+
+    // Persist the verdict audit. Also runs on crash-resume (status already
+    // 'accepted'): the audit fields are refreshed, the outcome is re-applied.
+    await client.query(
+      `UPDATE friction_signals
+       SET adjudication_status = $2,
+           adjudication_scope = 'fold',
+           adjudicated_at = now(),
+           adjudication_model = $3,
+           adjudication_prompt_version = $4,
+           adjudication_reason = $5
+       WHERE id = $1`,
+      [
+        signal.id,
+        verdict.accepted ? 'accepted' : 'rejected',
+        meta.modelId,
+        meta.promptVersion,
+        verdict.reason,
+      ],
+    );
+    if (!verdict.accepted) {
+      await client.query('COMMIT');
+      return 'rejected';
+    }
+
+    const target = await findFoldTarget(
+      client,
+      signal.project_id,
+      signal.session_id,
+      signal.occurred_at,
+    );
+    if (!target) {
+      // Verdict stays persisted; the caller continues down the bucket path.
+      await client.query('COMMIT');
+      return 'no_target';
+    }
+
+    // Attach exactly once with incremental impact and the 90-day evidence
+    // pin; preserve the target's status and never enqueue work on a fold.
+    await attachSignalIncrementally(client, signal, target.errorGroupId);
+
+    await client.query('COMMIT');
+    return 'attached';
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// === Bucket path (plan D1: one adjudication per threshold crossing) ===
+
+export interface BucketTuple {
+  projectId: string;
+  environmentId: string;
+  fingerprint: string;
+  ruleVersion: number;
+  promptVersion: number;
+}
+
+export interface GenerationRow {
+  id: string;
+  status: string;
+  claim_job_id: string | null;
+  model_id: string | null;
+  prompt_version: number;
+  promoted_incident_id: string | null;
+}
+
+export type BucketOutcome = 'promoted' | 'updated' | 'rejected' | 'noop';
+
+/** Friction incidents reuse UNIQUE(project_id, fingerprint) by deriving an
+ * environment-scoped grouping key, so production and staging never combine. */
+export function frictionIncidentFingerprint(environmentId: string, signalFingerprint: string): string {
+  return `friction:${environmentId}:${signalFingerprint}`;
+}
+
+const SIGNAL_TYPE_TITLES: Record<string, string> = {
+  rage_click: 'Rage clicks',
+  dead_click: 'Dead clicks',
+  form_abandon: 'Form abandonment',
+};
+
+export interface CandidateDescriptor {
+  signalType: string;
+  pageUrlNormalized: string;
+  elementSelector: string | null;
+}
+
+/** Upserts the hidden candidate row (plan D2): a pure workflow record with
+ * zero impact — no occurrence, no affected users, no junction rows — until
+ * promotion. Returns the candidate/incident id for the tuple. */
+export async function ensureCandidate(
+  client: pg.PoolClient,
+  tuple: Pick<BucketTuple, 'projectId' | 'environmentId' | 'fingerprint'>,
+  descriptor: CandidateDescriptor,
+): Promise<string> {
+  const incidentFp = frictionIncidentFingerprint(tuple.environmentId, tuple.fingerprint);
+  const title = `${SIGNAL_TYPE_TITLES[descriptor.signalType] ?? 'Friction'} on ${descriptor.pageUrlNormalized}`;
+  await client.query(
+    `INSERT INTO error_groups
+       (project_id, fingerprint, title, first_seen, last_seen,
+        occurrence_count, affected_users_count, status, kind,
+        environment_id, signal_type, element_selector, page_url_normalized)
+     VALUES ($1, $2, $3, now(), now(), 0, 0, 'candidate', 'friction', $4, $5, $6, $7)
+     ON CONFLICT (project_id, fingerprint) DO NOTHING`,
+    [
+      tuple.projectId,
+      incidentFp,
+      title,
+      tuple.environmentId,
+      descriptor.signalType,
+      descriptor.elementSelector,
+      descriptor.pageUrlNormalized,
+    ],
+  );
+  const { rows } = await client.query<{ id: string }>(
+    `SELECT id FROM error_groups WHERE project_id = $1 AND fingerprint = $2`,
+    [tuple.projectId, incidentFp],
+  );
+  return rows[0]!.id;
+}
+
+/** Distinct identified users behind pending active signals for the tuple in
+ * the rolling seven-day window. Anonymous signals never count (plan D3);
+ * terminal, retracted, and superseded signals never count (plan D5). */
+export async function countEligibleUsers(
+  client: pg.PoolClient,
+  tuple: Pick<BucketTuple, 'projectId' | 'environmentId' | 'fingerprint'>,
+): Promise<number> {
+  const { rows } = await client.query<{ n: number }>(
+    `SELECT COUNT(DISTINCT end_user_id)::int AS n
+     FROM friction_signals
+     WHERE project_id = $1 AND environment_id = $2 AND fingerprint = $3
+       AND adjudication_status = 'pending'
+       AND end_user_id IS NOT NULL
+       AND retracted_at IS NULL AND superseded_by IS NULL
+       AND occurred_at > now() - interval '7 days'`,
+    [tuple.projectId, tuple.environmentId, tuple.fingerprint],
+  );
+  return rows[0]!.n;
+}
+
+/** Creates the durable in-flight generation for a threshold crossing. The
+ * partial unique index arbitrates: concurrent fifth-user claimers get null
+ * and skip their model call — exactly one adjudication per crossing. Runs
+ * outside any transaction so the claim survives a later crash. */
+export async function claimGeneration(
+  tuple: BucketTuple,
+  claimJobId: string,
+): Promise<GenerationRow | null> {
+  const { rows } = await getPool().query<GenerationRow>(
+    `INSERT INTO friction_adjudication_generations
+       (project_id, environment_id, fingerprint, rule_version, prompt_version,
+        status, window_start, window_end, claim_job_id, attempts)
+     VALUES ($1, $2, $3, $4, $5, 'adjudicating', now() - interval '7 days', now(), $6, 1)
+     ON CONFLICT (project_id, environment_id, fingerprint, rule_version, prompt_version)
+       WHERE status = 'adjudicating'
+     DO NOTHING
+     RETURNING id, status, claim_job_id, model_id, prompt_version, promoted_incident_id`,
+    [
+      tuple.projectId,
+      tuple.environmentId,
+      tuple.fingerprint,
+      tuple.ruleVersion,
+      tuple.promptVersion,
+      claimJobId,
+    ],
+  );
+  return rows[0] ?? null;
+}
+
+/** An accepted generation whose verdict is still valid; later matching
+ * signals inherit it instead of triggering a new model call. */
+export async function findValidAcceptedGeneration(
+  client: pg.PoolClient,
+  tuple: BucketTuple,
+): Promise<GenerationRow | null> {
+  const { rows } = await client.query<GenerationRow>(
+    `SELECT id, status, claim_job_id, model_id, prompt_version, promoted_incident_id
+     FROM friction_adjudication_generations
+     WHERE project_id = $1 AND environment_id = $2 AND fingerprint = $3
+       AND rule_version = $4 AND prompt_version = $5
+       AND status = 'accepted' AND valid_until > now()
+     ORDER BY adjudicated_at DESC
+     LIMIT 1`,
+    [
+      tuple.projectId,
+      tuple.environmentId,
+      tuple.fingerprint,
+      tuple.ruleVersion,
+      tuple.promptVersion,
+    ],
+  );
+  return rows[0] ?? null;
+}
+
+/** Incremental single-signal attachment shared by inheritance (and mirrored
+ * by the fold path): occurrence +1, seen-guards, junction upsert, recount,
+ * evidence pin. Caller owns the transaction. */
+async function attachSignalIncrementally(
+  client: pg.PoolClient,
+  signal: FoldSignal,
+  incidentId: string,
+): Promise<void> {
+  await client.query(`UPDATE friction_signals SET incident_id = $2 WHERE id = $1`, [
+    signal.id,
+    incidentId,
+  ]);
+  // The signal's own occurrence_count (repeats within its session) is the
+  // increment, read under the row lock the caller already holds.
+  await client.query(
+    `UPDATE error_groups
+     SET occurrence_count = occurrence_count +
+           (SELECT occurrence_count FROM friction_signals WHERE id = $3),
+         first_seen = LEAST(first_seen, $2::timestamptz),
+         last_seen = GREATEST(last_seen, $2::timestamptz),
+         updated_at = now()
+     WHERE id = $1`,
+    [incidentId, signal.occurred_at, signal.id],
+  );
+  if (signal.end_user_id) {
+    await client.query(
+      `INSERT INTO error_group_affected_users
+         (error_group_id, end_user_id, first_seen, last_seen, occurrence_count)
+       VALUES ($1, $2, $3, $3,
+               (SELECT occurrence_count FROM friction_signals WHERE id = $4))
+       ON CONFLICT (error_group_id, end_user_id) DO UPDATE
+         SET first_seen = LEAST(error_group_affected_users.first_seen, EXCLUDED.first_seen),
+             last_seen = GREATEST(error_group_affected_users.last_seen, EXCLUDED.last_seen),
+             occurrence_count = error_group_affected_users.occurrence_count + EXCLUDED.occurrence_count`,
+      [incidentId, signal.end_user_id, signal.occurred_at, signal.id],
+    );
+    await client.query(
+      `UPDATE error_groups
+       SET affected_users_count =
+         (SELECT COUNT(*) FROM error_group_affected_users WHERE error_group_id = $1)
+       WHERE id = $1`,
+      [incidentId],
+    );
+  }
+  await client.query(
+    `UPDATE sessions
+     SET retain_until = GREATEST(COALESCE(retain_until, 'epoch'::timestamptz),
+                                 started_at + interval '90 days')
+     WHERE id = $1 AND project_id = $2`,
+    [signal.session_id, signal.project_id],
+  );
+}
+
+/**
+ * One transaction that persists a bucket verdict and applies its visible
+ * outcome atomically. Serialized per tuple with the same advisory lock as
+ * the fold path. Resume semantics: an 'accepted' generation with unattached
+ * claimed signals re-applies the outcome; terminal generations with nothing
+ * left to attach are no-ops.
+ */
+export async function applyBucketOutcome(opts: {
+  tuple: BucketTuple;
+  generationId: string;
+  verdict: AdjudicationVerdict;
+  meta: FoldMeta;
+}): Promise<BucketOutcome> {
+  const { tuple, generationId, verdict, meta } = opts;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const [k1, k2] = tupleLockKey(tuple.projectId, tuple.environmentId, tuple.fingerprint);
+    await client.query('SELECT pg_advisory_xact_lock($1, $2)', [k1, k2]);
+
+    const genRes = await client.query<{
+      status: string;
+      claim_job_id: string | null;
+      adjudicated_at: string | null;
+    }>(
+      `SELECT status, claim_job_id, adjudicated_at::text AS adjudicated_at
+       FROM friction_adjudication_generations
+       WHERE id = $1 AND project_id = $2
+       FOR UPDATE`,
+      [generationId, tuple.projectId],
+    );
+    const generation = genRes.rows[0];
+    if (!generation || generation.status === 'rejected' || generation.status === 'unchecked') {
+      await client.query('COMMIT');
+      return 'noop';
+    }
+    const isResume = generation.status === 'accepted';
+    const claimJobId = generation.claim_job_id ?? meta.jobId;
+
+    // Signals this outcome owns: pending rows claimed for this call, plus
+    // accepted-but-unattached rows from a crash between verdict and outcome.
+    const signalRes = await client.query<FoldSignal & { signal_type: string; page_url_normalized: string; element_selector: string | null; occurrence_count: number }>(
+      `SELECT id, project_id, environment_id, end_user_id, session_id, fingerprint,
+              occurred_at::text AS occurred_at, signal_type, page_url_normalized,
+              element_selector, occurrence_count
+       FROM friction_signals
+       WHERE project_id = $1 AND environment_id = $2 AND fingerprint = $3
+         AND end_user_id IS NOT NULL
+         AND retracted_at IS NULL AND superseded_by IS NULL
+         AND ((adjudication_status = 'pending' AND adjudication_job_id = $4)
+              OR (adjudication_status = 'accepted' AND generation_id = $5 AND incident_id IS NULL))
+       ORDER BY occurred_at ASC
+       FOR UPDATE`,
+      [tuple.projectId, tuple.environmentId, tuple.fingerprint, claimJobId, generationId],
+    );
+    const signals = signalRes.rows;
+    if (isResume && signals.length === 0) {
+      await client.query('COMMIT');
+      return 'noop';
+    }
+
+    // Persist the generation verdict (idempotent on resume).
+    if (!isResume) {
+      await client.query(
+        `UPDATE friction_adjudication_generations
+         SET status = $2, verdict_reason = $3, model_id = $4,
+             adjudicated_at = now(),
+             valid_until = CASE WHEN $2 = 'accepted' THEN now() + interval '7 days' END,
+             finished_at = now()
+         WHERE id = $1`,
+        [generationId, verdict.accepted ? 'accepted' : 'rejected', verdict.reason, meta.modelId],
+      );
+    }
+    // Persist per-signal verdicts and audit.
+    await client.query(
+      `UPDATE friction_signals
+       SET adjudication_status = $2,
+           adjudication_scope = 'bucket',
+           generation_id = $3,
+           adjudicated_at = now(),
+           adjudication_model = $4,
+           adjudication_prompt_version = $5,
+           adjudication_reason = $6
+       WHERE id = ANY($1::uuid[])`,
+      [
+        signals.map((s) => s.id),
+        verdict.accepted ? 'accepted' : 'rejected',
+        generationId,
+        meta.modelId,
+        meta.promptVersion,
+        verdict.reason,
+      ],
+    );
+    if (!verdict.accepted) {
+      await client.query('COMMIT');
+      return 'rejected';
+    }
+
+    // Candidate row (create defensively on resume if the orchestration's
+    // ensureCandidate never ran).
+    const first = signals[0]!;
+    const incidentId = await ensureCandidate(client, tuple, {
+      signalType: first.signal_type,
+      pageUrlNormalized: first.page_url_normalized,
+      elementSelector: first.element_selector,
+    });
+    const groupRes = await client.query<{ status: string }>(
+      `SELECT status FROM error_groups WHERE id = $1 FOR UPDATE`,
+      [incidentId],
+    );
+    const wasCandidate = groupRes.rows[0]!.status === 'candidate';
+
+    // Attach every owned signal, then materialize impact from source rows.
+    await client.query(
+      `UPDATE friction_signals SET incident_id = $2 WHERE id = ANY($1::uuid[])`,
+      [signals.map((s) => s.id), incidentId],
+    );
+    await recomputeIncidentImpact(client, incidentId, tuple.projectId);
+    await client.query(
+      `UPDATE sessions
+       SET retain_until = GREATEST(COALESCE(retain_until, 'epoch'::timestamptz),
+                                   started_at + interval '90 days')
+       WHERE project_id = $1 AND id IN (
+         SELECT session_id FROM friction_signals
+         WHERE incident_id = $2 AND retracted_at IS NULL AND superseded_by IS NULL)`,
+      [tuple.projectId, incidentId],
+    );
+
+    let outcome: BucketOutcome = 'updated';
+    if (wasCandidate) {
+      // Deterministic representative (plan criterion 15).
+      const rep = await client.query<{ id: string; session_id: string }>(
+        `SELECT id, session_id FROM friction_signals
+         WHERE incident_id = $1 AND adjudication_status = 'accepted'
+           AND retracted_at IS NULL AND superseded_by IS NULL
+         ORDER BY occurrence_count DESC, occurred_at ASC, id ASC
+         LIMIT 1`,
+        [incidentId],
+      );
+      await client.query(
+        `UPDATE error_groups
+         SET status = 'queued',
+             environment_id = $2,
+             representative_signal_id = $3,
+             representative_session_id = $4,
+             updated_at = now()
+         WHERE id = $1`,
+        [incidentId, tuple.environmentId, rep.rows[0]?.id ?? null, rep.rows[0]?.session_id ?? null],
+      );
+      // Exactly one investigate job on first promotion.
+      await client.query(
+        `INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
+         VALUES ($1, $2, 'investigate', 'auto')`,
+        [incidentId, tuple.projectId],
+      );
+      outcome = 'promoted';
+    }
+    await client.query(
+      `UPDATE friction_adjudication_generations SET promoted_incident_id = $2 WHERE id = $1`,
+      [generationId, incidentId],
+    );
+
+    await client.query('COMMIT');
+    return outcome;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Attaches one later matching signal under a still-valid accepted
+ * generation: no model call, incremental impact, same tuple lock. */
+export async function attachInheritedSignal(
+  signal: FoldSignal,
+  generation: GenerationRow,
+): Promise<'attached' | 'noop'> {
+  if (!generation.promoted_incident_id) return 'noop';
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const [k1, k2] = tupleLockKey(signal.project_id, signal.environment_id, signal.fingerprint);
+    await client.query('SELECT pg_advisory_xact_lock($1, $2)', [k1, k2]);
+
+    const { rows } = await client.query<{ adjudication_status: string; incident_id: string | null }>(
+      `SELECT adjudication_status, incident_id FROM friction_signals
+       WHERE id = $1 AND retracted_at IS NULL AND superseded_by IS NULL
+       FOR UPDATE`,
+      [signal.id],
+    );
+    const current = rows[0];
+    if (!current || current.incident_id !== null || current.adjudication_status !== 'pending') {
+      await client.query('COMMIT');
+      return 'noop';
+    }
+    await client.query(
+      `UPDATE friction_signals
+       SET adjudication_status = 'accepted',
+           adjudication_scope = 'bucket',
+           generation_id = $2,
+           adjudicated_at = now(),
+           adjudication_model = $3,
+           adjudication_prompt_version = $4,
+           adjudication_reason = 'inherited from accepted generation'
+       WHERE id = $1`,
+      [signal.id, generation.id, generation.model_id, generation.prompt_version],
+    );
+    await attachSignalIncrementally(client, signal, generation.promoted_incident_id);
+    await client.query('COMMIT');
+    return 'attached';
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Full impact rebuild from active source rows: the incident's own error
+ * events plus attached, non-retracted, non-superseded friction signals.
+ * Reserved for promotion materialization and supersession/retraction (plan:
+ * normal folds stay incremental); reversibility requires recomputation here.
+ */
+export async function recomputeIncidentImpact(
+  client: pg.PoolClient,
+  incidentId: string,
+  projectId: string,
+): Promise<void> {
+  // Signals carry occurrence_count (repeats within one session), so impact
+  // sums those; each error event counts once.
+  await client.query(
+    `UPDATE error_groups eg
+     SET occurrence_count = src.n,
+         first_seen = COALESCE(src.first_at, eg.first_seen),
+         last_seen = COALESCE(src.last_at, eg.last_seen),
+         updated_at = now()
+     FROM (
+       SELECT COALESCE(SUM(cnt), 0)::int AS n, MIN(at) AS first_at, MAX(at) AS last_at
+       FROM (
+         SELECT "timestamp" AS at, 1 AS cnt FROM error_events
+          WHERE error_group_id = $1 AND project_id = $2
+         UNION ALL
+         SELECT occurred_at, occurrence_count FROM friction_signals
+          WHERE incident_id = $1 AND project_id = $2
+            AND retracted_at IS NULL AND superseded_by IS NULL
+       ) source_rows
+     ) src
+     WHERE eg.id = $1 AND eg.project_id = $2`,
+    [incidentId, projectId],
+  );
+  await client.query(
+    `DELETE FROM error_group_affected_users WHERE error_group_id = $1`,
+    [incidentId],
+  );
+  await client.query(
+    `INSERT INTO error_group_affected_users
+       (error_group_id, end_user_id, first_seen, last_seen, occurrence_count)
+     SELECT $1, end_user_id, MIN(at), MAX(at), SUM(cnt)::int
+     FROM (
+       SELECT end_user_id, "timestamp" AS at, 1 AS cnt FROM error_events
+        WHERE error_group_id = $1 AND project_id = $2 AND end_user_id IS NOT NULL
+       UNION ALL
+       SELECT end_user_id, occurred_at, occurrence_count FROM friction_signals
+        WHERE incident_id = $1 AND project_id = $2 AND end_user_id IS NOT NULL
+          AND retracted_at IS NULL AND superseded_by IS NULL
+     ) source_rows
+     GROUP BY end_user_id`,
+    [incidentId, projectId],
+  );
+  await client.query(
+    `UPDATE error_groups
+     SET affected_users_count =
+       (SELECT COUNT(*) FROM error_group_affected_users WHERE error_group_id = $1)
+     WHERE id = $1 AND project_id = $2`,
+    [incidentId, projectId],
+  );
+}

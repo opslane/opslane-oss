@@ -13,3 +13,4 @@ eval/results/
 !.verify/spec.md
 .claude/
 .omx/
+.gstack/

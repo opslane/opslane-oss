@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router';
 import type { Incident, AffectedUser } from '../types/api';
 import { getIncident, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
 import { getProjectId, statusBadgeClass, safeUrl, formatDate, formatAbsolute } from '../utils';
+import { kindBadge, fixControlsVisible } from '../components/incident-kind';
 import PipelineIndicator from '../components/PipelineIndicator.vue';
 import ReplayPlayer from '../components/ReplayPlayer.vue';
 import type { eventWithTime } from '@rrweb/types';
@@ -219,10 +220,24 @@ onMounted(async () => {
           <h2 class="text-xl font-semibold text-text flex-1" v-text="incident.title"></h2>
           <span
             class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap mt-1"
+            :class="kindBadge(incident.kind, incident.adjudication_status).class"
+            v-text="kindBadge(incident.kind, incident.adjudication_status).label"
+          >
+          </span>
+          <span
+            class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap mt-1"
             :class="statusBadgeClass(incident.status)"
             v-text="incident.status.replace('_', ' ')"
           >
           </span>
+        </div>
+        <div
+          v-if="incident.adjudication_status === 'unchecked'"
+          class="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 border-l-2 border-l-amber-500 rounded-lg text-sm text-amber-800"
+        >
+          The automated friction check for this detection could not complete
+          (it exhausted its retries). It is shown for visibility only: it has
+          no impact counts and cannot be fixed automatically.
         </div>
         <div class="mt-2 flex flex-wrap gap-4 text-sm text-text-muted">
           <span>{{ incident.occurrence_count }} occurrences</span>
@@ -387,9 +402,11 @@ onMounted(async () => {
           </div>
         </div>
 
-        <!-- Find Fix / Generate fix button -->
+        <!-- Fix trigger: errors when investigated; friction only when a human
+             approval is awaited (awaiting_approval). Insight, candidates, and
+             unchecked diagnostics never render fix controls. -->
         <div
-          v-if="incident.status === 'investigated' || incident.status === 'awaiting_approval'"
+          v-if="fixControlsVisible(incident.kind, incident.status)"
           class="p-4 bg-surface border border-border rounded-lg space-y-3"
         >
           <p v-if="incident.status === 'awaiting_approval'" class="text-xs text-text-muted">

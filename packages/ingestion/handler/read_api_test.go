@@ -61,3 +61,35 @@ func TestIncidentJSON_SessionPointer(t *testing.T) {
 		t.Fatalf("nil session pointer was not omitted: %s", without)
 	}
 }
+
+func TestIncidentJSON_AdjudicationFields(t *testing.T) {
+	envID := "env-123"
+	status := "unchecked"
+	inc := toIncidentJSON(db.ErrorGroup{
+		Kind:               "friction",
+		EnvironmentID:      &envID,
+		AdjudicationStatus: &status,
+	})
+	data, err := json.Marshal(inc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"environment_id":"env-123"`) {
+		t.Errorf("expected environment_id in %s", data)
+	}
+	if !strings.Contains(string(data), `"adjudication_status":"unchecked"`) {
+		t.Errorf("expected adjudication_status in %s", data)
+	}
+}
+
+func TestIncidentJSON_AdjudicationFieldsOmittedForErrors(t *testing.T) {
+	inc := toIncidentJSON(db.ErrorGroup{Kind: "error"})
+	data, err := json.Marshal(inc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "environment_id") ||
+		strings.Contains(string(data), "adjudication_status") {
+		t.Errorf("error incidents must omit adjudication fields, got %s", data)
+	}
+}

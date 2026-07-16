@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/opslane/opslane/packages/ingestion/db"
@@ -96,6 +97,7 @@ func main() {
 		GitHubAppPrivateKey:   githubAppPrivateKey,
 		GitHubAppSlug:         githubAppSlug,
 		DashboardOrigin:       dashboardOrigin,
+		AdminEmails:           handler.ParseAdminEmails(os.Getenv("ADMIN_EMAILS")),
 	}
 	r := handler.NewRouterWithPool(deps, pool)
 
@@ -129,8 +131,19 @@ func main() {
 		slog.Info("chunk scrubber started")
 
 		sweeper := &retention.Sweeper{Q: queries, MinIO: minioClient}
-		go sweeper.Start(context.Background(), time.Hour)
-		slog.Info("retention sweeper started")
+		if v := os.Getenv("SESSION_IDLE_CLOSE_MINUTES"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+				sweeper.IdleCloseMinutes = parsed
+			}
+		}
+		sweepInterval := time.Hour
+		if v := os.Getenv("RETENTION_SWEEP_INTERVAL_SECONDS"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+				sweepInterval = time.Duration(parsed) * time.Second
+			}
+		}
+		go sweeper.Start(context.Background(), sweepInterval)
+		slog.Info("retention sweeper started", "interval", sweepInterval.String())
 	}
 
 	slog.Info("Opslane ingestion starting", "port", port)

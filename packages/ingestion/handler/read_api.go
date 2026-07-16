@@ -22,6 +22,8 @@ type incidentJSON struct {
 	Title               string              `json:"title"`
 	Status              string              `json:"status"`
 	Kind                string              `json:"kind"`
+	EnvironmentID       *string             `json:"environment_id,omitempty"`
+	AdjudicationStatus  *string             `json:"adjudication_status,omitempty"`
 	FirstSeen           string              `json:"first_seen"`
 	LastSeen            string              `json:"last_seen"`
 	OccurrenceCount     int                 `json:"occurrence_count"`
@@ -67,6 +69,8 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 		Title:               g.Title,
 		Status:              g.Status,
 		Kind:                g.Kind,
+		EnvironmentID:       g.EnvironmentID,
+		AdjudicationStatus:  g.AdjudicationStatus,
 		FirstSeen:           g.FirstSeen.Format(time.RFC3339),
 		LastSeen:            g.LastSeen.Format(time.RFC3339),
 		OccurrenceCount:     g.OccurrenceCount,
@@ -269,6 +273,18 @@ func (d *Dependencies) ListAffectedUsers(w http.ResponseWriter, r *http.Request)
 	}
 
 	incidentID := chi.URLParam(r, "incidentID")
+	// No candidate — ordinary or unchecked — exposes affected users (issue
+	// #56): the endpoint 404s rather than returning an empty list, matching
+	// the detail API's treatment of hidden rows.
+	group, err := d.Queries.GetErrorGroup(r.Context(), projectID, incidentID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to load incident")
+		return
+	}
+	if group == nil || group.Status == "candidate" {
+		writeJSONError(w, http.StatusNotFound, "incident not found")
+		return
+	}
 	users, err := d.Queries.ListAffectedUsers(r.Context(), projectID, incidentID)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to list affected users")

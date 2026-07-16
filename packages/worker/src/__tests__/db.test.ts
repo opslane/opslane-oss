@@ -6,6 +6,7 @@ import {
   completeJob,
   failJob,
   requeueStaleJobs,
+  resolveSilentMergedGroups,
   updateGroupStatus,
   updateGroupInvestigation,
   updateGroupAndCreateFixJob,
@@ -75,6 +76,8 @@ async function seedErrorGroupAndJob(overrides?: {
 
 async function cleanupTestData(): Promise<void> {
   // Delete in reverse FK order
+  await testPool.query(`DELETE FROM friction_signals WHERE project_id = $1`, [testProjectId]);
+  await testPool.query(`DELETE FROM friction_adjudication_generations WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
   await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
@@ -131,9 +134,118 @@ describeDb('db.ts integration tests', () => {
 
   beforeEach(async () => {
     // Clean only jobs and error groups between tests, keep tenant
+    await testPool.query(`DELETE FROM friction_signals WHERE project_id = $1`, [testProjectId]);
+    await testPool.query(`DELETE FROM friction_adjudication_generations WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
+  });
+
+  describe('group lifecycle timestamps', () => {
+    const reason = {
+      reason_code: 'worker_runtime_error' as const,
+      reason_message: 'The worker could not complete the incident',
+      remediation: 'Review the incident manually',
+    };
+
+    it('stamps PR creation and retains it across later status changes', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/42',
+        pr_number: 42,
+      });
+      const stamped = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(stamped.rows[0]?.pr_created_at).toBeInstanceOf(Date);
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'analyzing');
+      const retained = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(retained.rows[0]?.pr_created_at).toEqual(stamped.rows[0]?.pr_created_at);
+    });
+
+    it('stamps needs-human status updates and retains the timestamp later', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'needs_human', { reason });
+      const stamped = await testPool.query<{ needs_human_at: Date | null }>(
+        `SELECT needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(stamped.rows[0]?.needs_human_at).toBeInstanceOf(Date);
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'queued');
+      const retained = await testPool.query<{ needs_human_at: Date | null }>(
+        `SELECT needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(retained.rows[0]?.needs_human_at).toEqual(stamped.rows[0]?.needs_human_at);
+    });
+
+    it('stamps needs-human investigation results', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupInvestigation(errorGroupId, testProjectId, 'needs_human', {
+        rootCause: 'External dependency failed',
+        reason,
+      });
+
+      const result = await testPool.query<{
+        status: string;
+        needs_human_at: Date | null;
+      }>(
+        `SELECT status, needs_human_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(result.rows[0]?.status).toBe('needs_human');
+      expect(result.rows[0]?.needs_human_at).toBeInstanceOf(Date);
+    });
+
+    it('does not move pr_created_at when the same status is written again', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/43',
+        pr_number: 43,
+      });
+      const first = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+
+      // Retried terminal writes happen under the at-least-once job model; they
+      // must not drag the stamp forward and inflate windowed admin metrics.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await updateGroupStatus(errorGroupId, testProjectId, 'pr_created', {
+        pr_url: 'https://github.com/octocat/hello/pull/43',
+        pr_number: 43,
+      });
+      const second = await testPool.query<{ pr_created_at: Date | null }>(
+        `SELECT pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(second.rows[0]?.pr_created_at).toEqual(first.rows[0]?.pr_created_at);
+    });
+
+    it('stamps pr_created_at through investigation updates', async () => {
+      const { errorGroupId } = await seedErrorGroupAndJob();
+
+      await updateGroupInvestigation(errorGroupId, testProjectId, 'pr_created', {
+        rootCause: 'Fix PR opened after investigation',
+      });
+
+      const result = await testPool.query<{ status: string; pr_created_at: Date | null }>(
+        `SELECT status, pr_created_at FROM error_groups WHERE id = $1`,
+        [errorGroupId],
+      );
+      expect(result.rows[0]?.status).toBe('pr_created');
+      expect(result.rows[0]?.pr_created_at).toBeInstanceOf(Date);
+    });
   });
 
   describe('claimJob', () => {
@@ -355,6 +467,342 @@ describeDb('db.ts integration tests', () => {
       expect(completed).toBe(true);
       const a3 = await claimJob('w5', 600_000, 2);
       expect(a3?.jobType).toBe('session_analysis');
+    });
+  });
+
+  describe('automatic fix creation kind gate (issue #56)', () => {
+    it('refuses automatic fix creation for friction incidents (typed no-transition result)', async () => {
+      const groupRes = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status, kind)
+         VALUES ($1, $2, 'Friction incident', now(), now(), 'analyzing', 'friction')
+         RETURNING id`,
+        [testProjectId, `fp-${crypto.randomUUID()}`]
+      );
+      const groupId = groupRes.rows[0]!.id;
+      await testPool.query(
+        `INSERT INTO error_group_jobs (error_group_id, project_id, job_type)
+         VALUES ($1, $2, 'investigate')`,
+        [groupId, testProjectId]
+      );
+      const claim = await claimJob('gate-worker', 60_000);
+      const lease = {
+        id: claim!.id,
+        workerId: 'gate-worker',
+        leaseGeneration: claim!.leaseGeneration,
+        projectId: testProjectId,
+        errorGroupId: groupId,
+        sessionId: null,
+      };
+
+      const result = await updateGroupAndCreateFixJob(
+        groupId,
+        testProjectId,
+        { rootCause: 'code cause', confidence: 'high' },
+        lease
+      );
+      expect(result).toEqual({ created: false, reason: 'kind_not_error' });
+
+      const group = (await testPool.query(
+        `SELECT status FROM error_groups WHERE id = $1`, [groupId]
+      )).rows[0]!;
+      expect(group.status).toBe('analyzing');
+      const fixJobs = await testPool.query(
+        `SELECT count(*)::int AS n FROM error_group_jobs
+         WHERE error_group_id = $1 AND job_type IN ('fix', 'error_fix')`,
+        [groupId]
+      );
+      expect(fixJobs.rows[0]!.n).toBe(0);
+    });
+  });
+
+  describe('dead-letter reconciliation for session_analysis (issue #56)', () => {
+    async function seedEnvAndSession(): Promise<{ envId: string; sessionId: string }> {
+      const envRes = await testPool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [testProjectId, `env-${crypto.randomUUID()}`]
+      );
+      const sessionId = `sess-${crypto.randomUUID()}`;
+      await testPool.query(
+        `INSERT INTO sessions (id, project_id, environment_id, started_at)
+         VALUES ($1, $2, $3, now())`,
+        [sessionId, testProjectId, envRes.rows[0]!.id]
+      );
+      return { envId: envRes.rows[0]!.id, sessionId };
+    }
+
+    async function seedAnalysisJobRow(sessionId: string, maxAttempts: number): Promise<string> {
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO error_group_jobs (project_id, status, job_type, session_id, max_attempts)
+         VALUES ($1, 'pending', 'session_analysis', $2, $3) RETURNING id`,
+        [testProjectId, sessionId, maxAttempts]
+      );
+      return res.rows[0]!.id;
+    }
+
+    async function seedClaimedSignal(opts: {
+      envId: string;
+      sessionId?: string;
+      jobId: string | null;
+      status?: string;
+      fingerprint?: string;
+    }): Promise<string> {
+      // Bucket signals share a fingerprint across DIFFERENT sessions
+      // (UNIQUE(session_id, fingerprint, rule_version)); give each its own.
+      const sessionId = `sess-${crypto.randomUUID()}`;
+      await testPool.query(
+        `INSERT INTO sessions (id, project_id, environment_id, started_at)
+         VALUES ($1, $2, $3, now())`,
+        [sessionId, testProjectId, opts.envId]
+      );
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO friction_signals
+           (session_id, project_id, environment_id, rule_version, signal_type,
+            fingerprint, page_url_normalized, occurred_at, adjudication_status,
+            adjudication_job_id, adjudication_attempts)
+         VALUES ($1, $2, $3, 1, 'rage_click', $4, '/checkout', now(), $5, $6, 1)
+         RETURNING id`,
+        [
+          sessionId,
+          testProjectId,
+          opts.envId,
+          opts.fingerprint ?? 'fp-deadletter',
+          opts.status ?? 'pending',
+          opts.jobId,
+        ]
+      );
+      return res.rows[0]!.id;
+    }
+
+    async function seedInFlightGeneration(envId: string, jobId: string): Promise<string> {
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO friction_adjudication_generations
+           (project_id, environment_id, fingerprint, rule_version, prompt_version,
+            status, window_start, window_end, claim_job_id, attempts)
+         VALUES ($1, $2, 'fp-deadletter', 1, 1, 'adjudicating',
+                 now() - interval '7 days', now(), $3, 1)
+         RETURNING id`,
+        [testProjectId, envId, jobId]
+      );
+      return res.rows[0]!.id;
+    }
+
+    it('explicit failJob at max attempts reconciles signals, generation, and diagnostic atomically', async () => {
+      const { envId, sessionId } = await seedEnvAndSession();
+      const jobRowId = await seedAnalysisJobRow(sessionId, 1);
+      const claim = await claimJob('dl-worker', 60_000);
+      expect(claim?.id).toBe(jobRowId);
+
+      const pendingA = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId });
+      const pendingB = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId });
+      const accepted = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId, status: 'accepted' });
+      const unclaimed = await seedClaimedSignal({ envId, sessionId, jobId: null });
+      const generationId = await seedInFlightGeneration(envId, jobRowId);
+
+      const failed = await failJob(jobRowId, 'dl-worker', claim!.leaseGeneration, 'adjudicator down');
+      expect(failed).toBe(true);
+
+      const job = (await testPool.query(
+        `SELECT status FROM error_group_jobs WHERE id = $1`, [jobRowId]
+      )).rows[0]!;
+      expect(job.status).toBe('dead_letter');
+
+      const statuses = new Map(
+        (await testPool.query(
+          `SELECT id, adjudication_status FROM friction_signals WHERE project_id = $1`,
+          [testProjectId]
+        )).rows.map((r) => [r.id, r.adjudication_status])
+      );
+      expect(statuses.get(pendingA)).toBe('unchecked');
+      expect(statuses.get(pendingB)).toBe('unchecked');
+      expect(statuses.get(accepted)).toBe('accepted');
+      expect(statuses.get(unclaimed)).toBe('pending');
+
+      const gen = (await testPool.query(
+        `SELECT status, finished_at, diagnostic_incident_id
+         FROM friction_adjudication_generations WHERE id = $1`,
+        [generationId]
+      )).rows[0]!;
+      expect(gen.status).toBe('unchecked');
+      expect(gen.finished_at).toBeTruthy();
+      expect(gen.diagnostic_incident_id).toBeTruthy();
+
+      const diagnostic = (await testPool.query(
+        `SELECT fingerprint, status, kind, adjudication_status, occurrence_count, affected_users_count
+         FROM error_groups WHERE id = $1`,
+        [gen.diagnostic_incident_id]
+      )).rows[0]!;
+      expect(diagnostic.fingerprint).toBe(`friction-unchecked:${generationId}`);
+      expect(diagnostic.status).toBe('candidate');
+      expect(diagnostic.kind).toBe('friction');
+      expect(diagnostic.adjudication_status).toBe('unchecked');
+      expect(diagnostic.occurrence_count).toBe(0);
+      expect(diagnostic.affected_users_count).toBe(0);
+      const junctions = await testPool.query(
+        `SELECT count(*)::int AS n FROM error_group_affected_users WHERE error_group_id = $1`,
+        [gen.diagnostic_incident_id]
+      );
+      expect(junctions.rows[0]!.n).toBe(0);
+      const diagJobs = await testPool.query(
+        `SELECT count(*)::int AS n FROM error_group_jobs WHERE error_group_id = $1`,
+        [gen.diagnostic_incident_id]
+      );
+      expect(diagJobs.rows[0]!.n).toBe(0);
+
+      // The in-flight slot is released: a later generation can be claimed.
+      const again = await testPool.query(
+        `INSERT INTO friction_adjudication_generations
+           (project_id, environment_id, fingerprint, rule_version, prompt_version,
+            status, window_start, window_end)
+         VALUES ($1, $2, 'fp-deadletter', 1, 1, 'adjudicating', now() - interval '7 days', now())
+         RETURNING id`,
+        [testProjectId, envId]
+      );
+      expect(again.rows[0]!.id).toBeTruthy();
+    });
+
+    it('a retryable failure reconciles nothing', async () => {
+      const { envId, sessionId } = await seedEnvAndSession();
+      const jobRowId = await seedAnalysisJobRow(sessionId, 3);
+      const claim = await claimJob('dl-worker-2', 60_000);
+      const pending = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId });
+      const generationId = await seedInFlightGeneration(envId, jobRowId);
+
+      await failJob(jobRowId, 'dl-worker-2', claim!.leaseGeneration, 'transient');
+
+      const sig = (await testPool.query(
+        `SELECT adjudication_status FROM friction_signals WHERE id = $1`, [pending]
+      )).rows[0]!;
+      expect(sig.adjudication_status).toBe('pending');
+      const gen = (await testPool.query(
+        `SELECT status FROM friction_adjudication_generations WHERE id = $1`, [generationId]
+      )).rows[0]!;
+      expect(gen.status).toBe('adjudicating');
+    });
+
+    it('lease-reaper dead-lettering performs the same reconciliation', async () => {
+      const { envId, sessionId } = await seedEnvAndSession();
+      const jobRowId = await seedAnalysisJobRow(sessionId, 1);
+      await claimJob('dl-worker-3', 60_000);
+      const pending = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId });
+      const generationId = await seedInFlightGeneration(envId, jobRowId);
+
+      await testPool.query(
+        `UPDATE error_group_jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1`,
+        [jobRowId]
+      );
+      expect(await requeueStaleJobs()).toBe(1);
+
+      const sig = (await testPool.query(
+        `SELECT adjudication_status FROM friction_signals WHERE id = $1`, [pending]
+      )).rows[0]!;
+      expect(sig.adjudication_status).toBe('unchecked');
+      const gen = (await testPool.query(
+        `SELECT status, diagnostic_incident_id FROM friction_adjudication_generations WHERE id = $1`,
+        [generationId]
+      )).rows[0]!;
+      expect(gen.status).toBe('unchecked');
+      expect(gen.diagnostic_incident_id).toBeTruthy();
+      const session = (await testPool.query(
+        `SELECT status FROM sessions WHERE id = $1`, [sessionId]
+      )).rows[0]!;
+      expect(session.status).toBe('analysis_failed');
+    });
+
+    it('fold-claimed signals with no generation get signal-scoped diagnostics', async () => {
+      const { envId, sessionId } = await seedEnvAndSession();
+      const jobRowId = await seedAnalysisJobRow(sessionId, 1);
+      const claim = await claimJob('dl-worker-4', 60_000);
+      const signalId = await seedClaimedSignal({ envId, sessionId, jobId: jobRowId, fingerprint: 'fp-fold-dl' });
+
+      await failJob(jobRowId, 'dl-worker-4', claim!.leaseGeneration, 'boom');
+
+      const diagnostic = (await testPool.query(
+        `SELECT status, kind, adjudication_status FROM error_groups
+         WHERE project_id = $1 AND fingerprint = $2`,
+        [testProjectId, `friction-unchecked:${signalId}`]
+      )).rows[0]!;
+      expect(diagnostic.kind).toBe('friction');
+      expect(diagnostic.adjudication_status).toBe('unchecked');
+    });
+  });
+
+  describe('resolveSilentMergedGroups (friction-aware, issue #56)', () => {
+    async function seedMergedGroup(): Promise<string> {
+      const res = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status, merged_at)
+         VALUES ($1, $2, 'Merged Error', now() - interval '3 days', now() - interval '2 days',
+                 'merged', now() - interval '2 days')
+         RETURNING id`,
+        [testProjectId, `fp-${crypto.randomUUID()}`]
+      );
+      return res.rows[0]!.id;
+    }
+
+    async function seedLinkedSignal(groupId: string, opts: {
+      status: string;
+      occurredAt: string;
+      retracted?: boolean;
+    }): Promise<void> {
+      const envRes = await testPool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [testProjectId, `env-${crypto.randomUUID()}`]
+      );
+      const sessionId = `sess-${crypto.randomUUID()}`;
+      await testPool.query(
+        `INSERT INTO sessions (id, project_id, environment_id, started_at)
+         VALUES ($1, $2, $3, now() - interval '1 day')`,
+        [sessionId, testProjectId, envRes.rows[0]!.id]
+      );
+      await testPool.query(
+        `INSERT INTO friction_signals
+           (session_id, project_id, environment_id, rule_version, signal_type,
+            fingerprint, page_url_normalized, occurred_at, adjudication_status,
+            incident_id, retracted_at)
+         VALUES ($1, $2, $3, 1, 'rage_click', $4, '/x', $5, $6, $7, $8)`,
+        [
+          sessionId,
+          testProjectId,
+          envRes.rows[0]!.id,
+          `fp-${crypto.randomUUID()}`,
+          opts.occurredAt,
+          opts.status,
+          groupId,
+          opts.retracted ? new Date() : null,
+        ]
+      );
+    }
+
+    const afterMerge = () => new Date(Date.now() - 1 * 3600 * 1000).toISOString();
+    const beforeMerge = () => new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+
+    it('resolves a truly silent merged group', async () => {
+      const groupId = await seedMergedGroup();
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
+    });
+
+    it('does not resolve when active accepted linked friction occurred after merged_at', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: afterMerge() });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).not.toContain(groupId);
+    });
+
+    it('resolves when linked friction predates the merge', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: beforeMerge() });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
+    });
+
+    it('resolves when post-merge linked friction is rejected or retracted', async () => {
+      const groupId = await seedMergedGroup();
+      await seedLinkedSignal(groupId, { status: 'rejected', occurredAt: afterMerge() });
+      await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: afterMerge(), retracted: true });
+      const resolved = await resolveSilentMergedGroups();
+      expect(resolved).toContain(groupId);
     });
   });
 
@@ -654,13 +1102,13 @@ describeDb('db.ts integration tests', () => {
       );
       expect(staleFixCount.rows[0]?.count).toBe('0');
 
-      const fixJobId = await updateGroupAndCreateFixJob(
+      const fixResult = await updateGroupAndCreateFixJob(
         errorGroupId,
         testProjectId,
         { rootCause: 'current result', confidence: 'high' },
         currentLease,
       );
-      expect(fixJobId).toEqual(expect.any(String));
+      expect(fixResult).toEqual({ created: true, fixJobId: expect.any(String) });
       const final = await testPool.query<{
         status: string;
         root_cause: string | null;

@@ -16,6 +16,10 @@ paths = [
   # The read handler repeats that guarantee after fetching stored chunks; keep
   # its realistic canary scoped to this integration-test file as well.
   '''packages/ingestion/handler/session_read_test\.go''',
+  # The admin jobs redactor asserts realistic-shaped GitHub/npm/Slack/AWS/JWT
+  # tokens are stripped from last_error before operators see it; a token
+  # gitleaks ignores would prove nothing.
+  '''packages/ingestion/handler/admin_test\.go''',
   '''packages/sdk/src/__tests__/scrub\.test\.ts''',
   '''test-e2e/error-to-pr\.test\.ts''',
   '''test-e2e/replay-contract\.test\.ts''',

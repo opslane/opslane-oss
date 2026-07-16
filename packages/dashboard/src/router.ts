@@ -8,6 +8,7 @@ import SetupWizard from './views/SetupWizard.vue';
 import Settings from './views/Settings.vue';
 import AccountsList from './views/AccountsList.vue';
 import AccountDetail from './views/AccountDetail.vue';
+import { routeNeedsProject } from './route-project';
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -22,6 +23,7 @@ export const router = createRouter({
     { path: '/sessions', name: 'sessions', component: () => import('./views/SessionsList.vue') },
     { path: '/sessions/:sessionId', name: 'session-detail', component: () => import('./views/SessionDetail.vue') },
     { path: '/settings', name: 'settings', component: Settings },
+    { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 });
@@ -41,7 +43,7 @@ router.beforeEach((to) => {
   }
 
   // Redirect to setup if authenticated but no project configured
-  if (authed && to.name !== 'setup' && to.name !== 'login' && to.name !== 'auth-callback') {
+  if (authed && routeNeedsProject(to.name)) {
     const hasProject = !!localStorage.getItem('opslane_project_id');
     if (!hasProject) {
       return { name: 'setup' };

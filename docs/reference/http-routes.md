@@ -42,6 +42,8 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/api/v1/auth/me` | Current user |
 | GET | `/api/v1/auth/verify` | Validate session |
 | POST | `/api/v1/auth/logout` | End session |
+| GET | `/api/v1/admin/overview` | Operator-only cross-tenant observability overview (404 unless allowlisted) |
+| GET | `/api/v1/admin/jobs` | Operator-only recent jobs (404 unless allowlisted) |
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
 | POST | `/api/v1/projects` | Create project |
