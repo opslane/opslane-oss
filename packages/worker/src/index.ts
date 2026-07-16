@@ -493,16 +493,31 @@ export async function processFrictionInvestigateJob(
       const autonomyAllowsFix = project.friction_autonomy === 'auto_fix'
         || project.friction_autonomy === 'auto_fix_ux';
       if (result.confidence === 'high' && autonomyAllowsFix) {
-        const fixJobId = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
+        // allowFriction is the ladder's explicit opt-in past the kind gate;
+        // refuse-by-default stays intact for every other caller (issue #56).
+        const fixResult = await updateGroupAndCreateFixJob(job.errorGroupId, job.projectId, {
           rootCause: result.reason,
           suggestedMitigation: result.remediation,
           confidence: result.confidence,
-        }, job);
-        logger.info('Friction investigation: auto-triggering fix (autonomy ladder)', {
-          job_id: job.id,
-          fix_job_id: fixJobId,
-          autonomy: project.friction_autonomy,
-        });
+        }, job, { allowFriction: true });
+        if (fixResult.created) {
+          logger.info('Friction investigation: auto-triggering fix (autonomy ladder)', {
+            job_id: job.id,
+            fix_job_id: fixResult.fixJobId,
+            autonomy: project.friction_autonomy,
+          });
+        } else {
+          // Never drop the investigation: park it for human approval instead.
+          await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
+            rootCause: result.reason,
+            suggestedMitigation: result.remediation,
+            confidence: result.confidence,
+          }, job);
+          logger.warn('Friction investigation: auto-fix refused by kind gate — parked for approval', {
+            job_id: job.id,
+            reason: fixResult.reason,
+          });
+        }
       } else {
         await updateGroupInvestigation(job.errorGroupId, job.projectId, 'awaiting_approval', {
           rootCause: result.reason,

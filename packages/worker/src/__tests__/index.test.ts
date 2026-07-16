@@ -366,12 +366,13 @@ describe('friction worker path', () => {
       vi.mocked(investigateFriction).mockResolvedValue({
         codeCause: true, confidence: 'high', reason: 'save handler is disconnected', remediation: 'wire the handler',
       });
-      vi.mocked(db.updateGroupAndCreateFixJob).mockResolvedValue('fix-job-1');
+      vi.mocked(db.updateGroupAndCreateFixJob).mockResolvedValue({ created: true, fixJobId: 'fix-job-1' });
 
       await processInvestigateJob(makeJob(), new AbortController().signal);
 
       expect(db.updateGroupAndCreateFixJob).toHaveBeenCalledWith(
         'grp-1', 'proj-1', expect.objectContaining({ confidence: 'high' }), makeJob(),
+        { allowFriction: true },
       );
       expect(db.updateGroupInvestigation).not.toHaveBeenCalledWith(
         'grp-1', 'proj-1', 'awaiting_approval', expect.anything(), expect.anything(),

@@ -926,9 +926,12 @@ export async function updateGroupInvestigation(
  * confidence and auto-triggers a fix.
  */
 /** Result of an automatic investigate→fix transition attempt. Friction
- * incidents are refused at this layer (issue #56 defense in depth): even a
- * future caller that skips the route-level kind check cannot auto-create a
- * fix job for kind='friction'. */
+ * incidents are refused at this layer by default (issue #56 defense in
+ * depth): even a future caller that skips the route-level kind check cannot
+ * auto-create a fix job for kind='friction'. The one sanctioned exception is
+ * the autonomy ladder (issue #57), which must opt in explicitly via
+ * allowFriction after checking projects.friction_autonomy — and the fix-job
+ * gate in processFixJob re-checks autonomy at claim time as a second layer. */
 export type FixJobResult =
   | { created: true; fixJobId: string }
   | { created: false; reason: 'kind_not_error' };
@@ -942,6 +945,7 @@ export async function updateGroupAndCreateFixJob(
     confidence?: ConfidenceLevel;
   },
   lease: JobLease,
+  opts?: { allowFriction?: boolean },
 ): Promise<FixJobResult> {
   const db = getPool();
   const client = await db.connect();
@@ -978,8 +982,10 @@ export async function updateGroupAndCreateFixJob(
     if ((group.rowCount ?? 0) !== 1) {
       throw new Error(`Cannot create fix job: group ${errorGroupId} was not found`);
     }
-    if (group.rows[0]!.kind !== 'error') {
+    const kind = group.rows[0]!.kind;
+    if (kind !== 'error' && !(kind === 'friction' && opts?.allowFriction)) {
       // Typed no-transition result: nothing changed, nothing enqueued.
+      // Friction passes only via the autonomy ladder's explicit opt-in.
       await client.query('COMMIT');
       return { created: false, reason: 'kind_not_error' };
     }
