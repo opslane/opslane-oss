@@ -267,6 +267,11 @@ type IngestParams struct {
 	Context       string // JSON, defaults to "{}"
 	Release       string // source map lookup
 	SessionID     string // links error event to replay
+	// EventTime is the validated client-side event time (issue #27). Zero
+	// means "unknown" and falls back to server arrival time. It feeds
+	// error_events.timestamp and group/junction impact times; created_at
+	// always keeps server arrival time.
+	EventTime time.Time
 
 	// B2B end-user identity (optional, extracted from context.user)
 	EndUserID          string
@@ -318,13 +323,20 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 
 	now := time.Now()
 
+	// Client event time (issue #27): when the browser told us when the error
+	// happened, persist that; otherwise fall back to server arrival time.
+	eventTime := p.EventTime
+	if eventTime.IsZero() {
+		eventTime = now
+	}
+
 	// 1. Insert error event
 	var eventID string
 	err = tx.QueryRow(ctx,
 		`INSERT INTO error_events (project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, breadcrumbs, context, release, session_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10)
 		 RETURNING id`,
-		p.ProjectID, p.EnvironmentID, now, p.ErrorType, p.ErrorMessage, p.StackTraceRaw, p.Breadcrumbs, p.Context, nilIfEmpty(p.Release), nilIfEmpty(p.SessionID),
+		p.ProjectID, p.EnvironmentID, eventTime, p.ErrorType, p.ErrorMessage, p.StackTraceRaw, p.Breadcrumbs, p.Context, nilIfEmpty(p.Release), nilIfEmpty(p.SessionID),
 	).Scan(&eventID)
 	if err != nil {
 		return nil, fmt.Errorf("insert error event: %w", err)
@@ -353,12 +365,13 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id)
 		 VALUES ($1, $2, $3, $4, $4, 1, $5)
 		 ON CONFLICT (project_id, fingerprint) DO UPDATE
-		   SET last_seen = $4,
+		   SET first_seen = LEAST(error_groups.first_seen, $4),
+		       last_seen = GREATEST(error_groups.last_seen, $4),
 		       occurrence_count = error_groups.occurrence_count + 1,
 		       sample_event_id = $5,
 		       updated_at = now()
 		 RETURNING id, (xmax = 0) AS is_new`,
-		p.ProjectID, p.Fingerprint, p.Title, now, eventID,
+		p.ProjectID, p.Fingerprint, p.Title, eventTime, eventID,
 	).Scan(&groupID, &isNew)
 	if err != nil {
 		return nil, fmt.Errorf("upsert error group: %w", err)
@@ -405,9 +418,10 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 			`INSERT INTO error_group_affected_users (error_group_id, end_user_id, first_seen, last_seen, occurrence_count)
 			 VALUES ($1, $2, $3, $3, 1)
 			 ON CONFLICT (error_group_id, end_user_id) DO UPDATE
-			   SET last_seen = $3,
+			   SET first_seen = LEAST(error_group_affected_users.first_seen, $3),
+			       last_seen = GREATEST(error_group_affected_users.last_seen, $3),
 			       occurrence_count = error_group_affected_users.occurrence_count + 1`,
-			groupID, endUserDBID, now,
+			groupID, endUserDBID, eventTime,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("upsert affected user: %w", err)

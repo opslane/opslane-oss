@@ -147,6 +147,7 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 	result, err := d.Queries.InsertErrorEventAndGroup(r.Context(), db.IngestParams{
 		ProjectID:          projectID,
 		EnvironmentID:      environmentID,
+		EventTime:          resolveEventTime(payload.Timestamp, start),
 		ErrorType:          payload.Error.Type,
 		ErrorMessage:       payload.Error.Message,
 		StackTraceRaw:      payload.Error.Stack,
