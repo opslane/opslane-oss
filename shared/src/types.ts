@@ -133,10 +133,25 @@ export type ConfidenceLevel = 'high' | 'medium' | 'low';
 export type IncidentKind = 'error' | 'friction';
 export type FrictionSignalType = 'rage_click' | 'dead_click' | 'form_abandon';
 
+// === Friction adjudication (Batch 4, issue #56) ===
+
+/** Signal-level verdict lifecycle. 'unchecked' = the adjudicator dead-lettered
+ * before finishing; diagnostic only — an unchecked signal never folds, never
+ * counts toward the promotion threshold, and never becomes fix-eligible. */
+export type AdjudicationStatus = 'pending' | 'accepted' | 'rejected' | 'unchecked';
+/** Which path adjudicated a signal: an eager same-session fold check, or a
+ * bucket-level call at the five-user promotion threshold. */
+export type AdjudicationScope = 'fold' | 'bucket';
+
 export interface Incident {
   id: string;
   project_id: string;
   kind: IncidentKind;
+  /** Present only on kind='friction': friction identity is environment-scoped. */
+  environment_id?: string;
+  /** Present only on kind='friction'; 'unchecked' flags an exhausted
+   * adjudication surfaced as a non-fixable diagnostic. */
+  adjudication_status?: AdjudicationStatus;
   fingerprint: string;
   title: string;
   status: ErrorGroupStatus;
