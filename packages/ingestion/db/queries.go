@@ -238,6 +238,8 @@ type ErrorGroup struct {
 	AffectedUsersCount  int
 	Status              string
 	Kind                string
+	EnvironmentID       *string
+	AdjudicationStatus  *string
 	ReasonCode          *string
 	ReasonMessage       *string
 	Remediation         *string
@@ -529,6 +531,7 @@ type ErrorGroupFilters struct {
 func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters *ErrorGroupFilters) ([]ErrorGroup, error) {
 	query := `SELECT DISTINCT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
 		        eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		        eg.environment_id, eg.adjudication_status,
 		        eg.reason_code, eg.reason_message, eg.remediation,
 		        eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
 		        eg.signal_type, eg.element_selector, eg.page_url_normalized,
@@ -538,7 +541,9 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 
 	args := []interface{}{projectID}
 	argIdx := 2
-	wheres := []string{"eg.project_id = $1", "eg.status <> 'candidate'"}
+	// Ordinary candidates are hidden workflow records (issue #56); the only
+	// visible candidate is an exhausted 'unchecked' adjudication diagnostic.
+	wheres := []string{"eg.project_id = $1", "(eg.status <> 'candidate' OR eg.adjudication_status = 'unchecked')"}
 
 	needsJoin := filters != nil && (filters.AccountID != "" || filters.EndUserID != "")
 	if needsJoin {
@@ -579,6 +584,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		err := rows.Scan(
 			&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
 			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+			&g.EnvironmentID, &g.AdjudicationStatus,
 			&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 			&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
 			&g.SignalType, &g.ElementSelector, &g.PageURLNormalized,
@@ -633,6 +639,7 @@ func (q *Queries) ListAffectedUsers(ctx context.Context, projectID, errorGroupID
 		 JOIN end_users eu ON eu.id = eau.end_user_id
 		 JOIN error_groups eg ON eg.id = eau.error_group_id
 		 WHERE eau.error_group_id = $1 AND eg.project_id = $2
+		   AND eg.status <> 'candidate'
 		 ORDER BY eau.last_seen DESC`,
 		errorGroupID, projectID,
 	)
@@ -719,17 +726,20 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, project_id, fingerprint, title, first_seen, last_seen,
 		        occurrence_count, affected_users_count, status, kind,
+		        environment_id, adjudication_status,
 		        reason_code, reason_message, remediation,
 		        confidence, pr_url, root_cause, suggested_mitigation,
 		        signal_type, element_selector, page_url_normalized,
 		        created_at, updated_at,
 		        merged_at, resolved_at, archived_at
 		 FROM error_groups
-		 WHERE id = $1 AND project_id = $2 AND status <> 'candidate'`,
+		 WHERE id = $1 AND project_id = $2
+		   AND (status <> 'candidate' OR adjudication_status = 'unchecked')`,
 		groupID, projectID,
 	).Scan(
 		&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
 		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+		&g.EnvironmentID, &g.AdjudicationStatus,
 		&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 		&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
 		&g.SignalType, &g.ElementSelector, &g.PageURLNormalized,

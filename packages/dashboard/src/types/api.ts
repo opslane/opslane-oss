@@ -25,6 +25,11 @@ export interface Incident {
   id: string;
   project_id: string;
   kind: 'error' | 'friction';
+  /** Present only on kind='friction': friction identity is environment-scoped. */
+  environment_id?: string;
+  /** Present only on kind='friction'; 'unchecked' flags an exhausted,
+   * non-fixable adjudication diagnostic. */
+  adjudication_status?: 'pending' | 'accepted' | 'rejected' | 'unchecked';
   fingerprint: string;
   title: string;
   status: ErrorGroupStatus;

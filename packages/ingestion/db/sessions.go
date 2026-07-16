@@ -245,17 +245,45 @@ func (q *Queries) ClaimUnscrubbedChunks(ctx context.Context, limit int) ([]Chunk
 // MarkChunkScrubbed makes a chunk readable. Call it only after the redacted
 // bytes are durably stored.
 func (q *Queries) MarkChunkScrubbed(ctx context.Context, sessionID, projectID string, seq int, firstEventMs, lastEventMs *int64, decodedSizeBytes int64) error {
-	_, err := q.pool.Exec(ctx,
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin mark chunk scrubbed: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
 		`UPDATE session_chunks
 		    SET scrubbed_at = now(), scrub_error = NULL, scrub_claimed_at = NULL,
 		        first_event_ms = $4, last_event_ms = $5, decoded_size_bytes = $6
 		  WHERE session_id = $1 AND seq = $2 AND project_id = $3`,
 		sessionID, seq, projectID, firstEventMs, lastEventMs, decodedSizeBytes,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("mark chunk scrubbed: %w", err)
 	}
-	return nil
+
+	// Late-chunk re-analysis (issue #56, design v4-5 whole-session truth): a
+	// chunk becoming READABLE after its session closed/analyzed re-enqueues
+	// analysis, unless a live job already covers it. Scrub time is the correct
+	// producer moment — a commit-time job races the scrubber and analyzes a
+	// partial session. Same transaction: a chunk is never readable without its
+	// re-analysis job.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO error_group_jobs (project_id, job_type, session_id)
+		 SELECT s.project_id, 'session_analysis', s.id
+		   FROM sessions s
+		  WHERE s.id = $1 AND s.project_id = $2
+		    AND s.status IN ('closed', 'analyzed', 'analysis_failed')
+		    AND NOT EXISTS (
+		      SELECT 1 FROM error_group_jobs j
+		       WHERE j.session_id = s.id
+		         AND j.job_type = 'session_analysis'
+		         AND j.status IN ('pending', 'claimed'))`,
+		sessionID, projectID,
+	); err != nil {
+		return fmt.Errorf("re-enqueue late-chunk analysis: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // MarkChunkScrubFailed records why scrubbing failed while leaving the chunk
@@ -453,13 +481,23 @@ func (q *Queries) ReleaseChunkReservation(ctx context.Context, sessionID, projec
 	return nil
 }
 
-// CloseIdleSessions marks recording sessions with no recent chunk as closed.
+// CloseIdleSessions marks recording sessions with no recent chunk as closed
+// and enqueues one session_analysis job per closed session — the friction
+// detection producer (issue #56, design: "session close → session_analysis
+// job"). One statement, so a close is never observed without its job. The
+// recording→closed transition happens exactly once per session, which makes
+// the enqueue naturally idempotent.
 func (q *Queries) CloseIdleSessions(ctx context.Context, idleMinutes int) (int64, error) {
 	tag, err := q.pool.Exec(ctx,
-		`UPDATE sessions
-		    SET status = 'closed'
-		  WHERE status = 'recording'
-		    AND COALESCE(last_chunk_at, started_at) < now() - make_interval(mins => $1)`,
+		`WITH closed AS (
+		   UPDATE sessions
+		      SET status = 'closed'
+		    WHERE status = 'recording'
+		      AND COALESCE(last_chunk_at, started_at) < now() - make_interval(mins => $1)
+		    RETURNING id, project_id
+		 )
+		 INSERT INTO error_group_jobs (project_id, job_type, session_id)
+		 SELECT project_id, 'session_analysis', id FROM closed`,
 		idleMinutes,
 	)
 	if err != nil {
