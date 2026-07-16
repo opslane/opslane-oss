@@ -36,7 +36,7 @@ Two security reviews reshaped this design. Four rules are non-negotiable (see th
 ---
 title: React guide
 covers:
-  - packages/sdk/src/react/**
+  - packages/sdk/src/react.tsx
   - packages/sdk/vite-plugin/**
 ---
 ```
