@@ -6,6 +6,7 @@ import {
   completeJob,
   failJob,
   requeueStaleJobs,
+  resolveInactiveGroups,
   resolveSilentMergedGroups,
   updateGroupStatus,
   updateGroupInvestigation,
@@ -781,6 +782,21 @@ describeDb('db.ts integration tests', () => {
       const groupId = await seedMergedGroup();
       const resolved = await resolveSilentMergedGroups();
       expect(resolved).toContain(groupId);
+
+      const group = await testPool.query<{
+        status: string;
+        resolved_reason: string | null;
+        resolved_in_release: string | null;
+      }>(
+        `SELECT status, resolved_reason, resolved_in_release
+         FROM error_groups WHERE id = $1`,
+        [groupId],
+      );
+      expect(group.rows[0]).toEqual({
+        status: 'resolved',
+        resolved_reason: 'merged',
+        resolved_in_release: null,
+      });
     });
 
     it('does not resolve when active accepted linked friction occurred after merged_at', async () => {
@@ -803,6 +819,95 @@ describeDb('db.ts integration tests', () => {
       await seedLinkedSignal(groupId, { status: 'accepted', occurredAt: afterMerge(), retracted: true });
       const resolved = await resolveSilentMergedGroups();
       expect(resolved).toContain(groupId);
+    });
+  });
+
+  describe('resolveInactiveGroups', () => {
+    it('resolves only stale eligible groups and stamps the newest release', async () => {
+      const env = await testPool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name)
+         VALUES ($1, $2) RETURNING id`,
+        [testProjectId, `env-${crypto.randomUUID()}`],
+      );
+      const environmentId = env.rows[0]!.id;
+
+      await testPool.query(
+        // created_at (server arrival), not the client timestamp, drives release
+        // ranking — set it explicitly so the two rows don't tie on now().
+        `INSERT INTO error_events
+           (project_id, environment_id, timestamp, error_type, error_message,
+            stack_trace_raw, release, created_at)
+         VALUES
+           ($1, $2, now() - interval '10 days', 'Error', 'old', 'stack', 'release-old', now() - interval '10 days'),
+           ($1, $2, now() - interval '2 days', 'Error', 'new', 'stack', 'release-new', now() - interval '2 days')`,
+        [testProjectId, environmentId],
+      );
+
+      const statuses = [
+        'needs_human',
+        'investigated',
+        'new',
+        'pr_created',
+        'analyzing',
+        'queued',
+        'fixing',
+        'merged',
+        'archived',
+        'resolved',
+      ] as const;
+      const groupIds = new Map<string, string>();
+      for (const status of statuses) {
+        const group = await testPool.query<{ id: string }>(
+          `INSERT INTO error_groups
+             (project_id, fingerprint, title, first_seen, last_seen, status)
+           VALUES ($1, $2, 'Inactive Error', now() - interval '30 days',
+                   now() - interval '20 days', $3::error_group_status)
+           RETURNING id`,
+          [testProjectId, `fp-${status}-${crypto.randomUUID()}`, status],
+        );
+        groupIds.set(status, group.rows[0]!.id);
+      }
+      const recent = await testPool.query<{ id: string }>(
+        `INSERT INTO error_groups
+           (project_id, fingerprint, title, first_seen, last_seen, status)
+         VALUES ($1, $2, 'Recent Error', now() - interval '5 days',
+                 now() - interval '3 days', 'needs_human')
+         RETURNING id`,
+        [testProjectId, `fp-recent-${crypto.randomUUID()}`],
+      );
+
+      const resolved = await resolveInactiveGroups(14);
+      expect(new Set(resolved)).toEqual(new Set([
+        groupIds.get('needs_human')!,
+        groupIds.get('investigated')!,
+      ]));
+
+      const groups = await testPool.query<{
+        id: string;
+        status: string;
+        resolved_at: Date | null;
+        resolved_reason: string | null;
+        resolved_in_release: string | null;
+      }>(
+        `SELECT id, status, resolved_at, resolved_reason, resolved_in_release
+         FROM error_groups
+         WHERE id = ANY($1::uuid[])`,
+        [[...groupIds.values(), recent.rows[0]!.id]],
+      );
+      const byId = new Map(groups.rows.map((row) => [row.id, row]));
+
+      for (const status of ['needs_human', 'investigated'] as const) {
+        expect(byId.get(groupIds.get(status)!)).toMatchObject({
+          status: 'resolved',
+          resolved_at: expect.any(Date),
+          resolved_reason: 'auto_resolved',
+          resolved_in_release: 'release-new',
+        });
+      }
+      for (const status of statuses.slice(2)) {
+        expect(byId.get(groupIds.get(status)!)?.status).toBe(status);
+      }
+      expect(byId.get(recent.rows[0]!.id)?.status).toBe('needs_human');
     });
   });
 
