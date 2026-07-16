@@ -453,13 +453,23 @@ func (q *Queries) ReleaseChunkReservation(ctx context.Context, sessionID, projec
 	return nil
 }
 
-// CloseIdleSessions marks recording sessions with no recent chunk as closed.
+// CloseIdleSessions marks recording sessions with no recent chunk as closed
+// and enqueues one session_analysis job per closed session — the friction
+// detection producer (issue #56, design: "session close → session_analysis
+// job"). One statement, so a close is never observed without its job. The
+// recording→closed transition happens exactly once per session, which makes
+// the enqueue naturally idempotent.
 func (q *Queries) CloseIdleSessions(ctx context.Context, idleMinutes int) (int64, error) {
 	tag, err := q.pool.Exec(ctx,
-		`UPDATE sessions
-		    SET status = 'closed'
-		  WHERE status = 'recording'
-		    AND COALESCE(last_chunk_at, started_at) < now() - make_interval(mins => $1)`,
+		`WITH closed AS (
+		   UPDATE sessions
+		      SET status = 'closed'
+		    WHERE status = 'recording'
+		      AND COALESCE(last_chunk_at, started_at) < now() - make_interval(mins => $1)
+		    RETURNING id, project_id
+		 )
+		 INSERT INTO error_group_jobs (project_id, job_type, session_id)
+		 SELECT project_id, 'session_analysis', id FROM closed`,
 		idleMinutes,
 	)
 	if err != nil {

@@ -21,6 +21,8 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `REPLAY_STORE_ACCESS_KEY` / `REPLAY_STORE_SECRET_KEY` | for replays | Storage credentials |
 | `REPLAY_STORE_BUCKET` / `REPLAY_STORE_REGION` | for replays | Bucket and region |
 | `INTERNAL_READ_TOKEN` | for worker replay evidence | Shared secret guarding worker-to-ingestion chunk reads. Unset disables the internal endpoint. |
+| `SESSION_IDLE_CLOSE_MINUTES` | no (30) | Idle minutes before a recording session closes and its `session_analysis` job is enqueued (friction detection producer) |
+| `RETENTION_SWEEP_INTERVAL_SECONDS` | no (3600) | How often the retention sweeper runs (session close + expiry pass) |
 | `VERSION` | no | Reported by `/health` |
 
 Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in its test code, not runtime configuration.
