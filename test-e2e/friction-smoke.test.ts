@@ -92,11 +92,11 @@ describe.skipIf(hasLLMKey || !keylessWorkerRunning || !playwrightAvailable)(
         await pollScrubbedChunk(sessionId, 120_000);
 
         await insertSessionAnalysisJob(tenant.projectId, sessionId);
-        const status = await pollSessionStatus(
-          sessionId,
-          ['analyzed', 'analysis_failed'],
-          90_000
-        );
+        // Poll for 'analyzed' only: on transient faults the worker writes
+        // 'analysis_failed' and rethrows, so the job retries and may still
+        // succeed. A genuine failure surfaces as a poll timeout that names
+        // the stuck status.
+        const status = await pollSessionStatus(sessionId, ['analyzed'], 90_000);
         expect(status).toBe('analyzed');
 
         const signals = await getActiveFrictionSignals(sessionId);
