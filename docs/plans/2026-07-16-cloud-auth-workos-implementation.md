@@ -6,7 +6,7 @@
 
 **Architecture:** A pluggable `AuthProvider` interface (OSS = GitHub/password, cloud = WorkOS) chosen at boot by explicit `AUTH_PROVIDER`. Local Postgres stays the source of truth; WorkOS is identity-only. Active org is per-device session state carried in the JWT and pinned on the refresh token. Multi-org tables ship everywhere but are written/read only on the cloud path ("ship-but-gate").
 
-**Tech Stack:** Go 1.24, chi, pgx/v5; hand-rolled HS256 JWT (`packages/ingestion/auth`); WorkOS official SDK `github.com/workos/workos-go`; Vue 3 dashboard.
+**Tech Stack:** Go 1.25 (`go.mod`), chi, pgx/v5; hand-rolled HS256 JWT (`packages/ingestion/auth`); WorkOS official SDK `github.com/workos/workos-go/v9` (semantic-import versioned); Vue 3 dashboard.
 
 **Design doc:** `docs/plans/2026-07-16-cloud-auth-workos-design.md`
 
@@ -160,45 +160,62 @@ git add db/queries.go db/auth_identities_test.go
 git commit -m "feat(db): identity upsert + lookup queries"
 ```
 
-### Task 1.3: GitHub login writes/reads `auth_identities`
+### Task 1.3: GitHub login resolves identity-first, then writes it
 
-Wire the existing GitHub provisioning to also write an identity row and to resolve by identity first. Keep `github_id` writes as-is (fallback during rollout).
+Wire the existing GitHub provisioning to resolve **by identity first** (then
+github_id, then email, then create), and to write the identity row. Keep
+`github_id` writes as-is (fallback during rollout).
 
 **Files:**
 - Modify: `handler/github_oauth.go:133-176` (the upsert block)
-- Test: `handler/github_oauth_test.go` (add a case)
+- Test: `handler/github_oauth_test.go` (add cases)
 
-**Step 1: Write the failing test** — after a fresh GitHub login, an `auth_identities` row exists for `('github', <githubID>)` resolving to the created user. Model it on the existing tests in `handler/github_oauth_test.go` (reuse their callback harness). Assert:
-```go
-gotUserID, err := q.GetUserIDByIdentity(ctx, "github", strconv.FormatInt(ghID, 10))
-if err != nil || gotUserID == "" {
-	t.Fatalf("expected github identity row, got id=%q err=%v", gotUserID, err)
-}
-```
+**Step 1: Write the failing tests**
+- After a fresh GitHub login, an `auth_identities` row exists for
+  `('github', <githubID>)` resolving to the created user:
+  ```go
+  gotUserID, err := q.GetUserIDByIdentity(ctx, "github", strconv.FormatInt(ghID, 10))
+  if err != nil || gotUserID == "" {
+  	t.Fatalf("expected github identity row, got id=%q err=%v", gotUserID, err)
+  }
+  ```
+- **Identity-first resolution:** given an existing `auth_identities` row for
+  `('github', X)` → user U, a login with GitHub id X resolves to U **without**
+  consulting `github_id`/email (assert the same user id, no new user created).
 
 **Step 2: Run to verify it fails**
 
 Run: `go test ./handler -run TestGitHub -v`
-Expected: FAIL (no identity row written yet).
+Expected: FAIL (identity-first branch absent; no identity row written).
 
-**Step 3: Implement** — in the three provisioning branches (existing-github-user, linked, new-user) of `handler/github_oauth.go`, after `user` is resolved, add:
-```go
-if err := d.Queries.UpsertIdentity(r.Context(), user.ID, "github", strconv.FormatInt(ghUser.ID, 10)); err != nil {
-	slog.Error("upsert github identity failed", "error", err, "user_id", user.ID)
-	// non-fatal during rollout: github_id column remains the fallback
-}
-```
+**Step 3: Implement**
+- **Resolution order** at the top of the upsert block: first
+  `GetUserIDByIdentity(ctx, "github", <id>)`; if found, load that user and skip
+  the github_id/email/create branches. Otherwise fall through to today's logic.
+- After `user` is resolved in every branch, write the identity:
+  ```go
+  if err := d.Queries.UpsertIdentity(r.Context(), user.ID, "github", strconv.FormatInt(ghUser.ID, 10)); err != nil {
+  	slog.Error("upsert github identity failed", "error", err, "user_id", user.ID)
+  	// non-fatal during rollout: github_id column remains the fallback
+  }
+  ```
+- **Conflict validation** (in `UpsertIdentity` / a companion read): `ON CONFLICT
+  DO NOTHING` must not silently pass when `(provider, subject)` already maps to a
+  **different** user. After upsert, re-read via `GetUserIDByIdentity` and, if it
+  resolves to a different user than expected, return an error rather than
+  proceeding. Add a test for this.
+
 (`strconv` is already imported in this file.)
 
 **Step 4: Run to verify it passes**
 
-Run: `go test ./handler -run TestGitHub -v`
+Run: `go test ./handler ./db -run 'TestGitHub|Identity' -v`
 Expected: PASS.
 
 **Step 5: Commit**
 ```bash
-git add handler/github_oauth.go handler/github_oauth_test.go
-git commit -m "feat(auth): github login writes auth_identities row"
+git add handler/github_oauth.go handler/github_oauth_test.go db/queries.go db/auth_identities_test.go
+git commit -m "feat(auth): github login resolves identity-first, writes + validates identity"
 ```
 
 ---
@@ -237,48 +254,56 @@ git add handler/read_api_test.go
 git commit -m "test(auth): lock SDK key cannot access sibling project"
 ```
 
-### Task 2.2: Extract a `RequireProjectAccess` middleware wrapping the existing helper
+### Task 2.2: Extract a `checkProjectAccess` core (safe, lands now)
+
+The land-now deliverable is the **extraction**, not a router change. Project
+routes are registered individually with differing auth (`AuthenticateSession` vs
+`AuthenticateSessionOrSDK`, `routes.go:95+`), so a parent middleware group risks
+running before route auth and doubling session-path DB reads — that is deferred to
+Task 2.3.
 
 **Files:**
-- Modify: `handler/auth.go` (add middleware), `handler/routes.go` (apply on `/projects/{projectID}/...` groups)
+- Modify: `handler/read_api.go` (factor `verifyProjectAccess`)
 - Test: `handler/auth_middleware_test.go` (add)
 
-**Step 1: Write the failing test** — a request through `RequireProjectAccess` with a mismatched SDK project returns 403; with a matching SDK project passes; with a session whose org owns the project passes; with a session whose org does not own it returns 403. Reuse the branch logic already proven in `verifyProjectAccess`.
+**Step 1: Write the failing test** — a table test over `checkProjectAccess`:
+mismatched SDK project → not-ok/403; matching SDK project → ok; session org owns
+project → ok; session org does not own → not-ok/403. Both branches unchanged from
+today.
 
 **Step 2: Run to verify it fails**
 
-Run: `go test ./handler -run TestRequireProjectAccess -v`
-Expected: FAIL (`RequireProjectAccess` undefined).
+Run: `go test ./handler -run TestCheckProjectAccess -v`
+Expected: FAIL (`checkProjectAccess` undefined).
 
-**Step 3: Implement** — factor the body of `verifyProjectAccess` into a boolean core `checkProjectAccess(ctx, projectID) (ok bool, status int, msg string)` (both branches unchanged), then:
-```go
-// RequireProjectAccess enforces the tenant boundary for {projectID} routes.
-// SDK auth: projectID must equal the authenticated project (exact isolation).
-// Session auth: the project's org must equal the active org.
-func (d *Dependencies) RequireProjectAccess(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		projectID := chi.URLParam(r, "projectID")
-		ok, status, msg := d.checkProjectAccess(r.Context(), projectID)
-		if !ok {
-			writeJSONError(w, status, msg)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-```
-Keep `verifyProjectAccess` as a thin wrapper over `checkProjectAccess` so the ~27 existing call sites stay working (DRY, no churn). Apply `RequireProjectAccess` on the `/projects/{projectID}` route groups in `routes.go` as defense-in-depth.
+**Step 3: Implement** — factor the body of `verifyProjectAccess` into a pure core
+`checkProjectAccess(ctx, projectID) (ok bool, status int, msg string)` with both
+branches unchanged, and make `verifyProjectAccess` a thin wrapper over it so all
+~27 call sites keep working (DRY, no behavior change, no extra DB reads).
 
 **Step 4: Run to verify it passes**
 
-Run: `go test ./handler -run 'TestRequireProjectAccess|TestSDKKeyCannotAccessSiblingProject' -v`
-Expected: PASS (both, including the Phase-2.1 guard).
+Run: `go test ./handler -run 'TestCheckProjectAccess|TestSDKKeyCannotAccessSiblingProject' -v`
+Expected: PASS (including the Phase-2.1 guard).
 
 **Step 5: Commit**
 ```bash
-git add handler/auth.go handler/routes.go handler/auth_middleware_test.go
-git commit -m "refactor(auth): centralize project-access check as middleware, both branches intact"
+git add handler/read_api.go handler/auth_middleware_test.go
+git commit -m "refactor(auth): extract checkProjectAccess core, both branches intact"
 ```
+
+### Task 2.3 (DEFERRED — do NOT land with Phase 2): promote to `RequireProjectAccess` middleware
+
+Only do this after deciding it's worth the churn. Requirements that make it safe:
+- **Ordering:** apply as `r.With(Authenticate*, RequireProjectAccess)` per route —
+  never as a parent group that could precede route-level authentication.
+- **Real-router tests:** exercise the actual chi router for both the session path
+  and the SDK path (not just the middleware in isolation), proving auth runs first.
+- **No double reads:** on each route migrated to the middleware, **remove** the
+  now-redundant in-handler `verifyProjectAccess` call so the session path does not
+  run its `GetProjectByOrgID` query twice.
+
+This is intentionally separate so Phase 2's safe extraction can land immediately.
 
 ---
 
@@ -306,7 +331,7 @@ import (
 type stubProvider struct{}
 
 func (stubProvider) Name() string { return "stub" }
-func (stubProvider) AuthorizeURL(req auth.AuthRequest) string { return "https://idp/authorize?state=" + req.State }
+func (stubProvider) AuthorizeURL(req auth.AuthRequest) (string, error) { return "https://idp/authorize?state=" + req.State, nil }
 func (stubProvider) ExchangeCode(ctx context.Context, code string) (auth.Identity, error) {
 	return auth.Identity{Provider: "stub", ProviderSubject: "s1", Email: "a@b.com", EmailVerified: true}, nil
 }
@@ -354,7 +379,8 @@ type Identity struct {
 // only proves identity.
 type AuthProvider interface {
 	Name() string
-	AuthorizeURL(req AuthRequest) string
+	// Returns an error: AuthKit URL generation can fail per the SDK contract.
+	AuthorizeURL(req AuthRequest) (string, error)
 	ExchangeCode(ctx context.Context, code string) (Identity, error)
 	// SupportsLocalPasswordForm reports whether /oauth/authorize should render
 	// the local CLI password form (OSS) or route the CLI through the external
@@ -383,13 +409,20 @@ git commit -m "feat(auth): AuthProvider interface + Identity type"
 **Step 1: Write the failing test** — put the selection logic in a testable pure function `handler.SelectAuthProvider(cfg)` (or `auth.SelectAuthProvider`) rather than inline in `main`, and test:
 - `AUTH_PROVIDER=github` → GitHub provider, no error.
 - `AUTH_PROVIDER=workos` with empty `WORKOS_API_KEY` → error (fail closed).
-- `AUTH_PROVIDER=workos` with keys present → WorkOS provider (can be a nil-safe stub until Phase 5).
+- `AUTH_PROVIDER=workos` **until Phase 5 exists** → error "workos provider not yet supported". **Do not boot with a stub** in a production-looking mode. (Flip this to construct the real provider in Task 5.1.)
 - unset/empty `AUTH_PROVIDER` → defaults to `github` (OSS default), no error.
 ```go
 func TestSelectAuthProviderFailsClosed(t *testing.T) {
 	_, err := SelectAuthProvider(AuthConfig{Provider: "workos"}) // no keys
 	if err == nil {
 		t.Fatal("expected error when AUTH_PROVIDER=workos but WorkOS keys missing")
+	}
+}
+
+func TestSelectAuthProviderWorkosUnsupportedUntilPhase5(t *testing.T) {
+	_, err := SelectAuthProvider(AuthConfig{Provider: "workos", APIKey: "sk_x", ClientID: "c_x"})
+	if err == nil {
+		t.Fatal("expected workos to be rejected as unsupported until the real provider exists")
 	}
 }
 ```
@@ -412,14 +445,14 @@ git add main.go *_test.go
 git commit -m "feat(auth): explicit AUTH_PROVIDER selection, fail-closed on partial config"
 ```
 
-### Task 3.3: `/auth/login` route with `/auth/github` compatibility redirect
+### Task 3.3: `/auth/login` route with `/auth/github` + `/auth/github/callback` aliases
 
 **Files:**
-- Modify: `handler/routes.go` (add `/auth/login`; keep `/auth/github` as a 302 to `/auth/login`)
+- Modify: `handler/routes.go` (add `/auth/login`; keep `/auth/github` as a 302 to `/auth/login`; **keep `/auth/github/callback` as an alias to the callback handler** — existing deployments at `routes.go:45` are configured for it)
 - Modify: `packages/dashboard/src/views/Login.vue:3` (`/auth/github` → `/auth/login`)
 - Test: `handler/routes` test or `handler/github_oauth_test.go`
 
-**Step 1: Write the failing test** — `GET /auth/github` returns 302 to `/auth/login`; `GET /auth/login` starts the provider flow (302 to the provider authorize URL).
+**Step 1: Write the failing test** — `GET /auth/github` returns 302 to `/auth/login`; `GET /auth/login` starts the provider flow (302 to the provider authorize URL); `GET /auth/github/callback` still routes to the callback handler (alias preserved).
 
 **Step 2: Run to verify it fails** → **Step 3: Implement** → **Step 4: Run to verify it passes.**
 
@@ -472,7 +505,7 @@ ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(
 CREATE TABLE IF NOT EXISTS org_invitations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-  email TEXT NOT NULL,
+  email TEXT NOT NULL,               -- store normalized (lowercased, trimmed)
   role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
   invited_by UUID NOT NULL REFERENCES users(id),
   token_hash TEXT NOT NULL UNIQUE,
@@ -481,10 +514,21 @@ CREATE TABLE IF NOT EXISTS org_invitations (
   accepted_at TIMESTAMPTZ,
   revoked_at TIMESTAMPTZ
 );
+-- Case-insensitive outstanding-invite uniqueness (email is a normalization contract).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invitations_outstanding
-  ON org_invitations(org_id, email)
+  ON org_invitations(org_id, lower(email))
   WHERE accepted_at IS NULL AND revoked_at IS NULL;
+
+-- Case-insensitive user email uniqueness. Additive; on a legacy DB that already
+-- holds two rows differing only by case this CREATE will fail — normalize those
+-- rows first. Cloud is greenfield, so it applies cleanly there.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_lower_email ON users(lower(email));
 ```
+
+> Application contract: normalize (`strings.ToLower(strings.TrimSpace(email))`)
+> on **every** email write and lookup — `GetUserByEmail`, identity linking, and
+> invitation create/accept. Add tests for mixed-case linking and mixed-case
+> invitation acceptance.
 
 **Step 2: Verify apply + idempotency**
 
@@ -571,7 +615,9 @@ Expected: green. OSS behavior unchanged (no memberships written; refresh falls b
 
 ## PHASE 5 — WorkOS provider, transactional cloud provisioning, membership re-check, switch-org (cloud only)
 
-> **PREREQUISITE (human):** Create the WorkOS project, enable GitHub + Google + email in AuthKit, set the redirect URI to the configured `/auth/callback` origin, and provide `WORKOS_API_KEY` / `WORKOS_CLIENT_ID` in the cloud environment. Verify exact SDK call shapes against `github.com/workos/workos-go` (the tasks below name the operations; confirm signatures at implementation time — do not guess).
+> **PREREQUISITE (human):** Create the WorkOS project, enable GitHub + Google + email in AuthKit, set the redirect URI to the configured `/auth/callback` origin, and provide `WORKOS_API_KEY` / `WORKOS_CLIENT_ID` in the cloud environment. Verify exact SDK call shapes against **`github.com/workos/workos-go/v9`** (semantic-import versioned; `go get github.com/workos/workos-go/v9@latest`). The tasks below name the operations; confirm signatures at implementation time — do not guess. Note `AuthorizeURL` returns `(string, error)`.
+>
+> **Order within Phase 5:** do Task **5.6 (callback hardening) BEFORE 5.5 and before flipping `AUTH_PROVIDER=workos` on in Task 5.1's boot path.** Hardening precedes exposure.
 
 ### Task 5.1: `WorkOSProvider` implementing `AuthProvider`
 
@@ -597,37 +643,48 @@ git commit -m "feat(auth): WorkOSProvider (AuthKit) implementing AuthProvider"
 **Step 1: Write the failing tests** (the concurrency/idempotency guarantees the reviewer required):
 - New identity → creates user + personal org + one `owner` membership + identity row, all present.
 - Repeated/replayed callback with the same identity → still exactly one user, one org, one membership (idempotent).
-- Existing verified-email user, new provider identity → links identity, no new org.
+- Existing verified-email user, new provider identity → links identity, no new org, **and an `owner` membership is ensured** for that user (defensive; see below).
 - **Unverified email cannot link** — `EmailVerified:false` against an existing email must NOT link to the existing account (assert no membership/identity is attached to the pre-existing user).
+- **Genuinely concurrent** first logins for the same `(provider, subject)` → exactly one user + one org + one membership. The test must launch two real transactions concurrently (two goroutines each with their own `pool.BeginTx`), not a sequential replay.
+- Identity `(provider, subject)` already owned by a **different** user → error, not a silent link.
 
 **Step 2-4:** implement `ProvisionFromIdentity(ctx, tx, identity) (userID, orgID string, err error)`:
-- `SELECT ... FOR UPDATE` / `ON CONFLICT DO NOTHING` on `auth_identities` so concurrent first-logins converge to one row.
-- Link by email only when `identity.EmailVerified`.
+- **Concurrency:** `SELECT ... FOR UPDATE` cannot lock a not-yet-existing identity row, so two first-logins can both create user+org before one loses the unique conflict. Use **either** a transaction advisory lock keyed by the subject —
+  `pg_advisory_xact_lock(hashtext($provider || ':' || $subject))` at the top of the tx — **or** insert the identity first and, on unique-violation, roll back and retry the resolve path (the winner's row now exists).
+- After resolving/inserting the identity, **re-read** the owner via `GetUserIDByIdentity`; if it maps to a **different** user than expected, return an error (do not treat `ON CONFLICT DO NOTHING` as success-by-default).
+- Link by email only when `identity.EmailVerified` — and normalize the email first.
 - On new user (cloud): create org, user, `owner` membership, identity — same tx.
+- On link to an existing user: **ensure an `owner` membership** exists for that user's `users.org_id` via idempotent `ON CONFLICT DO NOTHING` (insurance — cloud is greenfield so no user should lack a membership, but this guarantees the Task 5.3 re-check can't lock them out).
 Wrap the whole thing in `pool.BeginTx`; on any error, roll back (no orphan orgs).
 
 **Step 5: Commit**
 ```bash
 git add db/queries.go handler/*.go db/provisioning_test.go
-git commit -m "feat(auth): transactional cloud provisioning (idempotent, verified-email gate)"
+git commit -m "feat(auth): transactional cloud provisioning (concurrent-safe, verified-email gate)"
 ```
 
-### Task 5.3: Session middleware loads current role from membership (cloud)
+### Task 5.3: Role authz surface — `ctxRole` / `RoleFromCtx` / `RequireRole` + membership re-check (cloud)
+
+Defines the role authorization primitives (referenced by 5.4/6.3) **and** the
+membership re-check that populates them from the DB. The JWT `Role` claim, if
+present, is informational only and is **always overwritten** here.
 
 **Files:**
-- Modify: `handler/auth.go` — a cloud-only decorator (or a branch guarded by provider mode) that, after `AuthenticateSession`, loads the **current** membership for `(ctxUserID, ctxOrgID)`, rejects if absent (member removed), and puts the current `role` in context (not the JWT role).
+- Modify: `handler/auth.go` — add `ctxRole` context key + `RoleFromCtx`; add a cloud-only middleware `RequireMembership` that, after `AuthenticateSession`, loads the **current** membership for `(ctxUserID, ctxOrgID)`, rejects if absent (member removed), and puts the current `role` in context (never the JWT role); add `RequireRole(role string)` that reads `RoleFromCtx` and applies the hierarchy (`auth.RoleSatisfies`, owner⊇admin⊇member).
 - Test: `handler/auth_middleware_test.go`
 
 **Step 1: Write the failing tests:**
+- `RoleFromCtx` returns the role set by `RequireMembership`, not the JWT role (set a JWT with `Role:"admin"` but a membership row of `member` → `RequireRole("admin")` rejects).
 - Membership removed → next request 401/403 within the access-token TTL (not after expiry).
-- Role downgraded admin→member → `RequireRole("admin")` now rejects immediately.
+- Role downgraded admin→member → `RequireRole("admin")` rejects immediately.
+- **Middleware order:** a route wired `AuthenticateSession → RequireMembership → RequireRole("admin")` runs authentication and membership loading before the role check (test that a request missing the session is rejected by auth first, and that `RequireRole` never sees an unauthenticated context).
 
-**Step 2-4:** implement; short in-process cache acceptable but must honor removal/downgrade quickly (keep TTL ≤ a few seconds, or skip cache initially — measure before optimizing).
+**Step 2-4:** implement. Short in-process cache acceptable but must honor removal/downgrade quickly (keep TTL ≤ a few seconds, or skip cache initially — measure before optimizing).
 
 **Step 5: Commit**
 ```bash
 git add handler/auth.go handler/auth_middleware_test.go
-git commit -m "feat(auth): load current role from membership row, not stale JWT"
+git commit -m "feat(auth): RequireMembership/RequireRole; current role from DB, not JWT"
 ```
 
 ### Task 5.4: `POST /auth/switch-org`
@@ -639,25 +696,30 @@ git commit -m "feat(auth): load current role from membership row, not stale JWT"
 **Step 1: Write the failing tests:**
 - Switch to an org the user is a member of → new JWT + new refresh token, refresh token's `org_id` = target; cookies rotated; `users.org_id` unchanged.
 - Switch to an org the user is NOT a member of → 403, no token minted.
-- **Refresh after switch preserves the switched org** (integration: switch, then `/auth/refresh`, assert JWT org = switched org).
+- **Old refresh token stops working after the switch** — capture the pre-switch refresh token, switch, then call `/auth/refresh` with the OLD token → 401 (it was consumed). This is the P0 the review caught: switching must *rotate*, not merely add a token.
+- **Refresh after switch preserves the switched org** (integration: switch, then `/auth/refresh` with the NEW token, assert JWT org = switched org).
 
-**Step 2-4:** implement: verify membership, then reissue via `issueTokenPairCookie` (cookie) / `issueTokenPair` (CLI) with the target `orgID`. Do not touch `users.org_id`.
+**Step 2-4:** implement. Switching must **rotate** the session:
+1. Require the **current** refresh token (cookie for browser, request field for CLI). Reject if absent.
+2. Verify membership for the target org.
+3. **`ConsumeRefreshToken`** the current token atomically (reusing the family), then issue the replacement **in the same family** stamped with the target `orgID`, plus a fresh JWT — do not just call `issueTokenPair*` (which only adds a token and leaves the old one live). Rotate both cookies. Do not touch `users.org_id`.
 
 **Step 5: Commit**
 ```bash
 git add handler/auth_handlers.go handler/routes.go handler/switch_org_test.go
-git commit -m "feat(auth): POST /auth/switch-org rotates tokens, pins active org"
+git commit -m "feat(auth): POST /auth/switch-org rotates (consumes+reissues) tokens, pins active org"
 ```
 
-### Task 5.5: Cloud CLI login through AuthKit
+### Task 5.5: Cloud CLI login through AuthKit (do AFTER Task 5.6 hardening)
 
 **Files:**
-- Modify: `handler/auth_handlers.go` — when `provider.SupportsLocalPasswordForm()` is false, `/oauth/authorize` skips the password form, stashes the PKCE request, and redirects through AuthKit; the `/auth/callback` handler, when it detects a pending CLI PKCE request, issues the existing local single-use auth code back to the localhost redirect URI.
+- Create: `db/migrations/011_cli_pkce_requests.sql` — a single-use, expiring record for the pending CLI PKCE request (survives the AuthKit round-trip across ingestion replicas; **must not** be process-memory).
+- Modify: `handler/auth_handlers.go` — when `provider.SupportsLocalPasswordForm()` is false, `/oauth/authorize` skips the password form, **persists the PKCE request as a single-use DB record** (client_id, redirect_uri, code_challenge, expiry, keyed to the callback state), and redirects through AuthKit; the callback handler, when it finds a pending CLI PKCE record, consumes it exactly once and issues the existing local single-use auth code back to the localhost redirect URI.
 - Test: `handler/cli_cloud_login_test.go`
 
-**Step 1: Write the failing test** — cloud CLI flow for a WorkOS-only user (no password): `/oauth/authorize` with PKCE params → redirect to AuthKit (not the HTML form) → simulated AuthKit callback → local auth code issued to the localhost `redirect_uri` → `/oauth/token` exchanges it for a JWT. Assert no password form is ever rendered and the localhost redirect allowlist still holds.
+**Step 1: Write the failing test** — cloud CLI flow for a WorkOS-only user (no password): `/oauth/authorize` with PKCE params → redirect to AuthKit (not the HTML form) → simulated AuthKit callback → local auth code issued to the localhost `redirect_uri` → `/oauth/token` exchanges it for a JWT. Assert: no password form is ever rendered; the localhost redirect allowlist still holds; the pending PKCE record is **single-use** (a replayed callback with the same state is rejected).
 
-**Step 2-4:** implement the provider-branched `/oauth/authorize` and the callback bridge. Preserve `isAllowedRedirectURI` (localhost-only) for the final CLI redirect. OSS path (password form) unchanged.
+**Step 2-4:** implement the provider-branched `/oauth/authorize` and the callback bridge over the DB-backed pending record. Preserve `isAllowedRedirectURI` (localhost-only) for the final CLI redirect. OSS path (password form) unchanged.
 
 **Step 5: Commit**
 ```bash
@@ -665,7 +727,7 @@ git add handler/auth_handlers.go handler/cli_cloud_login_test.go
 git commit -m "feat(auth): cloud CLI login routes PKCE through AuthKit"
 ```
 
-### Task 5.6: Callback hardening
+### Task 5.6: Callback hardening — DO THIS FIRST IN PHASE 5 (before 5.5 and before enabling WorkOS)
 
 **Files:**
 - Modify: the `/auth/callback` handler
@@ -703,9 +765,11 @@ Verify: `(cd packages/dashboard && pnpm build && pnpm test)`. Commit.
 ### Task 6.3: Invitations UI (create, list, accept)
 
 **Files:**
-- Backend: invitation create/list/revoke/accept handlers + routes (session-authed, `RequireRole("admin")`), backed by the Phase-4 queries; enforce single-use + email-bound acceptance transactionally.
-- Frontend: an invitations panel; an `/invite/accept?token=…` view.
-- Tests: Go handler tests (single-use, email-bound, expired rejected) + dashboard Vitest.
+- Backend routes with **split auth** (the review's P0 — an invitee is not an admin, or even a member, yet):
+  - `create` / `list` / `revoke` → `AuthenticateSession → RequireMembership → RequireRole("admin")`.
+  - `accept` → `AuthenticateSession` only (any authenticated user). Acceptance verifies, in the transaction: token single-use + **not expired** + the accepting user's **verified, normalized** email equals the (normalized) invite email; then inserts the membership and stamps `accepted_at`.
+- Frontend: an invitations panel (admin); an `/invite/accept?token=…` view (any signed-in user).
+- Tests: Go handler tests — acceptance is single-use, email-bound (normalized/mixed-case), expired rejected, and **acceptance does NOT require admin** (a non-member with a matching verified email can accept); create/list/revoke reject non-admins. Plus dashboard Vitest.
 
 TDD per task; commit each.
 
@@ -726,15 +790,19 @@ Then the live smoke: apply migrations, `scripts/seed-e2e.sql`, log in via OSS Gi
 ## Test inventory (maps to design §7 — must all exist by end of Phase 5/6)
 
 - [ ] Refresh after an org switch preserves the selected org (Task 5.4)
+- [ ] **Old refresh token stops working after an org switch** (Task 5.4)
 - [ ] Two sessions for one user hold different active orgs (Task 5.4 / 4.2)
 - [ ] Membership removal + role downgrade take effect immediately (Task 5.3)
+- [ ] **`RequireRole` uses DB role, not the JWT role; middleware-order enforced** (Task 5.3)
 - [ ] SDK key cannot access a sibling project in the same org (Task 2.1)
-- [ ] Cloud CLI login works for a WorkOS-only user (Task 5.5)
+- [ ] **Identity-first resolution; conflict on a different owner errors** (Task 1.3)
+- [ ] Cloud CLI login works for a WorkOS-only user; pending PKCE record is single-use (Task 5.5)
 - [ ] Unverified email cannot link an existing account (Task 5.2)
-- [ ] Concurrent / replayed callbacks create exactly one identity + membership (Task 5.2)
-- [ ] Invitation acceptance is single-use and email-bound (Task 6.3)
+- [ ] **Mixed-case** email linking + invitation acceptance resolve correctly (Tasks 5.2 / 6.3)
+- [ ] **Genuinely concurrent** first logins create exactly one identity + org + membership (Task 5.2)
+- [ ] Invitation acceptance is single-use, email-bound, and **not admin-gated** (Task 6.3)
 - [ ] Migrations run on clean + representative DBs and reapply idempotently (Tasks 1.1, 4.1 via harness)
-- [ ] Partial WorkOS config fails boot closed (Task 3.2)
+- [ ] Partial WorkOS config fails boot closed; `AUTH_PROVIDER=workos` rejected pre-Phase-5 (Task 3.2)
 
 ## Rollback notes
 

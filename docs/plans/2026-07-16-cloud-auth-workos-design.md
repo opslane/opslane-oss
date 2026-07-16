@@ -144,8 +144,9 @@ single `AuthorizeURL(state)`:
 type AuthProvider interface {
     Name() string // "github" | "workos"
 
-    // Browser (dashboard) login.
-    AuthorizeURL(req AuthRequest) string
+    // Browser (dashboard) login. Returns an error because AuthKit URL
+    // generation can fail (SDK contract) — do not swallow it.
+    AuthorizeURL(req AuthRequest) (string, error)
     ExchangeCode(ctx context.Context, code string) (Identity, error)
 
     // Whether this provider serves the local CLI password form (OSS) or must
@@ -170,13 +171,25 @@ type Identity struct {
 
 - `GithubProvider` wraps today's `github_oauth.go`. OSS default. Serves the local
   CLI password form.
-- `WorkOSProvider` wraps the official Go SDK **`github.com/workos/workos-go`**.
-  Enabled by config. Does not serve a local password form.
+- `WorkOSProvider` wraps the official Go SDK **`github.com/workos/workos-go/v9`**
+  (semantic-import versioned; the module is Go 1.25). Enabled by config. Does not
+  serve a local password form.
 
 Provider selection in `main.go` is **explicit and fail-closed**:
 `AUTH_PROVIDER=github|workos`. If `workos` is selected but `WORKOS_API_KEY` /
 `WORKOS_CLIENT_ID` are missing, **boot fails** — no silent fallback. Inferring the
 mode from the mere presence of secrets is rejected (accidental mode changes).
+Until the real `WorkOSProvider` exists (Phase 5), `AUTH_PROVIDER=workos` is
+**rejected as unsupported** — never boot with a stub provider in a mode that
+looks production-ready.
+
+**Email normalization is a DB-level contract, not a per-call convenience.**
+`users.email` and invitation email are today case-sensitive
+(`GetUserByEmail` is `WHERE email = $1`). Normalize (lowercase + trim) on **every**
+write and lookup, and back it with `lower(email)` uniqueness where feasible
+(a functional unique index on `users(lower(email))`, and the invitation
+outstanding index keyed on `lower(email)`). Mixed-case linking and invitation
+acceptance must be tested.
 
 Browser login flow (cloud):
 1. `Login.vue` hits `/auth/login`. `/auth/github` is kept as a **compatibility
@@ -184,10 +197,12 @@ Browser login flow (cloud):
    rename plus alias).
 2. Redirect to `provider.AuthorizeURL(...)` — AuthKit's hosted page for WorkOS
    (GitHub/Google/email), HMAC-signed state cookie as today.
-3. WorkOS redirects to `/auth/callback`. The callback handler must handle:
-   provider **denial/error** query params, **code replay** (single-use code),
-   the **state-cookie path** scoping, and an **allowlisted configured redirect
-   origin** (never trust the request Host header).
+3. WorkOS redirects to `/auth/callback` (keep `/auth/github/callback` as an
+   **alias** — existing deployments are configured for it, `routes.go:45`). The
+   callback handler must handle: provider **denial/error** query params, **code
+   replay** (single-use code), the **state-cookie path** scoping, and an
+   **allowlisted configured redirect origin** (never trust the request Host
+   header). This hardening ships **before** WorkOS is enabled, not after.
 4. `provider.ExchangeCode` → `Identity`.
 5. **Provision transactionally** (see §5).
 6. Mint JWT + refresh (§3), set the existing `__opslane_*` cookies.
@@ -210,13 +225,25 @@ type Claims struct {
 }
 ```
 OSS: `OrgID` = `users.org_id`, `Role` unused (OSS keeps `ADMIN_EMAILS` for the
-operator surface). Cloud: `OrgID` = active org, `Role` = current membership role.
+operator surface). Cloud: `OrgID` = active org.
+
+**`Role` in the JWT is informational only and is never trusted for authorization.**
+Every authorization decision reads the role from context, which the cloud
+membership re-check (below) sets from the **current** membership row on each
+request. A stale JWT role from before a downgrade must never grant access. If
+this informational field adds confusion in review, drop it from `Claims` — the
+DB is the sole authority either way.
 
 ### Org switching (cloud-only) — `POST /auth/switch-org {org_id}`
-1. Verify a `memberships` row exists for `(ctxUserID, org_id)`; reject otherwise.
-2. Mint a **fresh JWT and a fresh refresh token**, the refresh token stamped with
-   `org_id`. Rotate both cookies. No WorkOS round-trip. `users.org_id` is **not**
-   touched.
+Switching must **rotate** the session, not merely add a second live token.
+1. Require the **current** refresh token (cookie for browser, request field for
+   CLI) and verify a `memberships` row exists for `(ctxUserID, org_id)`; reject
+   otherwise.
+2. **Atomically consume** the current refresh token (`ConsumeRefreshToken`) and
+   issue the replacement **in the same family**, stamped with the target `org_id`,
+   plus a fresh JWT. Rotate both cookies. The **old refresh token must stop
+   working** — otherwise it could restore the previous org. No WorkOS round-trip.
+   `users.org_id` is **not** touched (two devices may hold different active orgs).
 
 ### Refresh (`auth_handlers.go`)
 Read the active org from `refresh_tokens.org_id`; fall back to `users.org_id`
@@ -235,14 +262,27 @@ preserved**:
 - **Session auth**: the project's org must equal the active `ctxOrgID`
   (`GetProjectByOrgID`).
 
-Centralization goal: promote this into middleware / a single enforced chokepoint
-so a new handler cannot forget to call it — **keeping both branches intact**.
+Centralization goal: make the check a single enforced chokepoint so a new handler
+cannot forget it — **keeping both branches intact**. But mind the routing:
+project routes are registered individually, some with `AuthenticateSession` and
+some with `AuthenticateSessionOrSDK` (`routes.go:95+`). A parent middleware group
+could run **before** route-level authentication. So the contract is:
+- Land now (safe): factor a `checkProjectAccess` core (both branches) and keep
+  `verifyProjectAccess` as its wrapper — a pure refactor, no ordering risk, no
+  extra DB reads.
+- Promoting to `RequireProjectAccess` middleware is a **separate, careful** task:
+  enforce ordering `Authenticate* → RequireProjectAccess`, add real-router tests
+  for both session and SDK paths, and **remove the now-redundant in-handler check**
+  on migrated routes so the session path does not double its DB reads.
 
 Cloud adds a **membership re-check** in the session path: on each request (short
 cache acceptable) load the **current** membership row and put its **current role**
 into context — do **not** trust a stale JWT role. Otherwise an admin→member
 downgrade or a membership removal stays ineffective until token expiry. OSS skips
-this (no memberships, single org).
+this (no memberships, single org). This is also where `ctxRole`, `RoleFromCtx`,
+and `RequireRole(role)` are defined (see §3 claims: role comes from the DB, never
+the JWT). Middleware-order tests must prove authentication and membership loading
+run before any role check.
 
 CLI PKCE token exchange and SDK key auth are otherwise untouched.
 
@@ -260,6 +300,12 @@ all be true. Resolution:
   server issues the **existing local single-use authorization code** back to the
   CLI's localhost callback. The CLI's `/oauth/token` exchange is unchanged.
 
+The pending CLI PKCE request must survive the AuthKit round-trip **across
+ingestion replicas** — do not stash it in process memory. Persist it as a
+**single-use, expiring DB record** (or an authenticated/encrypted cookie carrying
+the request), keyed to the callback, consumed exactly once. The localhost-only
+redirect allowlist (`isAllowedRedirectURI`) still gates the final CLI redirect.
+
 This is why the provider interface carries `SupportsLocalPasswordForm()` and the
 flow is provider-driven rather than a single `AuthorizeURL(state)`.
 
@@ -271,8 +317,33 @@ membership for cloud) in **one transaction**. Concurrent first logins and repeat
 - Resolve by `auth_identities(provider, subject)` first (idempotent on replay).
 - Else link by **verified** email.
 - Else create user; cloud also creates a personal org + `owner` membership.
-- Invitation acceptance: within the transaction, verify single-use + email match,
-  then insert membership and stamp `accepted_at`.
+
+**Concurrency (do it right).** `SELECT ... FOR UPDATE` cannot lock a row that does
+not exist yet, so two simultaneous first-logins could each create a user+org
+before one loses the `auth_identities` unique conflict — leaving an orphan org.
+Use one of:
+- a **transaction advisory lock** keyed by `hashtext(provider || ':' || subject)`
+  taken at the top of the tx, or
+- **insert-identity-first, then on unique conflict roll back and retry** the
+  resolve path (the winner's row now exists).
+
+`ON CONFLICT DO NOTHING` on the identity insert must **not** be treated as
+success-by-default: re-read the row and validate the resolved owner; if the
+subject already belongs to a **different** user, that is an error, not a link.
+The regression test must use **genuinely concurrent transactions**, not sequential
+replay.
+
+**Defensive membership ensure (insurance, not P0).** When linking a verified
+identity to an existing user, also ensure an `owner` membership exists for that
+user's `users.org_id` (idempotent `ON CONFLICT DO NOTHING`). Cloud is greenfield
+so no user should lack a membership — this just guarantees the Phase-5 session
+re-check can never lock out a linked account.
+
+- **Invitation acceptance** runs in the transaction: verify single-use +
+  **not expired** + the accepting user's **verified, normalized** email equals the
+  (normalized) invite email, then insert membership and stamp `accepted_at`.
+  Acceptance is **not** admin-gated — the invitee is not a member yet. Only
+  create/list/revoke require `RequireRole("admin")`.
 
 WorkOS organization semantics for now: **ignored** at login. `workos_org_id` is
 populated lazily only when an org enables SSO. Directory (SCIM) sync, when built,
@@ -315,8 +386,14 @@ copy `WORKOS_API_KEY` / `WORKOS_CLIENT_ID` into cloud env only.
   `verifyProjectAccess` branches preserved).
 - Cloud CLI login works for a WorkOS-only user (no local password).
 - Unverified email cannot link an existing account.
-- Concurrent / replayed callbacks create exactly one identity and one membership.
-- Invitation acceptance is single-use and email-bound.
+- **Mixed-case** email links and invitation acceptance resolve correctly
+  (normalization contract).
+- Concurrent / replayed callbacks create exactly one identity and one membership —
+  test uses **genuinely concurrent transactions**.
+- Identity insert conflict for a subject owned by a **different** user is an error,
+  not a silent link.
+- **Old refresh token stops working after an org switch** (rotation, not addition).
+- Invitation acceptance is single-use and email-bound, and is **not** admin-gated.
 - Migrations run on clean and representative existing databases and reapply
   idempotently.
 - Partial WorkOS configuration fails boot closed (`AUTH_PROVIDER=workos` without
@@ -370,3 +447,33 @@ copy `WORKOS_API_KEY` / `WORKOS_CLIENT_ID` into cloud env only.
 - Explicit `AUTH_PROVIDER`, fail-closed; `/auth/github` alias; `workos_org_id`
   unique; invitation lifecycle fields; correct SDK path
   `github.com/workos/workos-go`; callback error/replay/state/redirect handling. ✔
+
+### Round 2 (post-implementation-plan review)
+
+- **P0** Org switch must **consume** the current refresh token and reissue in the
+  same family; the old token must stop working (was only additive). ✔
+- **P0** Invitation **acceptance** is not admin-gated; requires an authenticated
+  user whose verified/normalized email matches. Only create/list/revoke need
+  admin. ✔
+- **P1** Provisioning concurrency: advisory-lock or insert-then-conflict-retry
+  (FOR UPDATE can't lock a nonexistent row); conflict on a different owner is an
+  error; test with genuinely concurrent txns. ✔
+- **P1** Phase 1 resolves **identity-first**, then email, then create; identity
+  conflict validates the resolved owner (not silent DO-NOTHING). ✔
+- **P1** Role authz surface defined: `ctxRole` / `RoleFromCtx` / `RequireRole`;
+  JWT `Role` is informational-only and always overwritten from the DB;
+  middleware-order tests required. ✔
+- **P1** CLI PKCE pending request persisted as a single-use expiring DB record
+  (multi-replica safe); callback hardening lands **before** enabling WorkOS;
+  `/auth/github/callback` kept as an alias. ✔
+- **P1** Email normalization is a DB contract: normalize on every write/lookup,
+  `lower(email)` uniqueness where feasible, test mixed-case. ✔
+- **P2** SDK `github.com/workos/workos-go/v9`; `AuthorizeURL` returns
+  `(string, error)`; module is Go 1.25; `AUTH_PROVIDER=workos` rejected until the
+  real provider exists (no stub boot). ✔
+- **P2** `RequireProjectAccess` middleware promotion is a separate, careful task
+  (ordering `Authenticate* → RequireProjectAccess`, real-router tests, remove
+  redundant handler check to avoid double reads); Phase 2 lands only the safe
+  `checkProjectAccess` extraction + guard test. ✔
+- Defensive: ensure `owner` membership on link (insurance; no existing users at
+  launch, so not P0). ✔
