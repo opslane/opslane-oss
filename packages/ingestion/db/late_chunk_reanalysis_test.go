@@ -7,10 +7,12 @@ import (
 	"github.com/opslane/opslane/packages/ingestion/db"
 )
 
-// Batch 4 (issue #56): a chunk that lands after a session was closed and
-// analyzed must re-enqueue analysis — otherwise the SDK's flush cadence
-// silently drops late evidence forever (whole-session truth, design v4-5).
-func TestCommitChunk_LateChunkReenqueuesAnalysis(t *testing.T) {
+// Batch 4 (issue #56): a chunk that becomes READABLE after its session was
+// closed and analyzed must re-enqueue analysis — otherwise late evidence is
+// silently dropped forever (whole-session truth, design v4-5). The producer
+// fires at scrub time, not commit time: a commit-time job races the scrubber
+// and analyzes a partial session.
+func TestMarkChunkScrubbed_LateChunkReenqueuesAnalysis(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	q := db.New(pool)
@@ -64,40 +66,46 @@ func TestCommitChunk_LateChunkReenqueuesAnalysis(t *testing.T) {
 		return n
 	}
 
-	// Late chunk on an ANALYZED session re-enqueues exactly once.
+	scrub := func(sessionID string, seq int) {
+		if err := q.MarkChunkScrubbed(ctx, sessionID, proj.ID, seq, nil, nil, 100); err != nil {
+			t.Fatalf("MarkChunkScrubbed %s/%d: %v", sessionID, seq, err)
+		}
+	}
+
+	// COMMIT of a late chunk must NOT enqueue: the chunk is not readable yet,
+	// and a commit-time job races the scrubber into a partial analysis.
 	seed("late-analyzed", "analyzed", 0)
 	if err := q.CommitChunk(ctx, "late-analyzed", proj.ID, 0, 100); err != nil {
 		t.Fatalf("CommitChunk: %v", err)
 	}
-	if n := countJobs("late-analyzed"); n != 1 {
-		t.Errorf("analyzed session late chunk: jobs = %d, want 1", n)
+	if n := countJobs("late-analyzed"); n != 0 {
+		t.Errorf("commit must not enqueue (scrub does): jobs = %d, want 0", n)
 	}
 
-	// A second late chunk while a job is still pending does not duplicate.
-	seed("late-analyzed", "analyzed", 1)
-	if err := q.CommitChunk(ctx, "late-analyzed", proj.ID, 1, 100); err != nil {
-		t.Fatalf("CommitChunk seq1: %v", err)
+	// SCRUB of that late chunk re-enqueues exactly once.
+	scrub("late-analyzed", 0)
+	if n := countJobs("late-analyzed"); n != 1 {
+		t.Errorf("analyzed session late scrub: jobs = %d, want 1", n)
 	}
+
+	// A second late chunk scrubbed while a job is still pending: no duplicate.
+	seed("late-analyzed", "analyzed", 1)
+	scrub("late-analyzed", 1)
 	if n := countJobs("late-analyzed"); n != 1 {
 		t.Errorf("pending dedupe: jobs = %d, want 1", n)
 	}
 
-	// A recording session's normal chunk enqueues nothing (close will).
+	// A recording session's normal scrub enqueues nothing (close will).
 	seed("still-recording", "recording", 0)
-	if err := q.CommitChunk(ctx, "still-recording", proj.ID, 0, 100); err != nil {
-		t.Fatalf("CommitChunk recording: %v", err)
-	}
+	scrub("still-recording", 0)
 	if n := countJobs("still-recording"); n != 0 {
 		t.Errorf("recording session: jobs = %d, want 0", n)
 	}
 
-	// Closed (awaiting first analysis is already queued by close): a late
-	// chunk with no live job still re-enqueues.
+	// Closed session, no live job: a late scrubbed chunk still re-enqueues.
 	seed("late-closed", "closed", 0)
-	if err := q.CommitChunk(ctx, "late-closed", proj.ID, 0, 100); err != nil {
-		t.Fatalf("CommitChunk closed: %v", err)
-	}
+	scrub("late-closed", 0)
 	if n := countJobs("late-closed"); n != 1 {
-		t.Errorf("closed session late chunk: jobs = %d, want 1", n)
+		t.Errorf("closed session late scrub: jobs = %d, want 1", n)
 	}
 }
