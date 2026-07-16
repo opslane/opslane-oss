@@ -65,6 +65,7 @@ services:
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
       INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
+      ADMIN_EMAILS: ${OPSLANE_ADMIN_EMAILS:-}
     depends_on:
       postgres:
         condition: service_healthy

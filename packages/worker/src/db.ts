@@ -428,6 +428,16 @@ export async function updateGroupStatus(
          reason_code = $7,
          reason_message = $8,
          remediation = $9,
+         pr_created_at = CASE
+           WHEN $3::error_group_status = 'pr_created'
+                AND status IS DISTINCT FROM 'pr_created' THEN now()
+           ELSE pr_created_at
+         END,
+         needs_human_at = CASE
+           WHEN $3::error_group_status = 'needs_human'
+                AND status IS DISTINCT FROM 'needs_human' THEN now()
+           ELSE needs_human_at
+         END,
          updated_at = now()
      WHERE id = $1 AND project_id = $2
        ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
@@ -774,7 +784,7 @@ export async function getSourceMaps(projectId: string, release: string): Promise
 export async function updateGroupInvestigation(
   errorGroupId: string,
   projectId: string,
-  status: 'investigated' | 'fixing' | 'needs_human' | 'insight' | 'awaiting_approval',
+  status: 'investigated' | 'fixing' | 'pr_created' | 'needs_human' | 'insight' | 'awaiting_approval',
   fields: {
     rootCause?: string;
     suggestedMitigation?: string;
@@ -816,6 +826,16 @@ export async function updateGroupInvestigation(
          reason_code = $7,
          reason_message = $8,
          remediation = $9,
+         pr_created_at = CASE
+           WHEN $3::error_group_status = 'pr_created'
+                AND status IS DISTINCT FROM 'pr_created' THEN now()
+           ELSE pr_created_at
+         END,
+         needs_human_at = CASE
+           WHEN $3::error_group_status = 'needs_human'
+                AND status IS DISTINCT FROM 'needs_human' THEN now()
+           ELSE needs_human_at
+         END,
          updated_at = now()
      WHERE id = $1 AND project_id = $2
        ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}

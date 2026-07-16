@@ -155,3 +155,90 @@ export interface SetupPrStatus {
   pr_number: number | null;
   error?: string;
 }
+
+// === Admin observability ===
+
+export type AdminJobStatus =
+  | 'pending'
+  | 'claimed'
+  | 'completed'
+  | 'failed'
+  | 'dead_letter';
+
+export type AdminJobType =
+  | 'investigate'
+  | 'fix'
+  | 'error_fix'
+  | 'setup_pr'
+  | 'session_analysis';
+
+export interface AdminHourlyEventBucket {
+  hour: string;
+  count: number;
+}
+
+export interface AdminTopProject {
+  project_id: string;
+  project_name: string;
+  org_name: string;
+  count: number;
+}
+
+export interface AdminOverview {
+  events: {
+    last_1h: number;
+    last_24h: number;
+    last_7d: number;
+    hourly: AdminHourlyEventBucket[];
+    top_projects: AdminTopProject[];
+  };
+  jobs: {
+    by_status: Partial<Record<AdminJobStatus, number>>;
+    by_type: Partial<Record<AdminJobType, number>>;
+    oldest_pending_age_seconds: number | null;
+    dead_letters_7d: number;
+  };
+  workers: {
+    live_claims: number;
+    active_5m: number;
+  };
+  outcomes: {
+    by_status: Record<string, number>;
+    pr_created_24h: number;
+    pr_created_7d: number;
+    needs_human_7d: number;
+    merged_7d: number;
+    closed_7d: number;
+  };
+}
+
+export interface AdminJob {
+  id: string;
+  project_name: string;
+  job_type: AdminJobType;
+  status: AdminJobStatus;
+  attempts: number;
+  created_at: string;
+  duration_seconds: number | null;
+  last_error: string | null;
+  trace_url: string | null;
+  incident_title: string | null;
+  pr_url: string | null;
+}
+
+export interface AdminJobsResponse {
+  jobs: AdminJob[];
+}
+
+export interface HealthCheckResult {
+  status: string;
+  latency_ms?: number;
+  error?: string;
+}
+
+export interface HealthResponse {
+  status: string;
+  checks: Record<string, HealthCheckResult>;
+  version: string;
+  uptime_seconds: number;
+}

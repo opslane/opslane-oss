@@ -2,6 +2,7 @@ import type {
   Incident, AffectedUser, Account, IncidentFilters,
   GitHubConfig, GitHubAppStatus, GitHubRepo, SetupPrStatus,
   SessionDetail, SessionFilters, SessionListResponse,
+  AdminOverview, AdminJobsResponse, HealthResponse,
 } from './types/api';
 import type { ChunkEnvelope } from './components/session-replay';
 
@@ -26,6 +27,7 @@ export interface AuthUser {
   org_id: string;
   email: string;
   name: string;
+  is_admin: boolean;
 }
 
 export function isAuthenticated(): boolean {
@@ -196,6 +198,40 @@ export interface ReplayRecording {
 
 export function getMe(): Promise<AuthUser> {
   return fetchJSON<AuthUser>('/auth/me');
+}
+
+// A hung admin request would otherwise wedge AdminView's poll loop forever
+// (its refreshing guard skips every later tick), so these calls carry a timeout.
+const ADMIN_FETCH_TIMEOUT_MS = 30_000;
+
+export function getAdminOverview(): Promise<AdminOverview> {
+  return fetchWithAuth<AdminOverview>('/admin/overview', {
+    signal: AbortSignal.timeout(ADMIN_FETCH_TIMEOUT_MS),
+  });
+}
+
+export function listAdminJobs(limit = 50): Promise<AdminJobsResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return fetchWithAuth<AdminJobsResponse>(`/admin/jobs?${params}`, {
+    signal: AbortSignal.timeout(ADMIN_FETCH_TIMEOUT_MS),
+  });
+}
+
+export async function getHealth(): Promise<HealthResponse> {
+  const response = await fetch('/health', {
+    credentials: 'include',
+    signal: AbortSignal.timeout(ADMIN_FETCH_TIMEOUT_MS),
+  });
+  // The health endpoint intentionally returns its useful diagnostic payload with
+  // a 503 when the database is unhealthy, so callers should still render it.
+  if (!response.ok && response.status !== 503) {
+    throw new APIError(response.status, `Health API ${response.status}`);
+  }
+  try {
+    return await response.json() as HealthResponse;
+  } catch {
+    throw new APIError(response.status, `Health API ${response.status}: non-JSON response`);
+  }
 }
 
 export function listProjects(): Promise<Project[]> {
