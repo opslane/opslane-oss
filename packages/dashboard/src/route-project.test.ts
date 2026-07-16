@@ -1,0 +1,13 @@
+import { describe, expect, it } from 'vitest';
+import { routeNeedsProject } from './route-project';
+
+describe('routeNeedsProject', () => {
+  it('lets an operator without a selected project open the admin dashboard', () => {
+    expect(routeNeedsProject('admin')).toBe(false);
+  });
+
+  it('still requires a project for tenant-scoped routes', () => {
+    expect(routeNeedsProject('activity')).toBe(true);
+    expect(routeNeedsProject('sessions')).toBe(true);
+  });
+});
