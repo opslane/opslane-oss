@@ -251,9 +251,16 @@ func (q *Queries) AdminOverviewData(ctx context.Context) (*AdminOverview, error)
 // AdminRecentJobs intentionally returns jobs across all tenants. The caller must
 // validate status/jobType against the public allowlists before calling.
 func (q *Queries) AdminRecentJobs(ctx context.Context, limit int, status, jobType string) ([]AdminJob, error) {
-	// The handler clamps limit too; bound it here as well so the slice
-	// allocation and query LIMIT can never depend on an unchecked caller.
-	limit = max(1, min(limit, 200))
+	// The handler clamps limit too; bound it here as well so the query LIMIT
+	// can never depend on an unchecked caller. Explicit comparisons rather
+	// than the min/max builtins: CodeQL's taint analysis only recognizes
+	// branch guards as allocation-size barriers.
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
 	rows, err := q.pool.Query(ctx, `
 		SELECT
 			j.id, coalesce(p.name, ''), j.job_type, j.status::text, j.attempts, j.created_at,
@@ -275,7 +282,9 @@ func (q *Queries) AdminRecentJobs(ctx context.Context, limit int, status, jobTyp
 	}
 	defer rows.Close()
 
-	jobs := make([]AdminJob, 0, limit)
+	// Non-nil so an empty result serializes as [] not null; grown by append
+	// so the allocation size never derives from request input.
+	jobs := []AdminJob{}
 	for rows.Next() {
 		var job AdminJob
 		if err := rows.Scan(
