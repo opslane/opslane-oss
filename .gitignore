@@ -11,6 +11,14 @@ pgdata/
 eval/results/
 .verify/*
 !.verify/spec.md
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/docs-sync/
+!.claude/skills/docs-sync/SKILL.md
+!.claude/skills/docs-sync/scripts/
+.claude/skills/docs-sync/scripts/*
+!.claude/skills/docs-sync/scripts/run.mjs
+!.claude/skills/docs-sync/scripts/run.test.mjs
 .omx/
 .gstack/

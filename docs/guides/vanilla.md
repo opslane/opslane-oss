@@ -1,3 +1,9 @@
+---
+covers:
+  - packages/sdk/src/core.ts
+  - packages/sdk/src/index.ts
+  - packages/sdk/src/config.ts
+---
 # Vanilla JavaScript setup
 
 Use the Opslane SDK in any browser app — no framework required.

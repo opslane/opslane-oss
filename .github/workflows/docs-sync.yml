@@ -1,0 +1,139 @@
+name: Docs sync
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Event-level guard: when every changed file is documentation, no job is created.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    # Internal branches only. claude/* is reserved for generated commits.
+    if: >-
+      github.event.pull_request.head.repo.fork == false &&
+      !startsWith(github.event.pull_request.head.ref, 'claude/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.map.outputs.publish }}
+    steps:
+      - name: Check out base SHA (trusted scripts only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Fetch PR head as data
+        working-directory: trusted
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags origin "$HEAD_SHA"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: trusted/.nvmrc
+      - name: Map changed files to docs
+        id: map
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if git log -1 --format=%s "$HEAD_SHA" | grep -qE '^docs: sync for #[0-9]+'; then
+            echo "publish=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-status -z --find-renames "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/name-status.z"
+          node --input-type=module - "$RUNNER_TEMP/name-status.z" "$RUNNER_TEMP/changed.txt" <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { parseNameStatusZ } from './scripts/docs-sync/diff.mjs';
+          writeFileSync(process.argv[3], `${parseNameStatusZ(readFileSync(process.argv[2])).join('\n')}\n`);
+          NODE
+          if ! grep -qvE '^(docs/|[^/]+\.md$)' "$RUNNER_TEMP/changed.txt"; then
+            echo "publish=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node scripts/docs-map.mjs < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/map.json"
+          matched=$(node -e 'const m=require(process.argv[1]); process.stdout.write(String(m.matched.length))' "$RUNNER_TEMP/map.json")
+          if [ "$matched" -eq 0 ]; then echo "publish=0" >> "$GITHUB_OUTPUT"; else echo "publish=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Claude authentication smoke
+        if: steps.map.outputs.publish == '1'
+        working-directory: trusted
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        # Verified against 2.1.211 --help: --tools limits available built-ins;
+        # --safe-mode disables settings, CLAUDE.md, hooks, plugins, skills, and MCP.
+        run: >-
+          npx --yes @anthropic-ai/claude-code@2.1.211 --print --safe-mode
+          --disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+          --tools '' --allowed-tools '' --no-session-persistence
+          'Reply with exactly: ok' | grep -qix ok
+      - name: Isolated per-doc reasoning
+        if: steps.map.outputs.publish == '1'
+        working-directory: trusted
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # plan.mjs passes one doc + diff over stdin with all Claude tools disabled,
+        # then validates schema output before deterministically staging the doc.
+        run: node scripts/docs-sync/plan.mjs "$RUNNER_TEMP/map.json" "$RUNNER_TEMP/docs-sync-staging" "$PWD"
+      - name: Upload edited docs and allowlist
+        if: steps.map.outputs.publish == '1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-sync-staging
+          path: ${{ runner.temp }}/docs-sync-staging
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.publish == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out base SHA (trusted scripts only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: trusted/.nvmrc
+      - name: Download planned edits
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-sync-staging
+          path: ${{ runner.temp }}/docs-sync-staging
+      - name: Check out pinned PR head for publication
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+      - name: Validate, scan, commit, and guarded push
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          node trusted/scripts/docs-sync/publish.mjs
+          "$RUNNER_TEMP/docs-sync-staging"
+          "$RUNNER_TEMP/docs-sync-staging/map.json"
+          "$GITHUB_WORKSPACE/pr"

@@ -16,7 +16,7 @@ Two security reviews reshaped this design. Four rules are non-negotiable (see th
 
 1. **Trusted code, untrusted data.** Every executed script comes from the **base/default branch**. The PR head is read only as git blobs (its diff and doc contents) — never executed. No `pnpm install` of PR packages, no running PR scripts. This closes the "privileged job runs PR-controlled code with the secret" path.
 
-2. **The LLM is filesystem-isolated and never touches version control.** Claude runs in a throwaway directory containing only one matched doc plus its diff slice, with tools restricted to Read/Edit and MCP/settings disabled. `--allowed-tools` alone is *not* a sandbox — it only pre-approves. Every mutation happens in deterministic steps. Three gates run before any push: (a) allowlist — every edited path ∈ matched docs; (b) secret scan — reject if an edited doc contains the OAuth token or a secret pattern; (c) guarded `--force-with-lease` push pinned to the recorded head SHA.
+2. **The LLM has no filesystem or version-control tools.** One matched doc plus its diff slice is passed over stdin to a fresh Claude process with all built-in tools disabled, MCP/settings disabled, and schema-validated output. `--allowed-tools` alone is *not* a sandbox — it only pre-approves. Trusted code performs every filesystem mutation deterministically. Three gates run before any push: (a) allowlist — every edited path ∈ matched docs; (b) secret scan — reject if an edited doc contains the OAuth token or a secret pattern; (c) guarded `--force-with-lease` push pinned to the recorded head SHA.
 
 3. **Split privilege across two jobs.** A `plan` job holds `CLAUDE_CODE_OAUTH_TOKEN` with `contents: read` only. A separate `publish` job holds `contents: write` with no Claude token. They communicate via an artifact.
 
@@ -25,7 +25,7 @@ Two security reviews reshaped this design. Four rules are non-negotiable (see th
 ## Scope decisions
 
 - **Prose tier only, one canonical predicate.** A single exported `isProseTierDoc(path)` (in `scripts/docs-map.mjs`) defines the tier and is imported by the mapper, the lint, and the workflow — no three-way drift. v1 tier: `docs/guides/**`, `docs/architecture/**`, `docs/quickstart/**`, and `docs/install.md`. Excluded: `reference/` (already deterministic), `contracts/`, `agents/`, and `docs/plans/`.
-- **Two entry points, one engine.** A local `/docs-sync` skill (fast path while coding) and a PR GitHub Action (internal safety net). Both run **Claude Code restricted to Read/Edit**; all VCS is deterministic.
+- **Two entry points, one engine.** A local `/docs-sync` skill (fast path while coding) and a PR GitHub Action (internal safety net). Both run **Claude Code with all built-in tools disabled** and accept only schema-validated document output; all filesystem and VCS operations are deterministic.
 - **Subscription auth, no API billing.** Same token style as `asset-management-jira`: local CLI uses the local session; the Action passes `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) to a headless Claude run. No metered `ANTHROPIC_API_KEY`.
 - **PR behavior: commit onto the source branch.** The Action commits the doc updates directly to the code PR's own branch (`docs: sync for #<PR#>`), so docs and code review and merge together and the update can't be silently dropped. This was chosen over a companion PR because a companion targeting the code branch does not *guarantee* landing — a maintainer can merge the source first. Internal-only scope makes committing to the branch safe. Trade-off: the code PR's diff now includes the doc changes.
 - **Deterministic scoping via `covers:` frontmatter.** Each prose doc declares the code globs it documents; Claude only sees docs whose globs match the PR's changed files.
@@ -63,7 +63,7 @@ Per-doc prompt, in essence:
 
 > Here is one document and the slices of this PR's diff that touch code it covers. Update **only** what the change made stale. If nothing is stale, make no edit. Never invent features or document behavior absent from the diff. You may edit only this file.
 
-Claude's allowed tools are `Read` and `Edit` on the single target file — no `Bash`, no `git`, no `gh`.
+Claude receives the document and diff through stdin with **no built-in tools** and returns the complete document through a JSON schema. It cannot read the runner filesystem, environment, git repository, or `gh`; the trusted driver alone decides whether to write the returned content.
 
 ## Component 4 — local `/docs-sync` skill
 
@@ -80,7 +80,7 @@ Two jobs, split by privilege (security rule #3). Concurrency is per-PR with `can
 1. Check out the **base/default branch** (trusted scripts). `persist-credentials: false`.
 2. Fetch the PR head `head.sha` as data (`git fetch`), never checked out for execution. No `pnpm install`.
 3. Compute changed paths with `git diff --name-status -z --find-renames base...head` (three-dot = merge-base; rename-aware), map via `docs-map.mjs`. Docs-only PR ⇒ skip.
-4. For each matched doc: run Claude **filesystem-isolated** in a temp dir holding only that doc (its `head` contents, as data) + its diff slice; tools = Read/Edit, MCP/settings off.
+4. For each matched doc: pass that doc (its `head` contents, as data) + its diff slice over stdin to a fresh Claude process; disable all built-in tools, MCP, and settings, and require schema-validated full-document output.
 5. Upload the edited docs + `map.json` as an artifact.
 
 **`publish` job** — `contents: write`, **no** Claude token, needs `plan`:
@@ -129,7 +129,7 @@ Workflow layer:
 - **Concurrency:** two rapid `synchronize` events — the older run cancels; the pushed commit reflects the newer `head.sha`; the guarded push fails rather than clobber a moved branch.
 - **Idempotency:** identical edits already on the branch produce no new commit.
 - **End-to-end:** a PR changing `packages/sdk/src/react.tsx` yields a `docs: sync for #<PR#>` commit on the same branch editing only `guides/react.md`; a docs-only PR produces no run.
-- **Injection drill:** a diff that instructs the model to write the OAuth token into a doc yields no change (tool restriction) and is caught by the secret scan even if it did.
+- **Injection drill:** a diff that instructs the model to write the OAuth token into a doc cannot access that token because the model has no tools or secret-bearing context; the secret scan still rejects an exact or token-shaped leak before push.
 
 ## Open questions
 

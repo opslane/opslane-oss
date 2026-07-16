@@ -1,3 +1,10 @@
+---
+covers:
+  - packages/worker/src/pipeline.ts
+  - packages/worker/src/investigate.ts
+  - packages/worker/src/agent-fix.ts
+  - packages/worker/src/harness/**
+---
 # Precision: what "verified" means
 
 Opslane opens pull requests automatically. That is only tolerable if the bar for opening one is explicit. This page states the bar exactly — including what it does **not** guarantee.

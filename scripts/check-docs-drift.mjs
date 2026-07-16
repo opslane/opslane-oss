@@ -15,12 +15,19 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { buildDocsIndex, findUncoveredProseDocs } from './docs-map.mjs';
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => readFileSync(join(root, p), 'utf8');
 const problems = [];
 
 // Known drift, allowlisted with a tracking issue. Remove entries as bugs close.
 const KNOWN_DRIFT = new Map([]);
+
+// ---------- prose-doc coverage metadata ----------
+for (const doc of findUncoveredProseDocs(buildDocsIndex(root))) {
+  problems.push(`${doc} is a prose-tier doc but does not declare a non-empty covers: list`);
+}
 
 const normalize = (p) => p.replace(/\{[^}]+\}/g, '{param}');
 

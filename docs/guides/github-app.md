@@ -1,3 +1,10 @@
+---
+covers:
+  - packages/worker/src/github-app.ts
+  - packages/worker/src/pr.ts
+  - packages/worker/src/repo-clone.ts
+  - packages/worker/src/setup-pr.ts
+---
 # Connecting GitHub
 
 The worker needs GitHub access for two things: cloning the repository during investigation and opening the fix PR. There are two credential modes; pick one.
