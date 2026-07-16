@@ -22,6 +22,7 @@ vi.mock('../db.js', () => ({
   getReplayArtifacts: vi.fn(),
   getSourceMaps: vi.fn(),
   requeueStaleJobs: vi.fn(),
+  resolveInactiveGroups: vi.fn(),
   resolveSilentMergedGroups: vi.fn(),
   updateJobTraceUrl: vi.fn(),
   closePool: vi.fn(),
