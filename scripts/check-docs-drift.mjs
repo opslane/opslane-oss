@@ -8,13 +8,14 @@
 //      with documented-but-unread vars allowed only in the dead-config section
 //   4. SdkInitOptions keys and defaults vs docs/reference/sdk-options.md
 //   5. ReasonCode union vs docs/reference/reason-codes.md
+//   6. Local paths linked from llms.txt exist
 //
 // Run: pnpm docs:check  (wired into the root `pnpm test` gate)
-import { readFileSync, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => readFileSync(join(root, p), 'utf8');
 const problems = [];
 
@@ -188,6 +189,22 @@ if (countM && Number(countM[1]) !== codes.length) {
   problems.push(`reason-codes.md says "${countM[1]} codes total" but shared/src/types.ts defines ${codes.length}`);
 }
 
+// ---------- 6. llms.txt local paths ----------
+const llms = read('llms.txt');
+let llmsPathCount = 0;
+for (const m of llms.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+  const target = m[1].trim();
+  if (target.startsWith('#') || target.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(target)) continue;
+
+  llmsPathCount += 1;
+  const path = target.replace(/^<|>$/g, '').split(/[?#]/, 1)[0];
+  const resolved = path ? resolve(root, decodeURIComponent(path)) : '';
+  const insideRepo = resolved.startsWith(root + sep);
+  if (!insideRepo || !existsSync(resolved) || !statSync(resolved).isFile()) {
+    problems.push(`llms.txt links to missing local path ${target}`);
+  }
+}
+
 // ---------- verdict ----------
 if (problems.length > 0) {
   console.error(`✗ docs drift detected (${problems.length}):`);
@@ -195,5 +212,5 @@ if (problems.length > 0) {
   process.exit(1);
 }
 console.log(
-  `✓ no docs drift: ${routes.size} routes, ${codeVars.size} env vars, ${optionKeys.length} SDK options, ${codes.length} reason codes all consistent`
+  `✓ no docs drift: ${routes.size} routes, ${codeVars.size} env vars, ${optionKeys.length} SDK options, ${codes.length} reason codes, and ${llmsPathCount} llms.txt paths all consistent`
 );

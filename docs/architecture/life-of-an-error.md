@@ -4,7 +4,7 @@ What happens between an exception in a user's browser and a pull request (or an 
 
 ## 1. Capture (browser)
 
-The SDK catches the error via global handlers (or a framework hook), attaches breadcrumbs (console, fetch/XHR, navigation), scrubs tokens and credentials from text and URLs, and POSTs to `/api/v1/events`. If replay is enabled, the surrounding session recording (inputs masked) is uploaded alongside.
+The SDK catches the error via global handlers (or a framework hook), attaches breadcrumbs (console, fetch/XHR, navigation), scrubs tokens and credentials from text and URLs, and POSTs to `/api/v1/events`. Session recording is enabled by default; when browser support, storage, and the project's server-side switch allow it, the SDK uploads a continuous stream of masked-input chunks and the error points into that session.
 
 ## 2. Ingest and group (ingestion API)
 

@@ -57,7 +57,7 @@ pointers.
 For error events, ingestion also replaces sensitive headers, well-known API-key
 prefixes, and URL-embedded credentials with `[REDACTED]` before persistence.
 
-See [replay privacy](../replay-privacy.md) for what replay data may contain.
+See [replay privacy and masking](../guides/replay-privacy.md) for what replay data may contain.
 
 ## Credential storage
 
