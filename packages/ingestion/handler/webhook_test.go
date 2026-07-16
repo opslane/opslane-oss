@@ -1,11 +1,32 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
+
+func TestHandleWebhook_MissingDeliveryID(t *testing.T) {
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "test-secret")
+	payload := []byte(`{"action":"closed","pull_request":{"number":1,"merged":true},"repository":{"full_name":"org/repo"}}`)
+	mac := hmac.New(sha256.New, []byte("test-secret"))
+	mac.Write(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", bytes.NewReader(payload))
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+
+	rec := httptest.NewRecorder()
+	(&Dependencies{}).HandleWebhook(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
 
 func TestVerifyWebhookSignature_Valid(t *testing.T) {
 	secret := "test-secret"

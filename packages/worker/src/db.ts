@@ -385,6 +385,7 @@ export async function updateGroupStatus(
     confidence?: ConfidenceLevel;
     pr_url?: string;
     pr_number?: number;
+    pr_fix_job_id?: string;
     reason?: NeedsHumanReason;
   },
   lease?: JobLease,
@@ -408,9 +409,9 @@ export async function updateGroupStatus(
   const ownedCte = lease
     ? `WITH owned AS (
          SELECT id FROM error_group_jobs
-         WHERE id = $10
-           AND worker_id = $11
-           AND lease_generation = $12::bigint
+         WHERE id = $11
+           AND worker_id = $12
+           AND lease_generation = $13::bigint
            AND project_id = $2
            AND error_group_id = $1
            AND status = 'claimed'
@@ -425,9 +426,10 @@ export async function updateGroupStatus(
          confidence = $4,
          pr_url = $5,
          pr_number = $6,
-         reason_code = $7,
-         reason_message = $8,
-         remediation = $9,
+         pr_fix_job_id = COALESCE($7, pr_fix_job_id),
+         reason_code = $8,
+         reason_message = $9,
+         remediation = $10,
          updated_at = now()
      WHERE id = $1 AND project_id = $2
        ${lease ? 'AND EXISTS (SELECT 1 FROM owned)' : ''}
@@ -439,6 +441,7 @@ export async function updateGroupStatus(
       fields?.confidence ?? null,
       fields?.pr_url ?? null,
       fields?.pr_number ?? null,
+      fields?.pr_fix_job_id ?? null,
       reason?.reason_code ?? null,
       reason?.reason_message ?? null,
       reason?.remediation ?? null,
@@ -512,13 +515,14 @@ export interface ErrorGroupData {
   signal_type: string | null;
   element_selector: string | null;
   page_url_normalized: string | null;
+  confidence: ConfidenceLevel | null;
 }
 
 export async function getErrorGroup(groupId: string, projectId: string): Promise<ErrorGroupData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ErrorGroupData>(
     `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status,
-            kind, signal_type, element_selector, page_url_normalized
+            kind, signal_type, element_selector, page_url_normalized, confidence
      FROM error_groups WHERE id = $1 AND project_id = $2`,
     [groupId, projectId],
   );
@@ -548,17 +552,20 @@ export async function getErrorEvent(eventId: string, projectId: string): Promise
   return rows[0] ?? null;
 }
 
+export type FrictionAutonomy = 'ask_first' | 'auto_fix' | 'auto_fix_ux';
+
 export interface ProjectData {
   id: string;
   name: string;
   github_repo: string;
   default_branch: string;
+  friction_autonomy: FrictionAutonomy;
 }
 
 export async function getProject(projectId: string): Promise<ProjectData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ProjectData>(
-    `SELECT id, name, github_repo, default_branch
+    `SELECT id, name, github_repo, default_branch, friction_autonomy
      FROM projects WHERE id = $1`,
     [projectId],
   );

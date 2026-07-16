@@ -203,3 +203,136 @@ func TestUnarchiveIncidentRestoresKindSafeStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateProjectFrictionAutonomy(t *testing.T) {
+	q, projectID := createFrictionTestProject(t, "autonomy-settings")
+	ctx := context.Background()
+
+	var orgID string
+	if err := q.Pool().QueryRow(ctx,
+		`SELECT org_id FROM projects WHERE id = $1`, projectID,
+	).Scan(&orgID); err != nil {
+		t.Fatalf("get project org: %v", err)
+	}
+
+	autoFix := "auto_fix"
+	project, err := q.UpdateProject(ctx, orgID, projectID, nil, &autoFix)
+	if err != nil || project == nil {
+		t.Fatalf("UpdateProject = (%+v, %v)", project, err)
+	}
+	if project.FrictionAutonomy != autoFix {
+		t.Fatalf("FrictionAutonomy = %q, want %q", project.FrictionAutonomy, autoFix)
+	}
+	if project.GithubRepo == nil || *project.GithubRepo != "org/repo" {
+		t.Fatalf("GithubRepo was clobbered: %v", project.GithubRepo)
+	}
+
+	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil)
+	if err != nil || project == nil || project.FrictionAutonomy != autoFix {
+		t.Fatalf("omitted autonomy was not preserved: project=%+v err=%v", project, err)
+	}
+
+	invalid := "yolo"
+	if _, err := q.UpdateProject(ctx, orgID, projectID, nil, &invalid); err == nil {
+		t.Fatal("expected invalid autonomy to violate the database constraint")
+	}
+}
+
+func TestGetFixStats(t *testing.T) {
+	q, projectID := createFrictionTestProject(t, "fix-stats")
+	ctx := context.Background()
+
+	errorGroupID := insertIncident(t, q, projectID, "fp-stats-error", "error", "merged")
+	frictionGroupID := insertIncident(t, q, projectID, "fp-stats-friction", "friction", "pr_created")
+
+	var errorJobID, frictionJobID string
+	if err := q.Pool().QueryRow(ctx,
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
+		 VALUES ($1, $2, 'fix', 'auto') RETURNING id`,
+		errorGroupID, projectID,
+	).Scan(&errorJobID); err != nil {
+		t.Fatalf("insert auto fix job: %v", err)
+	}
+	if err := q.Pool().QueryRow(ctx,
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
+		 VALUES ($1, $2, 'fix', 'human') RETURNING id`,
+		frictionGroupID, projectID,
+	).Scan(&frictionJobID); err != nil {
+		t.Fatalf("insert human fix job: %v", err)
+	}
+
+	for _, receipt := range []struct {
+		groupID  string
+		prNumber int
+		outcome  string
+		delivery string
+		fixJobID string
+	}{
+		{errorGroupID, 41, "merged", "fix-stats-merged", errorJobID},
+		{frictionGroupID, 42, "closed", "fix-stats-closed", frictionJobID},
+	} {
+		if _, err := q.Pool().Exec(ctx,
+			`INSERT INTO pr_outcomes
+			   (error_group_id, project_id, pr_number, outcome, github_delivery_id, fix_job_id, occurred_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, now())`,
+			receipt.groupID, projectID, receipt.prNumber, receipt.outcome, receipt.delivery, receipt.fixJobID,
+		); err != nil {
+			t.Fatalf("insert %s receipt: %v", receipt.outcome, err)
+		}
+	}
+
+	stats, err := q.GetFixStats(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetFixStats: %v", err)
+	}
+	if stat := stats["error"]; stat.GeneratedAuto != 1 || stat.GeneratedHuman != 0 || stat.PRsMerged != 1 || stat.PRsClosed != 0 {
+		t.Fatalf("error stats = %+v", stat)
+	}
+	// The error merge came from an auto job, so it counts in the auto split.
+	if stat := stats["error"]; stat.PRsMergedAuto != 1 || stat.PRsClosedAuto != 0 {
+		t.Fatalf("error auto splits = %+v", stat)
+	}
+	if stat := stats["friction"]; stat.GeneratedAuto != 0 || stat.GeneratedHuman != 1 || stat.PRsMerged != 0 || stat.PRsClosed != 1 {
+		t.Fatalf("friction stats = %+v", stat)
+	}
+	// The friction close came from a human-requested job: total counts it, the
+	// auto split must not.
+	if stat := stats["friction"]; stat.PRsMergedAuto != 0 || stat.PRsClosedAuto != 0 {
+		t.Fatalf("friction auto splits = %+v", stat)
+	}
+}
+
+func TestGetFixStats_TenantScoped(t *testing.T) {
+	q, projectID := createFrictionTestProject(t, "fix-stats-scope-a")
+	_, otherProjectID := createFrictionTestProject(t, "fix-stats-scope-b")
+	ctx := context.Background()
+
+	otherGroupID := insertIncident(t, q, otherProjectID, "fp-stats-other", "error", "merged")
+	var otherJobID string
+	if err := q.Pool().QueryRow(ctx,
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
+		 VALUES ($1, $2, 'fix', 'auto') RETURNING id`,
+		otherGroupID, otherProjectID,
+	).Scan(&otherJobID); err != nil {
+		t.Fatalf("insert other project's fix job: %v", err)
+	}
+	if _, err := q.Pool().Exec(ctx,
+		`INSERT INTO pr_outcomes
+		   (error_group_id, project_id, pr_number, outcome, github_delivery_id, fix_job_id, occurred_at)
+		 VALUES ($1, $2, 99, 'merged', 'fix-stats-scope-d1', $3, now())`,
+		otherGroupID, otherProjectID, otherJobID,
+	); err != nil {
+		t.Fatalf("insert other project's receipt: %v", err)
+	}
+
+	stats, err := q.GetFixStats(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetFixStats: %v", err)
+	}
+	if stat := stats["error"]; stat != (db.FixStats{}) {
+		t.Fatalf("leaked another project's error stats: %+v", stat)
+	}
+	if stat := stats["friction"]; stat != (db.FixStats{}) {
+		t.Fatalf("leaked another project's friction stats: %+v", stat)
+	}
+}

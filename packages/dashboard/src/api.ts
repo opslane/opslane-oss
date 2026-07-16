@@ -144,7 +144,18 @@ export interface Project {
   id: string;
   name: string;
   github_repo: string | null;
+  friction_autonomy: 'ask_first' | 'auto_fix' | 'auto_fix_ux';
   created_at: string;
+}
+
+export interface FixStats {
+  generated_auto: number;
+  generated_human: number;
+  prs_merged: number;
+  prs_closed: number;
+  /** Outcomes attributed to auto-triggered fix jobs only. */
+  prs_merged_auto: number;
+  prs_closed_auto: number;
 }
 
 export interface Environment {
@@ -208,9 +219,13 @@ export function createProject(name: string, githubRepo: string): Promise<Project
 
 export function updateProject(
   projectId: string,
-  data: { github_repo?: string }
+  data: { github_repo?: string; friction_autonomy?: Project['friction_autonomy'] }
 ): Promise<Project> {
   return patchJSON<Project>(`/projects/${projectId}`, data);
+}
+
+export function getFixStats(projectId: string): Promise<Record<'error' | 'friction', FixStats>> {
+  return fetchJSON<Record<'error' | 'friction', FixStats>>(`/projects/${projectId}/fix-stats`);
 }
 
 export function listEnvironments(projectId: string): Promise<Environment[]> {

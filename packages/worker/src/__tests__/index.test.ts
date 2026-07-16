@@ -108,6 +108,7 @@ function makeGroup(overrides?: Partial<ErrorGroupData>): ErrorGroupData {
     signal_type: null,
     element_selector: null,
     page_url_normalized: null,
+    confidence: null,
     ...overrides,
   };
 }
@@ -207,7 +208,9 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
       stack_trace_raw: 'at App.vue:42', stack_trace_resolved: null,
       breadcrumbs: '[]', context: '{}', release: null, session_id: null,
     } as ErrorEventData);
-    mockGetProject.mockResolvedValue({ id: 'p1', name: 'app', github_repo: 'org/app', default_branch: 'main' } as ProjectData);
+    mockGetProject.mockResolvedValue({
+      id: 'p1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'ask_first',
+    } as ProjectData);
     mockCloneRepo.mockResolvedValue({ repoDir: '/tmp/r', cleanup: vi.fn() } as never);
     vi.mocked(db.getProjectGitHubInstallation).mockResolvedValue(null as never);
     vi.mocked(db.getReplayForGroup).mockResolvedValue(null as never);
@@ -271,6 +274,7 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     const call = mockUpdateGroupStatus.mock.calls.find((c) => c[2] === 'pr_created');
     expect(call).toBeTruthy();
     expect(call![3]?.pr_url).toBe('https://github.com/org/app/pull/7');
+    expect(call![3]?.pr_fix_job_id).toBe('j1');
   });
 
   it('prefers session-pointer evidence fetched through ingestion', async () => {
@@ -325,14 +329,14 @@ describe('friction worker path', () => {
       page_url_normalized: 'https://app.example.com/settings',
     }));
     mockGetProject.mockResolvedValue({
-      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main',
+      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'ask_first',
     });
     vi.mocked(db.getProjectGitHubInstallation).mockResolvedValue(null);
     mockCloneRepo.mockResolvedValue({ repoDir: '/tmp/repo', cleanup: vi.fn() } as never);
     vi.mocked(gatherFrictionEvidence).mockResolvedValue({ signals: [], timeline: '', truncated: false });
   });
 
-  it('skips error-only guards and never auto-fixes a code-caused friction incident', async () => {
+  it('parks code-caused friction under ask-first autonomy', async () => {
     vi.mocked(investigateFriction).mockResolvedValue({
       codeCause: true, confidence: 'high', reason: 'save handler is disconnected', remediation: 'wire the handler',
     });
@@ -349,6 +353,43 @@ describe('friction worker path', () => {
     );
   });
 
+  it.each(['auto_fix', 'auto_fix_ux'] as const)(
+    'auto-triggers a high-confidence friction fix under %s autonomy', async (frictionAutonomy) => {
+      mockGetProject.mockResolvedValue({
+        id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: frictionAutonomy,
+      });
+      vi.mocked(investigateFriction).mockResolvedValue({
+        codeCause: true, confidence: 'high', reason: 'save handler is disconnected', remediation: 'wire the handler',
+      });
+      vi.mocked(db.updateGroupAndCreateFixJob).mockResolvedValue('fix-job-1');
+
+      await processInvestigateJob(makeJob(), new AbortController().signal);
+
+      expect(db.updateGroupAndCreateFixJob).toHaveBeenCalledWith(
+        'grp-1', 'proj-1', expect.objectContaining({ confidence: 'high' }), makeJob(),
+      );
+      expect(db.updateGroupInvestigation).not.toHaveBeenCalledWith(
+        'grp-1', 'proj-1', 'awaiting_approval', expect.anything(), expect.anything(),
+      );
+    },
+  );
+
+  it('parks medium-confidence friction even when autonomy allows auto-fix', async () => {
+    mockGetProject.mockResolvedValue({
+      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'auto_fix',
+    });
+    vi.mocked(investigateFriction).mockResolvedValue({
+      codeCause: true, confidence: 'medium', reason: 'save handler is disconnected', remediation: 'wire the handler',
+    });
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+
+    expect(db.updateGroupInvestigation).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'awaiting_approval', expect.objectContaining({ confidence: 'medium' }), makeJob(),
+    );
+    expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
+  });
+
   it('records friction without a code cause as an insight', async () => {
     vi.mocked(investigateFriction).mockResolvedValue({
       codeCause: false, confidence: 'medium', reason: 'The workflow is confusing but functional.',
@@ -363,16 +404,50 @@ describe('friction worker path', () => {
     expect(db.updateGroupAndCreateFixJob).not.toHaveBeenCalled();
   });
 
-  it('refuses a non-human friction fix before cloning or running the pipeline', async () => {
+  it('refuses an auto friction fix under ask-first while preserving confidence', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({
+      kind: 'friction', status: 'fixing', sample_event_id: '', confidence: 'high',
+    }));
     const job = { ...makeJob(), jobType: 'fix' as const, triggeredBy: 'auto' as const };
 
     await processFixJob(job, new AbortController().signal);
 
     expect(mockUpdateGroupStatus).toHaveBeenCalledWith(
-      'grp-1', 'proj-1', 'awaiting_approval', undefined, job,
+      'grp-1', 'proj-1', 'awaiting_approval', expect.objectContaining({ confidence: 'high' }), job,
     );
     expect(mockCloneRepo).not.toHaveBeenCalled();
     expect(mockRunPipeline).not.toHaveBeenCalled();
+  });
+
+  it('processes an auto friction fix when autonomy allows it', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({
+      kind: 'friction', status: 'fixing', sample_event_id: '', confidence: 'high',
+    }));
+    mockGetProject.mockResolvedValue({
+      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'auto_fix',
+    });
+    const job = { ...makeJob(), jobType: 'fix' as const, triggeredBy: 'auto' as const };
+
+    await processFixJob(job, new AbortController().signal);
+
+    expect(mockCloneRepo).toHaveBeenCalled();
+  });
+
+  it('parks a legacy friction fix job with no attribution even under auto_fix', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({
+      kind: 'friction', status: 'fixing', sample_event_id: '', confidence: 'high',
+    }));
+    mockGetProject.mockResolvedValue({
+      id: 'proj-1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'auto_fix',
+    });
+    const job = { ...makeJob(), jobType: 'fix' as const, triggeredBy: null };
+
+    await processFixJob(job, new AbortController().signal);
+
+    expect(mockUpdateGroupStatus).toHaveBeenCalledWith(
+      'grp-1', 'proj-1', 'awaiting_approval', expect.objectContaining({ confidence: 'high' }), job,
+    );
+    expect(mockCloneRepo).not.toHaveBeenCalled();
   });
 });
 

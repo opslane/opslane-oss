@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { computed, ref, onMounted, watch } from 'vue';
 import {
   listProjects,
+  updateProject,
+  getFixStats,
   listEnvironments,
   createEnvironment,
   listAPIKeys,
@@ -14,6 +16,7 @@ import {
   type Environment,
   type APIKey,
   type APIKeyCreated,
+  type FixStats,
 } from '../api';
 import type { GitHubConfig, GitHubAppStatus } from '../types/api';
 import { formatDate, safeUrl } from '../utils';
@@ -29,6 +32,36 @@ const manualId = ref('');
 const showManual = ref(false);
 const saved = ref(false);
 const loadingProjects = ref(true);
+
+// Friction autonomy
+const autonomyOptions = [
+  {
+    value: 'ask_first',
+    label: 'Ask first (default)',
+    description: 'Friction fixes wait in awaiting-approval until you click Generate fix.',
+  },
+  {
+    value: 'auto_fix',
+    label: 'Auto-fix',
+    description: 'High-confidence, code-caused friction goes straight to a Suggestion PR.',
+  },
+  {
+    value: 'auto_fix_ux',
+    label: 'Auto-fix incl. UX suggestions',
+    description: 'Same as auto-fix today; reserved for UX-suggestion fixes when they ship.',
+  },
+] as const;
+
+const selectedProject = computed(() =>
+  projects.value.find((project) => project.id === selectedProjectId.value) ?? null,
+);
+const autonomy = ref<Project['friction_autonomy']>('ask_first');
+const autonomySaving = ref(false);
+const autonomyError = ref('');
+const fixStats = ref<Record<'error' | 'friction', FixStats> | null>(null);
+let statsRequestToken = 0;
+let autonomySaveToken = 0;
+let lastLoadedProjectId: string | null = null;
 
 // Environments tab
 const environments = ref<Environment[]>([]);
@@ -72,10 +105,93 @@ onMounted(async () => {
   }
 });
 
+watch(selectedProjectId, () => {
+  // Invalidate an in-flight save for the previously selected project so its
+  // completion cannot overwrite the new project's displayed state.
+  autonomySaveToken += 1;
+  autonomySaving.value = false;
+  void loadAutonomyAndStats();
+}, { immediate: true });
+watch(projects, () => {
+  // The projects list changes in two ways: the async load on mount (the
+  // selected project appears — fetch its stats) and a completed save (same
+  // project, only friction_autonomy changed — re-sync the toggle without
+  // refetching stats, which would flicker the receipts for nothing).
+  autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
+  if ((selectedProject.value?.id ?? null) !== lastLoadedProjectId) {
+    void loadAutonomyAndStats();
+  }
+});
+
+async function loadAutonomyAndStats(): Promise<void> {
+  const token = ++statsRequestToken;
+  autonomyError.value = '';
+  fixStats.value = null;
+  autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
+
+  const id = selectedProjectId.value;
+  lastLoadedProjectId = selectedProject.value?.id ?? null;
+  if (!id || !selectedProject.value) return;
+
+  try {
+    const stats = await getFixStats(id);
+    if (token === statsRequestToken) {
+      fixStats.value = stats;
+    }
+  } catch {
+    // Stats are best-effort; the autonomy setting works without them.
+  }
+}
+
+async function saveAutonomy(value: Project['friction_autonomy']): Promise<void> {
+  if (!selectedProject.value) return;
+
+  const projectId = selectedProject.value.id;
+  const saveToken = ++autonomySaveToken;
+  const previous = autonomy.value;
+  autonomy.value = value;
+  autonomySaving.value = true;
+  autonomyError.value = '';
+  try {
+    const updated = await updateProject(projectId, { friction_autonomy: value });
+    projects.value = projects.value.map((project) =>
+      project.id === updated.id ? updated : project,
+    );
+  } catch (err: unknown) {
+    if (saveToken === autonomySaveToken && selectedProjectId.value === projectId) {
+      autonomy.value = previous;
+      autonomyError.value = err instanceof Error
+        ? err.message
+        : 'Failed to save autonomy setting';
+    }
+  } finally {
+    if (saveToken === autonomySaveToken) {
+      autonomySaving.value = false;
+    }
+  }
+}
+
+function optionStats(value: Project['friction_autonomy']): string {
+  const stats = fixStats.value?.friction;
+  if (!stats) return '';
+
+  switch (value) {
+    case 'ask_first':
+      return `${stats.generated_human} friction fixes requested by you`;
+    case 'auto_fix':
+      // Attempts, not delivered PRs: a job can park or dead-end before a PR.
+      // The merged/closed splits count auto-triggered PRs only.
+      return `${stats.generated_auto} auto fix attempts · ${stats.prs_merged_auto} merged · ${stats.prs_closed_auto} closed without merge`;
+    case 'auto_fix_ux':
+      return 'Shares the auto-fix path today — activity is counted under Auto-fix';
+  }
+}
+
 function save(): void {
   const id = showManual.value ? manualId.value.trim() : selectedProjectId.value;
   if (!id) return;
 
+  selectedProjectId.value = id;
   localStorage.setItem('opslane_project_id', id);
 
   const project = projects.value.find((p) => p.id === id);
@@ -382,6 +498,60 @@ async function handleCreateKey(): Promise<void> {
           </div>
         </div>
       </div>
+
+      <!-- Friction autonomy (Batch 5, issue #57) -->
+      <section class="mt-8 p-4 bg-surface border border-border rounded-lg space-y-3">
+        <div>
+          <h3 id="friction-autonomy-heading" class="text-sm font-medium text-text">Friction autonomy</h3>
+          <p id="friction-autonomy-desc" class="mt-1 text-xs text-text-muted">
+            How Opslane acts on friction incidents (rage clicks, dead clicks, form abandonment)
+            that have a code cause. Error fixes are unaffected.
+          </p>
+        </div>
+        <p v-if="!selectedProject" class="text-xs text-text-faint">
+          Select one of your projects above to manage autonomy.
+          (Manually entered project IDs can't be managed here.)
+        </p>
+        <div
+          v-else
+          class="space-y-2"
+          role="radiogroup"
+          aria-labelledby="friction-autonomy-heading"
+          aria-describedby="friction-autonomy-desc"
+        >
+          <label
+            v-for="option in autonomyOptions"
+            :key="option.value"
+            class="flex items-start gap-3 p-3 border rounded-lg transition-colors focus-within:ring-1 focus-within:ring-teal"
+            :class="[
+              autonomy === option.value
+                ? 'border-teal bg-teal-500/5'
+                : 'border-border hover:border-text-faint hover:bg-surface-2',
+              autonomySaving ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer',
+            ]"
+          >
+            <input
+              type="radio"
+              name="friction-autonomy"
+              class="mt-0.5"
+              :value="option.value"
+              :checked="autonomy === option.value"
+              :disabled="autonomySaving"
+              @change="saveAutonomy(option.value)"
+            />
+            <span>
+              <span class="block text-sm text-text" v-text="option.label"></span>
+              <span class="block text-xs text-text-muted" v-text="option.description"></span>
+              <span
+                v-if="fixStats"
+                class="block mt-1 text-xs text-text-faint"
+                v-text="optionStats(option.value)"
+              ></span>
+            </span>
+          </label>
+        </div>
+        <p v-if="autonomyError" class="text-sm text-red" v-text="autonomyError"></p>
+      </section>
     </div>
 
     <!-- Environments tab -->

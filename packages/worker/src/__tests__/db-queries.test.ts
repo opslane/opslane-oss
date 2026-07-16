@@ -177,6 +177,7 @@ describe('getProject', () => {
     });
     const project = await getProject('p1');
     expect(project?.github_repo).toBe('org/repo');
+    expect(mockQuery.mock.calls[0][0]).toContain('friction_autonomy');
   });
 });
 
@@ -302,9 +303,9 @@ describe('requeueStaleJobs — reconcile dead-lettered fix jobs', () => {
     );
     expect(statusCall, 'expected a needs_human reconciliation update').toBeTruthy();
     expect(statusCall![1][0]).toBe('g1');         // errorGroupId
-    expect(statusCall![1][6]).toBe('lease_lost'); // reason_code
-    expect(statusCall![1][7]).toBeTruthy();        // reason_message
-    expect(statusCall![1][8]).toBeTruthy();        // remediation
+    expect(statusCall![1][7]).toBe('lease_lost'); // reason_code
+    expect(statusCall![1][8]).toBeTruthy();        // reason_message
+    expect(statusCall![1][9]).toBeTruthy();        // remediation
   });
 
   it('leaves requeued (non-dead-letter) and non-fix dead-letter jobs alone', async () => {

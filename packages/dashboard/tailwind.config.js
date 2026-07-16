@@ -17,6 +17,7 @@ export default {
         green: 'var(--color-green)',
         amber: 'var(--color-amber)',
         red: 'var(--color-red)',
+        purple: 'var(--color-purple)',
       },
       fontFamily: {
         sans: ['var(--font-sans)'],

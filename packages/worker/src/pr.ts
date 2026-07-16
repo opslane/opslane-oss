@@ -263,6 +263,9 @@ export function buildPRBody(input: PRInput): string {
   );
   const fence = '`'.repeat(maxBacktickRun + 1);
   const replayLink = buildReplayLink(input.errorGroupId, input.projectId);
+  const confidenceLine = input.kind === 'friction'
+    ? '**Confidence:** Suggestion · ✅ Repo tests passing · ⚠️ The friction itself was not re-verified — review before merging'
+    : '**Confidence:** High · ✅ Tests passing';
 
   return [
     input.kind === 'friction'
@@ -275,7 +278,7 @@ export function buildPRBody(input: PRInput): string {
     `${fence}diff`,
     input.diff.trim(),
     fence,
-    '**Confidence:** High · ✅ Tests passing',
+    confidenceLine,
     replayLink ? `📊 [Full investigation & session replay →](${replayLink})` : null,
     buildTechnicalDetails(input),
     '---',

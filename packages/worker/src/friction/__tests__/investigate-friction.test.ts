@@ -18,7 +18,7 @@ function group(): ErrorGroupData {
     id: 'g1', title: 'Rage click on save', fingerprint: 'fp', sample_event_id: '',
     occurrence_count: 1, status: 'queued', kind: 'friction',
     signal_type: 'rage_click', element_selector: '[data-testid="save"]',
-    page_url_normalized: 'https://app.example.com/checkout/:id',
+    page_url_normalized: 'https://app.example.com/checkout/:id', confidence: null,
   };
 }
 
