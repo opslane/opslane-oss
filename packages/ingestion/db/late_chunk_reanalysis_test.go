@@ -45,7 +45,7 @@ func TestCommitChunk_LateChunkReenqueuesAnalysis(t *testing.T) {
 		}
 		if _, err := pool.Exec(ctx,
 			`INSERT INTO session_chunks (session_id, project_id, seq, object_key)
-			 VALUES ($1, $2, $3, 'chunks/' || $1 || '/' || $3)`,
+			 VALUES ($1, $2, $3, 'chunks/' || $1 || '/' || $3::text)`,
 			sessionID, proj.ID, seq,
 		); err != nil {
 			t.Fatalf("seed chunk: %v", err)
