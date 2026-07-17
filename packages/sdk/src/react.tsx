@@ -4,6 +4,8 @@ import { captureException } from './core';
 interface Props {
   children: ReactNode;
   fallback?: ReactNode | ((error: Error) => ReactNode);
+  /** Invoked after the error is reported, for your own logging or UI side effects. */
+  onError?: (error: Error) => void;
 }
 interface State {
   error: Error | null;
@@ -23,6 +25,7 @@ export class OpslaneErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, _info: ErrorInfo): void {
     try {
       captureException(error);
+      this.props.onError?.(error);
     } catch {
       /* SDK must never throw */
     }
