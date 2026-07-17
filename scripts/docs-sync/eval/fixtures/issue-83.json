@@ -1,0 +1,97 @@
+{
+  "corpus": "issue-83",
+  "provenance": {
+    "codeCommit": "ac99a7d",
+    "observedDocsCommit": "6934799",
+    "description": "Reduced fixtures preserving the exact causal SDK diff and the three outcomes observed on docs-sync PR #83."
+  },
+  "cases": [
+    {
+      "id": "react-on-error",
+      "docPath": "docs/guides/react.md",
+      "docType": "setup",
+      "original": "---\ncovers:\n  - packages/sdk/src/react.tsx\n---\n# React setup\n\n## Install\n\n```bash\nnpm install @opslane/sdk\n```\n\n## Boundary\n\n```tsx\nimport { OpslaneErrorBoundary } from '@opslane/sdk/react';\n\nexport const boundary = (\n  <OpslaneErrorBoundary fallback={null}>\n    <div />\n  </OpslaneErrorBoundary>\n);\n```\n\n## What gets caught where\n\n- **Render errors** are caught by `OpslaneErrorBoundary`, reported, and replaced with your `fallback` UI.\n",
+      "diff": "diff --git a/packages/sdk/src/react.tsx b/packages/sdk/src/react.tsx\n--- a/packages/sdk/src/react.tsx\n+++ b/packages/sdk/src/react.tsx\n@@\n interface Props {\n   children: ReactNode;\n   fallback?: ReactNode | ((error: Error) => ReactNode);\n+  /** Invoked after the error is reported, for your own logging or UI side effects. */\n+  onError?: (error: Error) => void;\n@@\n       captureException(error);\n+      this.props.onError?.(error);\n",
+      "expected": {
+        "changed": true,
+        "required": ["onError"],
+        "forbidden": ["</content>", "<changed>", "idempotent", "seamless"],
+        "commandFences": ["npm install @opslane/sdk"],
+        "runnableManifest": {
+          "version": 1,
+          "documents": {
+            "docs/guides/react.md": {
+              "fences": [
+                { "language": "bash", "classification": "illustrative" },
+                {
+                  "language": "tsx",
+                  "classification": "runnable",
+                  "fixture": "test-fixtures/react-app",
+                  "target": "src/docs-eval.tsx",
+                  "command": ["pnpm", "exec", "tsc", "--noEmit"]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "recordedOutput": {
+        "changed": true,
+        "content": "---\ncovers:\n  - packages/sdk/src/react.tsx\n---\n# React setup\n\n## Install\n\n```bash\nnpm install @opslane/sdk\n```\n\n## Boundary\n\n```tsx\nimport { OpslaneErrorBoundary } from '@opslane/sdk/react';\n\nexport const boundary = (\n  <OpslaneErrorBoundary fallback={null}>\n    <div />\n  </OpslaneErrorBoundary>\n);\n```\n\n## What gets caught where\n\n- **Render errors** are caught by `OpslaneErrorBoundary`, reported, and replaced with your `fallback` UI.\n- Pass an `onError(error)` prop to `OpslaneErrorBoundary` to run your own logging or UI side effects after the error has been reported.\n"
+      }
+    },
+    {
+      "id": "overview-no-change",
+      "docPath": "docs/architecture/overview.md",
+      "docType": "internals",
+      "original": "# Architecture overview\n\n```mermaid\nflowchart LR\n    SDK[Browser SDK] --> ING[Ingestion API]\n    ING --> PG[(Postgres)]\n```\n\n## Read next\n\n- [Trust](trust.md) — permissions and data flow\n",
+      "diff": "diff --git a/packages/sdk/src/react.tsx b/packages/sdk/src/react.tsx\n--- a/packages/sdk/src/react.tsx\n+++ b/packages/sdk/src/react.tsx\n@@\n interface Props {\n+  onError?: (error: Error) => void;\n@@\n       captureException(error);\n+      this.props.onError?.(error);\n",
+      "expected": {
+        "changed": false,
+        "exactContent": "# Architecture overview\n\n```mermaid\nflowchart LR\n    SDK[Browser SDK] --> ING[Ingestion API]\n    ING --> PG[(Postgres)]\n```\n\n## Read next\n\n- [Trust](trust.md) — permissions and data flow\n",
+        "required": ["SDK[Browser SDK] --> ING[Ingestion API]"],
+        "forbidden": ["</content>", "<changed>"],
+        "expectMermaid": true,
+        "diagramGoldenExact": true
+      },
+      "recordedOutput": {
+        "changed": false,
+        "content": "# Architecture overview\n\n```mermaid\nflowchart LR\n    SDK[Browser SDK] --> ING[Ingestion API]\n    ING --> PG[(Postgres)]\n```\n\n## Read next\n\n- [Trust](trust.md) — permissions and data flow\n</content>\n<changed>false</changed>"
+      }
+    },
+    {
+      "id": "trust-no-change",
+      "docPath": "docs/architecture/trust.md",
+      "docType": "internals",
+      "original": "# Trust and security model\n\n## Why the prompts are public\n\nThe investigation and fix prompts live in this repository, not behind an API. You can read exactly what instructions the agent operates under before you let it near your code.\n",
+      "diff": "diff --git a/packages/sdk/src/react.tsx b/packages/sdk/src/react.tsx\n--- a/packages/sdk/src/react.tsx\n+++ b/packages/sdk/src/react.tsx\n@@\n interface Props {\n+  onError?: (error: Error) => void;\n@@\n       captureException(error);\n+      this.props.onError?.(error);\n",
+      "expected": {
+        "changed": false,
+        "exactContent": "# Trust and security model\n\n## Why the prompts are public\n\nThe investigation and fix prompts live in this repository, not behind an API. You can read exactly what instructions the agent operates under before you let it near your code.\n",
+        "required": ["The investigation and fix prompts live in this repository"],
+        "forbidden": ["</content>", "<changed>"]
+      },
+      "recordedOutput": {
+        "changed": false,
+        "content": "# Trust and security model\n\n## Why the prompts are public\n\nThe investigation and fix prompts live in this repository, not behind an API. You can read exactly what instructions the agent operates under before you let it near your code.\n</content>"
+      }
+    },
+    {
+      "id": "events-contract-no-change",
+      "docPath": "docs/contracts/events.md",
+      "docType": "contract",
+      "original": "# Event API contract\n\n`POST /api/v1/events` is append-only and backward-compatible.\n\n- Existing fields must never become required.\n- Frozen wire fixtures must never be edited or deleted.\n",
+      "diff": "diff --git a/packages/sdk/src/react.tsx b/packages/sdk/src/react.tsx\n--- a/packages/sdk/src/react.tsx\n+++ b/packages/sdk/src/react.tsx\n@@\n interface Props {\n+  onError?: (error: Error) => void;\n",
+      "expected": {
+        "changed": false,
+        "exactContent": "# Event API contract\n\n`POST /api/v1/events` is append-only and backward-compatible.\n\n- Existing fields must never become required.\n- Frozen wire fixtures must never be edited or deleted.\n",
+        "required": ["append-only and backward-compatible"],
+        "forbidden": ["</content>", "<changed>"],
+        "normativeLines": [
+          "- Existing fields must never become required.",
+          "- Frozen wire fixtures must never be edited or deleted."
+        ]
+      }
+    }
+  ]
+}

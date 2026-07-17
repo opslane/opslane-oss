@@ -7,6 +7,57 @@ import { fileURLToPath } from 'node:url';
 
 const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+export const PUBLISHED_DOCS_POLICY = Object.freeze({
+  prose: Object.freeze([
+    'docs/install.md',
+    'docs/guides/**/*.md',
+    'docs/quickstart/**/*.md',
+    'docs/architecture/**/*.md',
+  ]),
+  deterministic: Object.freeze(['docs/reference/**/*.md']),
+  manual: Object.freeze([
+    'docs/contracts/C4-amendments.md',
+    'docs/contracts/events.md',
+    'docs/contracts/reliability.md',
+  ]),
+  excluded: Object.freeze([]),
+});
+
+// Contracts remain human-maintained because their wording is normative. These
+// mappings never send a contract to the LLM; they only surface a deterministic
+// review reminder when code that can change the promise moves.
+export const MANUAL_DOC_COVERS = Object.freeze({
+  'docs/contracts/C4-amendments.md': Object.freeze([
+    'packages/sdk/package.json',
+    'packages/sdk/src/replay.ts',
+    'packages/sdk/src/session.ts',
+    'packages/sdk/src/chunk-upload.ts',
+    'packages/ingestion/handler/session*.go',
+    'packages/ingestion/handler/replay*.go',
+    'packages/ingestion/handler/routes.go',
+    'packages/ingestion/db/sessions*.go',
+    'packages/ingestion/db/migrations/002_sessions.sql',
+  ]),
+  'docs/contracts/events.md': Object.freeze([
+    'shared/src/types.ts',
+    'packages/sdk/src/core.ts',
+    'packages/sdk/src/transport.ts',
+    'packages/sdk/src/__tests__/wire-shape.test.ts',
+    'packages/ingestion/handler/error_event*.go',
+    'packages/ingestion/handler/wire_compat_test.go',
+    'test-fixtures/wire/events/**',
+    'scripts/check-wire-fixtures.mjs',
+    '.github/workflows/wire-fixtures.yml',
+  ]),
+  'docs/contracts/reliability.md': Object.freeze([
+    'packages/test-reliability/**',
+    'packages/worker/src/**',
+    'packages/ingestion/db/**',
+    'packages/ingestion/handler/**',
+    'packages/ingestion/db/migrations/*job*.sql',
+  ]),
+});
+
 function normalizePath(path) {
   if (typeof path !== 'string') return null;
   const normalized = path.trim().replaceAll('\\', '/').replace(/^(\.\/)+/, '');
@@ -18,6 +69,20 @@ export function isProseTierDoc(path) {
   if (!relative?.endsWith('.md')) return false;
   if (relative === 'docs/install.md') return true;
   return /^docs\/(guides|architecture|quickstart)\//.test(relative);
+}
+
+export function docTypeOf(path) {
+  const relative = normalizePath(path);
+  if (!relative?.endsWith('.md')) return null;
+  if (
+    relative === 'docs/install.md' ||
+    /^docs\/(guides|quickstart)\//.test(relative)
+  ) {
+    return 'setup';
+  }
+  if (/^docs\/architecture\//.test(relative)) return 'internals';
+  if (/^docs\/contracts\//.test(relative)) return 'contract';
+  return null;
 }
 
 export function readCovers(source) {
@@ -91,6 +156,40 @@ export function globToRegExp(glob) {
     }
   }
   return new RegExp(`^${expression}$`);
+}
+
+export function publishedPoliciesFor(path, policy = PUBLISHED_DOCS_POLICY) {
+  const relative = normalizePath(path);
+  if (!relative) return [];
+
+  return Object.entries(policy)
+    .filter(([, patterns]) => patterns.some((pattern) => globToRegExp(pattern).test(relative)))
+    .map(([name]) => name);
+}
+
+export function publishedPolicyOf(path, policy = PUBLISHED_DOCS_POLICY) {
+  const matches = publishedPoliciesFor(path, policy);
+  if (matches.length > 1) {
+    throw new Error(`${normalizePath(path)} has multiple published-doc policies: ${matches.join(', ')}`);
+  }
+  return matches[0] ?? null;
+}
+
+export function manualDocsForChangedPaths(changedPaths, mappings = MANUAL_DOC_COVERS) {
+  const matched = new Set();
+  const compiled = Object.entries(mappings).map(([path, patterns]) => ({
+    path,
+    patterns: patterns.map(globToRegExp),
+  }));
+
+  for (const rawPath of changedPaths) {
+    const path = normalizePath(rawPath);
+    if (!path) continue;
+    for (const doc of compiled) {
+      if (doc.patterns.some((pattern) => pattern.test(path))) matched.add(doc.path);
+    }
+  }
+  return [...matched].sort();
 }
 
 function isCodePath(path) {
@@ -189,6 +288,9 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
     .split('\n')
     .map((path) => path.trim())
     .filter(Boolean);
-  const result = mapChangedPaths(changedPaths, buildDocsIndex());
+  const result = {
+    ...mapChangedPaths(changedPaths, buildDocsIndex()),
+    manualReview: manualDocsForChangedPaths(changedPaths),
+  };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }

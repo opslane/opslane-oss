@@ -9,11 +9,12 @@
   "scripts": {
     "docs:check": "node scripts/check-docs-drift.mjs",
     "docs:map:test": "node --test scripts/__tests__/*.test.mjs .claude/skills/docs-sync/scripts/*.test.mjs",
+    "docs:scope": "node scripts/check-docs-scope.mjs",
     "db:up": "docker compose up -d postgres",
     "db:migrate": "docker compose run --rm migrate",
     "services:restart": "./scripts/restart-services.sh",
     "services:restart:wipe-db": "./scripts/restart-services.sh --wipe-db",
-    "test": "pnpm docs:map:test && node scripts/check-docs-drift.mjs && node scripts/check-action-pins.mjs && node --test scripts/check-wire-fixtures.test.mjs && pnpm -r --filter '!@opslane/test-e2e' test",
+    "test": "pnpm docs:map:test && pnpm docs:scope && node scripts/check-docs-drift.mjs && node scripts/check-action-pins.mjs && node --test scripts/check-wire-fixtures.test.mjs && pnpm -r --filter '!@opslane/test-e2e' test",
     "test:unit": "pnpm -r --filter '!@opslane/test-e2e' test",
     "test:e2e": "pnpm --filter @opslane/test-e2e test",
     "test:reliability:system": "./scripts/run-reliability-system.sh"

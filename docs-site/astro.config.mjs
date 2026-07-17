@@ -84,6 +84,7 @@ export default defineConfig({
           items: [
             { label: 'Reliability contract', slug: 'contracts/reliability' },
             { label: 'Session replay contract', slug: 'contracts/c4-amendments' },
+            { label: 'Event API contract', slug: 'contracts/events' },
           ],
         },
       ],
