@@ -55,6 +55,10 @@ services:
       REPLAY_STORE_ACCESS_KEY: minio
       REPLAY_STORE_SECRET_KEY: minio12345
       JWT_SECRET: opslane-dev-jwt-secret-key-minimum-32-bytes-long
+      AUTH_PROVIDER: ${AUTH_PROVIDER:-github}
+      AUTH_CALLBACK_ORIGIN: ${AUTH_CALLBACK_ORIGIN:-http://localhost:8082}
+      WORKOS_API_KEY: ${WORKOS_API_KEY:-}
+      WORKOS_CLIENT_ID: ${WORKOS_CLIENT_ID:-}
       ALLOW_REGISTRATION: "true"
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}

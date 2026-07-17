@@ -54,7 +54,7 @@ What you can do next depends on which credentials you provide:
 
    The event is captured and grouped, the worker picks up the investigation, and — since it has no AI or GitHub credentials — the error group ends in a `needs_human` state with an explicit reason code and message.
 
-2. **Dashboard sign-in** uses GitHub OAuth, which requires a GitHub App: set `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, and `DASHBOARD_ORIGIN=http://localhost:8082` in your environment before `docker compose up`. (Without `DASHBOARD_ORIGIN`, the OAuth callback redirects to port 3000 — the dashboard dev-server default — where nothing is listening in the Compose setup.)
+2. **Dashboard sign-in** defaults to GitHub OAuth, which requires a GitHub App: set `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, `AUTH_CALLBACK_ORIGIN=http://localhost:8082`, and `DASHBOARD_ORIGIN=http://localhost:8082` before `docker compose up`. Cloud deployments can instead select `AUTH_PROVIDER=workos` and must provide `WORKOS_API_KEY` plus `WORKOS_CLIENT_ID`; partial WorkOS configuration fails closed.
 
 3. **Full error-to-PR** additionally needs `ANTHROPIC_API_KEY`, `E2B_API_KEY`, and GitHub credentials with access to a repository the worker may open pull requests against.
 

@@ -15,67 +15,92 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/opslane/opslane/packages/ingestion/auth"
+	"github.com/opslane/opslane/packages/ingestion/db"
 	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
-// === GET /auth/github — start GitHub OAuth flow ===
-
-func (d *Dependencies) GitHubOAuthStart(w http.ResponseWriter, r *http.Request) {
-	if d.GitHubAppClientID == "" {
-		writeJSONError(w, http.StatusServiceUnavailable, "GitHub OAuth not configured")
-		return
-	}
-
+// OAuthLoginStart begins the configured browser identity-provider flow.
+func (d *Dependencies) OAuthLoginStart(w http.ResponseWriter, r *http.Request) {
 	state, err := generateOAuthState(d.JWTSecret)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if err := d.redirectToProvider(w, r, state); err != nil {
+		slog.Error("build provider authorization URL failed", "provider", d.provider().Name(), "error", err)
+		writeJSONError(w, http.StatusServiceUnavailable, "authentication provider is not configured")
+	}
+}
 
+// GitHubOAuthStart is retained for internal compatibility; public /auth/github
+// is now a redirect to /auth/login.
+func (d *Dependencies) GitHubOAuthStart(w http.ResponseWriter, r *http.Request) {
+	d.OAuthLoginStart(w, r)
+}
+
+func (d *Dependencies) redirectToProvider(w http.ResponseWriter, r *http.Request, state string) error {
+	callbackOrigin := d.AuthCallbackOrigin
+	if callbackOrigin == "" {
+		callbackOrigin = "http://localhost:8080"
+	}
+	redirectURL, err := d.provider().AuthorizeURL(auth.AuthRequest{
+		State:       state,
+		RedirectURI: callbackOrigin + "/auth/callback",
+	})
+	if err != nil {
+		return err
+	}
+	if d.Queries != nil {
+		if err := d.Queries.StoreOAuthLoginState(r.Context(), auth.HashToken(state), time.Now().Add(5*time.Minute)); err != nil {
+			return err
+		}
+	}
 	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
-		Name:     "__github_state",
+		Name:     "__auth_state",
 		Value:    state,
-		Path:     "/auth/github",
+		Path:     "/auth",
 		MaxAge:   300,
 		HttpOnly: true,
 		Secure:   isSecure,
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	params := url.Values{
-		"client_id":    {d.GitHubAppClientID},
-		"redirect_uri": {backendOrigin(r) + "/auth/github/callback"},
-		"scope":        {"user:email"},
-		"state":        {state},
-	}
-	redirectURL := "https://github.com/login/oauth/authorize?" + params.Encode()
 	http.Redirect(w, r, redirectURL, http.StatusFound)
+	return nil
 }
 
-// === GET /auth/github/callback — handle GitHub OAuth callback ===
-
-func (d *Dependencies) GitHubOAuthCallback(w http.ResponseWriter, r *http.Request) {
-	installationIDStr := r.URL.Query().Get("installation_id")
-	setupAction := r.URL.Query().Get("setup_action")
-	isInstallCallback := installationIDStr != "" && setupAction != ""
-
-	stateCookie, err := r.Cookie("__github_state")
-	stateParam := r.URL.Query().Get("state")
-	cookieValue := ""
-	if err == nil {
-		cookieValue = stateCookie.Value
-	}
-	if !validOAuthState(cookieValue, stateParam) {
-		writeJSONError(w, http.StatusForbidden, "invalid OAuth state")
+// OAuthLoginCallback completes either the browser login or the durable CLI bridge.
+func (d *Dependencies) OAuthLoginCallback(w http.ResponseWriter, r *http.Request) {
+	if providerError := r.URL.Query().Get("error"); providerError != "" {
+		writeJSONError(w, http.StatusBadRequest, "authentication was denied: "+providerError)
 		return
 	}
 
-	// Clear the state cookie (if it exists)
+	stateCookie, cookieErr := r.Cookie("__auth_state")
+	state := r.URL.Query().Get("state")
+	cookieValue := ""
+	if cookieErr == nil {
+		cookieValue = stateCookie.Value
+	}
+	if !validOAuthState(cookieValue, state) {
+		writeJSONError(w, http.StatusForbidden, "invalid OAuth state")
+		return
+	}
+	if d.Queries != nil {
+		valid, err := d.Queries.ConsumeOAuthLoginState(r.Context(), auth.HashToken(state))
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !valid {
+			writeJSONError(w, http.StatusForbidden, "OAuth state already used or expired")
+			return
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     "__github_state",
+		Name:     "__auth_state",
 		Value:    "",
-		Path:     "/auth/github",
+		Path:     "/auth",
 		MaxAge:   -1,
 		HttpOnly: true,
 	})
@@ -85,146 +110,168 @@ func (d *Dependencies) GitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "missing code parameter")
 		return
 	}
-
-	// Exchange code for user token
-	token, err := gh.ExchangeOAuthCode(d.GitHubAppClientID, d.GitHubAppClientSecret, code)
+	identity, err := d.provider().ExchangeCode(r.Context(), code)
 	if err != nil {
-		slog.Error("GitHub OAuth code exchange failed", "error", err)
-		writeJSONError(w, http.StatusBadGateway, "GitHub authentication failed")
+		slog.Warn("identity provider code exchange failed", "provider", d.provider().Name(), "error", err)
+		writeJSONError(w, http.StatusBadGateway, "authentication failed")
 		return
 	}
 
-	// Fetch user profile
-	ghUser, err := gh.GetUser(token.AccessToken)
-	if err != nil {
-		slog.Error("GitHub get user failed", "error", err)
-		writeJSONError(w, http.StatusBadGateway, "failed to fetch GitHub profile")
-		return
-	}
-
-	// Get email — fallback to /user/emails if profile email is empty
-	email := ghUser.Email
-	if email == "" {
-		emails, err := gh.GetUserEmails(token.AccessToken)
+	var user *db.User
+	if d.cloudAuthEnabled() {
+		userID, _, err := d.Queries.ProvisionFromIdentity(r.Context(), identity)
 		if err != nil {
-			slog.Error("GitHub get emails failed", "error", err)
-			writeJSONError(w, http.StatusBadGateway, "failed to fetch GitHub email")
+			slog.Error("cloud identity provisioning failed", "error", err)
+			writeJSONError(w, http.StatusConflict, "could not provision identity")
 			return
 		}
-		for _, e := range emails {
-			if e.Primary && e.Verified {
-				email = e.Email
-				break
-			}
+		user, err = d.Queries.GetUserByID(r.Context(), userID)
+		if err != nil || user == nil {
+			writeJSONError(w, http.StatusInternalServerError, "could not load provisioned user")
+			return
+		}
+	} else {
+		user, err = d.provisionGitHubIdentity(r, identity)
+		if err != nil {
+			slog.Error("GitHub identity provisioning failed", "error", err)
+			writeJSONError(w, http.StatusConflict, "could not provision identity")
+			return
 		}
 	}
-	if email == "" {
-		writeJSONError(w, http.StatusBadRequest, "no verified email found on GitHub account")
+
+	if err := d.applyCombinedGitHubInstallation(r, user); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Upsert user: try GitHub ID first, then email (account linking), then create new.
-	name := ghUser.Name
-	if name == "" {
-		name = ghUser.Login
-	}
-
-	user, err := d.Queries.GetUserByGitHubID(r.Context(), ghUser.ID)
+	// A matching pending record means this callback belongs to a CLI PKCE flow.
+	pending, err := d.Queries.ConsumeCLIPKCERequest(r.Context(), auth.HashToken(state))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-
-	if user != nil {
-		// Existing GitHub user — update profile fields
-		if err := d.Queries.UpdateUserGitHub(r.Context(), user.ID, ghUser.Login, ghUser.AvatarURL, email); err != nil {
-			slog.Error("update github user failed", "error", err)
-		}
-		user.Email = email
-	} else {
-		// No user with this GitHub ID — check if email already exists (account linking)
-		existingUser, err := d.Queries.GetUserByEmail(r.Context(), email)
+	if pending != nil {
+		rawCode, codeHash, err := auth.GenerateAuthCode()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-
-		if existingUser != nil {
-			// Link GitHub identity to the existing email/password user
-			if err := d.Queries.LinkUserGitHub(r.Context(), existingUser.ID, ghUser.ID, ghUser.Login, ghUser.AvatarURL); err != nil {
-				slog.Error("link github user failed", "error", err, "user_id", existingUser.ID, "github_id", ghUser.ID)
-				writeJSONError(w, http.StatusInternalServerError, "failed to link GitHub account")
-				return
-			}
-			slog.Info("linked GitHub identity to existing user", "user_id", existingUser.ID, "github_id", ghUser.ID)
-			user = existingUser
-		} else {
-			// Truly new user — create org + user
-			org, err := d.Queries.CreateOrg(r.Context(), ghUser.Login)
-			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, "failed to create organization")
-				return
-			}
-			user, err = d.Queries.CreateUserGitHub(r.Context(), org.ID, email, name, ghUser.ID, ghUser.Login, ghUser.AvatarURL)
-			if err != nil {
-				slog.Error("create github user failed", "error", err, "github_id", ghUser.ID)
-				writeJSONError(w, http.StatusInternalServerError, "failed to create user")
-				return
-			}
-		}
-	}
-
-	// If this is a combined install+auth callback, verify the installation before storing it.
-	if isInstallCallback && setupAction == "install" && installationIDStr != "" {
-		installationID, parseErr := strconv.ParseInt(installationIDStr, 10, 64)
-		if parseErr != nil || installationID <= 0 {
-			writeJSONError(w, http.StatusBadRequest, "invalid installation_id")
-			return
-		}
-		if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 {
-			writeJSONError(w, http.StatusServiceUnavailable, "GitHub App not configured")
-			return
-		}
-		appJWT, jwtErr := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
-		if jwtErr != nil {
-			slog.Error("could not generate app JWT for install verification", "error", jwtErr)
+		if err := d.Queries.StoreAuthorizationCode(r.Context(), user.ID, codeHash,
+			pending.CodeChallenge, pending.CodeChallengeMethod, pending.RedirectURI,
+			pending.ClientID, time.Now().Add(authCodeTTL)); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if _, verifyErr := gh.VerifyInstallation(appJWT, installationID); verifyErr != nil {
-			slog.Warn("installation verification failed", "error", verifyErr, "installation_id", installationID)
-			writeJSONError(w, http.StatusForbidden, "invalid or unauthorized installation")
-			return
-		}
-		if storeErr := d.Queries.SetOrgGitHubInstallation(r.Context(), user.OrgID, installationID); storeErr != nil {
-			slog.Error("failed to store installation id during install callback", "error", storeErr, "org_id", user.OrgID)
-			writeJSONError(w, http.StatusInternalServerError, "failed to store installation")
-			return
-		}
-		slog.Info("GitHub App installed via combined callback", "org_id", user.OrgID, "installation_id", installationID)
+		redirectURL := fmt.Sprintf("%s?code=%s&state=%s", pending.RedirectURI,
+			url.QueryEscape(rawCode), url.QueryEscape(pending.OAuthState))
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+		return
 	}
 
-	// Issue JWT + refresh token
-	familyID := uuid.New().String()
 	accessToken, err := auth.SignAccessToken(d.JWTSecret, user.ID, user.OrgID, user.Email)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to sign token")
 		return
 	}
-
 	rawRefresh, hashRefresh, err := auth.GenerateRefreshToken()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to generate refresh token")
 		return
 	}
-
-	if err := d.Queries.StoreRefreshToken(r.Context(), user.ID, hashRefresh, familyID, time.Now().Add(refreshTokenTTL)); err != nil {
+	if err := d.Queries.StoreRefreshToken(r.Context(), user.ID, hashRefresh, uuid.NewString(), user.OrgID, time.Now().Add(refreshTokenTTL)); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to store refresh token")
 		return
 	}
-
 	setAuthCookies(w, r, accessToken, rawRefresh)
-	http.Redirect(w, r, d.DashboardOrigin+"/auth/callback", http.StatusFound)
+	http.Redirect(w, r, d.DashboardOrigin+"/auth/complete", http.StatusFound)
+}
+
+func (d *Dependencies) GitHubOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	d.OAuthLoginCallback(w, r)
+}
+
+func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Identity) (*db.User, error) {
+	githubID, err := strconv.ParseInt(identity.ProviderSubject, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid GitHub subject: %w", err)
+	}
+	userID, err := d.Queries.GetUserIDByIdentity(r.Context(), "github", identity.ProviderSubject)
+	if err != nil {
+		return nil, err
+	}
+	var user *db.User
+	if userID != "" {
+		user, err = d.Queries.GetUserByID(r.Context(), userID)
+	} else {
+		user, err = d.Queries.GetUserByGitHubID(r.Context(), githubID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		existing, err := d.Queries.GetUserByEmail(r.Context(), identity.Email)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			if !identity.EmailVerified {
+				return nil, fmt.Errorf("unverified GitHub email cannot link an existing account")
+			}
+			if err := d.Queries.LinkUserGitHub(r.Context(), existing.ID, githubID, identity.Username, identity.AvatarURL); err != nil {
+				return nil, err
+			}
+			user = existing
+		} else {
+			// Fail closed: never create an account for an unverified email, or an
+			// attacker can seed an org under a victim's address and be adopted into
+			// it when the victim later signs in with their verified email.
+			if !identity.EmailVerified {
+				return nil, fmt.Errorf("unverified GitHub email cannot create an account")
+			}
+			org, err := d.Queries.CreateOrg(r.Context(), identity.Username)
+			if err != nil {
+				return nil, err
+			}
+			user, err = d.Queries.CreateUserGitHub(r.Context(), org.ID, identity.Email,
+				identity.Name, githubID, identity.Username, identity.AvatarURL)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := d.Queries.UpdateUserGitHub(r.Context(), user.ID, identity.Username, identity.AvatarURL, identity.Email); err != nil {
+		slog.Warn("refresh GitHub profile failed", "user_id", user.ID, "error", err)
+	}
+	if err := d.Queries.UpsertIdentityDetails(r.Context(), user.ID, "github", identity.ProviderSubject, identity.Email, identity.EmailVerified); err != nil {
+		return nil, err
+	}
+	user.Email = db.NormalizeEmail(identity.Email)
+	return user, nil
+}
+
+func (d *Dependencies) applyCombinedGitHubInstallation(r *http.Request, user *db.User) error {
+	if d.provider().Name() != "github" || r.URL.Query().Get("setup_action") != "install" {
+		return nil
+	}
+	installationIDText := r.URL.Query().Get("installation_id")
+	if installationIDText == "" {
+		return nil
+	}
+	installationID, err := strconv.ParseInt(installationIDText, 10, 64)
+	if err != nil || installationID <= 0 {
+		return fmt.Errorf("invalid installation_id")
+	}
+	if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 {
+		return fmt.Errorf("GitHub App not configured")
+	}
+	appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
+	if err != nil {
+		return fmt.Errorf("generate GitHub App token: %w", err)
+	}
+	if _, err := gh.VerifyInstallation(appJWT, installationID); err != nil {
+		return fmt.Errorf("invalid or unauthorized installation")
+	}
+	return d.Queries.SetOrgGitHubInstallation(r.Context(), user.OrgID, installationID)
 }
 
 // === helpers ===

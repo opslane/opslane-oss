@@ -3,7 +3,9 @@ import type {
   GitHubConfig, GitHubAppStatus, GitHubRepo, SetupPrStatus,
   SessionDetail, SessionFilters, SessionListResponse,
   AdminOverview, AdminJobsResponse, HealthResponse,
+  AuthUser, OrgInvitation,
 } from './types/api';
+export type { AuthUser, AuthMembership, OrgInvitation } from './types/api';
 import type { ChunkEnvelope } from './components/session-replay';
 
 const BASE = '/api/v1';
@@ -21,14 +23,6 @@ const AUTHED_KEY = 'opslane_authed';
 localStorage.removeItem('defender_access_token');
 localStorage.removeItem('defender_refresh_token');
 localStorage.removeItem('defender_token_expires_at');
-
-export interface AuthUser {
-  id: string;
-  org_id: string;
-  email: string;
-  name: string;
-  is_admin: boolean;
-}
 
 export function isAuthenticated(): boolean {
   return !!localStorage.getItem(AUTHED_KEY);
@@ -209,6 +203,36 @@ export interface ReplayRecording {
 
 export function getMe(): Promise<AuthUser> {
   return fetchJSON<AuthUser>('/auth/me');
+}
+
+export async function switchOrg(orgID: string): Promise<void> {
+  const response = await fetch('/auth/switch-org', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ org_id: orgID }),
+  });
+  if (!response.ok) {
+    throw new APIError(response.status, `Unable to switch organization (${response.status})`);
+  }
+  localStorage.removeItem('opslane_project_id');
+  localStorage.removeItem('opslane_project_name');
+}
+
+export function listInvitations(): Promise<OrgInvitation[]> {
+  return fetchJSON<OrgInvitation[]>('/invitations');
+}
+
+export function createInvitation(email: string, role: OrgInvitation['role']): Promise<{ invitation: OrgInvitation; token: string }> {
+  return postJSON<{ invitation: OrgInvitation; token: string }>('/invitations', { email, role });
+}
+
+export function revokeInvitation(invitationID: string): Promise<{ ok: boolean }> {
+  return deleteJSON<{ ok: boolean }>(`/invitations/${invitationID}`);
+}
+
+export function acceptInvitation(token: string): Promise<{ ok: boolean; org_id: string }> {
+  return postJSON<{ ok: boolean; org_id: string }>('/invitations/accept', { token });
 }
 
 // A hung admin request would otherwise wedge AdminView's poll loop forever

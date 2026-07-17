@@ -11,6 +11,13 @@ onMounted(async () => {
     await getMe();
     markAuthed();
 
+    const returnPath = sessionStorage.getItem('opslane_post_auth_path');
+    if (returnPath) {
+      sessionStorage.removeItem('opslane_post_auth_path');
+      router.push(returnPath);
+      return;
+    }
+
     const projects = await listProjects();
     if (projects.length > 0) {
       localStorage.setItem('opslane_project_id', projects[0].id);

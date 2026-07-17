@@ -3,6 +3,7 @@ import { ref, computed, onMounted, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { getMe, clearAuth, isAuthenticated, listProjects, type AuthUser, type Project } from './api';
 import { routeNeedsProject } from './route-project';
+import OrgSwitcher from './components/OrgSwitcher.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -10,7 +11,7 @@ const user = ref<AuthUser | null>(null);
 const projectName = ref(localStorage.getItem('opslane_project_name') ?? '');
 
 // Routes that hide the header and use full-page layout
-const fullPageRoutes = ['login', 'register', 'setup', 'auth-callback'];
+const fullPageRoutes = ['login', 'register', 'setup', 'auth-complete', 'invite-accept'];
 const isFullPage = computed(() => fullPageRoutes.includes(route.name as string));
 
 function navLinkClass(routeName: string): string {
@@ -126,6 +127,11 @@ watch(
           class="text-sm text-text-muted border-l border-border pl-3"
           v-text="projectName"
         ></span>
+        <OrgSwitcher
+          v-if="user?.memberships?.length"
+          :memberships="user.memberships"
+          :active-org-id="user.active_org_id ?? user.org_id"
+        />
       </div>
       <nav class="flex items-center gap-6 h-14">
         <router-link to="/" :class="navLinkClass('activity')">

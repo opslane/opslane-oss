@@ -4,6 +4,7 @@ import { routeNeedsProject } from './route-project';
 describe('routeNeedsProject', () => {
   it('lets an operator without a selected project open the admin dashboard', () => {
     expect(routeNeedsProject('admin')).toBe(false);
+    expect(routeNeedsProject('invite-accept')).toBe(false);
   });
 
   it('still requires a project for tenant-scoped routes', () => {

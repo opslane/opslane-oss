@@ -12,18 +12,22 @@ import {
   setGitHubConfig,
   deleteGitHubConfig,
   getGitHubAppStatus,
+  getMe,
   type Project,
   type Environment,
   type APIKey,
   type APIKeyCreated,
   type FixStats,
 } from '../api';
-import type { GitHubConfig, GitHubAppStatus } from '../types/api';
+import type { AuthMembership, GitHubConfig, GitHubAppStatus } from '../types/api';
 import { formatDate, safeUrl } from '../utils';
 import CopyButton from '../components/CopyButton.vue';
 import RepoSelector from '../components/RepoSelector.vue';
+import InvitationsPanel from '../components/InvitationsPanel.vue';
 
-const activeTab = ref<'project' | 'environments' | 'api-keys'>('project');
+type SettingsTab = 'project' | 'environments' | 'api-keys' | 'organization';
+const activeTab = ref<SettingsTab>('project');
+const activeRole = ref<AuthMembership['role']>();
 
 // Project tab
 const projects = ref<Project[]>([]);
@@ -91,6 +95,7 @@ const creatingKey = ref(false);
 const keyError = ref('');
 
 onMounted(async () => {
+  getMe().then((user) => { activeRole.value = user.active_role; }).catch(() => {});
   try {
     projects.value = await listProjects();
     // Load GitHub App status + per-project config
@@ -208,7 +213,7 @@ function save(): void {
   loadGitHubConfig(id);
 }
 
-function switchTab(tab: 'project' | 'environments' | 'api-keys'): void {
+function switchTab(tab: SettingsTab): void {
   activeTab.value = tab;
   const pid = selectedProjectId.value || localStorage.getItem('opslane_project_id') || '';
   if (tab === 'environments' && environments.value.length === 0 && pid) {
@@ -363,6 +368,14 @@ async function handleCreateKey(): Promise<void> {
           @click="switchTab('api-keys')"
         >
           API Keys
+        </button>
+        <button
+          v-if="activeRole"
+          class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+          :class="activeTab === 'organization' ? 'tab-active' : 'tab-inactive'"
+          @click="switchTab('organization')"
+        >
+          Organization
         </button>
       </nav>
     </div>
@@ -640,6 +653,10 @@ async function handleCreateKey(): Promise<void> {
           Generate new key
         </button>
       </div>
+    </div>
+
+    <div v-if="activeTab === 'organization'">
+      <InvitationsPanel :active-role="activeRole" />
     </div>
 
     <!-- New key modal -->

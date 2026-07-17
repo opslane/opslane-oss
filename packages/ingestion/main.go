@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
@@ -86,11 +87,34 @@ func main() {
 		slog.Warn("GITHUB_APP_CLIENT_ID/SECRET not set — GitHub OAuth login disabled")
 	}
 
+	authProvider, err := auth.SelectAuthProvider(auth.ProviderConfig{
+		Provider:           os.Getenv("AUTH_PROVIDER"),
+		GitHubClientID:     githubAppClientID,
+		GitHubClientSecret: githubAppClientSecret,
+		WorkOSAPIKey:       os.Getenv("WORKOS_API_KEY"),
+		WorkOSClientID:     os.Getenv("WORKOS_CLIENT_ID"),
+	})
+	if err != nil {
+		slog.Error("invalid auth provider configuration", "error", err)
+		os.Exit(1)
+	}
+	authCallbackOrigin := os.Getenv("AUTH_CALLBACK_ORIGIN")
+	if authCallbackOrigin == "" {
+		if authProvider.Name() == "workos" {
+			slog.Error("AUTH_CALLBACK_ORIGIN is required when AUTH_PROVIDER=workos")
+			os.Exit(1)
+		}
+		authCallbackOrigin = "http://localhost:" + port
+	}
+	slog.Info("auth provider selected", "provider", authProvider.Name())
+
 	queries := db.New(pool)
 	deps := &handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,
 		JWTSecret:             []byte(jwtSecret),
+		AuthProvider:          authProvider,
+		AuthCallbackOrigin:    authCallbackOrigin,
 		GitHubAppID:           githubAppID,
 		GitHubAppClientID:     githubAppClientID,
 		GitHubAppClientSecret: githubAppClientSecret,
