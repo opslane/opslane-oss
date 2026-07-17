@@ -40,10 +40,15 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 
 	// Auth endpoints (unauthenticated)
 	r.Post("/auth/refresh", deps.Refresh)
+	r.With(deps.AuthenticateUserSession).Post("/auth/switch-org", deps.SwitchOrg)
 
-	// GitHub OAuth (unauthenticated — user auth via GitHub)
-	r.Get("/auth/github", deps.GitHubOAuthStart)
-	r.Get("/auth/github/callback", deps.GitHubOAuthCallback)
+	// Browser OAuth (unauthenticated — user auth via configured provider).
+	r.Get("/auth/login", deps.OAuthLoginStart)
+	r.Get("/auth/github", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/auth/login", http.StatusFound)
+	})
+	r.Get("/auth/callback", deps.OAuthLoginCallback)
+	r.Get("/auth/github/callback", deps.OAuthLoginCallback)
 
 	// OAuth endpoints (unauthenticated — used by CLI PKCE flow)
 	r.HandleFunc("/oauth/authorize", deps.OAuthAuthorize) // GET + POST
@@ -81,69 +86,76 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateSDK, rateLimitByProject(sourcemapsLimiter)).Post("/sourcemaps", deps.UploadSourceMap)
 
 		// Session-authenticated endpoints (dashboard + CLI)
-		r.With(deps.AuthenticateSession).Get("/auth/me", deps.AuthMe)
-		r.With(deps.AuthenticateSession).Get("/auth/verify", deps.AuthVerify)
-		r.With(deps.AuthenticateSession).Post("/auth/logout", deps.Logout)
+		r.With(deps.AuthenticateUserSession).Get("/auth/me", deps.AuthMe)
+		r.With(deps.AuthenticateUserSession).Get("/auth/verify", deps.AuthVerify)
+		r.With(deps.AuthenticateUserSession).Post("/auth/logout", deps.Logout)
+
+		// Cloud organization invitations. Admin operations use the active org;
+		// acceptance is intentionally available to any authenticated user.
+		r.With(deps.AuthenticateUserSession, deps.RequireRole("admin")).Get("/invitations", deps.ListInvitations)
+		r.With(deps.AuthenticateUserSession, deps.RequireRole("admin")).Post("/invitations", deps.CreateInvitation)
+		r.With(deps.AuthenticateUserSession, deps.RequireRole("admin")).Delete("/invitations/{invitationID}", deps.RevokeInvitation)
+		r.With(deps.AuthenticateUserSession).Post("/invitations/accept", deps.AcceptInvitation)
 
 		// Cross-tenant operator observability. RequireAdmin deliberately returns 404.
-		r.With(deps.AuthenticateSession, deps.RequireAdmin).Get("/admin/overview", deps.AdminOverview)
-		r.With(deps.AuthenticateSession, deps.RequireAdmin).Get("/admin/jobs", deps.AdminJobs)
+		r.With(deps.AuthenticateUserSession, deps.RequireAdmin).Get("/admin/overview", deps.AdminOverview)
+		r.With(deps.AuthenticateUserSession, deps.RequireAdmin).Get("/admin/jobs", deps.AdminJobs)
 
 		// Onboarding
-		r.With(deps.AuthenticateSession).Post("/onboarding/setup", deps.OnboardingSetup)
+		r.With(deps.AuthenticateUserSession).Post("/onboarding/setup", deps.OnboardingSetup)
 
 		// Project CRUD
-		r.With(deps.AuthenticateSession).Get("/projects", deps.ListProjects)
-		r.With(deps.AuthenticateSession).Post("/projects", deps.CreateProjectEndpoint)
-		r.With(deps.AuthenticateSession).Patch("/projects/{projectID}", deps.UpdateProjectEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects", deps.ListProjects)
+		r.With(deps.AuthenticateUserSession).Post("/projects", deps.CreateProjectEndpoint)
+		r.With(deps.AuthenticateUserSession).Patch("/projects/{projectID}", deps.UpdateProjectEndpoint)
 
 		// Environment CRUD
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/environments", deps.ListEnvironmentsEndpoint)
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/environments", deps.CreateEnvironmentEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/environments", deps.ListEnvironmentsEndpoint)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/environments", deps.CreateEnvironmentEndpoint)
 
 		// API Key CRUD
-		r.With(deps.AuthenticateSession).Post("/environments/{envID}/api-keys", deps.CreateAPIKeyEndpoint)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/api-keys", deps.ListAPIKeysEndpoint)
+		r.With(deps.AuthenticateUserSession).Post("/environments/{envID}/api-keys", deps.CreateAPIKeyEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/api-keys", deps.ListAPIKeysEndpoint)
 
 		// Stats (session or SDK auth — CLI uses API key, dashboard uses JWT)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/event-count", deps.GetEventCountEndpoint)
 		// Fix-stats is dashboard-only (session auth): it backs the autonomy
 		// settings receipts, which no SDK/CLI caller consumes.
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/fix-stats", deps.GetFixStatsEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/fix-stats", deps.GetFixStatsEndpoint)
 
 		// Incidents (session or SDK auth — CLI uses API key, dashboard uses JWT)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents", deps.ListIncidents)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents/{incidentID}", deps.GetIncident)
 		// === Project D: replay retrieval (project-scoped, dashboard JWT auth) ===
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/replays/{replayID}", deps.GetReplay)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/replays/{replayID}", deps.GetReplay)
 		// Always-on session browsing and bounded chunk playback.
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions", deps.ListSessionsEndpoint)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions/{sessionID}", deps.GetSessionEndpoint)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/sessions/{sessionID}/chunks/{seq}", deps.GetSessionChunk)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/incidents/{incidentID}/affected-users", deps.ListAffectedUsers)
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/fix", deps.TriggerFix)
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/resolve", deps.ResolveIncident)
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/archive", deps.ArchiveIncident)
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/incidents/{incidentID}/unarchive", deps.UnarchiveIncident)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/sessions", deps.ListSessionsEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/sessions/{sessionID}", deps.GetSessionEndpoint)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/sessions/{sessionID}/chunks/{seq}", deps.GetSessionChunk)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/incidents/{incidentID}/affected-users", deps.ListAffectedUsers)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/incidents/{incidentID}/fix", deps.TriggerFix)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/incidents/{incidentID}/resolve", deps.ResolveIncident)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/incidents/{incidentID}/archive", deps.ArchiveIncident)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/incidents/{incidentID}/unarchive", deps.UnarchiveIncident)
 
 		// B2B Accounts
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts", deps.ListAccounts)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts/{accountID}", deps.GetAccount)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/accounts/{accountID}/incidents", deps.ListAccountIncidents)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/accounts", deps.ListAccounts)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/accounts/{accountID}", deps.GetAccount)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/accounts/{accountID}/incidents", deps.ListAccountIncidents)
 
 		// GitHub App integration
-		r.With(deps.AuthenticateSession).Get("/github/setup", deps.GitHubSetupCallback)
-		r.With(deps.AuthenticateSession).Get("/github/status", deps.GetGitHubAppStatus)
-		r.With(deps.AuthenticateSession).Get("/github/repos", deps.ListGitHubRepos)
+		r.With(deps.AuthenticateUserSession).Get("/github/setup", deps.GitHubSetupCallback)
+		r.With(deps.AuthenticateUserSession).Get("/github/status", deps.GetGitHubAppStatus)
+		r.With(deps.AuthenticateUserSession).Get("/github/repos", deps.ListGitHubRepos)
 
 		// Per-project GitHub config
-		r.With(deps.AuthenticateSession).Put("/projects/{projectID}/github", deps.SetGitHubConfig)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/github", deps.GetGitHubConfig)
-		r.With(deps.AuthenticateSession).Delete("/projects/{projectID}/github", deps.DeleteGitHubConfig)
+		r.With(deps.AuthenticateUserSession).Put("/projects/{projectID}/github", deps.SetGitHubConfig)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/github", deps.GetGitHubConfig)
+		r.With(deps.AuthenticateUserSession).Delete("/projects/{projectID}/github", deps.DeleteGitHubConfig)
 
 		// Setup PR
-		r.With(deps.AuthenticateSession).Post("/projects/{projectID}/setup-pr", deps.SetupPR)
-		r.With(deps.AuthenticateSession).Get("/projects/{projectID}/setup-pr", deps.GetSetupPR)
+		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/setup-pr", deps.SetupPR)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/setup-pr", deps.GetSetupPR)
 	})
 
 	// Serve dashboard SPA (must be last — catch-all).

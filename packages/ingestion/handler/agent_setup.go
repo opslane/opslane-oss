@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,8 +19,8 @@ import (
 )
 
 // Rate limiters for agent endpoints
-var agentSetupLimiter = newRateLimiter(5)  // 5/min per IP — session creation
-var agentPollLimiter = newRateLimiter(30)  // 30/min per IP — polling
+var agentSetupLimiter = newRateLimiter(5) // 5/min per IP — session creation
+var agentPollLimiter = newRateLimiter(30) // 30/min per IP — polling
 
 // repoURLPattern validates owner/repo format
 var repoURLPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
@@ -378,12 +379,20 @@ func (d *Dependencies) autoProvision(
 		orgID = existingInstall.OrgID
 	} else {
 		// New installation — need to create or find org
+		var identityUser *db.User
 
-		// Try to find user by GitHub ID or email for existing org
+		// Resolve the provider-neutral identity before the legacy GitHub column.
 		if ghUser != nil {
-			existingUser, lookupErr := d.Queries.GetUserByGitHubID(ctx, ghUser.ID)
-			if lookupErr == nil && existingUser != nil {
-				orgID = existingUser.OrgID
+			subject := strconv.FormatInt(ghUser.ID, 10)
+			identityUserID, lookupErr := d.Queries.GetUserIDByIdentity(ctx, "github", subject)
+			if lookupErr == nil && identityUserID != "" {
+				identityUser, lookupErr = d.Queries.GetUserByID(ctx, identityUserID)
+			}
+			if lookupErr == nil && identityUser == nil {
+				identityUser, lookupErr = d.Queries.GetUserByGitHubID(ctx, ghUser.ID)
+			}
+			if lookupErr == nil && identityUser != nil {
+				orgID = identityUser.OrgID
 			}
 		}
 
@@ -415,12 +424,18 @@ func (d *Dependencies) autoProvision(
 				if email == "" {
 					email = ghUser.Login + "@users.noreply.github.com"
 				}
-				_, createErr = d.Queries.CreateUserGitHub(
+				identityUser, createErr = d.Queries.CreateUserGitHub(
 					ctx, orgID, email, name, ghUser.ID, ghUser.Login, ghUser.AvatarURL,
 				)
 				if createErr != nil {
 					slog.Warn("agent auth: create user failed (non-fatal)", "error", createErr)
 				}
+			}
+		}
+		if identityUser != nil && ghUser != nil {
+			if identityErr := d.Queries.UpsertIdentityDetails(ctx, identityUser.ID, "github",
+				strconv.FormatInt(ghUser.ID, 10), email, false); identityErr != nil {
+				return "", "", "", fmt.Errorf("record GitHub identity: %w", identityErr)
 			}
 		}
 

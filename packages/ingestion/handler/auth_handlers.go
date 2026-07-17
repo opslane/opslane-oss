@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
@@ -154,29 +156,36 @@ type tokenResponse struct {
 }
 
 type userJSON struct {
-	ID      string `json:"id"`
-	OrgID   string `json:"org_id"`
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	IsAdmin bool   `json:"is_admin"`
+	ID          string          `json:"id"`
+	OrgID       string          `json:"org_id"`
+	ActiveOrgID string          `json:"active_org_id,omitempty"`
+	Email       string          `json:"email"`
+	Name        string          `json:"name"`
+	IsAdmin     bool            `json:"is_admin"`
+	Memberships []db.Membership `json:"memberships,omitempty"`
+	ActiveRole  string          `json:"active_role,omitempty"`
+}
+
+func (d *Dependencies) mintTokenPair(ctx context.Context, userID, orgID, email, familyID string) (string, string, error) {
+	accessToken, err := auth.SignAccessToken(d.JWTSecret, userID, orgID, email)
+	if err != nil {
+		return "", "", fmt.Errorf("sign access token: %w", err)
+	}
+	rawRefresh, hashRefresh, err := auth.GenerateRefreshToken()
+	if err != nil {
+		return "", "", fmt.Errorf("generate refresh token: %w", err)
+	}
+	if err := d.Queries.StoreRefreshToken(ctx, userID, hashRefresh, familyID, orgID, time.Now().Add(refreshTokenTTL)); err != nil {
+		return "", "", err
+	}
+	return accessToken, rawRefresh, nil
 }
 
 // issueTokenPair creates a JWT + refresh token and stores the refresh token hash.
 // familyID groups refresh tokens for rotation reuse detection.
 func (d *Dependencies) issueTokenPair(w http.ResponseWriter, r *http.Request, userID, orgID, email, name, familyID string) {
-	accessToken, err := auth.SignAccessToken(d.JWTSecret, userID, orgID, email)
+	accessToken, rawRefresh, err := d.mintTokenPair(r.Context(), userID, orgID, email, familyID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to sign token")
-		return
-	}
-
-	rawRefresh, hashRefresh, err := auth.GenerateRefreshToken()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to generate refresh token")
-		return
-	}
-
-	if err := d.Queries.StoreRefreshToken(r.Context(), userID, hashRefresh, familyID, time.Now().Add(refreshTokenTTL)); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to store refresh token")
 		return
 	}
@@ -199,19 +208,8 @@ func (d *Dependencies) issueTokenPair(w http.ResponseWriter, r *http.Request, us
 // issueTokenPairCookie mints a JWT + refresh token, stores the refresh hash, and
 // delivers both via httpOnly cookies. The JSON body contains no raw tokens.
 func (d *Dependencies) issueTokenPairCookie(w http.ResponseWriter, r *http.Request, userID, orgID, email, name, familyID string) {
-	accessToken, err := auth.SignAccessToken(d.JWTSecret, userID, orgID, email)
+	accessToken, rawRefresh, err := d.mintTokenPair(r.Context(), userID, orgID, email, familyID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to sign token")
-		return
-	}
-
-	rawRefresh, hashRefresh, err := auth.GenerateRefreshToken()
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to generate refresh token")
-		return
-	}
-
-	if err := d.Queries.StoreRefreshToken(r.Context(), userID, hashRefresh, familyID, time.Now().Add(refreshTokenTTL)); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to store refresh token")
 		return
 	}
@@ -266,7 +264,7 @@ func (d *Dependencies) Refresh(w http.ResponseWriter, r *http.Request) {
 	tokenHash := auth.HashToken(rawRefresh)
 
 	// Atomically consume the old refresh token (soft-revoke + reuse detection).
-	userID, familyID, err := d.Queries.ConsumeRefreshToken(r.Context(), tokenHash)
+	userID, familyID, orgID, err := d.Queries.ConsumeRefreshToken(r.Context(), tokenHash)
 	if errors.Is(err, db.ErrTokenReuse) {
 		slog.Warn("refresh token reuse detected", "ip", ip)
 		if cookieMode {
@@ -293,10 +291,26 @@ func (d *Dependencies) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if orgID == "" {
+		orgID = user.OrgID
+	}
+	// A refresh token can carry a switched-into org. Re-check membership so a
+	// user removed from that org cannot keep minting tokens scoped to it; fall
+	// back to the home org rather than issuing a session they can't act on.
+	if d.cloudAuthEnabled() && orgID != user.OrgID {
+		role, membershipErr := d.Queries.GetMembership(r.Context(), user.ID, orgID)
+		if membershipErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to verify membership")
+			return
+		}
+		if role == "" {
+			orgID = user.OrgID
+		}
+	}
 	if cookieMode {
-		d.issueTokenPairCookie(w, r, user.ID, user.OrgID, user.Email, user.Name, familyID)
+		d.issueTokenPairCookie(w, r, user.ID, orgID, user.Email, user.Name, familyID)
 	} else {
-		d.issueTokenPair(w, r, user.ID, user.OrgID, user.Email, user.Name, familyID)
+		d.issueTokenPair(w, r, user.ID, orgID, user.Email, user.Name, familyID)
 	}
 }
 
@@ -310,14 +324,25 @@ func (d *Dependencies) AuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userJSON{
+	response := userJSON{
 		ID:      user.ID,
 		OrgID:   user.OrgID,
 		Email:   user.Email,
 		Name:    user.Name,
 		IsAdmin: d.isAdminEmail(user.Email),
-	})
+	}
+	if d.cloudAuthEnabled() {
+		memberships, err := d.Queries.ListMembershipsByUser(r.Context(), user.ID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to load memberships")
+			return
+		}
+		response.Memberships = memberships
+		response.ActiveOrgID = OrgIDFromCtx(r.Context())
+		response.ActiveRole = RoleFromCtx(r.Context())
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // === GET /api/v1/auth/verify ===
@@ -342,6 +367,161 @@ func (d *Dependencies) Logout(w http.ResponseWriter, r *http.Request) {
 	clearAuthCookies(w, r)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+type switchOrgRequest struct {
+	OrgID        string `json:"org_id"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// SwitchOrg rotates the current session into another organization without
+// changing the OSS-compatible users.org_id home organization.
+func (d *Dependencies) SwitchOrg(w http.ResponseWriter, r *http.Request) {
+	if !d.cloudAuthEnabled() {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var request switchOrgRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.OrgID == "" {
+		writeJSONError(w, http.StatusBadRequest, "org_id is required")
+		return
+	}
+	userID := UserIDFromCtx(r.Context())
+	role, err := d.Queries.GetMembership(r.Context(), userID, request.OrgID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to verify membership")
+		return
+	}
+	if role == "" {
+		writeJSONError(w, http.StatusForbidden, "organization membership required")
+		return
+	}
+
+	rawRefresh := request.RefreshToken
+	cookieMode := false
+	if cookie, err := r.Cookie(RefreshCookieName); err == nil && cookie.Value != "" {
+		rawRefresh = cookie.Value
+		cookieMode = true
+	}
+	if rawRefresh == "" {
+		writeJSONError(w, http.StatusBadRequest, "current refresh token is required")
+		return
+	}
+	consumedUserID, familyID, _, err := d.Queries.ConsumeRefreshToken(r.Context(), auth.HashToken(rawRefresh))
+	if err != nil || consumedUserID == "" || consumedUserID != userID {
+		if cookieMode {
+			clearAuthCookies(w, r)
+		}
+		writeJSONError(w, http.StatusUnauthorized, "invalid current refresh token")
+		return
+	}
+	user, err := d.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		writeJSONError(w, http.StatusInternalServerError, "user not found")
+		return
+	}
+	accessToken, newRefresh, err := d.mintTokenPair(r.Context(), user.ID, request.OrgID, user.Email, familyID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to rotate session")
+		return
+	}
+	if cookieMode {
+		setAuthCookies(w, r, accessToken, newRefresh)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "active_org_id": request.OrgID})
+		return
+	}
+	writeJSON(w, http.StatusOK, tokenResponse{
+		AccessToken: accessToken, RefreshToken: newRefresh,
+		ExpiresIn: int(auth.DefaultAccessTokenTTL.Seconds()),
+		User: userJSON{ID: user.ID, OrgID: user.OrgID, ActiveOrgID: request.OrgID,
+			Email: user.Email, Name: user.Name, IsAdmin: d.isAdminEmail(user.Email)},
+	})
+}
+
+type createInvitationRequest struct {
+	Email string `json:"email"`
+	Role  string `json:"role"`
+}
+
+func (d *Dependencies) CreateInvitation(w http.ResponseWriter, r *http.Request) {
+	if !d.cloudAuthEnabled() {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var request createInvitationRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	request.Email = db.NormalizeEmail(request.Email)
+	// An inviter may never grant a role above their own: this is the ceiling
+	// that stops an admin from minting an owner and seizing the organization.
+	if request.Email == "" || !auth.RoleSatisfies(request.Role, "member") ||
+		!auth.RoleSatisfies(RoleFromCtx(r.Context()), request.Role) {
+		writeJSONError(w, http.StatusBadRequest, "valid email and role are required")
+		return
+	}
+	rawToken, tokenHash, err := auth.GenerateRefreshToken()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	invitation, err := d.Queries.CreateInvitation(r.Context(), OrgIDFromCtx(r.Context()),
+		request.Email, request.Role, UserIDFromCtx(r.Context()), tokenHash, time.Now().Add(7*24*time.Hour))
+	if err != nil {
+		writeJSONError(w, http.StatusConflict, "an outstanding invitation already exists")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"invitation": invitation, "token": rawToken})
+}
+
+func (d *Dependencies) ListInvitations(w http.ResponseWriter, r *http.Request) {
+	if !d.cloudAuthEnabled() {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	invitations, err := d.Queries.ListInvitationsByOrg(r.Context(), OrgIDFromCtx(r.Context()))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to list invitations")
+		return
+	}
+	writeJSON(w, http.StatusOK, invitations)
+}
+
+func (d *Dependencies) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
+	if !d.cloudAuthEnabled() {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err := d.Queries.RevokeInvitation(r.Context(), OrgIDFromCtx(r.Context()), chi.URLParam(r, "invitationID")); err != nil {
+		writeJSONError(w, http.StatusNotFound, "invitation not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+type acceptInvitationRequest struct {
+	Token string `json:"token"`
+}
+
+func (d *Dependencies) AcceptInvitation(w http.ResponseWriter, r *http.Request) {
+	if !d.cloudAuthEnabled() {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	var request acceptInvitationRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&request); err != nil || request.Token == "" {
+		writeJSONError(w, http.StatusBadRequest, "token is required")
+		return
+	}
+	orgID, err := d.Queries.AcceptInvitation(r.Context(), auth.HashToken(request.Token), UserIDFromCtx(r.Context()))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid, expired, or mismatched invitation")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "org_id": orgID})
 }
 
 // === OAuth endpoints ===
@@ -388,6 +568,31 @@ func (d *Dependencies) oauthAuthorizeGET(w http.ResponseWriter, r *http.Request)
 
 	if !isAllowedRedirectURI(redirectURI) {
 		writeJSONError(w, http.StatusBadRequest, "invalid redirect_uri: must be localhost")
+		return
+	}
+	if !d.provider().SupportsLocalPasswordForm() {
+		if clientID == "" || codeChallenge == "" || codeChallengeMethod != "S256" {
+			writeJSONError(w, http.StatusBadRequest, "client_id, code_challenge, and S256 code_challenge_method are required")
+			return
+		}
+		providerState, err := generateOAuthState(d.JWTSecret)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := d.Queries.StoreCLIPKCERequest(r.Context(), auth.HashToken(providerState), db.CLIPKCERequest{
+			ClientID:            clientID,
+			RedirectURI:         redirectURI,
+			OAuthState:          state,
+			CodeChallenge:       codeChallenge,
+			CodeChallengeMethod: codeChallengeMethod,
+		}, time.Now().Add(authCodeTTL)); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := d.redirectToProvider(w, r, providerState); err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "authentication provider is not configured")
+		}
 		return
 	}
 

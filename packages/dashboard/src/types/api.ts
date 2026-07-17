@@ -1,3 +1,32 @@
+export interface AuthMembership {
+  org_id: string;
+  name: string;
+  role: 'owner' | 'admin' | 'member';
+}
+
+export interface AuthUser {
+  id: string;
+  org_id: string;
+  active_org_id?: string;
+  active_role?: AuthMembership['role'];
+  email: string;
+  name: string;
+  is_admin: boolean;
+  memberships?: AuthMembership[];
+}
+
+export interface OrgInvitation {
+  id: string;
+  org_id: string;
+  email: string;
+  role: AuthMembership['role'];
+  invited_by: string;
+  expires_at: string;
+  created_at: string;
+  accepted_at?: string;
+  revoked_at?: string;
+}
+
 export type ErrorGroupStatus =
   | 'new'
   | 'queued'

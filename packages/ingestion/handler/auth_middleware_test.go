@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -120,6 +122,95 @@ func TestSDKAuth_CrossTenantProjectIsForbidden(t *testing.T) {
 		map[string]string{"X-API-Key": keyA})
 	if w.Code != http.StatusForbidden {
 		t.Errorf("cross-tenant event-count = %d, want 403: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSDKKeyCannotAccessSiblingProject(t *testing.T) {
+	router, q, pool := authTestRouter(t)
+	orgID, _, _, keyA := seedTenant(t, q)
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, orgID) })
+	projectB, err := q.CreateProject(context.Background(), orgID, "sibling", nil)
+	if err != nil {
+		t.Fatalf("CreateProject sibling: %v", err)
+	}
+	response := doRequest(router, http.MethodGet,
+		"/api/v1/projects/"+projectB.ID+"/event-count", map[string]string{"X-API-Key": keyA})
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "project mismatch") {
+		t.Fatalf("sibling access status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+type cloudAuthStub struct{}
+
+func (cloudAuthStub) Name() string                                  { return "workos" }
+func (cloudAuthStub) AuthorizeURL(auth.AuthRequest) (string, error) { return "", nil }
+func (cloudAuthStub) ExchangeCode(context.Context, string) (auth.Identity, error) {
+	return auth.Identity{}, nil
+}
+func (cloudAuthStub) SupportsLocalPasswordForm() bool { return false }
+
+func TestRequireMembershipAndRoleUseCurrentDatabaseRole(t *testing.T) {
+	_, q, pool := authTestRouter(t)
+	ctx := context.Background()
+	org, err := q.CreateOrg(ctx, "role-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, org.ID) })
+	user, err := q.CreateUserGitHub(ctx, org.ID, fmt.Sprintf("role-%d@example.com", time.Now().UnixNano()), "Role", time.Now().UnixNano(), "role", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.CreateMembership(ctx, user.ID, org.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	deps := &handler.Dependencies{Queries: q, JWTSecret: []byte(authTestJWTSecret), AuthProvider: cloudAuthStub{}}
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if handler.RoleFromCtx(r.Context()) != "admin" {
+			t.Errorf("role context=%q, want admin", handler.RoleFromCtx(r.Context()))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	protected := deps.AuthenticateUserSession(deps.RequireRole("admin")(next))
+	token, err := auth.SignAccessToken([]byte(authTestJWTSecret), user.ID, org.ID, user.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(withToken bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+		if withToken {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		response := httptest.NewRecorder()
+		protected.ServeHTTP(response, req)
+		return response
+	}
+	if response := request(false); response.Code != http.StatusUnauthorized || called {
+		t.Fatalf("missing auth status=%d called=%v", response.Code, called)
+	}
+	if response := request(true); response.Code != http.StatusForbidden || called {
+		t.Fatalf("member admin status=%d called=%v", response.Code, called)
+	}
+	if err := q.SetMembershipRole(ctx, user.ID, org.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if response := request(true); response.Code != http.StatusNoContent || !called {
+		t.Fatalf("admin status=%d called=%v", response.Code, called)
+	}
+	called = false
+	if err := q.SetMembershipRole(ctx, user.ID, org.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	if response := request(true); response.Code != http.StatusForbidden || called {
+		t.Fatalf("downgraded status=%d called=%v", response.Code, called)
+	}
+	if err := q.DeleteMembership(ctx, user.ID, org.ID); err != nil {
+		t.Fatal(err)
+	}
+	if response := request(true); response.Code != http.StatusForbidden || called {
+		t.Fatalf("removed status=%d called=%v", response.Code, called)
 	}
 }
 
@@ -330,6 +421,9 @@ func cleanupTenantHandler(t *testing.T, pool *pgxpool.Pool, orgID string) {
 		`DELETE FROM environment_api_keys WHERE environment_id IN (SELECT e.id FROM environments e JOIN projects p ON e.project_id = p.id WHERE p.org_id = $1)`,
 		`DELETE FROM environments WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM projects WHERE org_id = $1`,
+		`DELETE FROM org_invitations WHERE org_id = $1 OR invited_by IN (SELECT id FROM users WHERE org_id = $1)`,
+		`DELETE FROM memberships WHERE org_id = $1 OR user_id IN (SELECT id FROM users WHERE org_id = $1)`,
+		`DELETE FROM users WHERE org_id = $1`,
 		`DELETE FROM orgs WHERE id = $1`,
 	} {
 		if _, err := pool.Exec(ctx, q, orgID); err != nil {

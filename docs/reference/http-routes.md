@@ -11,8 +11,10 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/health` | none | Liveness + dependency checks |
 | GET | `/metrics` | none | Internal metrics |
 | POST | `/auth/refresh` | none | Rotate session tokens |
-| GET | `/auth/github` | none | Begin GitHub OAuth sign-in |
-| GET | `/auth/github/callback` | none | OAuth callback |
+| GET | `/auth/login` | none | Begin the configured identity-provider sign-in |
+| GET | `/auth/github` | none | Compatibility redirect to `/auth/login` |
+| GET | `/auth/callback` | none | Configured identity-provider callback |
+| GET | `/auth/github/callback` | none | Compatibility callback alias for existing GitHub App configurations |
 | GET+POST | `/oauth/authorize` | none | CLI PKCE authorization |
 | POST | `/oauth/token` | none | CLI PKCE token exchange |
 | POST | `/api/v1/agent/setup` | none | Agent-first onboarding start |
@@ -42,6 +44,11 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/api/v1/auth/me` | Current user |
 | GET | `/api/v1/auth/verify` | Validate session |
 | POST | `/api/v1/auth/logout` | End session |
+| POST | `/auth/switch-org` | Cloud only: rotate the current session into another member organization |
+| GET | `/api/v1/invitations` | Cloud org admin: list active-org invitations |
+| POST | `/api/v1/invitations` | Cloud org admin: create an active-org invitation |
+| DELETE | `/api/v1/invitations/{invitationID}` | Cloud org admin: revoke an outstanding invitation |
+| POST | `/api/v1/invitations/accept` | Cloud: accept a single-use, verified-email-bound invitation |
 | GET | `/api/v1/admin/overview` | Operator-only cross-tenant observability overview (404 unless allowlisted) |
 | GET | `/api/v1/admin/jobs` | Operator-only recent jobs (404 unless allowlisted) |
 | POST | `/api/v1/onboarding/setup` | First-run setup |

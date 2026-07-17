@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opslane/opslane/packages/ingestion/auth"
 )
 
 // ErrTokenReuse is returned when a previously consumed refresh token is presented again,
@@ -24,6 +25,14 @@ var ErrNotInvestigated = errors.New("incident not in a fix-triggerable state")
 
 // ErrNoGithubRepo indicates the project has no repo configured for a setup PR.
 var ErrNoGithubRepo = errors.New("project has no github_repo")
+
+// ErrIdentityConflict indicates that a provider subject is already owned by a
+// different local user. Callers must fail closed rather than issue a session.
+var ErrIdentityConflict = errors.New("auth identity belongs to a different user")
+
+// ErrInvalidInvitation is returned for missing, expired, revoked, consumed, or
+// email-mismatched invitations. It intentionally does not reveal which check failed.
+var ErrInvalidInvitation = errors.New("invalid invitation")
 
 // Queries wraps a connection pool and provides tenant-scoped database operations.
 // All query helpers MUST take tenant scope (project_id or org_id) as required parameter.
@@ -45,6 +54,11 @@ func nilIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// NormalizeEmail is the storage and lookup contract for user and invitation email.
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 // === Tenant hierarchy ===
@@ -1377,6 +1391,209 @@ type User struct {
 	UpdatedAt      time.Time
 }
 
+// === Auth identities and cloud provisioning ===
+
+// UpsertIdentity records a provider subject for a user. Ownership is immutable:
+// an existing mapping to another user returns ErrIdentityConflict.
+func (q *Queries) UpsertIdentity(ctx context.Context, userID, provider, subject string) error {
+	return q.UpsertIdentityDetails(ctx, userID, provider, subject, "", false)
+}
+
+// UpsertIdentityDetails also records the provider's current email verification
+// assertion so invitation acceptance can be bound to a verified identity.
+func (q *Queries) UpsertIdentityDetails(ctx context.Context, userID, provider, subject, providerEmail string, emailVerified bool) error {
+	provider = strings.TrimSpace(provider)
+	subject = strings.TrimSpace(subject)
+	if userID == "" || provider == "" || subject == "" {
+		return fmt.Errorf("upsert identity: user, provider, and subject are required")
+	}
+	providerEmail = NormalizeEmail(providerEmail)
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO auth_identities (user_id, provider, provider_subject, provider_email, email_verified)
+		 VALUES ($1, $2, $3, NULLIF($4, ''), $5)
+		 ON CONFLICT (provider, provider_subject) DO NOTHING`,
+		userID, provider, subject, providerEmail, emailVerified)
+	if err != nil {
+		return fmt.Errorf("upsert identity: %w", err)
+	}
+
+	owner, err := q.GetUserIDByIdentity(ctx, provider, subject)
+	if err != nil {
+		return err
+	}
+	if owner != userID {
+		return fmt.Errorf("%w: %s:%s", ErrIdentityConflict, provider, subject)
+	}
+
+	_, err = q.pool.Exec(ctx,
+		`UPDATE auth_identities
+		 SET provider_email = COALESCE(NULLIF($4, ''), provider_email),
+		     email_verified = email_verified OR $5
+		 WHERE user_id = $1 AND provider = $2 AND provider_subject = $3`,
+		userID, provider, subject, providerEmail, emailVerified)
+	if err != nil {
+		return fmt.Errorf("update identity details: %w", err)
+	}
+	return nil
+}
+
+// GetUserIDByIdentity resolves a provider subject, returning "" when absent.
+func (q *Queries) GetUserIDByIdentity(ctx context.Context, provider, subject string) (string, error) {
+	var userID string
+	err := q.pool.QueryRow(ctx,
+		`SELECT user_id FROM auth_identities WHERE provider = $1 AND provider_subject = $2`,
+		strings.TrimSpace(provider), strings.TrimSpace(subject)).Scan(&userID)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get user by identity: %w", err)
+	}
+	return userID, nil
+}
+
+// HasVerifiedIdentityEmail reports whether the local user authenticated an
+// identity provider that verified the supplied normalized email address.
+func (q *Queries) HasVerifiedIdentityEmail(ctx context.Context, userID, email string) (bool, error) {
+	var verified bool
+	err := q.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM auth_identities
+		   WHERE user_id = $1 AND email_verified AND lower(provider_email) = $2
+		 )`, userID, NormalizeEmail(email)).Scan(&verified)
+	if err != nil {
+		return false, fmt.Errorf("check verified identity email: %w", err)
+	}
+	return verified, nil
+}
+
+// ProvisionFromIdentity creates or links a cloud identity atomically.
+func (q *Queries) ProvisionFromIdentity(ctx context.Context, identity auth.Identity) (userID, orgID string, err error) {
+	tx, err := q.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("begin identity provisioning: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	userID, orgID, err = q.ProvisionFromIdentityTx(ctx, tx, identity)
+	if err != nil {
+		return "", "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", "", fmt.Errorf("commit identity provisioning: %w", err)
+	}
+	return userID, orgID, nil
+}
+
+// ProvisionFromIdentityTx is the transaction-scoped core, exposed so concurrency
+// tests can begin two independent transactions at the same time.
+func (q *Queries) ProvisionFromIdentityTx(ctx context.Context, tx pgx.Tx, identity auth.Identity) (string, string, error) {
+	provider := strings.TrimSpace(identity.Provider)
+	subject := strings.TrimSpace(identity.ProviderSubject)
+	email := NormalizeEmail(identity.Email)
+	if provider == "" || subject == "" || email == "" {
+		return "", "", fmt.Errorf("provision identity: provider, subject, and email are required")
+	}
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, provider+":"+subject); err != nil {
+		return "", "", fmt.Errorf("lock identity provisioning: %w", err)
+	}
+	if identity.EmailVerified {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "email:"+email); err != nil {
+			return "", "", fmt.Errorf("lock identity email: %w", err)
+		}
+	}
+
+	var userID, orgID string
+	err := tx.QueryRow(ctx,
+		`SELECT u.id, u.org_id
+		 FROM auth_identities ai JOIN users u ON u.id = ai.user_id
+		 WHERE ai.provider = $1 AND ai.provider_subject = $2`, provider, subject).Scan(&userID, &orgID)
+	if err != nil && err != pgx.ErrNoRows {
+		return "", "", fmt.Errorf("resolve identity in provisioning: %w", err)
+	}
+	if err == nil {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')
+			 ON CONFLICT (user_id, org_id) DO UPDATE SET role = 'owner'`, userID, orgID); err != nil {
+			return "", "", fmt.Errorf("ensure identity owner membership: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE auth_identities SET provider_email = $3,
+			 email_verified = email_verified OR $4
+			 WHERE provider = $1 AND provider_subject = $2`, provider, subject, email, identity.EmailVerified); err != nil {
+			return "", "", fmt.Errorf("refresh identity details: %w", err)
+		}
+		return userID, orgID, nil
+	}
+
+	if identity.EmailVerified {
+		err = tx.QueryRow(ctx,
+			`SELECT id, org_id FROM users WHERE lower(email) = $1`, email).Scan(&userID, &orgID)
+		if err != nil && err != pgx.ErrNoRows {
+			return "", "", fmt.Errorf("find verified email user: %w", err)
+		}
+	} else {
+		var existingID string
+		err = tx.QueryRow(ctx, `SELECT id FROM users WHERE lower(email) = $1`, email).Scan(&existingID)
+		if err == nil {
+			return "", "", fmt.Errorf("provision identity: unverified email cannot link an existing account")
+		}
+		if err != pgx.ErrNoRows {
+			return "", "", fmt.Errorf("check unverified email: %w", err)
+		}
+		// Fail closed: never create an account for an unverified email. Otherwise
+		// an attacker seeds a user+org under a victim's address, and the victim's
+		// later verified login is adopted into that attacker-owned org.
+		return "", "", fmt.Errorf("provision identity: unverified email cannot create an account")
+	}
+
+	if userID == "" {
+		orgName := strings.TrimSpace(identity.Username)
+		if orgName == "" {
+			orgName = strings.TrimSpace(identity.Name)
+		}
+		if orgName == "" {
+			orgName = strings.Split(email, "@")[0]
+		}
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO orgs (name) VALUES ($1) RETURNING id`, orgName).Scan(&orgID); err != nil {
+			return "", "", fmt.Errorf("create identity org: %w", err)
+		}
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO users (org_id, email, password_hash, name, avatar_url)
+			 VALUES ($1, $2, NULL, $3, NULLIF($4, '')) RETURNING id`,
+			orgID, email, identity.Name, identity.AvatarURL).Scan(&userID); err != nil {
+			return "", "", fmt.Errorf("create identity user: %w", err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')
+		 ON CONFLICT (user_id, org_id) DO UPDATE SET role = 'owner'`, userID, orgID); err != nil {
+		return "", "", fmt.Errorf("ensure owner membership: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO auth_identities
+		 (user_id, provider, provider_subject, provider_email, email_verified)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (provider, provider_subject) DO NOTHING`,
+		userID, provider, subject, email, identity.EmailVerified); err != nil {
+		return "", "", fmt.Errorf("insert provisioned identity: %w", err)
+	}
+
+	var owner string
+	if err := tx.QueryRow(ctx,
+		`SELECT user_id FROM auth_identities WHERE provider = $1 AND provider_subject = $2`,
+		provider, subject).Scan(&owner); err != nil {
+		return "", "", fmt.Errorf("validate provisioned identity: %w", err)
+	}
+	if owner != userID {
+		return "", "", fmt.Errorf("%w: %s:%s", ErrIdentityConflict, provider, subject)
+	}
+	return userID, orgID, nil
+}
+
 // GetUserByEmail looks up a user by email. Returns nil if not found.
 // Note: no org_id scope — this is called during login before org is known.
 // Email is globally unique so this is safe.
@@ -1384,8 +1601,8 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (*User, erro
 	var u User
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, org_id, email, password_hash, name, github_id, github_username, avatar_url, created_at, updated_at
-		 FROM users WHERE email = $1`,
-		email,
+		 FROM users WHERE lower(email) = $1`,
+		NormalizeEmail(email),
 	).Scan(&u.ID, &u.OrgID, &u.Email, &u.PasswordHash, &u.Name, &u.GitHubID, &u.GitHubUsername, &u.AvatarURL, &u.CreatedAt, &u.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -1440,7 +1657,7 @@ func (q *Queries) CreateUserGitHub(ctx context.Context, orgID, email, name strin
 		`INSERT INTO users (org_id, email, name, github_id, github_username, avatar_url)
 		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING id, org_id, email, password_hash, name, github_id, github_username, avatar_url, created_at, updated_at`,
-		orgID, email, name, githubID, githubUsername, avatarURL,
+		orgID, NormalizeEmail(email), name, githubID, githubUsername, avatarURL,
 	).Scan(&u.ID, &u.OrgID, &u.Email, &u.PasswordHash, &u.Name, &u.GitHubID, &u.GitHubUsername, &u.AvatarURL, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create github user: %w", err)
@@ -1467,7 +1684,7 @@ func (q *Queries) UpdateUserGitHub(ctx context.Context, userID, githubUsername, 
 	_, err := q.pool.Exec(ctx,
 		`UPDATE users SET github_username = $2, avatar_url = $3, email = $4, updated_at = now()
 		 WHERE id = $1`,
-		userID, githubUsername, avatarURL, email,
+		userID, githubUsername, avatarURL, NormalizeEmail(email),
 	)
 	if err != nil {
 		return fmt.Errorf("update github user: %w", err)
@@ -1507,15 +1724,280 @@ func (q *Queries) GetOrgGitHubInstallation(ctx context.Context, orgID string) (i
 	return *installationID, nil
 }
 
+// === Memberships and invitations (cloud-gated) ===
+
+type Membership struct {
+	UserID    string    `json:"user_id,omitempty"`
+	OrgID     string    `json:"org_id"`
+	OrgName   string    `json:"name"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
+func (q *Queries) CreateMembership(ctx context.Context, userID, orgID, role string) error {
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, $3)
+		 ON CONFLICT (user_id, org_id) DO NOTHING`, userID, orgID, role)
+	if err != nil {
+		return fmt.Errorf("create membership: %w", err)
+	}
+	existing, err := q.GetMembership(ctx, userID, orgID)
+	if err != nil {
+		return err
+	}
+	if existing != role {
+		return fmt.Errorf("create membership: existing role %q differs from %q", existing, role)
+	}
+	return nil
+}
+
+func (q *Queries) ListMembershipsByUser(ctx context.Context, userID string) ([]Membership, error) {
+	rows, err := q.pool.Query(ctx,
+		`SELECT m.user_id, m.org_id, o.name, m.role, m.created_at
+		 FROM memberships m JOIN orgs o ON o.id = m.org_id
+		 WHERE m.user_id = $1 ORDER BY m.created_at, m.org_id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user memberships: %w", err)
+	}
+	defer rows.Close()
+	result := make([]Membership, 0)
+	for rows.Next() {
+		var membership Membership
+		if err := rows.Scan(&membership.UserID, &membership.OrgID, &membership.OrgName, &membership.Role, &membership.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan membership: %w", err)
+		}
+		result = append(result, membership)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list user memberships: %w", err)
+	}
+	return result, nil
+}
+
+func (q *Queries) GetMembership(ctx context.Context, userID, orgID string) (string, error) {
+	var role string
+	err := q.pool.QueryRow(ctx,
+		`SELECT role FROM memberships WHERE user_id = $1 AND org_id = $2`, userID, orgID).Scan(&role)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get membership: %w", err)
+	}
+	return role, nil
+}
+
+func (q *Queries) SetMembershipRole(ctx context.Context, userID, orgID, role string) error {
+	ct, err := q.pool.Exec(ctx,
+		`UPDATE memberships SET role = $3 WHERE user_id = $1 AND org_id = $2`, userID, orgID, role)
+	if err != nil {
+		return fmt.Errorf("set membership role: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("set membership role: membership not found")
+	}
+	return nil
+}
+
+func (q *Queries) DeleteMembership(ctx context.Context, userID, orgID string) error {
+	_, err := q.pool.Exec(ctx,
+		`DELETE FROM memberships WHERE user_id = $1 AND org_id = $2`, userID, orgID)
+	if err != nil {
+		return fmt.Errorf("delete membership: %w", err)
+	}
+	return nil
+}
+
+type Invitation struct {
+	ID         string     `json:"id"`
+	OrgID      string     `json:"org_id"`
+	Email      string     `json:"email"`
+	Role       string     `json:"role"`
+	InvitedBy  string     `json:"invited_by"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+}
+
+func (q *Queries) CreateInvitation(ctx context.Context, orgID, email, role, invitedBy, tokenHash string, expiresAt time.Time) (*Invitation, error) {
+	email = NormalizeEmail(email)
+	tx, err := q.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin invitation create: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`UPDATE org_invitations SET revoked_at = now()
+		 WHERE org_id = $1 AND lower(email) = $2 AND accepted_at IS NULL
+		 AND revoked_at IS NULL AND expires_at <= now()`, orgID, email); err != nil {
+		return nil, fmt.Errorf("expire old invitation: %w", err)
+	}
+	var invitation Invitation
+	err = tx.QueryRow(ctx,
+		`INSERT INTO org_invitations (org_id, email, role, invited_by, token_hash, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING id, org_id, email, role, invited_by, expires_at, created_at, accepted_at, revoked_at`,
+		orgID, email, role, invitedBy, tokenHash, expiresAt,
+	).Scan(&invitation.ID, &invitation.OrgID, &invitation.Email, &invitation.Role,
+		&invitation.InvitedBy, &invitation.ExpiresAt, &invitation.CreatedAt,
+		&invitation.AcceptedAt, &invitation.RevokedAt)
+	if err != nil {
+		return nil, fmt.Errorf("create invitation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit invitation create: %w", err)
+	}
+	return &invitation, nil
+}
+
+func (q *Queries) ListInvitationsByOrg(ctx context.Context, orgID string) ([]Invitation, error) {
+	rows, err := q.pool.Query(ctx,
+		`SELECT id, org_id, email, role, invited_by, expires_at, created_at, accepted_at, revoked_at
+		 FROM org_invitations WHERE org_id = $1 ORDER BY created_at DESC`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("list invitations: %w", err)
+	}
+	defer rows.Close()
+	result := make([]Invitation, 0)
+	for rows.Next() {
+		var invitation Invitation
+		if err := rows.Scan(&invitation.ID, &invitation.OrgID, &invitation.Email, &invitation.Role,
+			&invitation.InvitedBy, &invitation.ExpiresAt, &invitation.CreatedAt,
+			&invitation.AcceptedAt, &invitation.RevokedAt); err != nil {
+			return nil, fmt.Errorf("scan invitation: %w", err)
+		}
+		result = append(result, invitation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list invitations: %w", err)
+	}
+	return result, nil
+}
+
+func (q *Queries) RevokeInvitation(ctx context.Context, orgID, invitationID string) error {
+	ct, err := q.pool.Exec(ctx,
+		`UPDATE org_invitations SET revoked_at = now()
+		 WHERE id = $1 AND org_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL`,
+		invitationID, orgID)
+	if err != nil {
+		return fmt.Errorf("revoke invitation: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrInvalidInvitation
+	}
+	return nil
+}
+
+// AcceptInvitation atomically validates the invite against a verified provider
+// identity for the accepting user, consumes it, and creates the membership.
+func (q *Queries) AcceptInvitation(ctx context.Context, tokenHash, userID string) (string, error) {
+	tx, err := q.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return "", fmt.Errorf("begin invitation acceptance: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var orgID, role string
+	err = tx.QueryRow(ctx,
+		`UPDATE org_invitations i SET accepted_at = now()
+		 WHERE i.token_hash = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL
+		   AND i.expires_at > now()
+		   AND EXISTS (
+		     SELECT 1 FROM users u
+		     JOIN auth_identities ai ON ai.user_id = u.id
+		     WHERE u.id = $2 AND ai.email_verified
+		       AND lower(ai.provider_email) = lower(i.email)
+		       AND lower(u.email) = lower(i.email)
+		   )
+		 RETURNING i.org_id, i.role`, tokenHash, userID).Scan(&orgID, &role)
+	if err == pgx.ErrNoRows {
+		return "", ErrInvalidInvitation
+	}
+	if err != nil {
+		return "", fmt.Errorf("consume invitation: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, $3)
+		 ON CONFLICT (user_id, org_id) DO NOTHING`, userID, orgID, role); err != nil {
+		return "", fmt.Errorf("create invited membership: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit invitation acceptance: %w", err)
+	}
+	return orgID, nil
+}
+
+type CLIPKCERequest struct {
+	ClientID            string
+	RedirectURI         string
+	OAuthState          string
+	CodeChallenge       string
+	CodeChallengeMethod string
+}
+
+func (q *Queries) StoreOAuthLoginState(ctx context.Context, stateHash string, expiresAt time.Time) error {
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO oauth_login_states (state_hash, expires_at) VALUES ($1, $2)`, stateHash, expiresAt)
+	if err != nil {
+		return fmt.Errorf("store OAuth login state: %w", err)
+	}
+	return nil
+}
+
+func (q *Queries) ConsumeOAuthLoginState(ctx context.Context, stateHash string) (bool, error) {
+	var consumed string
+	err := q.pool.QueryRow(ctx,
+		`UPDATE oauth_login_states SET consumed_at = now()
+		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+		 RETURNING state_hash`, stateHash).Scan(&consumed)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("consume OAuth login state: %w", err)
+	}
+	return true, nil
+}
+
+func (q *Queries) StoreCLIPKCERequest(ctx context.Context, stateHash string, request CLIPKCERequest, expiresAt time.Time) error {
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO cli_pkce_requests
+		 (state_hash, client_id, redirect_uri, oauth_state, code_challenge, code_challenge_method, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`, stateHash, request.ClientID,
+		request.RedirectURI, request.OAuthState, request.CodeChallenge, request.CodeChallengeMethod, expiresAt)
+	if err != nil {
+		return fmt.Errorf("store CLI PKCE request: %w", err)
+	}
+	return nil
+}
+
+func (q *Queries) ConsumeCLIPKCERequest(ctx context.Context, stateHash string) (*CLIPKCERequest, error) {
+	var request CLIPKCERequest
+	err := q.pool.QueryRow(ctx,
+		`UPDATE cli_pkce_requests SET consumed_at = now()
+		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+		 RETURNING client_id, redirect_uri, oauth_state, code_challenge, code_challenge_method`, stateHash,
+	).Scan(&request.ClientID, &request.RedirectURI, &request.OAuthState,
+		&request.CodeChallenge, &request.CodeChallengeMethod)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("consume CLI PKCE request: %w", err)
+	}
+	return &request, nil
+}
+
 // === Refresh Tokens ===
 
 // StoreRefreshToken inserts a hashed refresh token for a user with a family ID
 // for rotation reuse detection.
-func (q *Queries) StoreRefreshToken(ctx context.Context, userID, tokenHash, familyID string, expiresAt time.Time) error {
+func (q *Queries) StoreRefreshToken(ctx context.Context, userID, tokenHash, familyID, orgID string, expiresAt time.Time) error {
 	_, err := q.pool.Exec(ctx,
-		`INSERT INTO refresh_tokens (user_id, token_hash, family_id, expires_at)
-		 VALUES ($1, $2, $3, $4)`,
-		userID, tokenHash, familyID, expiresAt,
+		`INSERT INTO refresh_tokens (user_id, token_hash, family_id, org_id, expires_at)
+		 VALUES ($1, $2, $3, NULLIF($4, '')::uuid, $5)`,
+		userID, tokenHash, familyID, orgID, expiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("store refresh token: %w", err)
@@ -1529,15 +2011,15 @@ func (q *Queries) StoreRefreshToken(ctx context.Context, userID, tokenHash, fami
 // If the token was already revoked, this indicates token reuse (theft).
 // In that case, ALL tokens in the family are revoked and ErrTokenReuse is returned.
 //
-// Returns ("", "", nil) if the token is not found or expired.
-func (q *Queries) ConsumeRefreshToken(ctx context.Context, tokenHash string) (userID, familyID string, err error) {
+// Returns ("", "", "", nil) if the token is not found or expired.
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, tokenHash string) (userID, familyID, orgID string, err error) {
 	// Atomic consume: UPDATE ... RETURNING ensures only one concurrent caller wins.
 	err = q.pool.QueryRow(ctx,
 		`UPDATE refresh_tokens SET revoked_at = now()
 		 WHERE token_hash = $1 AND expires_at > now() AND revoked_at IS NULL
-		 RETURNING user_id, family_id`,
+		 RETURNING user_id, family_id, COALESCE(org_id::text, '')`,
 		tokenHash,
-	).Scan(&userID, &familyID)
+	).Scan(&userID, &familyID, &orgID)
 
 	if err == pgx.ErrNoRows {
 		// Token not found, expired, or already revoked.
@@ -1561,14 +2043,14 @@ func (q *Queries) ConsumeRefreshToken(ctx context.Context, tokenHash string) (us
 				slog.Error("failed to revoke token family on reuse detection",
 					"family_id", fID, "error", rErr)
 			}
-			return "", "", ErrTokenReuse
+			return "", "", "", ErrTokenReuse
 		}
-		return "", "", nil
+		return "", "", "", nil
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("consume refresh token: %w", err)
+		return "", "", "", fmt.Errorf("consume refresh token: %w", err)
 	}
-	return userID, familyID, nil
+	return userID, familyID, orgID, nil
 }
 
 // RevokeAllUserRefreshTokens revokes all active refresh tokens for a user (logout).
@@ -1598,6 +2080,18 @@ func (q *Queries) CleanupExpiredTokens(ctx context.Context) (int64, int64, error
 		`DELETE FROM oauth_authorization_codes WHERE expires_at < now() - INTERVAL '1 day'`)
 	if err != nil {
 		return ct1.RowsAffected(), 0, fmt.Errorf("cleanup auth codes: %w", err)
+	}
+	if _, err := q.pool.Exec(ctx,
+		`DELETE FROM cli_pkce_requests
+		 WHERE expires_at < now() - INTERVAL '1 day'
+		    OR consumed_at < now() - INTERVAL '1 day'`); err != nil {
+		return ct1.RowsAffected(), ct2.RowsAffected(), fmt.Errorf("cleanup CLI PKCE requests: %w", err)
+	}
+	if _, err := q.pool.Exec(ctx,
+		`DELETE FROM oauth_login_states
+		 WHERE expires_at < now() - INTERVAL '1 day'
+		    OR consumed_at < now() - INTERVAL '1 day'`); err != nil {
+		return ct1.RowsAffected(), ct2.RowsAffected(), fmt.Errorf("cleanup OAuth login states: %w", err)
 	}
 	return ct1.RowsAffected(), ct2.RowsAffected(), nil
 }

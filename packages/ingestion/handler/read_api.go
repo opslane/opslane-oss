@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -139,31 +140,37 @@ func (d *Dependencies) ListProjects(w http.ResponseWriter, r *http.Request) {
 // SDK auth: projectID must match the authenticated project (project-scoped).
 // Session auth: project's org must match the authenticated org (org-scoped).
 func (d *Dependencies) verifyProjectAccess(w http.ResponseWriter, r *http.Request, projectID string) bool {
+	ok, status, message := d.checkProjectAccess(r.Context(), projectID)
+	if !ok {
+		writeJSONError(w, status, message)
+	}
+	return ok
+}
+
+// checkProjectAccess is the shared project-authorization core. The SDK branch
+// remains exact-project scoped; the session branch remains active-org scoped.
+func (d *Dependencies) checkProjectAccess(ctx context.Context, projectID string) (bool, int, string) {
 	// SDK auth path: ProjectIDFromCtx is set
-	if authProjectID := ProjectIDFromCtx(r.Context()); authProjectID != "" {
+	if authProjectID := ProjectIDFromCtx(ctx); authProjectID != "" {
 		if authProjectID != projectID {
-			writeJSONError(w, http.StatusForbidden, "project mismatch")
-			return false
+			return false, http.StatusForbidden, "project mismatch"
 		}
-		return true
+		return true, 0, ""
 	}
 
 	// Session auth path: org-scoped check (tenant boundary enforced at query layer)
-	orgID := OrgIDFromCtx(r.Context())
+	orgID := OrgIDFromCtx(ctx)
 	if orgID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "authentication required")
-		return false
+		return false, http.StatusUnauthorized, "authentication required"
 	}
-	project, err := d.Queries.GetProjectByOrgID(r.Context(), orgID, projectID)
+	project, err := d.Queries.GetProjectByOrgID(ctx, orgID, projectID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to verify project access")
-		return false
+		return false, http.StatusInternalServerError, "failed to verify project access"
 	}
 	if project == nil {
-		writeJSONError(w, http.StatusForbidden, "project not found or does not belong to your organization")
-		return false
+		return false, http.StatusForbidden, "project not found or does not belong to your organization"
 	}
-	return true
+	return true, 0, ""
 }
 
 // ListIncidents returns incidents (error groups) for a project with optional filters.

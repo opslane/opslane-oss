@@ -9,6 +9,10 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `DATABASE_URL` | yes | Postgres connection string |
 | `PORT` | no (8080) | HTTP listen port |
 | `JWT_SECRET` | yes | Signs session tokens (≥32 bytes) |
+| `AUTH_PROVIDER` | no | Identity provider: `github` (default) or `workos`. Selection is explicit and invalid/partial WorkOS configuration fails boot. |
+| `AUTH_CALLBACK_ORIGIN` | no | Public ingestion origin used to construct the allowlisted `/auth/callback` URL. Never derived from the request Host header. Defaults to the local ingestion port; Compose sets `http://localhost:8082`. |
+| `WORKOS_API_KEY` | when `AUTH_PROVIDER=workos` | WorkOS secret API key used for AuthKit code exchange. |
+| `WORKOS_CLIENT_ID` | when `AUTH_PROVIDER=workos` | WorkOS project client ID used for AuthKit authorization. |
 | `DASHBOARD_DIR` | no | Directory of built dashboard SPA to serve (set in the Docker image) |
 | `DASHBOARD_ORIGIN` | no | Allowed dashboard origin for CORS **and** the OAuth redirect target. For the bundled Compose setup, set `http://localhost:8082`. |
 | `GITHUB_APP_ID` | for GitHub App | App ID |

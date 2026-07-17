@@ -22,6 +22,7 @@ const (
 	ctxRequestID
 	ctxUserID
 	ctxAllowedOrigins
+	ctxRole
 )
 
 // ProjectIDFromCtx extracts the project_id set by auth middleware.
@@ -48,6 +49,13 @@ func UserIDFromCtx(ctx context.Context) string {
 	return v
 }
 
+// RoleFromCtx returns the current database-backed membership role. JWT claims
+// are never used for authorization decisions.
+func RoleFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(ctxRole).(string)
+	return v
+}
+
 // AllowedOriginsFromCtx extracts the project's origin allowlist set by AuthenticateSDK.
 // A nil/empty slice means no allowlist is configured (allow all).
 func AllowedOriginsFromCtx(ctx context.Context) []string {
@@ -61,6 +69,10 @@ type Dependencies struct {
 	Health    *HealthChecker
 	MinIO     *minioPkg.Client
 	JWTSecret []byte
+	// AuthProvider is selected explicitly at boot. Nil retains the OSS GitHub
+	// default for narrow tests that construct Dependencies directly.
+	AuthProvider       auth.AuthProvider
+	AuthCallbackOrigin string
 	// GitHub App OAuth
 	GitHubAppID           string
 	GitHubAppClientID     string
@@ -69,6 +81,17 @@ type Dependencies struct {
 	GitHubAppSlug         string
 	DashboardOrigin       string // e.g. "http://localhost:3000"
 	AdminEmails           map[string]struct{}
+}
+
+func (d *Dependencies) provider() auth.AuthProvider {
+	if d.AuthProvider != nil {
+		return d.AuthProvider
+	}
+	return auth.GitHubProvider{ClientID: d.GitHubAppClientID, ClientSecret: d.GitHubAppClientSecret}
+}
+
+func (d *Dependencies) cloudAuthEnabled() bool {
+	return d.provider().Name() == "workos"
 }
 
 // ParseAdminEmails normalizes the comma-separated ADMIN_EMAILS allowlist.
@@ -146,7 +169,7 @@ func (d *Dependencies) AuthenticateSDK(next http.Handler) http.Handler {
 // Used for endpoints that both the dashboard (session) and CLI (API key) need.
 func (d *Dependencies) AuthenticateSessionOrSDK(next http.Handler) http.Handler {
 	sdkHandler := d.AuthenticateSDK(next)
-	sessionHandler := d.AuthenticateSession(next)
+	sessionHandler := d.AuthenticateUserSession(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-API-Key") != "" {
 			sdkHandler.ServeHTTP(w, r)
@@ -154,6 +177,15 @@ func (d *Dependencies) AuthenticateSessionOrSDK(next http.Handler) http.Handler 
 		}
 		sessionHandler.ServeHTTP(w, r)
 	})
+}
+
+// AuthenticateUserSession authenticates a local session and, in cloud mode,
+// immediately re-checks active membership so removals and downgrades take effect.
+func (d *Dependencies) AuthenticateUserSession(next http.Handler) http.Handler {
+	if !d.cloudAuthEnabled() {
+		return d.AuthenticateSession(next)
+	}
+	return d.AuthenticateSession(d.RequireMembership(next))
 }
 
 // AuthenticateSession validates a session token and sets ctxUserID + ctxOrgID.
@@ -183,6 +215,49 @@ func (d *Dependencies) AuthenticateSession(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, ctxOrgID, claims.OrgID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// RequireMembership loads the current role for the active org from Postgres.
+// It must run after AuthenticateSession.
+func (d *Dependencies) RequireMembership(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID := UserIDFromCtx(r.Context())
+		orgID := OrgIDFromCtx(r.Context())
+		if userID == "" || orgID == "" {
+			writeJSONError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		role, err := d.Queries.GetMembership(r.Context(), userID, orgID)
+		if err != nil {
+			slog.Error("load current membership failed", "error", err, "user_id", userID, "org_id", orgID)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if role == "" {
+			writeJSONError(w, http.StatusForbidden, "organization membership required")
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxRole, role)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// RequireRole enforces the owner >= admin >= member hierarchy using only the
+// current role populated by RequireMembership.
+func (d *Dependencies) RequireRole(required string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !d.cloudAuthEnabled() {
+				writeJSONError(w, http.StatusNotFound, "not found")
+				return
+			}
+			if !auth.RoleSatisfies(RoleFromCtx(r.Context()), required) {
+				writeJSONError(w, http.StatusForbidden, "insufficient organization role")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
