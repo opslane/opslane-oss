@@ -198,10 +198,21 @@ export async function planDocs({
       diff,
       runner,
     });
-    if (!result || typeof result.content !== 'string') {
-      throw new Error(`Claude returned no document content for ${docPath}`);
+    if (!result || typeof result.content !== 'string' || typeof result.changed !== 'boolean') {
+      throw new Error(`Claude returned no valid document result for ${docPath}`);
     }
+    // Trust the model's own staleness verdict: when it reports no change, leave
+    // the doc untouched instead of diffing a possibly-noisy echo of the original.
+    // This is what a stale-free doc should hit, and it stops a "same doc plus
+    // trailing junk" response from being staged just because it differs.
+    if (!result.changed) continue;
     const edited = result.content;
+    // A response that inlines the JSON-schema wrapper tags (</content>,
+    // <changed>) is malformed structured output leaking into the body, not
+    // document prose. Fail loudly rather than publish corrupted markup.
+    if (/<\/content>|<\/?changed>/.test(edited)) {
+      throw new Error(`Claude response for ${docPath} leaked structured-output wrapper tags`);
+    }
     if (oauthToken && edited.includes(oauthToken)) {
       throw new Error(`OAuth token leaked into ${docPath}`);
     }

@@ -64,3 +64,31 @@ test('exact OAuth token in an edited doc is rejected before staging', async () =
     }),
   }), /OAuth token leaked/);
 });
+
+// Regression for PR #83: Claude reported changed:false but its content field
+// echoed the original plus trailing `</content>`/`<changed>false</changed>`
+// markup. Staging on string-diff alone pushed that garbage into unrelated docs.
+test('a changed:false verdict is skipped even when the content echoes trailing noise', async () => {
+  const stagingDir = mkdtempSync(join(tmpdir(), 'docs-plan-test-'));
+  const original = '# React\nSafe prose.\n';
+  const result = await planDocs({
+    repoDir: '/trusted', map: { matched: ['docs/guides/react.md'] },
+    docsIndex: [{ path: 'docs/guides/react.md', covers: ['packages/sdk/src/react.tsx'] }],
+    stagingDir, baseSha: SHA_A, headSha: SHA_B,
+    runner: (_command, args) => args.includes('show') ? original : '+ behavior',
+    runClaude: async () => ({ content: `${original}</content>\n<changed>false</changed>`, changed: false }),
+  });
+  assert.deepEqual(result.changed, []);
+  assert.deepEqual(JSON.parse(readFileSync(join(stagingDir, 'artifact.json'), 'utf8')).changed, []);
+});
+
+test('a changed:true response leaking schema wrapper tags is rejected before staging', async () => {
+  const stagingDir = mkdtempSync(join(tmpdir(), 'docs-plan-test-'));
+  await assert.rejects(() => planDocs({
+    repoDir: '/trusted', map: { matched: ['docs/guides/react.md'] },
+    docsIndex: [{ path: 'docs/guides/react.md', covers: ['packages/sdk/src/react.tsx'] }],
+    stagingDir, baseSha: SHA_A, headSha: SHA_B,
+    runner: (_command, args) => args.includes('show') ? '# React\n' : '+ behavior',
+    runClaude: async () => ({ content: '# React\nNew prose.\n</content>', changed: true }),
+  }), /wrapper tags/);
+});
