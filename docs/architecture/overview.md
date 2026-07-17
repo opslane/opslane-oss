@@ -58,3 +58,5 @@ flowchart LR
 - [Life of an error](life-of-an-error.md) — the pipeline stage by stage
 - [Precision](precision.md) — what "verified" guarantees and what it does not
 - [Trust](trust.md) — permissions, data flow, token handling, retention
+</content>
+<changed>false</changed>

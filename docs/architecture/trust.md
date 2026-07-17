@@ -83,3 +83,4 @@ These are known, tracked, and stated here so you can make an informed deployment
 ## Why the prompts are public
 
 The investigation and fix prompts live in this repository (`packages/worker/src`), not behind an API. That is intentional: you can read exactly what instructions the agent operates under, what it is told never to do, and how untrusted error text is fenced (`<untrusted_user_data>` delimiters in the fix loop) before you let it near your code.
+</content>
