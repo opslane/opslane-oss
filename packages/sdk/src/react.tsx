@@ -38,9 +38,16 @@ export class OpslaneErrorBoundary extends Component<Props, State> {
   }
 }
 
-/** For Next.js app/global-error.tsx and error.tsx, which receive the error as a prop. */
-export function captureReactError(error: Error): void {
+/**
+ * For Next.js app/global-error.tsx and error.tsx, which receive the error as a prop.
+ * Pass the optional `componentStack` (from an error boundary's `ErrorInfo`) to
+ * append React's component trace to the reported stack for easier triage.
+ */
+export function captureReactError(error: Error, componentStack?: string): void {
   try {
+    if (componentStack) {
+      error.stack = `${error.stack ?? ''}\n${componentStack}`;
+    }
     captureException(error);
   } catch {
     /* SDK must never throw */
