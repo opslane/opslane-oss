@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -75,7 +75,8 @@ test('allowlist and secret failures happen before git side effects', async () =>
 
   const secret = 'oauth-test-secret-value-123456';
   const dirs = fixture(`# leaked ${secret}\n`);
-  const secretFingerprints = [{ length: secret.length, sha256: createHash('sha256').update(secret).digest('hex') }];
+  const salt = 'a'.repeat(32);
+  const secretFingerprints = [{ length: secret.length, salt, hmac: createHmac('sha256', salt).update(secret).digest('hex') }];
   await assert.rejects(() => publishDocs({ ...dirs, ...inputs(), artifact: { headSha: HEAD_SHA, changed: [DOC], secretFingerprints }, runner: (...args) => { calls.push(args); return ''; } }), /protected secret/);
   assert.equal(calls.length, 0);
 });

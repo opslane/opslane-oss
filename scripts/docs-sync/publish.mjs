@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 import { copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, posix, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -36,12 +36,21 @@ export function parsePorcelainZ(text) {
 }
 
 function fingerprintMatches(text, item) {
-  if (!Number.isSafeInteger(item.length) || item.length < 1 || !/^[0-9a-f]{64}$/.test(item.sha256)) return true;
+  // Fail closed: a malformed fingerprint is treated as a match so publishDocs
+  // aborts rather than silently skipping the leak check.
+  if (
+    !Number.isSafeInteger(item.length) ||
+    item.length < 1 ||
+    !/^[0-9a-f]{32}$/.test(item.salt) ||
+    !/^[0-9a-f]{64}$/.test(item.hmac)
+  ) {
+    return true;
+  }
   const candidates = text.match(/[A-Za-z0-9_./+=-]{16,}/g) ?? [];
   return candidates.some((candidate) => {
     if (candidate.length < item.length) return false;
     for (let i = 0; i <= candidate.length - item.length; i += 1) {
-      if (createHash('sha256').update(candidate.slice(i, i + item.length)).digest('hex') === item.sha256) return true;
+      if (createHmac('sha256', item.salt).update(candidate.slice(i, i + item.length)).digest('hex') === item.hmac) return true;
     }
     return false;
   });

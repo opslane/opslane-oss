@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix, resolve } from 'node:path';
@@ -48,10 +48,16 @@ export function normalizeRepoPath(value) {
   return normalized;
 }
 
+// Keyed fingerprint for cross-job leak detection: the publish job runs without
+// the token, so it can only match staged text against this. A per-run random
+// salt makes the digest non-precomputable and keeps it out of any
+// password-hash sink (the value is a high-entropy secret, not a password).
 function fingerprint(value) {
+  const salt = randomBytes(16).toString('hex');
   return {
     length: value.length,
-    sha256: createHash('sha256').update(value).digest('hex'),
+    salt,
+    hmac: createHmac('sha256', salt).update(value).digest('hex'),
   };
 }
 
