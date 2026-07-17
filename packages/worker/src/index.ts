@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import type { ClaimedJob } from './db.js';
 import * as db from './db.js';
-import { requeueStaleJobs, updateGroupStatus, closePool, updateGroupInvestigation, updateGroupAndCreateFixJob, getGroupInvestigation, resolveSilentMergedGroups, updateJobTraceUrl } from './db.js';
+import { requeueStaleJobs, updateGroupStatus, closePool, updateGroupInvestigation, updateGroupAndCreateFixJob, getGroupInvestigation, resolveInactiveGroups, resolveSilentMergedGroups, updateJobTraceUrl } from './db.js';
 import { buildReason } from './reason-codes.js';
 import { logger, setWorkerId } from './logger.js';
 import { fetchObject, getMinIOConfig } from './minio-client.js';
@@ -79,6 +79,21 @@ const REAPER_INTERVAL_MS = parseInt(
 );
 const SILENCE_CHECK_INTERVAL_MS = parseInt(
   process.env['SILENCE_CHECK_INTERVAL_MS'] ?? '300000', // 5 minutes default
+  10
+);
+const RESOLVE_AGE_DAYS_DEFAULT = 14;
+const RESOLVE_AGE_DAYS_RAW = parseInt(
+  process.env['RESOLVE_AGE_DAYS'] ?? String(RESOLVE_AGE_DAYS_DEFAULT),
+  10
+);
+// Guard against NaN/negative misconfiguration: a negative value would flip the
+// `now() - N days` window into the future and auto-resolve recent/active issues.
+const RESOLVE_AGE_DAYS =
+  Number.isInteger(RESOLVE_AGE_DAYS_RAW) && RESOLVE_AGE_DAYS_RAW > 0
+    ? RESOLVE_AGE_DAYS_RAW
+    : RESOLVE_AGE_DAYS_DEFAULT;
+const INACTIVITY_CHECK_INTERVAL_MS = parseInt(
+  process.env['INACTIVITY_CHECK_INTERVAL_MS'] ?? '900000', // 15 minutes default
   10
 );
 const WORKER_ID =
@@ -950,12 +965,36 @@ async function main(): Promise<void> {
       });
   }, SILENCE_CHECK_INTERVAL_MS);
 
+  // Inactivity checker — auto-resolve unresolved groups after the configured age
+  const inactivityTimer = setInterval(() => {
+    resolveInactiveGroups(RESOLVE_AGE_DAYS)
+      .then((ids) => {
+        if (ids.length > 0) {
+          logger.info('Inactivity checker: auto-resolved inactive groups', {
+            count: ids.length,
+            // Cap the sample: the first post-deploy sweep can resolve a large
+            // historical backlog and a full UUID array would blow up the log line.
+            group_ids: ids.slice(0, 50),
+            group_ids_truncated: ids.length > 50,
+            resolve_age_days: RESOLVE_AGE_DAYS,
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.error('Inactivity checker error', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }, INACTIVITY_CHECK_INTERVAL_MS);
+
   logger.info('Worker ready', {
     worker_id: WORKER_ID,
     poll_interval_ms: POLL_INTERVAL_MS,
     lease_duration_ms: LEASE_DURATION_MS,
     reaper_interval_ms: REAPER_INTERVAL_MS,
     silence_check_interval_ms: SILENCE_CHECK_INTERVAL_MS,
+    resolve_age_days: RESOLVE_AGE_DAYS,
+    inactivity_check_interval_ms: INACTIVITY_CHECK_INTERVAL_MS,
     health_port: HEALTH_PORT,
   });
 
@@ -963,6 +1002,7 @@ async function main(): Promise<void> {
     logger.info('Worker shutting down');
     clearInterval(reaperTimer);
     clearInterval(silenceTimer);
+    clearInterval(inactivityTimer);
     await poller.stop();
     healthServer.close();
     await shutdownTracing();

@@ -5,3 +5,4 @@ packages:
   - 'test-e2e'
   - 'test-fixtures/*'
   - 'eval'
+  - 'docs-site'

@@ -1,3 +1,8 @@
+---
+covers:
+  - packages/sdk/vite-plugin/**
+  - packages/worker/src/source-map.ts
+---
 # Source maps
 
 Without source maps, production stack traces point at minified bundles and investigations end in `sourcemap_unresolved` or `unfixable_no_sourcemap`. With them, the worker sees your original source. This guide covers the Vite plugin and CI.

@@ -214,6 +214,13 @@ var nonRetriableReasonCodes = map[string]struct{}{
 	// writeup terminal on recurrence rather than wiping it and re-investigating.
 	"low_confidence_fix": {},
 	"tests_failed":       {},
+	// These errors cannot be fixed in application code. They remain terminal even
+	// if inactivity resolution changes the group's status from needs_human.
+	"unfixable_infra":       {},
+	"unfixable_third_party": {},
+	"unfixable_test_error":  {},
+	// unfixable_no_sourcemap is intentionally absent: uploading source maps can
+	// make a later investigation actionable.
 }
 
 // requeueStatuses defines error group statuses eligible for re-queuing when a new
@@ -228,16 +235,42 @@ var requeueStatuses = map[string]struct{}{
 }
 
 // isRequeueEligible returns true if a group should be re-queued on recurrence.
-// Non-retriable needs_human reason codes (e.g. policy_blocked) are excluded.
+// Non-retriable reason codes (e.g. policy_blocked) are excluded regardless of
+// status so an auto-resolved permanent failure remains terminal.
 func isRequeueEligible(groupStatus string, reasonCode *string) bool {
 	if _, ok := requeueStatuses[groupStatus]; !ok {
 		return false
 	}
-	if groupStatus == "needs_human" && reasonCode != nil {
-		_, nonRetriable := nonRetriableReasonCodes[*reasonCode]
-		return !nonRetriable
+	if reasonCode != nil {
+		if _, nonRetriable := nonRetriableReasonCodes[*reasonCode]; nonRetriable {
+			return false
+		}
 	}
 	return true
+}
+
+// releaseNotOlder reports whether candidate is the resolved release or newer,
+// ranked by first-seen time. First-seen uses server-recorded created_at (not the
+// client-supplied timestamp) so a back-dated event cannot poison release ordering
+// and silently suppress a genuine regression. Gating applies only when both
+// releases are known; an empty or unranked side falls back to reopening.
+func (q *Queries) releaseNotOlder(ctx context.Context, tx pgx.Tx, projectID, candidate, resolvedRelease string) (bool, error) {
+	if candidate == "" || resolvedRelease == "" || candidate == resolvedRelease {
+		return true, nil
+	}
+
+	const query = `
+		SELECT
+			(SELECT min(created_at) FROM error_events WHERE project_id = $1 AND release = $2),
+			(SELECT min(created_at) FROM error_events WHERE project_id = $1 AND release = $3)`
+	var candidateFirstSeen, resolvedFirstSeen *time.Time
+	if err := tx.QueryRow(ctx, query, projectID, candidate, resolvedRelease).Scan(&candidateFirstSeen, &resolvedFirstSeen); err != nil {
+		return true, err
+	}
+	if candidateFirstSeen == nil || resolvedFirstSeen == nil {
+		return true, nil
+	}
+	return !candidateFirstSeen.Before(*resolvedFirstSeen), nil
 }
 
 // === Error groups ===
@@ -479,17 +512,27 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 			return nil, fmt.Errorf("update group status to queued: %w", err)
 		}
 	} else {
-		var groupStatus string
+		var groupStatus, resolvedInRelease string
 		var reasonCode *string
 		err = tx.QueryRow(ctx,
-			`SELECT status, reason_code FROM error_groups WHERE id = $1 AND project_id = $2`,
+			`SELECT status, reason_code, COALESCE(resolved_in_release, '')
+			 FROM error_groups WHERE id = $1 AND project_id = $2`,
 			groupID, p.ProjectID,
-		).Scan(&groupStatus, &reasonCode)
+		).Scan(&groupStatus, &reasonCode, &resolvedInRelease)
 		if err != nil {
 			return nil, fmt.Errorf("query group status for requeue check: %w", err)
 		}
 
-		if isRequeueEligible(groupStatus, reasonCode) {
+		eligible := isRequeueEligible(groupStatus, reasonCode)
+		if eligible && (groupStatus == "resolved" || groupStatus == "merged") {
+			notOlder, err := q.releaseNotOlder(ctx, tx, p.ProjectID, p.Release, resolvedInRelease)
+			if err != nil {
+				return nil, fmt.Errorf("release-order check: %w", err)
+			}
+			eligible = notOlder
+		}
+
+		if eligible {
 			err = tx.QueryRow(ctx,
 				`INSERT INTO error_group_jobs (error_group_id, project_id)
 				 VALUES ($1, $2)
@@ -511,6 +554,8 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 				     merged_at = NULL,
 				     resolved_at = NULL,
 				     archived_at = NULL,
+				     resolved_in_release = NULL,
+				     resolved_reason = NULL,
 				     updated_at = now()
 				 WHERE id = $1`,
 				groupID,
@@ -1326,9 +1371,17 @@ func recoverReopenedMerge(ctx context.Context, tx pgx.Tx, githubRepo string, prN
 func (q *Queries) ResolveErrorGroup(ctx context.Context, projectID, groupID string) error {
 	ct, err := q.pool.Exec(ctx,
 		`UPDATE error_groups
-		 SET status = 'resolved', resolved_at = now(), updated_at = now()
-		 WHERE id = $1 AND project_id = $2 AND status != 'archived'`,
-		groupID, projectID,
+		 SET status = 'resolved',
+		     resolved_at = now(),
+		     resolved_reason = 'manual',
+		     resolved_in_release = (
+		       SELECT release FROM error_events
+		       WHERE project_id = $1 AND release IS NOT NULL AND release <> ''
+		       GROUP BY release ORDER BY min(created_at) DESC LIMIT 1
+		     ),
+		     updated_at = now()
+		 WHERE id = $2 AND project_id = $1 AND status != 'archived'`,
+		projectID, groupID,
 	)
 	if err != nil {
 		return fmt.Errorf("resolve error group: %w", err)

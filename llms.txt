@@ -15,8 +15,17 @@ This file indexes the agent-relevant documentation. All canonical content is pla
 - [Architecture overview](docs/architecture/overview.md): components, trust boundaries, no-external-queue design
 - [Life of an error](docs/architecture/life-of-an-error.md): capture → group → claim → triage → fix → route by confidence
 - [Precision](docs/architecture/precision.md): exactly what "verified" guarantees and what it does not
-- [Trust and security model](docs/architecture/trust.md): GitHub permissions, data flow, credential storage, masking, honest gaps (incl. no automated replay retention)
-- [Replay privacy](docs/replay-privacy.md): what replay data may contain
+- [Trust and security model](docs/architecture/trust.md): GitHub permissions, data flow, credential storage, masking, and honest gaps
+- [Replay privacy](docs/guides/replay-privacy.md): what replay data may contain and how capture is controlled
+
+## Guides
+
+- [React](docs/guides/react.md): capture React 18/19 render errors with an error boundary
+- [Vue 3](docs/guides/vue.md): capture Vue component errors with component context
+- [Vanilla JavaScript](docs/guides/vanilla.md): initialize the browser SDK without a framework integration
+- [Source maps](docs/guides/source-maps.md): upload Vite source maps and troubleshoot resolution failures
+- [Connecting GitHub](docs/guides/github-app.md): configure a GitHub App or personal access token for investigations and fix PRs
+- [Replay privacy and masking](docs/guides/replay-privacy.md): understand replay capture, masking, storage, and controls
 
 ## Reference (drift-checked against source by the pnpm test gate)
 
@@ -24,7 +33,12 @@ This file indexes the agent-relevant documentation. All canonical content is pla
 - [HTTP routes](docs/reference/http-routes.md): every registered route with auth mode
 - [Environment variables](docs/reference/environment-variables.md): every var each service reads, plus known dead config
 - [Reason codes](docs/reference/reason-codes.md): all 22 needs_human reason codes with remediations
-- Drift check: scripts/check-docs-drift.mjs (run: pnpm docs:check)
+- [Drift check](scripts/check-docs-drift.mjs): run with `pnpm docs:check`
+
+## Contracts
+
+- [Reliability contract](docs/contracts/reliability.md): machine-checkable correctness properties of the event-to-resolution pipeline
+- [Session replay contract](docs/contracts/C4-amendments.md): chunk, pointer, scrub, retention, and evidence-lifecycle invariants
 
 ## Contributing and agents
 
@@ -36,4 +50,3 @@ This file indexes the agent-relevant documentation. All canonical content is pla
 
 - CLI reference: blocked on the CLI contract settling (issue #3, then #16)
 - Production self-hosting operations: blocked on retention/backup readiness (issue #23)
-- Task guides for Vue/React/vanilla/source-maps/GitHub App/replay privacy: issue #20

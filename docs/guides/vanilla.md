@@ -1,3 +1,9 @@
+---
+covers:
+  - packages/sdk/src/core.ts
+  - packages/sdk/src/index.ts
+  - packages/sdk/src/config.ts
+---
 # Vanilla JavaScript setup
 
 Use the Opslane SDK in any browser app — no framework required.
@@ -30,6 +36,8 @@ Opslane.init({ apiKey: '...' });
 ```
 
 `init` installs handlers for uncaught errors and unhandled promise rejections, and instruments `console`, `fetch`, and `XMLHttpRequest` as breadcrumb sources. It is idempotent — a second call is a no-op — and the SDK never throws into your code.
+
+> **Privacy:** Session recording is on by default since SDK 1.0.0; review [replay privacy and masking](replay-privacy.md) before deploying.
 
 ## Manual capture and user context
 

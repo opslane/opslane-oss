@@ -1,3 +1,8 @@
+---
+covers:
+  - packages/sdk/src/vue.ts
+  - packages/sdk/vite-plugin/**
+---
 # Vue 3 setup
 
 Wire the Opslane SDK into a Vue 3 app so component errors are captured with the failing component's name attached.
@@ -28,6 +33,8 @@ app.use(opslaneVuePlugin);
 app.mount('#app');
 ```
 
+> **Privacy:** Session recording is on by default since SDK 1.0.0; review [replay privacy and masking](replay-privacy.md) before deploying.
+
 Set the environment variables at build time:
 
 ```bash
@@ -54,5 +61,4 @@ The event should appear in your dashboard (or via the incidents API) within seco
 ## Next
 
 - [Upload source maps](source-maps.md) so stacks resolve to your `.vue` sources
-- [Replay privacy](replay-privacy.md) before enabling `replay: { enabled: true }`
 - All init options: [SDK options reference](../reference/sdk-options.md)

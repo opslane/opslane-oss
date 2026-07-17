@@ -1,0 +1,41 @@
+---
+title: Opslane documentation
+description: Set up Opslane and understand how it turns browser errors into verified fix pull requests or explicit incidents.
+template: splash
+hero:
+  tagline: Errors in, verified fix PRs out — or an explicit incident that says why not.
+  actions:
+    - text: Self-host quickstart
+      link: /quickstart/self-host/
+      icon: right-arrow
+    - text: Install the SDK
+      link: /install/
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <LinkCard
+    title="Self-host quickstart"
+    description="Run Opslane locally, connect the required services, and send a first error."
+    href="/quickstart/self-host/"
+  />
+  <LinkCard
+    title="Install the SDK"
+    description="Capture browser errors from React, Vue, or vanilla JavaScript."
+    href="/install/"
+  />
+  <LinkCard
+    title="How it works"
+    description="Follow an error from ingestion through investigation, verification, and resolution."
+    href="/architecture/life-of-an-error/"
+  />
+  <LinkCard
+    title="Reference"
+    description="Use contracts and reference tables that are drift-checked against source in CI."
+    href="/reference/sdk-options/"
+  />
+</CardGrid>
+
+The browser SDK, CLI, and shared types are MIT licensed. Server, worker, dashboard, eval, and test code are AGPL-3.0-only.

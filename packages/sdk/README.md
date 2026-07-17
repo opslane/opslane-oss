@@ -109,12 +109,12 @@ clearUser();
 
 ## Privacy defaults
 
-- **Replay is opt-in** (`replay.enabled` defaults to `false`).
-- When enabled, replay masks **all input values** (`maskAllInputs: true`) and any element matching the `.opslane-mask` selector.
+- **Session recording is on by default since 1.0.0** (`replay.enabled` defaults to `true`); opt out with `replay: { enabled: false }`.
+- Replay masks **all input values** (`maskAllInputs: true`) and any element matching the `.opslane-mask` selector; `.opslane-block` excludes a subtree entirely.
 - Captured URLs are scrubbed of query strings, userinfo, and token-bearing hashes; captured text is scrubbed of JWTs, `Bearer` tokens, and `password`/`secret`/`api_key`-style key-value pairs before leaving the browser.
 - Use `beforeSend` to drop or redact anything scrubbing doesn't cover.
 
-See [replay privacy](https://github.com/opslane/opslane-oss/blob/main/docs/replay-privacy.md) for what replay data may contain.
+See [replay privacy and masking](https://github.com/opslane/opslane-oss/blob/main/docs/guides/replay-privacy.md) for what replay data may contain.
 
 ## License
 

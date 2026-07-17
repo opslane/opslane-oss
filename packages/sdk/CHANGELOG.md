@@ -15,7 +15,7 @@ This is a deliberate major version so the default changes only when you choose
 to upgrade. A project-level kill switch can also stop new and in-flight
 recording without redeploying.
 
-Before upgrading, read [the replay privacy guide](../../docs/replay-privacy.md):
+Before upgrading, read [the replay privacy guide](../../docs/guides/replay-privacy.md):
 
 - Check masking. Inputs are masked by default; rendered text is not. Use
   `.opslane-mask` for sensitive text and `.opslane-block` to exclude a subtree.

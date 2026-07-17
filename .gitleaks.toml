@@ -23,6 +23,10 @@ paths = [
   '''packages/sdk/src/__tests__/scrub\.test\.ts''',
   '''test-e2e/error-to-pr\.test\.ts''',
   '''test-e2e/replay-contract\.test\.ts''',
+  # docs-sync's publish scanner test plants an AWS-shaped key and a generic
+  # token to prove assertSecretFree() rejects them; a token gitleaks ignores
+  # would prove nothing.
+  '''scripts/__tests__/publish\.test\.mjs''',
 ]
 regexes = [
   # Deterministic canary values planted by the keyless E2E lane's token-leak
