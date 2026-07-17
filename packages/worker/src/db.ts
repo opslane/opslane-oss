@@ -516,15 +516,23 @@ export async function updateGroupStatus(
 export async function resolveSilentMergedGroups(): Promise<string[]> {
   const pool = getPool();
   const result = await pool.query<{ id: string }>(
-    `UPDATE error_groups
-     SET status = 'resolved', resolved_at = now(), updated_at = now()
-     WHERE status = 'merged'
-       AND merged_at < now() - interval '24 hours'
+    `UPDATE error_groups g
+     SET status = 'resolved',
+         resolved_at = now(),
+         resolved_reason = 'merged',
+         resolved_in_release = (
+           SELECT release FROM error_events
+           WHERE project_id = g.project_id AND release IS NOT NULL AND release <> ''
+           GROUP BY release ORDER BY min(created_at) DESC LIMIT 1
+         ),
+         updated_at = now()
+     WHERE g.status = 'merged'
+       AND g.merged_at < now() - interval '24 hours'
        AND NOT EXISTS (
          SELECT 1
          FROM error_events
-         WHERE error_group_id = error_groups.id
-           AND created_at > error_groups.merged_at
+         WHERE error_group_id = g.id
+           AND created_at > g.merged_at
        )
        -- Ongoing linked friction blocks silence resolution (issue #56):
        -- an incident with active accepted friction after the merge is not
@@ -532,13 +540,40 @@ export async function resolveSilentMergedGroups(): Promise<string[]> {
        AND NOT EXISTS (
          SELECT 1
          FROM friction_signals fs
-         WHERE fs.incident_id = error_groups.id
+         WHERE fs.incident_id = g.id
            AND fs.adjudication_status = 'accepted'
            AND fs.retracted_at IS NULL
            AND fs.superseded_by IS NULL
-           AND fs.occurred_at > error_groups.merged_at
+           AND fs.occurred_at > g.merged_at
        )
-     RETURNING id`
+     RETURNING g.id`
+  );
+  return result.rows.map(r => r.id);
+}
+
+/**
+ * System-level background query: auto-resolves stuck-open issues not seen in
+ * `ageDays` days, independent of any fix. pr_created is intentionally excluded
+ * because the PR webhook only processes groups that remain in that status.
+ * Intentionally not tenant-scoped.
+ */
+export async function resolveInactiveGroups(ageDays: number): Promise<string[]> {
+  const pool = getPool();
+  const result = await pool.query<{ id: string }>(
+    `UPDATE error_groups g
+     SET status = 'resolved',
+         resolved_at = now(),
+         resolved_reason = 'auto_resolved',
+         resolved_in_release = (
+           SELECT release FROM error_events
+           WHERE project_id = g.project_id AND release IS NOT NULL AND release <> ''
+           GROUP BY release ORDER BY min(created_at) DESC LIMIT 1
+         ),
+         updated_at = now()
+     WHERE g.status IN ('needs_human', 'investigated')
+       AND g.last_seen < now() - ($1 || ' days')::interval
+     RETURNING g.id`,
+    [String(ageDays)]
   );
   return result.rows.map(r => r.id);
 }

@@ -48,6 +48,7 @@ docker compose config --quiet
 - Do not introduce Redis, BullMQ, or another queue without an architectural decision; use the existing Postgres job queue.
 - Do not persist production credentials in plaintext; use deployment environment variables or GitHub App credentials until encrypted storage is implemented.
 - Do not add legacy shims by default; preserve documented public contracts or change them explicitly.
+- The `POST /api/v1/events` wire contract is append-only and backward-compatible. Add optional fields only; never edit or delete a frozen fixture under `test-fixtures/wire/`. See `docs/contracts/events.md`.
 - Keep the change inside the current issue instead of expanding the product scope.
 - Reuse existing utilities before adding a dependency, and review any new dependency's license.
 - Preserve terminal-status and lease contracts; fix the implementation or test setup instead of weakening them.

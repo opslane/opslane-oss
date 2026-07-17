@@ -1,0 +1,77 @@
+name: Wire fixtures
+
+# SECURITY: pull_request_target runs the workflow and scripts from the trusted
+# base branch. A PR therefore cannot weaken this gate by editing the workflow or
+# checker in the same PR. This job reads only PR metadata: the checker asks the
+# GitHub API for the PR's changed-file list (names + status). The PR head is
+# never fetched, checked out, or executed, so no untrusted code enters this
+# privileged context. Keep it that way: this trigger has elevated trust.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+
+jobs:
+  publish-wire-fixture-status:
+    # This job's Actions check is attached to the pull_request_target base SHA.
+    # The required `wire-fixtures` context is instead published explicitly as a
+    # commit status on the PR head SHA below.
+    name: Trusted wire-fixture policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish pending status on PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending \
+            -f context=wire-fixtures \
+            -f description="Checking frozen wire fixtures" \
+            -f target_url="$TARGET_URL"
+      - name: Check out base branch (trusted workflow and script)
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'contract-change') }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Evaluate wire-fixture immutability
+        id: policy
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'contract-change') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/check-wire-fixtures.mjs
+      - name: Publish final required status on PR head
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONTRACT_CHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'contract-change') }}
+          POLICY_OUTCOME: ${{ steps.policy.outcome }}
+        run: |
+          if [[ "$CONTRACT_CHANGE" == "true" ]]; then
+            state=success
+            description="Approved contract-change bypass"
+          elif [[ "$POLICY_OUTCOME" == "success" ]]; then
+            state=success
+            description="Frozen wire fixtures are append-only"
+          else
+            state=failure
+            description="Frozen wire fixture policy failed"
+          fi
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" \
+            -f context=wire-fixtures \
+            -f description="$description" \
+            -f target_url="$TARGET_URL"
+          [[ "$state" == "success" ]]
