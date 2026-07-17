@@ -26,7 +26,16 @@ function fixture(text = '# Edited\n') {
 }
 
 function inputs(paths = [DOC]) {
-  return { map: { matched: [DOC] }, artifact: { headSha: HEAD_SHA, changed: paths, secretFingerprints: [] }, headSha: HEAD_SHA, headRef: 'feature/docs', prNumber: '42' };
+  return {
+    map: { matched: [DOC] },
+    artifact: { headSha: HEAD_SHA, changed: paths, secretFingerprints: [] },
+    headSha: HEAD_SHA,
+    headRef: 'feature/docs',
+    prNumber: '42',
+    snippetManifest: { version: 1, documents: { [DOC]: { fences: [] } } },
+    stage2Validator: () => {},
+    reportWarning: () => {},
+  };
 }
 
 test('parsePorcelainZ is NUL-safe', () => {
@@ -54,6 +63,56 @@ test('guarded push pins the recorded head SHA', async () => {
   assert.equal(result.pushed, true);
   assert.ok(calls.some((call) => call.includes(`--force-with-lease=refs/heads/feature/docs:${HEAD_SHA}`)));
   assert.ok(calls.some((call) => call.includes('HEAD:refs/heads/feature/docs')));
+});
+
+test('all edits are overlaid and Stage 2 passes before commit or push', async () => {
+  const dirs = fixture();
+  const second = 'docs/guides/vue.md';
+  mkdirSync(join(dirs.stagingDir, dirname(second)), { recursive: true });
+  mkdirSync(join(dirs.checkoutRoot, dirname(second)), { recursive: true });
+  writeFileSync(join(dirs.stagingDir, second), '# Vue edited\n');
+  writeFileSync(join(dirs.checkoutRoot, second), '# Vue original\n');
+  const calls = [];
+  const stage2Validator = ({ checkoutRoot }) => {
+    calls.push(['stage2']);
+    assert.equal(execFileSync('cat', [join(checkoutRoot, DOC)], { encoding: 'utf8' }), '# Edited\n');
+    assert.equal(execFileSync('cat', [join(checkoutRoot, second)], { encoding: 'utf8' }), '# Vue edited\n');
+    assert.equal(calls.some((call) => call.includes('commit') || call.includes('push')), false);
+  };
+  const runner = (command, args) => {
+    calls.push([command, ...args]);
+    if (args.includes('status')) return ` M ${DOC}\0 M ${second}\0`;
+    return '';
+  };
+  const common = inputs([DOC, second]);
+  common.map.matched.push(second);
+  common.snippetManifest.documents[second] = { fences: [] };
+  const result = await publishDocs({ ...dirs, ...common, stage2Validator, runner });
+  assert.equal(result.pushed, true);
+  assert.ok(calls.findIndex((call) => call[0] === 'stage2') < calls.findIndex((call) => call.includes('commit')));
+});
+
+test('Stage-1 and Stage-2 failures cannot commit or push', async () => {
+  const stage1 = fixture();
+  const stage1Calls = [];
+  await assert.rejects(() => publishDocs({
+    ...stage1,
+    ...inputs(),
+    contentValidator: () => { throw new Error('Stage 1 rejected'); },
+    runner: (...args) => { stage1Calls.push(args); return ''; },
+  }), /Stage 1 rejected/);
+  assert.equal(execFileSync('cat', [join(stage1.checkoutRoot, DOC)], { encoding: 'utf8' }), '# Original\n');
+  assert.equal(stage1Calls.length, 0);
+
+  const stage2 = fixture();
+  const stage2Calls = [];
+  await assert.rejects(() => publishDocs({
+    ...stage2,
+    ...inputs(),
+    stage2Validator: () => { throw new Error('Stage 2 rejected'); },
+    runner: (command, args) => { stage2Calls.push([command, ...args]); return ''; },
+  }), /Stage 2 rejected/);
+  assert.equal(stage2Calls.some((call) => call.includes('commit') || call.includes('push')), false);
 });
 
 test('empty and idempotent artifacts do not commit or push', async () => {
@@ -140,6 +199,9 @@ test('a real remote advance makes the guarded push fail without clobbering it', 
         headSha: recordedHead,
         headRef: 'feature/docs',
         prNumber: '42',
+        snippetManifest: { version: 1, documents: { [DOC]: { fences: [] } } },
+        stage2Validator: () => {},
+        reportWarning: () => {},
       }),
     /failed to push|stale info|fetch first/i,
   );

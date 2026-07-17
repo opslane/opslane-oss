@@ -5,11 +5,17 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
+  MANUAL_DOC_COVERS,
+  PUBLISHED_DOCS_POLICY,
   buildDocsIndex,
+  docTypeOf,
   findUncoveredProseDocs,
   globToRegExp,
   isProseTierDoc,
   mapChangedPaths,
+  manualDocsForChangedPaths,
+  publishedPoliciesFor,
+  publishedPolicyOf,
   readCovers,
 } from '../docs-map.mjs';
 
@@ -47,6 +53,85 @@ test('isProseTierDoc uses the canonical prose-tier scope', () => {
   ]) {
     assert.equal(isProseTierDoc(path), false, path);
   }
+});
+
+test('docTypeOf classifies setup, internals, and contract reader intent', () => {
+  for (const path of [
+    'docs/install.md',
+    'docs/guides/react.md',
+    './docs/quickstart/self-host.md',
+  ]) {
+    assert.equal(docTypeOf(path), 'setup', path);
+  }
+
+  assert.equal(docTypeOf('docs/architecture/overview.md'), 'internals');
+  assert.equal(docTypeOf('docs/contracts/events.md'), 'contract');
+  assert.equal(docTypeOf('docs/reference/http-routes.md'), null);
+  assert.equal(docTypeOf('docs/plans/internal.md'), null);
+  assert.equal(docTypeOf('docs/guides/react.txt'), null);
+});
+
+test('published policy keeps contracts manual and plans unpublished', () => {
+  assert.equal(publishedPolicyOf('docs/guides/react.md'), 'prose');
+  assert.equal(publishedPolicyOf('docs/architecture/overview.md'), 'prose');
+  assert.equal(publishedPolicyOf('docs/reference/http-routes.md'), 'deterministic');
+  assert.equal(publishedPolicyOf('docs/contracts/C4-amendments.md'), 'manual');
+  assert.equal(publishedPolicyOf('docs/contracts/events.md'), 'manual');
+  assert.equal(publishedPolicyOf('docs/contracts/reliability.md'), 'manual');
+  assert.equal(publishedPolicyOf('docs/plans/internal.md'), null);
+});
+
+test('published policy rejects overlapping declarations', () => {
+  const overlapping = {
+    ...PUBLISHED_DOCS_POLICY,
+    manual: [...PUBLISHED_DOCS_POLICY.manual, 'docs/guides/react.md'],
+  };
+
+  assert.deepEqual(publishedPoliciesFor('docs/guides/react.md', overlapping), [
+    'prose',
+    'manual',
+  ]);
+  assert.throws(
+    () => publishedPolicyOf('docs/guides/react.md', overlapping),
+    /multiple published-doc policies.*prose, manual/i,
+  );
+});
+
+test('manual contract mappings produce reminders without entering the prose tier', () => {
+  assert.deepEqual(
+    manualDocsForChangedPaths([
+      'packages/ingestion/handler/error_event.go',
+      'packages/sdk/src/session.ts',
+      'packages/worker/src/pipeline.ts',
+    ]),
+    [
+      'docs/contracts/C4-amendments.md',
+      'docs/contracts/events.md',
+      'docs/contracts/reliability.md',
+    ],
+  );
+  assert.deepEqual(manualDocsForChangedPaths(['packages/dashboard/src/main.ts']), []);
+  assert.deepEqual(Object.keys(MANUAL_DOC_COVERS).sort(), PUBLISHED_DOCS_POLICY.manual.slice().sort());
+  for (const doc of Object.keys(MANUAL_DOC_COVERS)) assert.equal(isProseTierDoc(doc), false);
+});
+
+test('manual contract mappings cover direct wire, replay, and lease implementations', () => {
+  assert.deepEqual(manualDocsForChangedPaths(['packages/sdk/src/core.ts']), [
+    'docs/contracts/events.md',
+  ]);
+  assert.deepEqual(manualDocsForChangedPaths(['packages/ingestion/handler/replay.go']), [
+    'docs/contracts/C4-amendments.md',
+    'docs/contracts/reliability.md',
+  ]);
+  assert.deepEqual(manualDocsForChangedPaths(['packages/sdk/package.json']), [
+    'docs/contracts/C4-amendments.md',
+  ]);
+  assert.deepEqual(manualDocsForChangedPaths(['packages/ingestion/db/queries.go']), [
+    'docs/contracts/reliability.md',
+  ]);
+  assert.deepEqual(manualDocsForChangedPaths(['packages/worker/src/setup-pr.ts']), [
+    'docs/contracts/reliability.md',
+  ]);
 });
 
 test('readCovers parses a non-empty YAML list', () => {

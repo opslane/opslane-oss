@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "generatedAt": "2026-07-17T00:00:00.000Z",
+  "source": {
+    "kind": "recorded-issue-83",
+    "note": "Historical output from commit 6934799. The production editor model was not explicit at the time, so this report is evidence of the pre-pin failure and is not promotion-eligible."
+  },
+  "corpus": "issue-83",
+  "provenance": {
+    "codeCommit": "ac99a7d",
+    "observedDocsCommit": "6934799"
+  },
+  "repeatedRunPolicy": {
+    "runsPerCase": 3,
+    "safetyAggregation": "worst-of-N",
+    "qualityAggregation": "mean-of-N"
+  },
+  "runCount": 1,
+  "repeatedRunPolicySatisfied": false,
+  "thresholds": {
+    "shared": {
+      "staleFixRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "falseEditRate": { "maximum": 0, "aggregation": "worst-of-N" },
+      "exactAssertionPassRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "requiredAssertionPassRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "forbiddenAssertionPassRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "readabilityJargonPassRate": { "minimum": 1, "aggregation": "mean-of-N" },
+      "maximumChangedLines": { "maximum": 4, "aggregation": "worst-of-N" }
+    },
+    "setup": {
+      "runnableSnippetPassRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "commandValidityPassRate": { "minimum": 1, "aggregation": "worst-of-N" }
+    },
+    "internals": {
+      "mermaidParsePassRate": { "minimum": 1, "aggregation": "worst-of-N" },
+      "diagramMatchesProseRate": { "minimum": 1, "aggregation": "mean-of-N" }
+    },
+    "contract": {
+      "normativeWordingPreservedRate": { "minimum": 1, "aggregation": "worst-of-N" }
+    }
+  },
+  "metrics": {
+    "shared": {
+      "staleFixRate": 1,
+      "falseEditRate": 1,
+      "exactAssertionPassRate": 0.3333333333333333,
+      "requiredAssertionPassRate": 1,
+      "forbiddenAssertionPassRate": 0.3333333333333333,
+      "readabilityJargonPassRate": 0.3333333333333333,
+      "maximumChangedLines": 3
+    },
+    "setup": {
+      "runnableSnippetPassRate": 1,
+      "commandValidityPassRate": 1
+    },
+    "internals": {
+      "mermaidParsePassRate": 1,
+      "diagramMatchesProseRate": 0
+    },
+    "contract": {
+      "normativeWordingPreservedRate": null
+    }
+  },
+  "promotionEligible": false
+}

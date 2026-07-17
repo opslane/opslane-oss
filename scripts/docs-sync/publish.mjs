@@ -5,6 +5,11 @@ import { dirname, join, posix, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizeRepoPath } from './plan.mjs';
+import {
+  loadSnippetManifest,
+  validateContentEdit,
+  validateSiteOverlay,
+} from './validation.mjs';
 
 const SECRET_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
@@ -97,10 +102,19 @@ export function validateHeadRef(value) {
   return value;
 }
 
-export async function publishDocs({ stagingDir, map, artifact, checkoutRoot, headSha, headRef, prNumber, runner = checkedRunner }) {
-  if (!/^[0-9a-f]{40}$/.test(headSha) || artifact.headSha !== headSha) throw new Error('artifact/head SHA mismatch');
-  validateHeadRef(headRef);
-  if (!/^\d+$/.test(String(prNumber))) throw new Error('invalid PR number');
+export function overlayStagedDocs({
+  stagingDir,
+  map,
+  artifact,
+  checkoutRoot,
+  expectedHeadSha,
+  snippetManifest,
+  contentValidator = validateContentEdit,
+  reportWarning = (warning) => console.warn(`::warning title=Docs sync quality::${warning.message}`),
+}) {
+  if (!/^[0-9a-f]{40}$/.test(expectedHeadSha) || artifact.headSha !== expectedHeadSha) {
+    throw new Error('artifact/head SHA mismatch');
+  }
   const allowed = new Set((map.matched ?? []).map(normalizeRepoPath));
   const changed = (artifact.changed ?? []).map(normalizeRepoPath).sort();
   const docsRoot = join(stagingDir, 'docs');
@@ -116,14 +130,47 @@ export async function publishDocs({ stagingDir, map, artifact, checkoutRoot, hea
     const text = readFileSync(source, 'utf8');
     assertSecretFree(text, artifact.secretFingerprints ?? []);
     assertSafeDestination(checkoutRoot, repoPath);
+    const original = readFileSync(join(checkoutRoot, repoPath), 'utf8');
+    const validation = contentValidator({ docPath: repoPath, original, edited: text, snippetManifest });
+    for (const warning of validation?.warnings ?? []) reportWarning(warning);
   }
-  if (staged.length === 0) return { pushed: false, reason: 'empty' };
-
   for (const repoPath of staged) {
     const destination = join(checkoutRoot, repoPath);
     mkdirSync(dirname(destination), { recursive: true });
     copyFileSync(join(stagingDir, repoPath), destination);
   }
+  return { staged, allowed };
+}
+
+export async function publishDocs({
+  stagingDir,
+  map,
+  artifact,
+  checkoutRoot,
+  trustedRoot = resolve(fileURLToPath(new URL('../../', import.meta.url))),
+  headSha,
+  headRef,
+  prNumber,
+  runner = checkedRunner,
+  snippetManifest = loadSnippetManifest(),
+  contentValidator = validateContentEdit,
+  stage2Validator = validateSiteOverlay,
+  reportWarning = (warning) => console.warn(`::warning title=Docs sync quality::${warning.message}`),
+}) {
+  validateHeadRef(headRef);
+  if (!/^\d+$/.test(String(prNumber))) throw new Error('invalid PR number');
+  const { staged, allowed } = overlayStagedDocs({
+    stagingDir,
+    map,
+    artifact,
+    checkoutRoot,
+    expectedHeadSha: headSha,
+    snippetManifest,
+    contentValidator,
+    reportWarning,
+  });
+  if (staged.length === 0) return { pushed: false, reason: 'empty' };
+  stage2Validator({ checkoutRoot, trustedRoot, runner });
   const status = runner('git', ['-C', checkoutRoot, 'status', '--porcelain=v1', '-z']);
   if (!status) return { pushed: false, reason: 'clean' };
   const dirty = parsePorcelainZ(status).map(normalizeRepoPath);
@@ -145,6 +192,7 @@ async function main() {
     artifact: JSON.parse(readFileSync(join(stagingDir, 'artifact.json'), 'utf8')),
     checkoutRoot: resolve(checkoutRoot), headSha: process.env.HEAD_SHA ?? '',
     headRef: process.env.HEAD_REF ?? '', prNumber: process.env.PR ?? '',
+    trustedRoot: resolve(fileURLToPath(new URL('../../', import.meta.url))),
   });
 }
 
