@@ -44,7 +44,7 @@ This example uses Vite. In Next.js, read `process.env.NEXT_PUBLIC_OPSLANE_API_KE
 
 - **Render errors** (thrown during render, in lifecycle, or in hooks' render phase) are caught by `OpslaneErrorBoundary`, reported, and replaced with your `fallback` UI.
 - **Everything else** — event handlers, `setTimeout`, promise rejections — bypasses React error boundaries by design; the SDK's global handlers (installed by `init`) catch those.
-- To report an error you caught yourself inside a boundary of your own, use `captureReactError(error)` from `@opslane/sdk/react` (or the framework-agnostic `captureException`).
+- To report an error you caught yourself inside a boundary of your own, use `captureReactError(error, componentStack?)` from `@opslane/sdk/react` (pass `componentStack` from `ErrorInfo` to include React's component trace; or use the framework-agnostic `captureException`).
 
 Place boundaries as granularly as you like — a boundary per route keeps one broken page from blanking the whole app, and every boundary still reports.
 
