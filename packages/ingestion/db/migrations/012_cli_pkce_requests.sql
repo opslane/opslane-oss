@@ -1,4 +1,4 @@
--- 011_cli_pkce_requests.sql — durable, single-use bridge for cloud CLI login.
+-- 012_cli_pkce_requests.sql — durable, single-use bridge for cloud CLI login.
 CREATE TABLE IF NOT EXISTS cli_pkce_requests (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   state_hash TEXT NOT NULL UNIQUE,

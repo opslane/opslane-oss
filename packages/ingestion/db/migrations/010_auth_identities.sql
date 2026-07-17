@@ -1,5 +1,5 @@
--- 009_auth_identities.sql — provider-agnostic identity map.
--- Append-only after 001-008. Idempotent: run-migrations.sh reapplies every file.
+-- 010_auth_identities.sql — provider-agnostic identity map.
+-- Append-only after 001-009. Idempotent: run-migrations.sh reapplies every file.
 -- Generalizes users.github_id so new IdPs (workos) are rows, not columns.
 CREATE TABLE IF NOT EXISTS auth_identities (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

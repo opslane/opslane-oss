@@ -1,4 +1,4 @@
--- 010_multi_org.sql — cloud-gated multi-org (memberships, invitations),
+-- 011_multi_org.sql — cloud-gated multi-org (memberships, invitations),
 -- WorkOS org mapping, and active-org session state on refresh tokens.
 -- Append-only, idempotent. OSS ships these tables but does not write them.
 

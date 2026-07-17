@@ -1,4 +1,4 @@
--- 012_oauth_login_states.sql — server-side single-use OAuth callback states.
+-- 013_oauth_login_states.sql — server-side single-use OAuth callback states.
 CREATE TABLE IF NOT EXISTS oauth_login_states (
   state_hash TEXT PRIMARY KEY,
   expires_at TIMESTAMPTZ NOT NULL,
