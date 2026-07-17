@@ -1,3 +1,8 @@
+---
+covers:
+  - packages/sdk/src/vue.ts
+  - packages/sdk/vite-plugin/**
+---
 # Vue 3 setup
 
 Wire the Opslane SDK into a Vue 3 app so component errors are captured with the failing component's name attached.

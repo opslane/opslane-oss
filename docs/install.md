@@ -1,3 +1,8 @@
+---
+covers:
+  - packages/sdk/src/index.ts
+  - packages/sdk/src/config.ts
+---
 # Install Opslane
 
 If you use hosted Opslane, follow the web setup flow below. If you self-host, follow [Manual Fallback](#manual-fallback) and set the SDK's [`endpoint` init option](reference/sdk-options.md) to your ingestion URL.

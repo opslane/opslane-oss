@@ -1,3 +1,10 @@
+---
+covers:
+  - packages/sdk/src/replay.ts
+  - packages/sdk/src/session.ts
+  - packages/sdk/src/chunk-upload.ts
+  - packages/sdk/src/scrub.ts
+---
 # Replay privacy and masking
 
 Session replay shows what a user saw and did around an error. It is the most privacy-sensitive feature in the SDK, and session recording is **on by default since SDK 1.0.0**. This guide explains when recording actually starts, what leaves the browser, how masking works, and how to turn recording off.

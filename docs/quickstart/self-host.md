@@ -1,3 +1,8 @@
+---
+covers:
+  - docker-compose.yml
+  - packages/ingestion/db/migrations/**
+---
 # Self-host quickstart
 
 Run Opslane locally with Docker Compose. This is **developer self-hosting** — the default Compose file uses development credentials and is not a production deployment (production operations are tracked separately).

@@ -1,3 +1,8 @@
+---
+covers:
+  - packages/sdk/src/react.tsx
+  - packages/sdk/vite-plugin/**
+---
 # React setup
 
 Wire the Opslane SDK into a React 18/19 app so render errors are captured through an error boundary.

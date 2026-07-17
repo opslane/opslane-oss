@@ -1,3 +1,9 @@
+---
+covers:
+  - packages/sdk/**
+  - packages/ingestion/**
+  - packages/worker/**
+---
 # Life of an error
 
 What happens between an exception in a user's browser and a pull request (or an honest reason there isn't one).
