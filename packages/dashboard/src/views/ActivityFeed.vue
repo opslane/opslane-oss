@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 import type { Incident, IncidentFilters, ErrorGroupStatus } from '../types/api';
 import { listIncidents } from '../api';
-import { getProjectId, statusBadgeClass, formatDate } from '../utils';
+import { getProjectId, statusBadgeClass, statusLabel, formatDate } from '../utils';
 import { kindBadge } from '../components/incident-kind';
 import { useTableSort } from '../composables/useTableSort';
 import FilterBar from '../components/FilterBar.vue';
@@ -23,12 +23,13 @@ const statusOrder: Record<ErrorGroupStatus, number> = {
   fixing: 3,
   investigated: 4,
   awaiting_approval: 4,
-  pr_created: 5,
-  needs_human: 6,
-  insight: 7,
-  resolved: 7,
-  merged: 8,
-  archived: 9,
+  pr_draft: 5,
+  pr_created: 6,
+  needs_human: 7,
+  insight: 8,
+  resolved: 8,
+  merged: 9,
+  archived: 10,
 };
 
 type SortKey = 'last_seen' | 'occurrences' | 'users' | 'status';
@@ -211,7 +212,7 @@ onUnmounted(() => stopPolling());
               <span
                 class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
                 :class="statusBadgeClass(incident.status)"
-                v-text="incident.status.replace('_', ' ')"
+                v-text="statusLabel(incident.status)"
               >
               </span>
             </td>

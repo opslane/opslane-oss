@@ -17,6 +17,8 @@ export function adminStatusBadgeClass(status: string): string {
     case 'merged':
     case 'pr_created':
       return 'bg-emerald-500/10 text-green';
+    case 'pr_draft':
+      return 'bg-amber-500/10 text-amber';
     case 'claimed':
     case 'analyzing':
     case 'queued':

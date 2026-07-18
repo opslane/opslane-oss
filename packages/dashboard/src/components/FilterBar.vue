@@ -82,6 +82,7 @@ watch([selectedAccountId, selectedStatus], onFilterChange);
         <option value="new">New</option>
         <option value="queued">Queued</option>
         <option value="analyzing">Analyzing</option>
+        <option value="pr_draft">Draft PR</option>
         <option value="pr_created">PR Created</option>
         <option value="merged">Merged</option>
         <option value="needs_human">Needs Human</option>
