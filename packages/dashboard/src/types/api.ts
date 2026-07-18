@@ -15,11 +15,14 @@ export interface AuthUser {
   memberships?: AuthMembership[];
 }
 
+export type SocialProviderId = 'google' | 'github';
+
 export interface AuthConfig {
   provider: string;
   supports_password: boolean;
   supports_signup: boolean;
   supports_reset: boolean;
+  social_providers: SocialProviderId[];
 }
 
 export type PasswordAuthResult =
