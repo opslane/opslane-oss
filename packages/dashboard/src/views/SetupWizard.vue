@@ -221,7 +221,7 @@ throw new Error('Hello Opslane!');`;
 
           <div v-else-if="githubAppStatus?.installed" class="space-y-4">
             <div class="flex items-center gap-2">
-              <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-green-500/10 text-green">
+              <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-green/10 text-green">
                 Connected
               </span>
               <span class="text-sm text-text-muted">GitHub App is installed</span>
@@ -325,7 +325,7 @@ throw new Error('Hello Opslane!');`;
             </div>
           </div>
 
-          <div class="mt-3 rounded-md bg-amber-500/10 border border-amber-500/20 p-3">
+          <div class="mt-3 rounded-md bg-amber/10 border border-amber/20 p-3">
             <p class="text-sm text-amber">
               Save this key -- you won't see it again.
             </p>
@@ -366,7 +366,7 @@ throw new Error('Hello Opslane!');`;
               Review & merge install PR<span v-if="setupPr.pr_number">&nbsp;#{{ setupPr.pr_number }}</span>
             </a>
 
-            <div class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3">
+            <div class="rounded-md border border-amber/20 bg-amber/10 p-3">
               <p class="text-sm text-amber mb-2">Add this key as a build environment variable before deploying.</p>
               <CodeBlock :code="viteEnvSnippet" />
             </div>
@@ -380,14 +380,14 @@ throw new Error('Hello Opslane!');`;
           </div>
 
           <div v-else-if="setupPr.status === 'already_installed'" class="space-y-4">
-            <div class="rounded-md border border-green/20 bg-green-500/10 p-4 text-sm text-green">
+            <div class="rounded-md border border-green/20 bg-green/10 p-4 text-sm text-green">
               Opslane is already installed in this repository.
             </div>
             <button @click="continueToTest" class="w-full btn-primary">Send a test error</button>
           </div>
 
           <div v-else class="space-y-4">
-            <div class="rounded-md border border-red/20 bg-red-500/10 p-4">
+            <div class="rounded-md border border-red/20 bg-red/10 p-4">
               <p class="text-sm text-red" v-text="setupPr.error || setupError || 'Opslane could not open the setup PR.'"></p>
             </div>
             <button @click="openSetupPR" class="w-full btn-primary">Retry</button>

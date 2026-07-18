@@ -516,12 +516,12 @@ async function handleCreateKey(): Promise<void> {
         <!-- GitHub App installed -->
         <div v-else class="space-y-4">
           <div class="flex items-center gap-2">
-            <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-green-500/10 text-green">
+            <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-green/10 text-green">
               GitHub App installed
             </span>
           </div>
 
-          <div class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber">
+          <div class="rounded-md border border-amber/20 bg-amber/10 p-3 text-xs text-amber">
             Draft PR verification requires the GitHub App's <strong>Checks: read</strong>
             permission. If you installed the App before this permission was added, approve
             the permission upgrade in GitHub. Until then, drafts stay drafts and show a
@@ -537,7 +537,7 @@ async function handleCreateKey(): Promise<void> {
             <button
               @click="handleDisconnectGithub"
               :disabled="disconnectingGithub"
-              class="rounded-md bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red hover:bg-red-500/20 focus:outline-none focus:ring-2 focus:ring-red focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50"
+              class="rounded-md bg-red/10 px-3 py-1.5 text-sm font-medium text-red hover:bg-red/20 focus:outline-none focus:ring-2 focus:ring-red focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50"
             >
               {{ disconnectingGithub ? 'Disconnecting...' : 'Disconnect repo' }}
             </button>
@@ -624,7 +624,7 @@ async function handleCreateKey(): Promise<void> {
             class="flex items-start gap-3 p-3 border rounded-lg transition-colors focus-within:ring-1 focus-within:ring-teal"
             :class="[
               autonomy === option.value
-                ? 'border-teal bg-teal-500/5'
+                ? 'border-teal bg-teal/5'
                 : 'border-border hover:border-text-faint hover:bg-surface-2',
               autonomySaving ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer',
             ]"
@@ -720,8 +720,8 @@ async function handleCreateKey(): Promise<void> {
                   <span
                     class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
                     :class="key.revoked_at
-                      ? 'bg-red-500/10 text-red'
-                      : 'bg-green-500/10 text-green'"
+                      ? 'bg-red/10 text-red'
+                      : 'bg-green/10 text-green'"
                   >
                     {{ key.revoked_at ? 'Revoked' : 'Active' }}
                   </span>
@@ -764,7 +764,7 @@ async function handleCreateKey(): Promise<void> {
               <CopyButton :text="newKeyResult.raw_key" />
             </div>
           </div>
-          <div class="mt-3 rounded-md bg-amber-500/10 border border-amber-500/20 p-3">
+          <div class="mt-3 rounded-md bg-amber/10 border border-amber/20 p-3">
             <p class="text-sm text-amber">
               Save this key -- you won't see it again.
             </p>

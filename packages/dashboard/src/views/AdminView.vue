@@ -107,7 +107,7 @@ onUnmounted(() => {
 
     <div
       v-if="overviewError"
-      class="rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red"
+      class="rounded-md border border-red/20 bg-red/10 p-4 text-sm text-red"
       v-text="overviewError"
     ></div>
 
@@ -236,7 +236,7 @@ onUnmounted(() => {
         <h2 class="text-base font-medium">Recent jobs</h2>
         <p class="mt-1 text-xs text-text-muted">Latest work across all projects</p>
       </div>
-      <p v-if="jobsError" class="m-5 rounded-md bg-red-500/10 p-3 text-sm text-red" v-text="jobsError"></p>
+      <p v-if="jobsError" class="m-5 rounded-md bg-red/10 p-3 text-sm text-red" v-text="jobsError"></p>
       <div v-else class="overflow-x-auto">
         <table class="min-w-full text-sm">
           <thead>
@@ -306,7 +306,7 @@ onUnmounted(() => {
         <span
           v-if="health"
           class="inline-flex rounded-full px-2.5 py-1 text-xs font-medium"
-          :class="health.status === 'ok' ? 'bg-green-500/10 text-green' : health.status === 'degraded' ? 'bg-amber-500/10 text-amber' : 'bg-red-500/10 text-red'"
+          :class="health.status === 'ok' ? 'bg-green/10 text-green' : health.status === 'degraded' ? 'bg-amber/10 text-amber' : 'bg-red/10 text-red'"
           v-text="health.status"
         ></span>
       </div>

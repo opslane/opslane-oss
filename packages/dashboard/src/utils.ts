@@ -26,22 +26,22 @@ export function statusBadgeClass(status: ErrorGroupStatus): string {
   switch (status) {
     case 'insight':
     case 'resolved':
-      return 'bg-green-500/10 text-green';
+      return 'bg-green/10 text-green';
     case 'merged':
     case 'pr_created':
-      return 'bg-emerald-500/10 text-green';
+      return 'bg-green/10 text-green';
     case 'pr_draft':
-      return 'bg-amber-500/10 text-amber';
+      return 'bg-amber/10 text-amber';
     case 'needs_human':
-      return 'bg-amber-500/10 text-amber';
+      return 'bg-amber/10 text-amber';
     case 'analyzing':
     case 'queued':
-      return 'bg-indigo-500/10 text-indigo';
+      return 'bg-indigo/10 text-indigo';
     case 'awaiting_approval':
     case 'investigated':
-      return 'bg-teal-500/10 text-teal';
+      return 'bg-teal/10 text-teal';
     case 'fixing':
-      return 'bg-indigo-500/10 text-indigo animate-pulse';
+      return 'bg-indigo/10 text-indigo animate-pulse';
     case 'archived':
       return 'bg-surface-2 text-text-faint';
     default:

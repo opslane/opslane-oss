@@ -75,7 +75,7 @@ onMounted(async () => {
 
     <div
       v-else-if="error"
-      class="rounded-md bg-red-500/10 border border-red-500/20 p-4 text-sm text-red"
+      class="rounded-md bg-red/10 border border-red/20 p-4 text-sm text-red"
     >
       <p v-text="error"></p>
     </div>
