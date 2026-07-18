@@ -6,8 +6,10 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -198,6 +200,35 @@ func TestGetUser(t *testing.T) {
 	}
 	if user.ID != 42 || user.Login != "testuser" {
 		t.Errorf("user = %+v", user)
+	}
+}
+
+func TestDeleteBranchIsIdempotent(t *testing.T) {
+	for _, status := range []int{http.StatusNoContent, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var gotPath, gotAuth string
+			origClient := httpClient
+			httpClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				gotPath = req.URL.EscapedPath()
+				gotAuth = req.Header.Get("Authorization")
+				return &http.Response{
+					StatusCode: status,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			defer func() { httpClient = origClient }()
+
+			if err := DeleteBranch("token", "owner/repo", "opslane/fix-1234"); err != nil {
+				t.Fatalf("DeleteBranch: %v", err)
+			}
+			if gotPath != "/repos/owner/repo/git/refs/heads/opslane%2Ffix-1234" {
+				t.Fatalf("path = %q", gotPath)
+			}
+			if gotAuth != "Bearer token" {
+				t.Fatalf("authorization = %q", gotAuth)
+			}
+		})
 	}
 }
 

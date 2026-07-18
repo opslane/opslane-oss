@@ -123,6 +123,44 @@ func TestUpdateErrorGroupStatus_IsTenantScoped(t *testing.T) {
 	}
 }
 
+func TestUpdateProjectPrPosture_DefaultValidationAndTenantScope(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	orgID, projectID, _, _ := seedGroup(t, pool, q, "pr-posture")
+	otherOrgID, _, _, _ := seedGroup(t, pool, q, "pr-posture-other")
+
+	project, err := q.GetProjectByOrgID(ctx, orgID, projectID)
+	if err != nil || project == nil {
+		t.Fatalf("GetProjectByOrgID = (%+v, %v)", project, err)
+	}
+	if project.PrPosture != "verified_only" {
+		t.Fatalf("default PrPosture = %q, want verified_only", project.PrPosture)
+	}
+
+	draft := "draft_when_unverified"
+	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, &draft)
+	if err != nil || project == nil {
+		t.Fatalf("UpdateProject posture = (%+v, %v)", project, err)
+	}
+	if project.PrPosture != draft {
+		t.Fatalf("PrPosture = %q, want %q", project.PrPosture, draft)
+	}
+
+	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, nil)
+	if err != nil || project == nil || project.PrPosture != draft {
+		t.Fatalf("omitted posture was not preserved: project=%+v err=%v", project, err)
+	}
+
+	invalid := "publish_everything"
+	if _, err := q.UpdateProject(ctx, orgID, projectID, nil, nil, &invalid); err == nil {
+		t.Fatal("expected invalid pr_posture to violate the database constraint")
+	}
+	if project, err := q.UpdateProject(ctx, otherOrgID, projectID, nil, nil, &draft); err != nil || project != nil {
+		t.Fatalf("cross-org UpdateProject = (%+v, %v), want nil, nil", project, err)
+	}
+}
+
 func TestTriggerFixJob_OnlyFromInvestigated(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -228,6 +266,108 @@ func TestProcessPRWebhook_ReceiptBeforeTransition_Idempotent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("receipts = %d, want 1", count)
+	}
+}
+
+func TestProcessPRWebhook_DraftCloseRestoresNeedsHumanAndClosesDelivery(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	_, projectID, _, groupID := seedGroup(t, pool, q, "draft-close")
+
+	const (
+		prNumber      = 81
+		prURL         = "https://github.com/org/draft-close/pull/81"
+		reasonCode    = "low_confidence_fix"
+		reason        = "The candidate passed review but local verification was incomplete."
+		remediation   = "Review the draft PR and its CI results before marking it ready."
+		candidateDiff = "diff --git a/src/a.ts b/src/a.ts"
+	)
+	evidence := `{"version":1,"tier":"E0","checks":[]}`
+	if _, err := pool.Exec(ctx,
+		`UPDATE error_groups
+		 SET status = 'pr_draft', pr_number = $2, pr_url = $3,
+		     reason_code = $4, reason_message = $5, remediation = $6,
+		     candidate_diff = $7, verification_evidence = $8::jsonb
+		 WHERE id = $1`,
+		groupID, prNumber, prURL, reasonCode, reason, remediation, candidateDiff, evidence,
+	); err != nil {
+		t.Fatalf("seed draft group: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO delivery_reservations
+		   (error_group_id, project_id, operation_key, branch_name, posture,
+		    diff_hash, candidate_diff, state, pr_url, pr_number)
+		 VALUES ($1, $2, $3, $4, 'draft', 'hash', $5, 'open', $6, $7)`,
+		groupID, projectID, "fix:"+groupID, "opslane/fix-draft", candidateDiff, prURL, prNumber,
+	); err != nil {
+		t.Fatalf("seed delivery reservation: %v", err)
+	}
+	var watchJobID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, payload)
+		 VALUES ($1, $2, 'ci_watch', $3::jsonb) RETURNING id`,
+		groupID, projectID, `{"pr_number":81,"head_sha":"abc123"}`,
+	).Scan(&watchJobID); err != nil {
+		t.Fatalf("seed CI watcher: %v", err)
+	}
+
+	result, err := q.ProcessPRWebhook(
+		ctx, "org/draft-close", prNumber, false, "delivery-draft-close", time.Now(),
+	)
+	if err != nil || result.GroupID != groupID || result.Duplicate {
+		t.Fatalf("ProcessPRWebhook = (%+v, %v), want group %s", result, err, groupID)
+	}
+	if result.CleanupBranch != "opslane/fix-draft" {
+		t.Fatalf("cleanup branch = %q, want stable draft branch", result.CleanupBranch)
+	}
+
+	var (
+		status, gotReasonCode, gotReason, gotRemediation string
+		gotDiff, gotEvidence                             string
+		gotPrURL                                         *string
+		gotPrNumber                                      *int
+		needsHumanAtSet                                  bool
+	)
+	if err := pool.QueryRow(ctx,
+		`SELECT status, reason_code, reason_message, remediation,
+		        candidate_diff, verification_evidence::text, pr_url, pr_number,
+		        needs_human_at IS NOT NULL
+		 FROM error_groups WHERE id = $1`,
+		groupID,
+	).Scan(&status, &gotReasonCode, &gotReason, &gotRemediation,
+		&gotDiff, &gotEvidence, &gotPrURL, &gotPrNumber, &needsHumanAtSet); err != nil {
+		t.Fatalf("query closed draft: %v", err)
+	}
+	if status != "needs_human" || gotReasonCode != reasonCode || gotReason != reason || gotRemediation != remediation {
+		t.Fatalf("closed draft writeup = status %q reason (%q, %q, %q)", status, gotReasonCode, gotReason, gotRemediation)
+	}
+	if gotDiff != candidateDiff || !strings.Contains(gotEvidence, `"tier": "E0"`) {
+		t.Fatalf("closed draft proof = diff %q evidence %q", gotDiff, gotEvidence)
+	}
+	if gotPrURL != nil || gotPrNumber != nil {
+		t.Fatalf("closed draft retained delivery fields: url=%v number=%v", gotPrURL, gotPrNumber)
+	}
+	if !needsHumanAtSet {
+		t.Fatal("closed draft did not stamp needs_human_at")
+	}
+
+	var watchStatus, reservationState string
+	if err := pool.QueryRow(ctx, `SELECT status FROM error_group_jobs WHERE id = $1`, watchJobID).Scan(&watchStatus); err != nil {
+		t.Fatalf("query watcher: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT state FROM delivery_reservations WHERE error_group_id = $1`, groupID).Scan(&reservationState); err != nil {
+		t.Fatalf("query reservation: %v", err)
+	}
+	if watchStatus != "completed" || reservationState != "closed" {
+		t.Fatalf("draft cleanup = watcher %q reservation %q, want completed/closed", watchStatus, reservationState)
+	}
+
+	redelivery, err := q.ProcessPRWebhook(
+		ctx, "org/draft-close", prNumber, false, "delivery-draft-close", time.Now(),
+	)
+	if err != nil || !redelivery.Duplicate || redelivery.CleanupBranch != "opslane/fix-draft" {
+		t.Fatalf("draft close redelivery = (%+v, %v), want duplicate cleanup retry", redelivery, err)
 	}
 }
 
