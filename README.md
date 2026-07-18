@@ -1,6 +1,6 @@
 # Opslane
 
-Opslane is an AI-powered production error-resolution engine for browser JavaScript apps. It ingests errors from your frontend, investigates the root cause, and either opens a fix pull request it has verified in a sandbox — or files an actionable incident that tells a human exactly what it found and why it stopped.
+Opslane is an AI-powered production error-resolution engine for browser JavaScript apps. It ingests errors from your frontend, investigates the root cause, and either opens a ready-for-review fix pull request backed by executed evidence, publishes an eligible unverified fix as a clearly labeled draft when the project opts in, or files an actionable incident that tells a human exactly what it found and why it stopped.
 
 **Status: early stage.** Opslane currently supports browser JavaScript errors and GitHub repositories. APIs and schemas may change without notice. See [the launch documentation epic](https://github.com/opslane/opslane-oss/issues/2) for what's being built next.
 
@@ -12,21 +12,22 @@ flowchart LR
     B --> C[(Postgres)]
     C -->|job queue| D[Worker]
     D -->|investigate + fix| E[Sandbox verification]
-    E -->|verified| F[GitHub PR]
-    E -->|not verified| G[needs_human incident]
+    E -->|ready evidence| F[Ready GitHub PR]
+    E -->|positive but incomplete evidence + opt-in| G[Draft GitHub PR]
+    E -->|blocked or rejected| H[needs_human incident]
 ```
 
 | Component | What it does | Where |
 | --- | --- | --- |
 | Browser SDK | Captures errors and session replays, with masking on by default | [`packages/sdk`](packages/sdk) |
 | Ingestion API | Go service that receives events, groups errors, and serves the dashboard | [`packages/ingestion`](packages/ingestion) |
-| Worker | Investigates errors with Claude, writes a fix, and verifies it in an [E2B](https://e2b.dev) sandbox before opening a PR | [`packages/worker`](packages/worker) |
+| Worker | Investigates errors with Claude, writes a fix, collects evidence in an [E2B](https://e2b.dev) sandbox, and publishes either a ready PR or an explicitly unverified draft according to project policy | [`packages/worker`](packages/worker) |
 | Dashboard | Vue app for incidents, replays, and project settings | [`packages/dashboard`](packages/dashboard) |
 | CLI | Agent-friendly command-line access to incidents and projects | [`cli`](cli) |
 
 Postgres is both the system of record and the job queue — there is no Redis or external queue to run.
 
-Every investigation ends in an explicit state, one of three: a fix PR is opened only when the fix passed verification with high confidence (`pr_created`); a medium/low-confidence analysis is posted as `investigated`, with the root cause waiting for you to review and trigger a fix; and anything the worker cannot progress becomes a `needs_human` incident with a reason code, a plain-language explanation, and a suggested remediation.
+Every run reaches an explicit state: a ready-for-review fix PR backed by executed verification evidence (`pr_created`); an opt-in, judge-approved but not locally verified draft (`pr_draft`) whose repository CI is still evidence in progress; a medium/low-confidence analysis posted as `investigated`, with the root cause waiting for you to review and trigger a fix; or a `needs_human` incident with a reason code, plain-language explanation, and suggested remediation.
 
 ## Run it locally
 

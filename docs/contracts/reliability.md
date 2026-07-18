@@ -19,16 +19,22 @@ branch, or pull request—not exactly one process invocation.
 
 - `needs_human` has nonblank `reason_code`, `reason_message`, and `remediation`.
 - `needs_human` does not expose pull-request delivery fields.
+- `pr_draft` has a nonblank HTTPS `pr_url`, a positive `pr_number`, and a
+  confidence value permitted by the canonical draft-delivery policy.
 - `pr_created` has a nonblank HTTPS `pr_url`, a positive `pr_number`, and a
   confidence value permitted by the canonical delivery policy.
-- The current worker only delivers a high-confidence fix. The broader API and
-  E2E confidence contract must be reconciled before this becomes a DB constraint.
+- A ready PR is either a locally verified high-confidence fix or a medium-confidence
+  draft promoted by passing external CI recorded for the exact published head SHA.
+- An unverified delivery is always a GitHub draft, requires judge approval plus a
+  passing build and no negative execution evidence, and requires project opt-in.
 - An active incident (`queued`, `analyzing`, or `fixing`) has live work in a
   `pending` or `claimed` job.
 - A terminal incident (`needs_human`, `pr_created`, `resolved`, `merged`, or `archived`)
   has no `pending` or `claimed` job.
 - `investigated` is intentionally nonterminal and may wait without a live job
   for human guidance.
+- `pr_draft` is intentionally nonterminal. It may wait without live work after CI
+  observation ends, or have one live `ci_watch` job while external evidence is pending.
 - A legal transition never changes another project's incident.
 
 ## Job and lease invariants
@@ -76,14 +82,20 @@ fixtures land together.
 - A retry reconciles an already-pushed branch or already-created pull request
   before issuing another create operation.
 - `pr_created` maps to exactly one recorded pull request for the operation key.
+- `pr_draft` and its later `pr_created` promotion map to the same recorded pull
+  request and stable operation key; promotion never creates another PR.
+- Draft delivery is reserved durably before a GitHub write. A project has at most
+  its configured number of open Opslane drafts, and one group has at most one.
+- External CI evidence is evaluated only for the exact head SHA Opslane pushed.
+  Zero completed successful checks is never green, and a moved head is never promoted.
 - A provider timeout after an ambiguous success is reconciled, not blindly
   retried as a new delivery.
 - Secrets and tenant data are absent from remote URLs, errors, logs, and pull
   request content except where the destination contract explicitly requires it.
 
-Crash-idempotent delivery is a target guarantee. The tracer harness records
-current branch/PR calls first; persistence and reconciliation follow as a
-separate, harness-driven change.
+Crash-idempotent delivery is enforced by the durable reservation written before
+provider calls, stable branch reconciliation, and pull-request adoption. The
+tracer harness exercises the same retry boundaries against a provider twin.
 
 ## Replay and session invariants
 
