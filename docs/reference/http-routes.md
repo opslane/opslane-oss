@@ -11,6 +11,12 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET | `/health` | none | Liveness + dependency checks |
 | GET | `/metrics` | none | Internal metrics |
 | POST | `/auth/refresh` | none | Rotate session tokens |
+| GET | `/auth/config` | none | Discover embedded sign-in, sign-up, and password-reset capabilities |
+| POST | `/auth/password` | none | Sign in with provider-managed email and password; issues local session cookies |
+| POST | `/auth/signup` | none | Create a provider account and begin required email verification |
+| POST | `/auth/verify-email` | none | Complete email verification and issue local session cookies |
+| POST | `/auth/password/forgot` | none | Send a password-reset email with an enumeration-safe response |
+| POST | `/auth/password/reset` | none | Set a new password from a reset token and revoke local refresh sessions |
 | GET | `/auth/login` | none | Begin the configured identity-provider sign-in |
 | GET | `/auth/github` | none | Compatibility redirect to `/auth/login` |
 | GET | `/auth/callback` | none | Configured identity-provider callback |
