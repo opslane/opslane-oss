@@ -154,6 +154,7 @@ func TestRegressionReasonCodePermanenceMatchesCatalog(t *testing.T) {
 		"auth_invalid":            true,
 		"low_confidence_fix":      true,
 		"policy_blocked":          true,
+		"repro_not_achievable":    true,
 		"tests_failed":            true,
 		"triage_unfixable":        true,
 		"unfixable_infra":         true,

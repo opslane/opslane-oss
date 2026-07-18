@@ -30,6 +30,8 @@ export function statusBadgeClass(status: ErrorGroupStatus): string {
     case 'merged':
     case 'pr_created':
       return 'bg-emerald-500/10 text-green';
+    case 'pr_draft':
+      return 'bg-amber-500/10 text-amber';
     case 'needs_human':
       return 'bg-amber-500/10 text-amber';
     case 'analyzing':
@@ -45,6 +47,12 @@ export function statusBadgeClass(status: ErrorGroupStatus): string {
     default:
       return 'bg-surface-2 text-text';
   }
+}
+
+export function statusLabel(status: ErrorGroupStatus): string {
+  if (status === 'pr_draft') return 'Draft PR';
+  if (status === 'pr_created') return 'PR Created';
+  return status.replace(/_/g, ' ');
 }
 
 export function safeUrl(url: string | undefined): string | undefined {

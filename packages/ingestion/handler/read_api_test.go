@@ -37,6 +37,30 @@ func TestIncidentJSONIncludesKind(t *testing.T) {
 	}
 }
 
+func TestIncidentJSON_IncludesVerificationEvidenceAndCandidateDiff(t *testing.T) {
+	diff := "diff --git a/src/a.ts b/src/a.ts"
+	inc := toIncidentJSON(db.ErrorGroup{
+		VerificationEvidence: []byte(`{"version":1,"tier":"E0","checks":[]}`),
+		CandidateDiff:        &diff,
+	})
+	body, err := json.Marshal(inc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	evidence, ok := got["verification_evidence"].(map[string]any)
+	if !ok || evidence["tier"] != "E0" {
+		t.Fatalf("verification_evidence = %#v, want tier E0", got["verification_evidence"])
+	}
+	if got["candidate_diff"] != diff {
+		t.Fatalf("candidate_diff = %#v, want %q", got["candidate_diff"], diff)
+	}
+}
+
 func TestIncidentJSON_SessionPointer(t *testing.T) {
 	inc := incidentJSON{
 		ID: "g1",

@@ -7,18 +7,18 @@ covers:
 ---
 # Connecting GitHub
 
-The worker needs GitHub access for two things: cloning the repository during investigation and opening the fix PR. There are two credential modes; pick one.
+The worker needs GitHub access for cloning during investigation, publishing fix PRs, and reading repository CI for draft promotion. There are two credential modes; pick one.
 
 ## Mode 1: personal access token (worker-only, fastest to try)
 
-Create a fine-grained PAT with **Contents: read/write** and **Pull requests: read/write** on the repositories you want Opslane to work on, then:
+Create a token for the repositories you want Opslane to work on. A classic PAT needs the **`repo`** scope, which covers contents, pull requests, checks, and commit statuses. For a fine-grained PAT, grant **Contents: read/write**, **Pull requests: read/write**, and read access to **Checks** and **Commit statuses**. Then:
 
 ```bash
 export GITHUB_TOKEN=github_pat_...
 docker compose up -d
 ```
 
-Be clear about what this mode covers: **the worker only** — cloning and opening PRs. It does **not** enable dashboard sign-in (that's GitHub OAuth, which needs App client credentials) or the dashboard's repository picker (which lists App installations). With PAT-only, set the project's repository via the API (`PUT /api/v1/projects/{projectID}/github`) or a seed script rather than the dashboard. Suitable for trying the pipeline; use Mode 2 for anything multi-user.
+Be clear about what this mode covers: **the worker only** — cloning, opening PRs, and observing CI. It does **not** enable dashboard sign-in (that's GitHub OAuth, which needs App client credentials) or the dashboard's repository picker (which lists App installations). With PAT-only, set the project's repository via the API (`PUT /api/v1/projects/{projectID}/github`) or a seed script rather than the dashboard. Suitable for trying the pipeline; use Mode 2 for anything multi-user.
 
 ## Mode 2: GitHub App
 
@@ -28,11 +28,17 @@ A GitHub App gives you short-lived installation tokens scoped to explicitly sele
 
 **Self-host** requires creating your own App once (GitHub → Settings → Developer settings → GitHub Apps):
 
-- Permissions: **Contents** read/write, **Pull requests** read/write
+- Permissions: **Contents** read/write, **Pull requests** read/write, **Checks** read
 - Event subscriptions: **Pull request** — required; the webhook handler acts on `pull_request` `closed` events to transition merged/closed fix PRs, so without this subscription incidents stay in `pr_created` forever
 - Callback URL: `https://your-instance/auth/github/callback`
 - Setup URL: `https://your-instance/api/v1/github/setup`
 - Webhook URL: `https://your-instance/api/v1/github/webhook` + a webhook secret
+
+Existing installations must approve the **Checks: read** permission upgrade in
+GitHub before Opslane can observe CI. Until it is approved, draft PRs remain drafts
+and their evidence records `permission_denied`; Opslane does not silently treat
+missing access or zero visible checks as a pass. The dashboard's GitHub settings
+section shows the same upgrade notice.
 
 Then provide its identity to both services before `docker compose up`:
 
@@ -62,4 +68,4 @@ Merge the PR, deploy, trigger a test error, and confirm the first event arrives 
 
 ## What Opslane will and won't do with this access
 
-Covered precisely in [trust](../architecture/trust.md): clones for investigation, pushes only newly created fix branches (no force pushes, never to existing branches), opens PRs, and never merges. Access failures surface as explicit incident states: `missing_github_token`, `repo_access_denied`, `auth_invalid`, `policy_blocked` — each with remediation ([reason codes](../reference/reason-codes.md)).
+Covered precisely in [trust](../architecture/trust.md): clones for investigation, reserves and reconciles stable Opslane fix branches (no force pushes, never to customer branches), opens ready or draft PRs, reads CI for the exact published commit, and never merges. Access failures surface as explicit incident states or evidence: `missing_github_token`, `repo_access_denied`, `auth_invalid`, `policy_blocked`, and CI `permission_denied` — each with remediation ([reason codes](../reference/reason-codes.md)).

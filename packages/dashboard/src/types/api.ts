@@ -33,6 +33,7 @@ export type ErrorGroupStatus =
   | 'analyzing'
   | 'investigated'
   | 'fixing'
+  | 'pr_draft'
   | 'pr_created'
   | 'needs_human'
   | 'resolved'
@@ -48,6 +49,34 @@ export interface NeedsHumanReason {
   reason_code: string;
   reason_message: string;
   remediation: string;
+}
+
+export type CheckOutcome = 'passed' | 'failed' | 'skipped_no_runner' | 'infra_error';
+
+export interface EvidenceCheck {
+  name: string;
+  outcome: CheckOutcome;
+  command: string;
+  exit_code?: number;
+  output_tail: string;
+}
+
+export interface EvidenceRecord {
+  version: 1 | 2;
+  tier: 'E0' | 'E1' | 'E2' | null;
+  checks: EvidenceCheck[];
+  suite?: {
+    baseline_failed_tests: string[];
+    new_failures: string[];
+  };
+  external_ci?: {
+    outcome: 'passed' | 'failed' | 'no_ci_observed' | 'head_moved' | 'permission_denied';
+    pr_number: number;
+    head_sha: string;
+    check_names: string[];
+    failing_checks?: string[];
+    observed_at: string;
+  };
 }
 
 export interface Incident {
@@ -69,6 +98,8 @@ export interface Incident {
   confidence?: ConfidenceLevel;
   pr_url?: string;
   reason?: NeedsHumanReason;
+  verification_evidence?: EvidenceRecord;
+  candidate_diff?: string;
   root_cause?: string;
   suggested_mitigation?: string;
   merged_at?: string;
@@ -204,6 +235,7 @@ export type AdminJobType =
   | 'fix'
   | 'error_fix'
   | 'setup_pr'
+  | 'ci_watch'
   | 'session_analysis';
 
 export interface AdminHourlyEventBucket {

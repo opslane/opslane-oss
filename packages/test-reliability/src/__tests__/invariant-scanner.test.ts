@@ -40,6 +40,7 @@ describe('scanReliabilityInvariants', () => {
           pr_url: null,
           pr_number: null,
           confidence: null,
+          verification_evidence: null,
         },
         {
           id: 'group-pr',
@@ -51,9 +52,17 @@ describe('scanReliabilityInvariants', () => {
           pr_url: '',
           pr_number: 0,
           confidence: null,
+          verification_evidence: null,
         },
       ]),
       queryResult([
+        {
+          id: 'group-draft-with-http-url',
+          project_id: 'project-1',
+          status: 'pr_draft',
+          pr_url: 'http://example.test/pull/11',
+          pr_number: 11,
+        },
         {
           id: 'group-needs-human-with-pr',
           project_id: 'project-1',
@@ -110,6 +119,11 @@ describe('scanReliabilityInvariants', () => {
         code: 'terminal_fields_incomplete',
         errorGroupId: 'group-pr',
         missingFields: ['pr_url', 'pr_number', 'confidence'],
+      }),
+      expect.objectContaining({
+        code: 'terminal_fields_incompatible',
+        errorGroupId: 'group-draft-with-http-url',
+        invalidFields: ['pr_url'],
       }),
       expect.objectContaining({
         code: 'terminal_fields_incompatible',
@@ -171,6 +185,17 @@ describe('scanReliabilityInvariants', () => {
     for (const [sql] of query.mock.calls) {
       expect(sql.trimStart()).toMatch(/^SELECT\b/);
     }
+  });
+
+  it('treats pr_draft as waiting delivery state, not active or terminal', async () => {
+    const { db, query } = mockQueryable(
+      queryResult([]), queryResult([]), queryResult([]), queryResult([]), queryResult([]),
+    );
+    await scanReliabilityInvariants(db);
+    const sql = query.mock.calls.map(([statement]) => String(statement)).join('\n');
+    expect(sql).toContain("status IN ('pr_created', 'pr_draft')");
+    expect(sql).not.toContain("eg.status IN ('queued', 'analyzing', 'fixing', 'pr_draft')");
+    expect(sql).not.toContain("eg.status IN ('pr_created', 'pr_draft', 'needs_human'");
   });
 
   it('propagates query failures to avoid a false clean report', async () => {

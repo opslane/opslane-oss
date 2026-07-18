@@ -22,3 +22,4 @@ eval/results/
 !.claude/skills/docs-sync/scripts/run.test.mjs
 .omx/
 .gstack/
+.context/

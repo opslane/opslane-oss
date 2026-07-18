@@ -12,6 +12,7 @@ export interface Project {
   name: string;
   github_repo: string;
   default_branch: string;
+  pr_posture: PRPosture;
   created_at: string;
 }
 
@@ -83,6 +84,7 @@ export type ErrorGroupStatus =
   | 'investigated'
   | 'fixing'
   | 'pr_created'
+  | 'pr_draft'
   | 'needs_human'
   | 'resolved'
   | 'merged'
@@ -117,12 +119,72 @@ export type ReasonCode =
   | 'budget_exhausted'
   | 'tests_failed'
   | 'low_confidence_fix'
+  | 'repro_not_achievable'
+  | 'verification_infra_error'
+  | 'draft_cap_reached'
   | 'triage_unfixable'
   | 'unfixable_no_app_frames'
   | 'unfixable_test_error'
   | 'unfixable_third_party'
   | 'unfixable_infra'
   | 'unfixable_no_sourcemap';
+
+// === Verification evidence (evidence-tiered fix verification) ===
+
+/** Highest verification tier fully achieved. E0=build, E1=suite vs pre-patch baseline, E2=repro red→green. */
+export type EvidenceTier = 'E0' | 'E1' | 'E2';
+
+/**
+ * Outcome taxonomy for any verification check.
+ * infra_error is retriable and is never evidence about the patch.
+ */
+export type CheckOutcome = 'passed' | 'failed' | 'skipped_no_runner' | 'infra_error';
+
+export interface EvidenceCheck {
+  /** 'build' | 'suite_baseline' | 'suite_post_patch' | 'repro_red' | 'repro_green' | 'repro_reversal' */
+  name: string;
+  outcome: CheckOutcome;
+  command: string;
+  exit_code?: number;
+  /** Bounded tail of combined stdout/stderr, secrets scrubbed. */
+  output_tail: string;
+}
+
+export interface EvidenceRecord {
+  version: 1 | 2;
+  tier: EvidenceTier | null;
+  /** Chronological; a retried check appears multiple times and the last entry per name is current. */
+  checks: EvidenceCheck[];
+  /** Per-test baseline comparison. Pre-existing failures are excluded from the gate. */
+  suite?: {
+    baseline_failed_tests: string[];
+    new_failures: string[];
+  };
+  /** Reproduction-gate details reserved for Phase 2. */
+  repro?: {
+    content_hash: string;
+    asserts_behavior: boolean;
+    path: string;
+  };
+  /** GitHub CI observed for the exact commit published by Opslane. */
+  external_ci?: ExternalCIEvidence;
+}
+
+export type ExternalCIOutcome =
+  | 'passed'
+  | 'failed'
+  | 'no_ci_observed'
+  | 'head_moved'
+  | 'permission_denied';
+
+export interface ExternalCIEvidence {
+  outcome: ExternalCIOutcome;
+  pr_number: number;
+  head_sha: string;
+  check_names: string[];
+  failing_checks?: string[];
+  observed_at: string;
+}
 
 // === Confidence ===
 
@@ -166,6 +228,10 @@ export interface Incident {
   session_pointer?: { session_id: string; error_at: string };
   reason?: NeedsHumanReason;
   root_cause?: string;
+  /** Structured verification evidence for the latest fix attempt. */
+  verification_evidence?: EvidenceRecord;
+  /** Candidate diff preserved on needs_human for manual review. */
+  candidate_diff?: string;
   visual_summary?: string;
   merged_at?: string;
   resolved_at?: string;
@@ -215,7 +281,9 @@ export interface Account {
   last_seen: string;
 }
 
-export type JobType = 'error_fix' | 'investigate' | 'fix' | 'setup_pr' | 'session_analysis';
+export type JobType = 'error_fix' | 'investigate' | 'fix' | 'setup_pr' | 'session_analysis' | 'ci_watch';
+
+export type PRPosture = 'verified_only' | 'draft_when_unverified';
 
 // === Session chunk wire format ===
 // Keep wire-compatible with packages/sdk/src/telemetry.ts and

@@ -112,6 +112,38 @@ func GetInstallationToken(appJWT string, installationID int64) (*InstallationTok
 	return &token, nil
 }
 
+// DeleteBranch removes a repository branch. A missing branch is treated as an
+// idempotent success so GitHub webhook redeliveries can safely retry cleanup.
+func DeleteBranch(token, repo, branch string) error {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || branch == "" {
+		return fmt.Errorf("invalid repository or branch")
+	}
+	reqURL := fmt.Sprintf("%s/repos/%s/%s/git/refs/heads/%s",
+		githubAPIBase,
+		url.PathEscape(parts[0]),
+		url.PathEscape(parts[1]),
+		url.PathEscape(branch),
+	)
+	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("create delete branch request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete branch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return fmt.Errorf("GitHub API error deleting branch (status %d): %s", resp.StatusCode, string(body))
+}
+
 // ListInstallationRepos lists all repositories accessible to the given installation.
 func ListInstallationRepos(installationToken string) ([]Repo, error) {
 	var allRepos []Repo

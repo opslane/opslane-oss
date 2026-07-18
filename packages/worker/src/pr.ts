@@ -1,6 +1,21 @@
-import type { ConfidenceLevel, NeedsHumanReason } from '@opslane/shared';
+import type {
+  CheckOutcome,
+  ConfidenceLevel,
+  EvidenceCheck,
+  EvidenceRecord,
+  EvidenceTier,
+  NeedsHumanReason,
+} from '@opslane/shared';
 import { Octokit } from '@octokit/rest';
 import { scrubDevPaths } from './harness/stack-trace-utils.js';
+import {
+  buildFallbackNarrative,
+  buildIncidentUrl,
+  escapeInlineCode,
+  normalizeProse,
+  renderPRSections,
+  type FixNarrative,
+} from './narrative.js';
 /** Extract file paths from +++ headers in a unified diff. */
 function extractFiles(diff: string): string[] {
   const files: string[] = [];
@@ -58,6 +73,9 @@ export interface PRInput {
   diff: string;
   title: string;
   confidence: ConfidenceLevel;
+  narrative?: FixNarrative;
+  /** Precomputed once by the pipeline so commit and PR render the same link. */
+  incidentUrl?: string | null;
   rootCause?: string;
   humanSummary?: string;
   // Evidence
@@ -72,6 +90,8 @@ export interface PRInput {
   errorType?: string;
   errorMessage?: string;
   kind?: 'error' | 'friction';
+  evidence?: EvidenceRecord | null;
+  draft?: boolean;
 }
 
 export type PRResult =
@@ -102,14 +122,12 @@ function formatTimestamp(value: string | null | undefined): string {
 }
 
 /**
- * Dashboard link to the incident, where the session replay plays. Reads the
- * dashboard base URL from env (DASHBOARD_URL, falling back to DASHBOARD_ORIGIN).
- * Returns null when no base is configured so the PR body degrades gracefully.
+ * Dashboard link to the incident, where the session replay plays. The reader-
+ * facing DASHBOARD_URL must be configured explicitly; DASHBOARD_ORIGIN is a
+ * CORS setting and is intentionally not a fallback.
  */
 export function buildReplayLink(errorGroupId: string, projectId: string): string | null {
-  const base = (process.env['DASHBOARD_URL'] ?? process.env['DASHBOARD_ORIGIN'] ?? '').replace(/\/+$/, '');
-  if (!base) return null;
-  return `${base}/incidents/${encodeURIComponent(errorGroupId)}?project_id=${encodeURIComponent(projectId)}`;
+  return buildIncidentUrl(process.env['DASHBOARD_URL'], errorGroupId, projectId);
 }
 
 // === Section builders ===
@@ -140,7 +158,7 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`): s
 }
 
 function inlineCode(text: string): string {
-  return `\`${sanitizeInline(text).replace(/`/g, "'")}\``;
+  return escapeInlineCode(text);
 }
 
 function buildHumanSummary(input: PRInput): string {
@@ -168,7 +186,7 @@ function buildHumanSummary(input: PRInput): string {
 }
 
 function buildFixLine(input: PRInput, files: string[]): string {
-  const rootCause = sanitizeInline(input.rootCause ?? '', MAX_FIX_LINE_LENGTH);
+  const rootCause = normalizeProse(input.rootCause ?? '', MAX_FIX_LINE_LENGTH);
   if (rootCause) return `Addresses ${rootCause}`;
   if (files.length > 0) {
     const namedFiles = files.slice(0, 3).map((file) => inlineCode(file)).join(', ');
@@ -254,6 +272,74 @@ function buildTechnicalDetails(input: PRInput): string {
   ].join('\n');
 }
 
+const TIER_LABELS: Record<EvidenceTier, string> = {
+  E0: 'build verified',
+  E1: 'no new test failures compared with the pre-fix baseline',
+  E2: 'reproduction verified red→green',
+};
+
+const CHECK_LABELS: Record<string, string> = {
+  build: 'Build',
+  suite_baseline: 'Existing suite (pre-patch baseline)',
+  suite_post_patch: 'Existing suite (with fix, vs baseline)',
+};
+
+function checkIcon(outcome: CheckOutcome): string {
+  if (outcome === 'passed') return '✅';
+  if (outcome === 'failed') return '❌';
+  if (outcome === 'infra_error') return '⚠️';
+  return '⏭️';
+}
+
+function buildEvidenceLines(evidence: EvidenceRecord): string[] {
+  const latest = new Map<string, EvidenceCheck>();
+  for (const check of evidence.checks) latest.set(check.name, check);
+  const lines = [...latest].map(([name, check]) =>
+    `- ${checkIcon(check.outcome)} ${CHECK_LABELS[name] ?? sanitizeInline(name, 60)}: ${check.outcome}`,
+  );
+  if (evidence.suite && evidence.suite.baseline_failed_tests.length > 0) {
+    lines.push(
+      '- ℹ️ Pre-existing baseline failures were excluded from the gate',
+    );
+  }
+  return lines;
+}
+
+export const VERIFICATION_START = '<!-- opslane-verification:start -->';
+export const VERIFICATION_END = '<!-- opslane-verification:end -->';
+
+export function buildVerificationSection(input: PRInput): string {
+  let content: string;
+  if (input.kind === 'friction') {
+    const lines = [
+      '**Confidence:** Suggestion · ⚠️ The friction itself was not re-verified — review before merging',
+    ];
+    if (input.evidence) lines.push(...buildEvidenceLines(input.evidence));
+    content = lines.join('\n');
+  } else if (input.evidence?.external_ci?.outcome === 'passed') {
+    content = [
+      '**Verification: external CI passed.** Opslane observed successful repository checks for the exact published commit.',
+      ...input.evidence.external_ci.check_names.map((name) => `- ✅ ${sanitizeInline(name, 100)}`),
+    ].join('\n');
+  } else if (input.draft) {
+    const tier = input.evidence?.tier ?? 'E0';
+    content = [
+      `**Verification: ${tier} — NOT verified for review.** Opslane could not execute enough local verification for this fix. The CI results on this draft are the verification — review them before marking it ready.`,
+      ...(input.evidence ? buildEvidenceLines(input.evidence) : []),
+    ].join('\n');
+  } else if (!input.evidence) {
+    content = '**Verification:** ⚠️ No verification evidence recorded';
+  } else {
+    content = [
+      `**Verification:** ${input.evidence.tier
+        ? `${input.evidence.tier} — ${TIER_LABELS[input.evidence.tier]}`
+        : '⚠️ no tier achieved'}`,
+      ...buildEvidenceLines(input.evidence),
+    ].join('\n');
+  }
+  return `${VERIFICATION_START}\n${content}\n${VERIFICATION_END}`;
+}
+
 // === PR body construction ===
 
 export function buildPRBody(input: PRInput): string {
@@ -262,15 +348,41 @@ export function buildPRBody(input: PRInput): string {
     (max, run) => Math.max(max, run.length), 2,
   );
   const fence = '`'.repeat(maxBacktickRun + 1);
-  const replayLink = buildReplayLink(input.errorGroupId, input.projectId);
-  const confidenceLine = input.kind === 'friction'
-    ? '**Confidence:** Suggestion · ✅ Repo tests passing · ⚠️ The friction itself was not re-verified — review before merging'
-    : '**Confidence:** High · ✅ Tests passing';
+  const replayLink = input.incidentUrl === undefined
+    ? buildReplayLink(input.errorGroupId, input.projectId)
+    : input.incidentUrl;
+
+  if (input.kind !== 'friction') {
+    const narrative = input.narrative ?? buildFallbackNarrative({
+      errorType: input.errorType ?? 'runtime error',
+      errorMessage: input.errorMessage ?? input.title,
+      primaryFile: files[0],
+    });
+    const sections = renderPRSections(narrative);
+    return [
+      `## ${sections.title}`,
+      '### What happened',
+      sections.whatHappened,
+      replayLink
+        ? `▶ [Watch the session replay and view the full incident in Opslane →](${replayLink})`
+        : null,
+      '### Why it broke',
+      sections.whyItBroke,
+      '### The fix',
+      sections.fixApproach,
+      buildFileLine(files),
+      `${fence}diff`,
+      input.diff.trim(),
+      fence,
+      buildVerificationSection(input),
+      buildTechnicalDetails(input),
+      '---',
+      `*Generated by Opslane · Error Group: ${inlineCode(input.errorGroupId.slice(0, 8))}*`,
+    ].filter(Boolean).join('\n\n');
+  }
 
   return [
-    input.kind === 'friction'
-      ? `## 💡 Opslane suggestion: ${sanitizeInline(input.title, 120)}`
-      : `## 🛡️ Opslane fixed ${sanitizeInline(input.title, 120)}`,
+    `## 💡 Opslane suggestion: ${sanitizeInline(input.title, 120)}`,
     buildHumanSummary(input),
     '### The fix',
     buildFixLine(input, files),
@@ -278,7 +390,7 @@ export function buildPRBody(input: PRInput): string {
     `${fence}diff`,
     input.diff.trim(),
     fence,
-    confidenceLine,
+    buildVerificationSection(input),
     replayLink ? `📊 [Full investigation & session replay →](${replayLink})` : null,
     buildTechnicalDetails(input),
     '---',
@@ -296,6 +408,7 @@ export interface GitHubClient {
     body: string;
     head: string;
     base: string;
+    draft?: boolean;
   }): Promise<{ url: string; number: number }>;
   getFileContent(params: {
     owner: string;
@@ -307,11 +420,32 @@ export interface GitHubClient {
     owner: string;
     repo: string;
     head: string;
-  }): Promise<{ url: string; number: number } | null>;
+  }): Promise<{ url: string; number: number; headSha: string; draft: boolean; body: string } | null>;
+  getBranchHead?(params: { owner: string; repo: string; branch: string }): Promise<string | null>;
+  getPullRequest?(params: { owner: string; repo: string; number: number }): Promise<{
+    nodeId: string;
+    headSha: string;
+    draft: boolean;
+    body: string;
+  }>;
+  listCheckRuns?(params: { owner: string; repo: string; ref: string }): Promise<Array<{
+    name: string;
+    status: string;
+    conclusion: string | null;
+  }>>;
+  listCommitStatuses?(params: { owner: string; repo: string; ref: string }): Promise<Array<{
+    context: string;
+    state: string;
+  }>>;
+  updatePullRequestBody?(params: { owner: string; repo: string; number: number; body: string }): Promise<void>;
+  markPullRequestReady?(params: { nodeId: string }): Promise<void>;
 }
 
-export function getGitHubClientOptions(token: string): ConstructorParameters<typeof Octokit>[0] {
-  const configuredBaseUrl = process.env['OPSLANE_GITHUB_API_URL']?.trim();
+export function getGitHubClientOptions(
+  token: string,
+  apiBaseUrl = process.env['OPSLANE_GITHUB_API_URL'],
+): ConstructorParameters<typeof Octokit>[0] {
+  const configuredBaseUrl = apiBaseUrl?.trim();
   return {
     auth: token,
     ...(configuredBaseUrl ? { baseUrl: configuredBaseUrl } : {}),
@@ -322,11 +456,14 @@ export function getGitHubClientOptions(token: string): ConstructorParameters<typ
  * Create a real GitHub client backed by Octokit.
  * Uses the provided token or falls back to GITHUB_TOKEN env. Returns null if no token available.
  */
-export function createGitHubClient(githubToken?: string): GitHubClient | null {
+export function createGitHubClient(
+  githubToken?: string,
+  apiBaseUrl = process.env['OPSLANE_GITHUB_API_URL'],
+): GitHubClient | null {
   const token = githubToken ?? process.env['GITHUB_TOKEN'];
   if (!token) return null;
 
-  const octokit = new Octokit(getGitHubClientOptions(token));
+  const octokit = new Octokit(getGitHubClientOptions(token, apiBaseUrl));
 
   return {
     async createPullRequest(params) {
@@ -337,6 +474,7 @@ export function createGitHubClient(githubToken?: string): GitHubClient | null {
         body: params.body,
         head: params.head,
         base: params.base,
+        draft: params.draft ?? false,
       });
       return { url: data.html_url, number: data.number };
     },
@@ -366,9 +504,88 @@ export function createGitHubClient(githubToken?: string): GitHubClient | null {
         head: `${params.owner}:${params.head}`,
       });
       const pr = data[0];
-      return pr ? { url: pr.html_url, number: pr.number } : null;
+      return pr ? {
+        url: pr.html_url,
+        number: pr.number,
+        headSha: pr.head.sha,
+        draft: pr.draft ?? false,
+        body: pr.body ?? '',
+      } : null;
+    },
+
+    async getBranchHead(params) {
+      try {
+        const { data } = await octokit.git.getRef({
+          owner: params.owner,
+          repo: params.repo,
+          ref: `heads/${params.branch}`,
+        });
+        return data.object.sha;
+      } catch (error: unknown) {
+        const status = typeof error === 'object' && error !== null && 'status' in error
+          ? Number((error as { status?: unknown }).status)
+          : 0;
+        if (status === 404) return null;
+        throw error;
+      }
+    },
+
+    async getPullRequest(params) {
+      const { data } = await octokit.pulls.get({
+        owner: params.owner,
+        repo: params.repo,
+        pull_number: params.number,
+      });
+      return {
+        nodeId: data.node_id,
+        headSha: data.head.sha,
+        draft: data.draft ?? false,
+        body: data.body ?? '',
+      };
+    },
+
+    async listCheckRuns(params) {
+      const { data } = await octokit.checks.listForRef({
+        ...params,
+        per_page: 100,
+      });
+      return data.check_runs.map((run) => ({
+        name: run.name,
+        status: run.status,
+        conclusion: run.conclusion,
+      }));
+    },
+
+    async listCommitStatuses(params) {
+      const { data } = await octokit.repos.listCommitStatusesForRef({
+        ...params,
+        per_page: 100,
+      });
+      return data.map((status) => ({ context: status.context, state: status.state }));
+    },
+
+    async updatePullRequestBody(params) {
+      await octokit.pulls.update({ ...params, pull_number: params.number });
+    },
+
+    async markPullRequestReady(params) {
+      await octokit.graphql(
+        `mutation MarkReady($pullRequestId: ID!) {
+          markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
+            pullRequest { id isDraft }
+          }
+        }`,
+        { pullRequestId: params.nodeId },
+      );
     },
   };
+}
+
+export function replaceVerificationSection(body: string, replacement: string): string {
+  const start = body.indexOf(VERIFICATION_START);
+  const end = body.indexOf(VERIFICATION_END);
+  if (start < 0 || end < start) return `${body.trim()}\n\n${replacement}`;
+  return `${body.slice(0, start)}${replacement}${body.slice(end + VERIFICATION_END.length)}`;
 }
 
 // === Main function ===
@@ -407,15 +624,28 @@ export async function createPR(
   const prBody = buildPRBody(input);
 
   try {
+    const existing = await client.listOpenPullsByHead?.({
+      owner,
+      repo,
+      head: input.branchName,
+    });
+    if (existing) {
+      return { status: 'created', prUrl: existing.url, prNumber: existing.number };
+    }
     const pr = await client.createPullRequest({
       owner,
       repo,
       title: input.kind === 'friction'
         ? `[Opslane] Suggestion: ${input.title}`
-        : `[Opslane] Fix: ${input.title}`,
+        : renderPRSections(input.narrative ?? buildFallbackNarrative({
+            errorType: input.errorType ?? 'runtime error',
+            errorMessage: input.errorMessage ?? input.title,
+            primaryFile: extractFiles(input.diff)[0],
+          })).title,
       body: prBody,
       head: input.branchName,
       base: input.defaultBranch,
+      draft: input.draft ?? false,
     });
 
     return {

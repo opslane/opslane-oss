@@ -118,6 +118,8 @@ export interface SeedGroupOptions {
   confidence?: string;
   prUrl?: string;
   prNumber?: number;
+  candidateDiff?: string;
+  verificationEvidence?: Record<string, unknown>;
 }
 
 /**
@@ -145,8 +147,8 @@ export async function seedErrorGroup(opts: SeedGroupOptions): Promise<string> {
        project_id, fingerprint, title, first_seen, last_seen,
        occurrence_count, affected_users_count, status, sample_event_id,
        reason_code, reason_message, remediation,
-       confidence, pr_url, pr_number
-     ) VALUES ($1, $2, $3, $4, $4, 1, 1, $5::error_group_status, $6, $7, $8, $9, $10, $11, $12)
+       confidence, pr_url, pr_number, candidate_diff, verification_evidence
+     ) VALUES ($1, $2, $3, $4, $4, 1, 1, $5::error_group_status, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
      RETURNING id`,
     [
       opts.projectId, fingerprint, title, now, opts.status, eventId,
@@ -156,6 +158,10 @@ export async function seedErrorGroup(opts: SeedGroupOptions): Promise<string> {
       opts.confidence ?? null,
       opts.prUrl ?? null,
       opts.prNumber ?? null,
+      opts.candidateDiff ?? null,
+      opts.verificationEvidence === undefined
+        ? null
+        : JSON.stringify(opts.verificationEvidence),
     ]
   );
   const groupId = groupResult.rows[0]!.id;
@@ -190,6 +196,8 @@ export interface Incident {
     reason_message: string;
     remediation: string;
   };
+  candidate_diff?: string;
+  verification_evidence?: Record<string, unknown>;
 }
 
 /**

@@ -21,6 +21,7 @@ const statusIndex: Record<ErrorGroupStatus, number> = {
   investigated: 3,
   fixing: 4,
   awaiting_approval: 5,
+  pr_draft: 5,
   pr_created: 5,
   needs_human: 5,
   insight: 5,
@@ -31,6 +32,7 @@ const statusIndex: Record<ErrorGroupStatus, number> = {
 
 const terminalLabels: Partial<Record<ErrorGroupStatus, string>> = {
   awaiting_approval: 'Awaiting approval',
+  pr_draft: 'Draft PR',
   pr_created: 'PR Created',
   needs_human: 'Needs Human',
   insight: 'Insight',
@@ -70,7 +72,7 @@ function connectorClass(stepIdx: number): string {
         :class="connectorClass(i)"
       ></div>
     </template>
-    <!-- Terminal status -->
+    <!-- Post-fix outcome/status. Draft PR is intentionally nonterminal while CI is observed. -->
     <div
       v-if="terminalLabels[status]"
       class="flex flex-col items-center ml-0"
@@ -83,7 +85,7 @@ function connectorClass(stepIdx: number): string {
     >
       <div
         class="h-6 px-2 rounded-full flex items-center justify-center text-[10px] font-medium ring-2"
-        :class="status === 'needs_human' ? 'bg-amber text-background ring-amber/30' : 'bg-teal text-background ring-teal/30'"
+        :class="status === 'needs_human' || status === 'pr_draft' ? 'bg-amber text-background ring-amber/30' : 'bg-teal text-background ring-teal/30'"
       >
         {{ terminalLabels[status] }}
       </div>
