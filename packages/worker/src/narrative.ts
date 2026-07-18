@@ -213,7 +213,9 @@ export function buildIncidentUrl(
     if (url.username || url.password) return null;
     url.search = '';
     url.hash = '';
-    url.pathname = `${url.pathname.replace(/\/+$/, '')}/incidents/${encodeURIComponent(errorGroupId)}`;
+    let basePath = url.pathname;
+    while (basePath.endsWith('/')) basePath = basePath.slice(0, -1);
+    url.pathname = `${basePath}/incidents/${encodeURIComponent(errorGroupId)}`;
     url.search = `?project_id=${encodeURIComponent(projectId)}`;
     return url.toString();
   } catch {
