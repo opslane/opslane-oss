@@ -65,6 +65,16 @@ jobs:
             echo "publish=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Jumbo-PR guard: per-doc planning assumes a reviewable diff. Beyond
+          # 50 changed code files the agent blows the 15-minute job budget, so
+          # skip the sync and leave documentation to the PR author (reference
+          # docs are still enforced by the drift check in pnpm test).
+          code_changed=$(grep -cvE '^(docs/|[^/]+\.md$)' "$RUNNER_TEMP/changed.txt" || true)
+          if [ "$code_changed" -gt 50 ]; then
+            echo "::notice::docs-sync skipped: $code_changed changed code files exceeds the 50-file planning budget. Sync docs in this PR by hand or run docs-sync on a smaller follow-up."
+            echo "publish=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           node scripts/docs-map.mjs < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/map.json"
           node --input-type=module - "$RUNNER_TEMP/map.json" <<'NODE'
           import { readFileSync } from 'node:fs';
