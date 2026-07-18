@@ -23,11 +23,31 @@ type workOSSDKClient struct {
 	client *workos.Client
 }
 
+// workOSProviderParam maps public provider values to WorkOS SDK values. This is
+// the only social-login boundary that uses WorkOS-specific vocabulary.
+func workOSProviderParam(provider SocialProvider) (string, bool) {
+	switch provider {
+	case SocialProviderGoogle:
+		return string(workos.SSOProviderGoogleOAuth), true
+	case SocialProviderGitHub:
+		return string(workos.SSOProviderGitHubOAuth), true
+	default:
+		return "", false
+	}
+}
+
 func (c workOSSDKClient) AuthorizationURL(req AuthRequest) (string, error) {
 	state := req.State
 	// provider=authkit selects the AuthKit hosted UI. Without it WorkOS cannot
 	// pick a connection and redirects to error.workos.com/sso/invalid-connection-selector.
 	provider := "authkit"
+	if req.SocialProvider != "" {
+		mapped, ok := workOSProviderParam(req.SocialProvider)
+		if !ok {
+			return "", fmt.Errorf("unsupported social provider %q", req.SocialProvider)
+		}
+		provider = mapped
+	}
 	return c.client.GetAuthKitAuthorizationURL(workos.AuthKitAuthorizationURLParams{
 		RedirectURI: req.RedirectURI,
 		Provider:    &provider,
