@@ -38,6 +38,7 @@ export function extractStackTraceFiles(stackTrace: string): string[] {
   const patterns: RegExp[] = [
     /\(([^)]+?):\d+:\d+\)/g,               // V8: (src/App.vue:19:17)
     /at\s+([^\s(:]+):\d+/g,                // V8 bare: at src/App.vue:19
+    /at\s+(https?:\/\/\S+?):\d+:\d+(?=\s|$)/g, // V8 bare URL (anonymous frame): at http://localhost:5174/src/App.vue:19:17
     /[@]([^\s@]+?):\d+:\d+/g,              // Firefox/Safari: func@http://localhost:5175/src/App.vue:19:17
   ];
 
