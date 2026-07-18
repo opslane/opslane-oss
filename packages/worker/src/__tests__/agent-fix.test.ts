@@ -17,6 +17,30 @@ vi.mock('../harness/diff-judge.js', () => ({
   judgeDiff: vi.fn(),
 }));
 
+vi.mock('../harness/sandbox-repo.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../harness/sandbox-repo.js')>();
+  return {
+    ...actual,
+    runBuildGate: vi.fn(async () => ({ outcome: 'passed', exitCode: 0, output: 'build ok' })),
+  };
+});
+
+vi.mock('../harness/test-runner.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../harness/test-runner.js')>();
+  return {
+    ...actual,
+    planTests: vi.fn(async () => ({ kind: 'vitest', command: 'vitest run' })),
+    runSuite: vi.fn(async () => ({
+      outcome: 'passed',
+      command: 'vitest run',
+      tests: new Map([['src/foo.test.ts::works', 'passed']]),
+      total: 1,
+      exitCode: 0,
+      output: 'suite ok',
+    })),
+  };
+});
+
 // Mock the investigation module (vi.hoisted ensures the fn exists before vi.mock factory runs)
 const { mockInvestigateError } = vi.hoisted(() => ({
   mockInvestigateError: vi.fn(),
@@ -39,6 +63,8 @@ import type { AgentCompletionResult } from '../harness/types.js';
 import { Sandbox } from 'e2b';
 import { runAgentLoop } from '../harness/agent-loop.js';
 import { judgeDiff } from '../harness/diff-judge.js';
+import { runBuildGate } from '../harness/sandbox-repo.js';
+import { planTests, runSuite } from '../harness/test-runner.js';
 
 function makeAgentResult(overrides?: Partial<AgentCompletionResult>): AgentCompletionResult {
   return {
@@ -146,6 +172,16 @@ beforeEach(() => {
   vi.mocked(judgeDiff).mockResolvedValue({
     scope: 2, correctness: 2, preservation: 2, total: 6,
     qualityPassed: true, explanation: 'Looks good',
+  });
+  vi.mocked(runBuildGate).mockResolvedValue({ outcome: 'passed', exitCode: 0, output: 'build ok' });
+  vi.mocked(planTests).mockResolvedValue({ kind: 'vitest', command: 'vitest run' });
+  vi.mocked(runSuite).mockResolvedValue({
+    outcome: 'passed',
+    command: 'vitest run',
+    tests: new Map([['src/foo.test.ts::works', 'passed']]),
+    total: 1,
+    exitCode: 0,
+    output: 'suite ok',
   });
 });
 
@@ -257,6 +293,137 @@ describe('triageError', () => {
 });
 
 describe('runAgentFix', () => {
+  describe('evidence-tiered verification', () => {
+    it('excludes pre-existing failures and reaches E1 with a comparable baseline', async () => {
+      vi.mocked(runSuite)
+        .mockResolvedValueOnce({
+          outcome: 'failed', command: 'vitest run',
+          tests: new Map([['t1', 'passed' as const], ['t2', 'failed' as const]]),
+          total: 2, exitCode: 1, output: 'baseline',
+        })
+        .mockResolvedValueOnce({
+          outcome: 'failed', command: 'vitest run',
+          tests: new Map([['t1', 'passed' as const], ['t2', 'failed' as const]]),
+          total: 2, exitCode: 1, output: 'post',
+        });
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+      const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+
+      expect(result.status).toBe('fix_ready');
+      expect(result.evidence?.tier).toBe('E1');
+      expect(result.evidence?.suite).toEqual({
+        baseline_failed_tests: ['t2'],
+        new_failures: [],
+      });
+      expect(runSuite).toHaveBeenCalledTimes(2);
+    });
+
+    it('blocks a pass-to-fail regression', async () => {
+      vi.mocked(runSuite)
+        .mockResolvedValueOnce({
+          outcome: 'passed', command: 'vitest run',
+          tests: new Map([['t1', 'passed' as const]]), total: 1, exitCode: 0, output: 'baseline',
+        })
+        .mockResolvedValue({
+          outcome: 'failed', command: 'vitest run',
+          tests: new Map([['t1', 'failed' as const]]), total: 1, exitCode: 1, output: 'post',
+        });
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+      const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+
+      expect(result.status).toBe('needs_human');
+      expect(result.reason?.reason_code).toBe('tests_failed');
+      expect(result.evidence?.suite?.new_failures).toEqual(['t1']);
+    });
+
+    it('throws a typed error with evidence after an in-gate infra retry', async () => {
+      vi.mocked(runSuite)
+        .mockResolvedValueOnce({
+          outcome: 'passed', command: 'vitest run',
+          tests: new Map([['t1', 'passed' as const]]), total: 1, exitCode: 0, output: 'baseline',
+        })
+        .mockResolvedValue({
+          outcome: 'infra_error', command: 'vitest run',
+          tests: null, total: null, output: 'runner crashed',
+        });
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+      await expect(runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }))).rejects.toMatchObject({
+        name: 'VerificationInfraError',
+        evidence: expect.objectContaining({ version: 1 }),
+      });
+      expect(runSuite).toHaveBeenCalledTimes(3);
+    });
+
+    it('distinguishes a repository with no runner from infrastructure failure', async () => {
+      vi.mocked(planTests).mockResolvedValue({ kind: 'none', command: null });
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+
+      const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+
+      expect(result.status).toBe('needs_human');
+      expect(result.reason?.reason_code).toBe('low_confidence_fix');
+      expect(result.reason?.reason_message).toContain('no test runner');
+      expect(result.draftEligible).toBe(true);
+      expect(result.evidence?.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'suite_post_patch', outcome: 'skipped_no_runner' }),
+      ]));
+    });
+
+    it('captures the candidate diff before post-patch gates and records a failed build', async () => {
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+      vi.mocked(runBuildGate).mockImplementation(async () => {
+        expect(mockSandbox.commands.run.mock.calls.some(([command]) => String(command).includes('git diff --cached'))).toBe(true);
+        return { outcome: 'failed', exitCode: 2, output: 'tsc error' };
+      });
+
+      const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+
+      expect(result.status).toBe('needs_human');
+      expect(result.evidence?.tier).toBeNull();
+      expect(result.evidence?.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'build', outcome: 'failed', exit_code: 2 }),
+      ]));
+    });
+
+    it('retries persistent build infrastructure failure and throws with its evidence', async () => {
+      vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
+      vi.mocked(runBuildGate).mockResolvedValue({
+        outcome: 'infra_error',
+        output: 'build timed out',
+      });
+
+      await expect(runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }))).rejects.toMatchObject({
+        name: 'VerificationInfraError',
+        evidence: expect.objectContaining({
+          checks: expect.arrayContaining([
+            expect.objectContaining({ name: 'build', outcome: 'infra_error' }),
+          ]),
+        }),
+      });
+      expect(runBuildGate).toHaveBeenCalledTimes(2);
+    });
+
+    it('attaches evidence when the agent gives up after verification starts', async () => {
+      vi.mocked(runAgentLoop).mockImplementation(async (config) => {
+        config.externalState!.gaveUp = true;
+        config.externalState!.giveUpReason = {
+          reason_code: 'worker_runtime_error',
+          reason_message: 'Cannot safely patch',
+          remediation: 'Review manually',
+        };
+        return makeAgentResult();
+      });
+
+      const result = await runAgentFix(makeInput({ model: 'claude-sonnet-4-6' }));
+
+      expect(result.status).toBe('needs_human');
+      expect(result.evidence).toMatchObject({ version: 1, checks: expect.any(Array) });
+    });
+  });
+
   it('returns fix_ready with high confidence when test gate passes', async () => {
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
@@ -274,7 +441,7 @@ describe('runAgentFix', () => {
     expect(mockSandbox.kill).toHaveBeenCalled();
   });
 
-  it('adds optional humanSummary to fix_ready when summary generation returns text', async () => {
+  it('adds a validated structured narrative to fix_ready', async () => {
     mockMessagesCreate
       .mockResolvedValueOnce({
         content: [{
@@ -286,8 +453,15 @@ describe('runAgentFix', () => {
       })
       .mockResolvedValueOnce({
         content: [{
-          type: 'text',
-          text: 'The user saved a profile. The page crashed because data was missing. The fix checks the value before rendering.',
+          type: 'tool_use',
+          id: 'narrative-1',
+          name: 'submit_fix_narrative',
+          input: {
+            subject: 'Guard missing profiles in UserCard',
+            whatHappened: 'Saving a user without a profile crashed the page.',
+            whyItBroke: 'UserCard read the profile before checking whether it existed.',
+            fixApproach: 'Guard the nullable profile before rendering the dependent fields.',
+          },
         }],
       });
     mockSandboxWithPassingTests();
@@ -296,11 +470,52 @@ describe('runAgentFix', () => {
     const result = await runAgentFix(makeInput());
 
     expect(result.status).toBe('fix_ready');
-    expect(result.humanSummary).toBe('The user saved a profile. The page crashed because data was missing. The fix checks the value before rendering.');
+    expect(result.narrative).toEqual({
+      subject: 'Guard missing profiles in UserCard',
+      whatHappened: 'Saving a user without a profile crashed the page.',
+      whyItBroke: 'UserCard read the profile before checking whether it existed.',
+      fixApproach: 'Guard the nullable profile before rendering the dependent fields.',
+    });
+  });
+
+  it('falls back deterministically when any narrative field is invalid', async () => {
+    mockMessagesCreate
+      .mockResolvedValueOnce({
+        content: [{
+          type: 'tool_use',
+          id: 'triage-1',
+          name: 'classify_error',
+          input: { fixable: true, confidence: 'medium', reason: 'Has application frames' },
+        }],
+      })
+      .mockResolvedValueOnce({
+        content: [{
+          type: 'tool_use',
+          id: 'narrative-1',
+          name: 'submit_fix_narrative',
+          input: {
+            subject: 'TypeError: Cannot read properties of null.',
+            whatHappened: 'The page crashed.',
+            whyItBroke: '',
+            fixApproach: 'Guard the value.',
+          },
+        }],
+      });
+    mockSandboxWithPassingTests();
+    vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ summary: 'Missing null guard' }));
+
+    const result = await runAgentFix(makeInput());
+
+    expect(result.narrative).toEqual({
+      subject: 'Fix TypeError in foo',
+      whatHappened: 'The application hit a TypeError: Cannot read properties of null.',
+      whyItBroke: 'The failing path in foo did not handle the state described by this error.',
+      fixApproach: 'The change updates foo to handle that state before continuing.',
+    });
   });
 
   it('GATE: no test runner → needs_human (below floor), diff attached, confidence medium', async () => {
-    // defaultCommandsRun reports runner "none" (tests skipped); judge default = qualityPassed:true.
+    vi.mocked(planTests).mockResolvedValue({ kind: 'none', command: null });
     // Under the precision gate, a fix we cannot verify by tests never opens a PR.
     vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult({ turnCount: 2, toolCallCount: 3, tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 } }));
 
@@ -308,6 +523,7 @@ describe('runAgentFix', () => {
     expect(result.status).toBe('needs_human');
     expect(result.reason?.reason_code).toBe('low_confidence_fix');
     expect(result.confidence).toBe('medium'); // judge liked it, but tests could not run
+    expect(result.draftEligible).toBe(true);
     expect(result.diff).toContain('diff --git'); // candidate diff preserved for the human
   });
 
@@ -346,17 +562,19 @@ describe('runAgentFix', () => {
   });
 
   it('retries once when test gate fails, then succeeds', async () => {
-    let testCallCount = 0;
-    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
-      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
-      if (cmd.includes('npm test')) {
-        testCallCount++;
-        if (testCallCount === 1) throw new Error('Tests failed: 1 assertion failed');
-        return { exitCode: 0, stdout: 'All tests passed', stderr: '' };
-      }
-      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
-      return { exitCode: 0, stdout: '', stderr: '' };
-    });
+    vi.mocked(runSuite)
+      .mockResolvedValueOnce({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'baseline',
+      })
+      .mockResolvedValueOnce({
+        outcome: 'failed', command: 'vitest run', tests: new Map([['t1', 'failed' as const]]),
+        total: 1, exitCode: 1, output: 'Tests failed: 1 assertion failed',
+      })
+      .mockResolvedValue({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'All tests passed',
+      });
 
     vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
 
@@ -371,12 +589,15 @@ describe('runAgentFix', () => {
   });
 
   it('returns needs_human with tests_failed after retry exhaustion', async () => {
-    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
-      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
-      if (cmd.includes('npm test')) throw new Error('Tests failed: assertion error');
-      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
-      return { exitCode: 0, stdout: '', stderr: '' };
-    });
+    vi.mocked(runSuite)
+      .mockResolvedValueOnce({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'baseline',
+      })
+      .mockResolvedValue({
+        outcome: 'failed', command: 'vitest run', tests: new Map([['t1', 'failed' as const]]),
+        total: 1, exitCode: 1, output: 'Tests failed: assertion error',
+      });
 
     vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
 
@@ -524,17 +745,20 @@ describe('runAgentFix', () => {
   });
 
   it('sanitizes secrets from test output before retry prompt', async () => {
-    let testCallCount = 0;
-    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
-      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
-      if (cmd.includes('npm test')) {
-        testCallCount++;
-        if (testCallCount === 1) throw new Error('Error: https://user:ghp_SECRET123@github.com/repo failed with sk-ant-KEY123');
-        return { exitCode: 0, stdout: 'All tests passed', stderr: '' };
-      }
-      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
-      return { exitCode: 0, stdout: '', stderr: '' };
-    });
+    vi.mocked(runSuite)
+      .mockResolvedValueOnce({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'baseline',
+      })
+      .mockResolvedValueOnce({
+        outcome: 'failed', command: 'vitest run', tests: new Map([['t1', 'failed' as const]]),
+        total: 1, exitCode: 1,
+        output: 'Error: https://user:ghp_SECRET123@github.com/repo failed with sk-ant-KEY123',
+      })
+      .mockResolvedValue({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'All tests passed',
+      });
 
     vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
 
@@ -546,20 +770,23 @@ describe('runAgentFix', () => {
     expect(retryMsg).toContain('[REDACTED]');
   });
 
-  it('treats test timeout as worker_runtime_error, not tests_failed', async () => {
-    mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
-      if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'npm-test', stderr: '' };
-      if (cmd.includes('npm test')) throw new Error('Command timed out after 120000ms');
-      if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
-      return { exitCode: 0, stdout: '', stderr: '' };
-    });
+  it('treats a persistent test timeout as retryable verification infrastructure failure', async () => {
+    vi.mocked(runSuite)
+      .mockResolvedValueOnce({
+        outcome: 'passed', command: 'vitest run', tests: new Map([['t1', 'passed' as const]]),
+        total: 1, exitCode: 0, output: 'baseline',
+      })
+      .mockResolvedValue({
+        outcome: 'infra_error', command: 'vitest run', tests: null,
+        total: null, output: 'Command timed out after 120000ms',
+      });
 
     vi.mocked(runAgentLoop).mockResolvedValue(makeAgentResult());
 
-    const result = await runAgentFix(makeInput());
-    expect(result.status).toBe('needs_human');
-    expect(result.reason?.reason_code).toBe('worker_runtime_error');
-    expect(result.reason?.reason_message).toContain('timed out');
+    await expect(runAgentFix(makeInput())).rejects.toMatchObject({
+      name: 'VerificationInfraError',
+      evidence: expect.objectContaining({ version: 1 }),
+    });
   });
 
   it('short-circuits with needs_human when triage says unfixable with high confidence', async () => {

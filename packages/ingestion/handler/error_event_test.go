@@ -417,6 +417,82 @@ func TestGetIncident_IncludesReplayID(t *testing.T) {
 	}
 }
 
+func TestIncidentEvidence_IsDetailOnly(t *testing.T) {
+	deps, pool := testDeps(t)
+	orgID, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	t.Cleanup(func() { cleanupTenantHandler(t, pool, orgID) })
+
+	body := `{"timestamp":"2026-07-17T00:00:00Z","error":{"type":"TypeError","message":"evidence detail","stack":"at a (src/a.ts:1:1)"},"breadcrumbs":[],"context":{}}`
+	ingest := httptest.NewRecorder()
+	ingestRequest := httptest.NewRequest("POST", "/api/v1/events", strings.NewReader(body))
+	ingestRequest.Header.Set("Content-Type", "application/json")
+	ingestRequest.Header.Set("X-API-Key", rawKey)
+	handler.NewRouter(deps).ServeHTTP(ingest, ingestRequest)
+	if ingest.Code != http.StatusAccepted {
+		t.Fatalf("event ingest: %d (%s)", ingest.Code, ingest.Body.String())
+	}
+	var event map[string]string
+	if err := json.NewDecoder(ingest.Body).Decode(&event); err != nil {
+		t.Fatalf("decode event response: %v", err)
+	}
+	groupID := event["error_group_id"]
+	diff := "diff --git a/src/a.ts b/src/a.ts"
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups
+		 SET verification_evidence = '{"version":1,"tier":"E0","checks":[]}'::jsonb,
+		     candidate_diff = $2
+		 WHERE id = $1`, groupID, diff); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+
+	list := httptest.NewRecorder()
+	listRequest := httptest.NewRequest("GET", "/api/v1/projects/"+projectID+"/incidents", nil)
+	listRequest.Header.Set("X-API-Key", rawKey)
+	handler.NewRouter(deps).ServeHTTP(list, listRequest)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list incidents: %d (%s)", list.Code, list.Body.String())
+	}
+	var incidents []map[string]any
+	if err := json.NewDecoder(list.Body).Decode(&incidents); err != nil {
+		t.Fatalf("decode incident list: %v", err)
+	}
+	found := false
+	for _, incident := range incidents {
+		if incident["id"] != groupID {
+			continue
+		}
+		found = true
+		if _, ok := incident["verification_evidence"]; ok {
+			t.Fatalf("list item unexpectedly includes verification_evidence: %#v", incident)
+		}
+		if _, ok := incident["candidate_diff"]; ok {
+			t.Fatalf("list item unexpectedly includes candidate_diff: %#v", incident)
+		}
+	}
+	if !found {
+		t.Fatalf("incident %q missing from list response", groupID)
+	}
+
+	detail := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest("GET", "/api/v1/projects/"+projectID+"/incidents/"+groupID, nil)
+	detailRequest.Header.Set("X-API-Key", rawKey)
+	handler.NewRouter(deps).ServeHTTP(detail, detailRequest)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("get incident: %d (%s)", detail.Code, detail.Body.String())
+	}
+	var incident map[string]any
+	if err := json.NewDecoder(detail.Body).Decode(&incident); err != nil {
+		t.Fatalf("decode incident detail: %v", err)
+	}
+	evidence, ok := incident["verification_evidence"].(map[string]any)
+	if !ok || evidence["tier"] != "E0" {
+		t.Fatalf("detail verification_evidence = %#v, want tier E0", incident["verification_evidence"])
+	}
+	if incident["candidate_diff"] != diff {
+		t.Fatalf("detail candidate_diff = %#v, want %q", incident["candidate_diff"], diff)
+	}
+}
+
 func TestIngest_RedactsBreadcrumbsAndContextBeforePersist(t *testing.T) {
 	deps, pool := testDeps(t)
 	_, projectID, _, rawKey := seedTenant(t, deps.Queries)

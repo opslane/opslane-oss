@@ -1,5 +1,7 @@
+import type { CheckOutcome } from '@opslane/shared';
 import { logger } from '../logger.js';
 import { buildGitNetrc } from '../repo-clone.js';
+import { scrubSecrets } from './redact.js';
 import { createSandboxRuntime, type SandboxRuntime } from './sandbox-runtime.js';
 
 const SANDBOX_REPO = '/home/user/repo';
@@ -41,6 +43,33 @@ export interface RepoSandbox {
   installSucceeded: boolean;
 }
 
+const SANDBOX_NODE_VERSION = '22.17.0';
+
+/**
+ * The default E2B image ships Node 20.9, which predates crypto.hash() and
+ * breaks modern Vite plugins (they require >= 20.12). Install a user-space
+ * Node when the sandbox's Node is too old; later command shells pick it up
+ * through ~/.profile and ~/.bashrc.
+ */
+async function ensureModernNode(sandbox: SandboxRuntime): Promise<void> {
+  try {
+    await sandbox.commands.run(
+      `node -e "if (typeof require('crypto').hash !== 'function') process.exit(1)"`,
+    );
+    return;
+  } catch {
+    // Node is missing or too old — install below.
+  }
+  const url = `https://nodejs.org/dist/v${SANDBOX_NODE_VERSION}/node-v${SANDBOX_NODE_VERSION}-linux-x64.tar.xz`;
+  await sandbox.commands.run(
+    `curl -fsSL ${url} -o /tmp/node.tar.xz` +
+      ' && mkdir -p ~/.opslane-node && tar -xJf /tmp/node.tar.xz -C ~/.opslane-node --strip-components=1' +
+      ` && echo 'export PATH="$HOME/.opslane-node/bin:$PATH"' >> ~/.profile` +
+      ` && echo 'export PATH="$HOME/.opslane-node/bin:$PATH"' >> ~/.bashrc`,
+    { timeoutMs: 180_000 },
+  );
+}
+
 /**
  * Create an E2B sandbox, clone the repo via .netrc auth, install deps, and
  * commit a baseline so a later diff captures only the agent's work.
@@ -49,52 +78,70 @@ export async function createRepoSandbox(opts: {
   repoUrl: string;
   defaultBranch: string;
   githubToken?: string;
+  /** Commands applied after the baseline commit and committed separately. */
+  setupCommands?: string[];
 }): Promise<RepoSandbox> {
   const sandbox = await createSandboxRuntime();
-  await sandbox.commands.run('git config --global user.email "opslane-agent@opslane.com" && git config --global user.name "Opslane Agent"');
-
-  const token = opts.githubToken ?? process.env['GITHUB_TOKEN'] ?? '';
-  const gitNetrc = token ? buildGitNetrc(opts.repoUrl, token) : null;
-  if (gitNetrc) {
-    await sandbox.files.write('/home/user/.netrc', gitNetrc);
-    await sandbox.commands.run('chmod 600 /home/user/.netrc');
-  }
-
   try {
+    await ensureModernNode(sandbox);
+    await sandbox.commands.run('git config --global user.email "opslane-agent@opslane.com" && git config --global user.name "Opslane Agent"');
+
+    const token = opts.githubToken ?? process.env['GITHUB_TOKEN'] ?? '';
+    const gitNetrc = token ? buildGitNetrc(opts.repoUrl, token) : null;
+    if (gitNetrc) {
+      await sandbox.files.write('/home/user/.netrc', gitNetrc);
+      await sandbox.commands.run('chmod 600 /home/user/.netrc');
+    }
+
+    try {
+      await sandbox.commands.run(
+        `git clone --depth 1 --branch ${shellEscape(opts.defaultBranch)} ${shellEscape(opts.repoUrl)} ${SANDBOX_REPO}`,
+        { timeoutMs: 120_000 },
+      );
+    } catch (err: unknown) {
+      const msg = (err instanceof Error ? err.message : String(err))
+        .replace(/https:\/\/[^@]+@/g, 'https://***@');
+      throw new Error(`clone failed: ${msg}`);
+    }
+
+    if (gitNetrc) await sandbox.commands.run('rm -f /home/user/.netrc');
+
     await sandbox.commands.run(
-      `git clone --depth 1 --branch ${shellEscape(opts.defaultBranch)} ${shellEscape(opts.repoUrl)} ${SANDBOX_REPO}`,
-      { timeoutMs: 120_000 },
+      `cd ${SANDBOX_REPO} && printf "\\nnode_modules\\n.cache\\ncoverage\\n" >> .gitignore`,
+      { timeoutMs: 10_000 },
     );
+
+    let installSucceeded = false;
+    try {
+      await sandbox.commands.run(
+        `cd ${SANDBOX_REPO} && if [ -f pnpm-lock.yaml ]; then pnpm install; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; else echo "no package.json"; fi`,
+        { timeoutMs: 120_000 },
+      );
+      installSucceeded = true;
+    } catch (err: unknown) {
+      logger.warn('setup install failed; continuing', { error: err instanceof Error ? err.message : String(err) });
+    }
+
+    await sandbox.commands.run(
+      `cd ${SANDBOX_REPO} && git add -A && git commit -m "baseline: setup" --allow-empty`,
+      { timeoutMs: 30_000 },
+    );
+
+    if (opts.setupCommands && opts.setupCommands.length > 0) {
+      for (const command of opts.setupCommands) {
+        await sandbox.commands.run(`cd ${SANDBOX_REPO} && ${command}`, { timeoutMs: 60_000 });
+      }
+      await sandbox.commands.run(
+        `cd ${SANDBOX_REPO} && git add -A && git commit -m "eval: setup" --allow-empty`,
+        { timeoutMs: 30_000 },
+      );
+    }
+
+    return { sandbox, installSucceeded };
   } catch (err: unknown) {
-    const msg = (err instanceof Error ? err.message : String(err)).replace(/https:\/\/[^@]+@/g, 'https://***@');
     await sandbox.kill().catch(() => {});
-    throw new Error(`clone failed: ${msg}`);
+    throw err;
   }
-
-  if (gitNetrc) await sandbox.commands.run('rm -f /home/user/.netrc');
-
-  await sandbox.commands.run(
-    `cd ${SANDBOX_REPO} && printf "\\nnode_modules\\n.cache\\ncoverage\\n" >> .gitignore`,
-    { timeoutMs: 10_000 },
-  );
-
-  let installSucceeded = false;
-  try {
-    await sandbox.commands.run(
-      `cd ${SANDBOX_REPO} && if [ -f pnpm-lock.yaml ]; then pnpm install; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; else echo "no package.json"; fi`,
-      { timeoutMs: 120_000 },
-    );
-    installSucceeded = true;
-  } catch (err: unknown) {
-    logger.warn('setup install failed; continuing', { error: err instanceof Error ? err.message : String(err) });
-  }
-
-  await sandbox.commands.run(
-    `cd ${SANDBOX_REPO} && git add -A && git commit -m "baseline: setup" --allow-empty`,
-    { timeoutMs: 30_000 },
-  );
-
-  return { sandbox, installSucceeded };
 }
 
 /** Extract the agent's change as a unified diff. */
@@ -107,12 +154,26 @@ export async function extractDiff(sandbox: SandboxRuntime): Promise<{ diff: stri
 }
 
 export interface BuildGateResult {
-  passed: boolean;
-  skipped: boolean;
+  outcome: CheckOutcome;
+  exitCode?: number;
   output: string;
 }
 
-/** Run the build/typecheck gate. Returns skipped:true when there's nothing to run. */
+interface BuildFailureLike {
+  message?: string;
+  exitCode?: number | null;
+  stdout?: unknown;
+  stderr?: unknown;
+}
+
+function buildFailureExitCode(error: unknown): number | undefined {
+  const failure = error as BuildFailureLike;
+  if (typeof failure.exitCode === 'number') return failure.exitCode;
+  const match = String(failure.message ?? '').match(/exited with code (\d+)/i);
+  return match?.[1] ? Number(match[1]) : undefined;
+}
+
+/** Run the build/typecheck gate using the verification outcome taxonomy. */
 export async function runBuildGate(sandbox: SandboxRuntime): Promise<BuildGateResult> {
   let pkg: PackageJsonLike = {};
   try {
@@ -129,14 +190,26 @@ export async function runBuildGate(sandbox: SandboxRuntime): Promise<BuildGateRe
         : 'npm';
 
   const cmd = selectBuildCommand(pkg, tsconfigExists, pm);
-  if (!cmd) return { passed: true, skipped: true, output: 'no build script or tsconfig' };
+  if (!cmd) return { outcome: 'skipped_no_runner', output: 'no build script or tsconfig' };
 
   try {
     const res = await sandbox.commands.run(`cd ${SANDBOX_REPO} && ${cmd}`, { timeoutMs: 240_000 });
-    return { passed: true, skipped: false, output: (res.stdout ?? '').slice(-2000) };
+    const output = scrubSecrets(`${res.stdout ?? ''}${res.stderr ? `\n${res.stderr}` : ''}`).slice(-2000);
+    return res.exitCode === 0
+      ? { outcome: 'passed', exitCode: 0, output }
+      : { outcome: 'failed', exitCode: res.exitCode, output };
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { passed: false, skipped: false, output: msg.slice(-2000) };
+    const failure = err as BuildFailureLike;
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const detail = [failure.stderr, failure.stdout]
+      .map((part) => String(part ?? '').trim())
+      .filter(Boolean)
+      .join('\n');
+    const output = scrubSecrets(detail || rawMessage).slice(-2000);
+    if (/timed out|timeout/i.test(rawMessage)) {
+      return { outcome: 'infra_error', output };
+    }
+    return { outcome: 'failed', exitCode: buildFailureExitCode(err), output };
   }
 }
 

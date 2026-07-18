@@ -1,5 +1,5 @@
 import pg from 'pg';
-import type { ErrorGroupStatus, NeedsHumanReason, ConfidenceLevel, JobType, SetupPrStatus } from '@opslane/shared';
+import type { ErrorGroupStatus, NeedsHumanReason, ConfidenceLevel, JobType, SetupPrStatus, EvidenceRecord, PRPosture } from '@opslane/shared';
 import { reconcileDeadLetteredSessionAnalysis } from './friction/dead-letter.js';
 
 const { Pool } = pg;
@@ -30,11 +30,14 @@ export interface ClaimedJob {
   projectId: string;
   jobType: JobType;
   attempts: number;
+  /** Maximum failed executions before the job dead-letters. Populated by claimJob. */
+  maxAttempts?: number;
   guidance: string | null;
   /** Monotonically increasing fencing token for this claim. */
   leaseGeneration: string;
   triggeredBy: 'auto' | 'human' | null;
   sessionId: string | null;
+  payload?: unknown;
 }
 
 export interface JobLease {
@@ -121,11 +124,13 @@ export async function claimJob(
     project_id: string;
     job_type: JobType;
     attempts: number;
+    max_attempts: number;
     guidance: string | null;
     worker_id: string;
     lease_generation: string;
     triggered_by: 'auto' | 'human' | null;
     session_id: string | null;
+    payload: unknown;
   }>;
   try {
     await client.query('BEGIN');
@@ -143,6 +148,7 @@ export async function claimJob(
      WHERE id = (
        SELECT id FROM error_group_jobs
        WHERE status = 'pending'
+         AND available_at <= now()
          AND (job_type <> 'session_analysis'
               OR (SELECT COUNT(*) FROM error_group_jobs
                    WHERE status = 'claimed'
@@ -162,9 +168,9 @@ export async function claimJob(
        LIMIT 1
        FOR UPDATE SKIP LOCKED
      )
-     RETURNING id, error_group_id, source_id, project_id, job_type, attempts, guidance,
+     RETURNING id, error_group_id, source_id, project_id, job_type, attempts, max_attempts, guidance,
                worker_id, lease_generation::text AS lease_generation,
-               triggered_by, session_id`,
+               triggered_by, session_id, payload`,
       [workerId, leaseDurationMs / 1000, sessionAnalysisCap]
     );
     await client.query('COMMIT');
@@ -186,11 +192,50 @@ export async function claimJob(
     projectId: row.project_id,
     jobType: row.job_type,
     attempts: row.attempts,
+    maxAttempts: row.max_attempts,
     guidance: row.guidance,
     leaseGeneration: row.lease_generation,
     triggeredBy: row.triggered_by,
     sessionId: row.session_id,
+    payload: row.payload,
   };
+}
+
+export class JobRescheduledError extends Error {
+  constructor(jobId: string) {
+    super(`Job ${jobId} was durably rescheduled`);
+    this.name = 'JobRescheduledError';
+  }
+}
+
+/** Return a claimed job to pending without consuming a retry attempt. */
+export async function rescheduleJob(
+  lease: JobLease,
+  availableAt: Date,
+  payload?: unknown,
+): Promise<void> {
+  const result = await getPool().query(
+    `UPDATE error_group_jobs
+     SET status = 'pending', worker_id = NULL, claimed_at = NULL,
+         lease_expires_at = NULL, available_at = $7,
+         payload = COALESCE($8::jsonb, payload), updated_at = now()
+     WHERE id = $1 AND worker_id = $2 AND lease_generation = $3::bigint
+       AND project_id = $4
+       AND error_group_id IS NOT DISTINCT FROM $5::uuid
+       AND session_id IS NOT DISTINCT FROM $6
+       AND status = 'claimed' AND lease_expires_at > now()`,
+    [
+      lease.id,
+      lease.workerId,
+      lease.leaseGeneration,
+      lease.projectId,
+      lease.errorGroupId,
+      lease.sessionId,
+      availableAt,
+      payload === undefined ? null : JSON.stringify(payload),
+    ],
+  );
+  if ((result.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
 }
 
 /** Extends the lease on a claimed job. Returns false if the job is no longer owned by this worker. */
@@ -431,6 +476,8 @@ export async function updateGroupStatus(
     pr_number?: number;
     pr_fix_job_id?: string;
     reason?: NeedsHumanReason;
+    candidate_diff?: string;
+    evidence?: EvidenceRecord;
   },
   lease?: JobLease,
 ): Promise<void> {
@@ -453,9 +500,9 @@ export async function updateGroupStatus(
   const ownedCte = lease
     ? `WITH owned AS (
          SELECT id FROM error_group_jobs
-         WHERE id = $11
-           AND worker_id = $12
-           AND lease_generation = $13::bigint
+         WHERE id = $13
+           AND worker_id = $14
+           AND lease_generation = $15::bigint
            AND project_id = $2
            AND error_group_id = $1
            AND status = 'claimed'
@@ -474,6 +521,8 @@ export async function updateGroupStatus(
          reason_code = $8,
          reason_message = $9,
          remediation = $10,
+         candidate_diff = $11,
+         verification_evidence = $12::jsonb,
          pr_created_at = CASE
            WHEN $3::error_group_status = 'pr_created'
                 AND status IS DISTINCT FROM 'pr_created' THEN now()
@@ -499,11 +548,264 @@ export async function updateGroupStatus(
       reason?.reason_code ?? null,
       reason?.reason_message ?? null,
       reason?.remediation ?? null,
+      fields?.candidate_diff ?? null,
+      fields?.evidence ? JSON.stringify(fields.evidence) : null,
       ...(lease ? [lease.id, lease.workerId, lease.leaseGeneration] : []),
     ]
   );
   if (lease && (result.rowCount ?? 0) === 0) {
     throw new LeaseLostError(lease.id);
+  }
+}
+
+export interface DeliveryReservation {
+  operationKey: string;
+  branchName: string;
+  posture: 'ready' | 'draft';
+  candidateDiff: string;
+  state: 'reserved' | 'pushed' | 'open' | 'closed';
+  headSha?: string;
+  prUrl?: string;
+  prNumber?: number;
+  existing: boolean;
+}
+
+export type ReserveDeliveryResult =
+  | { status: 'reserved'; reservation: DeliveryReservation }
+  | { status: 'cap_reached' };
+
+/** Persists a stable delivery intent before the first provider write. */
+export async function reserveDelivery(
+  errorGroupId: string,
+  projectId: string,
+  input: {
+    operationKey: string;
+    branchName: string;
+    posture: 'ready' | 'draft';
+    diffHash: string;
+    candidateDiff: string;
+  },
+  lease: JobLease,
+): Promise<ReserveDeliveryResult> {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const owned = await client.query(
+      `SELECT id FROM error_group_jobs
+       WHERE id = $1 AND worker_id = $2 AND lease_generation = $3::bigint
+         AND project_id = $4 AND error_group_id = $5
+         AND status = 'claimed' AND lease_expires_at > now()
+       FOR UPDATE`,
+      [lease.id, lease.workerId, lease.leaseGeneration, projectId, errorGroupId],
+    );
+    if ((owned.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
+
+    const existing = await client.query<{
+      operation_key: string;
+      branch_name: string;
+      posture: 'ready' | 'draft';
+      candidate_diff: string;
+      state: DeliveryReservation['state'];
+      head_sha: string | null;
+      pr_url: string | null;
+      pr_number: number | null;
+    }>(
+      `SELECT operation_key, branch_name, posture, candidate_diff, state,
+              head_sha, pr_url, pr_number
+       FROM delivery_reservations
+       WHERE error_group_id = $1 AND project_id = $2
+       FOR UPDATE`,
+      [errorGroupId, projectId],
+    );
+    const row = existing.rows[0];
+    if (row) {
+      await client.query('COMMIT');
+      return {
+        status: 'reserved',
+        reservation: {
+          operationKey: row.operation_key,
+          branchName: row.branch_name,
+          posture: row.posture,
+          candidateDiff: row.candidate_diff,
+          state: row.state,
+          ...(row.head_sha ? { headSha: row.head_sha } : {}),
+          ...(row.pr_url ? { prUrl: row.pr_url } : {}),
+          ...(row.pr_number ? { prNumber: row.pr_number } : {}),
+          existing: true,
+        },
+      };
+    }
+
+    const project = await client.query<{ draft_pr_cap: number }>(
+      `SELECT draft_pr_cap FROM projects WHERE id = $1 FOR UPDATE`,
+      [projectId],
+    );
+    if (!project.rows[0]) throw new Error(`Project ${projectId} not found`);
+    if (input.posture === 'draft') {
+      const count = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+         FROM delivery_reservations
+         WHERE project_id = $1 AND posture = 'draft'
+           AND state IN ('reserved', 'pushed', 'open')`,
+        [projectId],
+      );
+      if (Number(count.rows[0]?.count ?? 0) >= project.rows[0].draft_pr_cap) {
+        await client.query('COMMIT');
+        return { status: 'cap_reached' };
+      }
+    }
+
+    await client.query(
+      `INSERT INTO delivery_reservations
+         (error_group_id, project_id, operation_key, branch_name, posture,
+          diff_hash, candidate_diff)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        errorGroupId,
+        projectId,
+        input.operationKey,
+        input.branchName,
+        input.posture,
+        input.diffHash,
+        input.candidateDiff,
+      ],
+    );
+    await client.query('COMMIT');
+    return {
+      status: 'reserved',
+      reservation: {
+        operationKey: input.operationKey,
+        branchName: input.branchName,
+        posture: input.posture,
+        candidateDiff: input.candidateDiff,
+        state: 'reserved',
+        existing: false,
+      },
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function recordDeliveryPushed(
+  errorGroupId: string,
+  projectId: string,
+  headSha: string,
+  lease: JobLease,
+): Promise<void> {
+  const result = await getPool().query(
+    `UPDATE delivery_reservations r
+     SET state = 'pushed', head_sha = $3, updated_at = now()
+     WHERE r.error_group_id = $1 AND r.project_id = $2
+       AND EXISTS (
+         SELECT 1 FROM error_group_jobs j
+         WHERE j.id = $4 AND j.worker_id = $5
+           AND j.lease_generation = $6::bigint
+           AND j.project_id = $2 AND j.error_group_id = $1
+           AND j.status = 'claimed' AND j.lease_expires_at > now()
+       )`,
+    [errorGroupId, projectId, headSha, lease.id, lease.workerId, lease.leaseGeneration],
+  );
+  if ((result.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
+}
+
+/** Atomically records the PR, transitions the incident, and starts CI watching. */
+export async function finalizeDelivery(
+  errorGroupId: string,
+  projectId: string,
+  input: {
+    status: 'pr_created' | 'pr_draft';
+    prUrl: string;
+    prNumber: number;
+    headSha: string;
+    confidence: ConfidenceLevel;
+    fixJobId: string;
+    reason?: NeedsHumanReason;
+    candidateDiff?: string;
+    evidence?: EvidenceRecord;
+  },
+  lease: JobLease,
+): Promise<void> {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const owned = await client.query(
+      `SELECT id FROM error_group_jobs
+       WHERE id = $1 AND worker_id = $2 AND lease_generation = $3::bigint
+         AND project_id = $4 AND error_group_id = $5
+         AND status = 'claimed' AND lease_expires_at > now()
+       FOR UPDATE`,
+      [lease.id, lease.workerId, lease.leaseGeneration, projectId, errorGroupId],
+    );
+    if ((owned.rowCount ?? 0) === 0) throw new LeaseLostError(lease.id);
+
+    const reason = input.reason;
+    const updated = await client.query(
+      `UPDATE error_groups
+       SET status = $3::error_group_status, confidence = $4,
+           pr_url = $5, pr_number = $6, pr_fix_job_id = $7,
+           reason_code = $8, reason_message = $9, remediation = $10,
+           candidate_diff = $11, verification_evidence = $12::jsonb,
+           pr_created_at = CASE WHEN $3::error_group_status = 'pr_created'
+                                THEN COALESCE(pr_created_at, now())
+                                ELSE pr_created_at END,
+           updated_at = now()
+       WHERE id = $1 AND project_id = $2
+         AND status IN ('fixing', 'pr_draft', 'pr_created')`,
+      [
+        errorGroupId,
+        projectId,
+        input.status,
+        input.confidence,
+        input.prUrl,
+        input.prNumber,
+        input.fixJobId,
+        reason?.reason_code ?? null,
+        reason?.reason_message ?? null,
+        reason?.remediation ?? null,
+        input.candidateDiff ?? null,
+        input.evidence ? JSON.stringify(input.evidence) : null,
+      ],
+    );
+    if ((updated.rowCount ?? 0) === 0) {
+      throw new Error(`Cannot finalize delivery for group ${errorGroupId}`);
+    }
+
+    await client.query(
+      `UPDATE delivery_reservations
+       SET state = 'open', head_sha = $3, pr_url = $4, pr_number = $5,
+           updated_at = now()
+       WHERE error_group_id = $1 AND project_id = $2`,
+      [errorGroupId, projectId, input.headSha, input.prUrl, input.prNumber],
+    );
+
+    if (input.status === 'pr_draft') {
+      const payload = {
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        watchStartedAt: new Date().toISOString(),
+      };
+      await client.query(
+        `INSERT INTO error_group_jobs
+           (error_group_id, project_id, job_type, triggered_by, payload, available_at)
+         SELECT $1, $2, 'ci_watch', 'auto', $3::jsonb, now()
+         WHERE NOT EXISTS (
+           SELECT 1 FROM error_group_jobs
+           WHERE error_group_id = $1 AND project_id = $2
+             AND job_type = 'ci_watch' AND status IN ('pending', 'claimed')
+         )`,
+        [errorGroupId, projectId, JSON.stringify(payload)],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -617,17 +919,69 @@ export interface ErrorGroupData {
   element_selector: string | null;
   page_url_normalized: string | null;
   confidence: ConfidenceLevel | null;
+  pr_url?: string | null;
+  pr_number?: number | null;
+  reason_code?: string | null;
+  reason_message?: string | null;
+  remediation?: string | null;
+  verification_evidence?: EvidenceRecord | null;
 }
 
 export async function getErrorGroup(groupId: string, projectId: string): Promise<ErrorGroupData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ErrorGroupData>(
     `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status,
-            kind, signal_type, element_selector, page_url_normalized, confidence
+            kind, signal_type, element_selector, page_url_normalized, confidence,
+            pr_url, pr_number, reason_code, reason_message, remediation,
+            verification_evidence
      FROM error_groups WHERE id = $1 AND project_id = $2`,
     [groupId, projectId],
   );
   return rows[0] ?? null;
+}
+
+/** Persist an external-CI observation, optionally promoting the draft. */
+export async function saveExternalCIResult(
+  errorGroupId: string,
+  projectId: string,
+  input: {
+    evidence: EvidenceRecord;
+    promote: boolean;
+    remediation?: string;
+  },
+  lease: JobLease,
+): Promise<boolean> {
+  const result = await getPool().query(
+    `UPDATE error_groups g
+     SET status = CASE WHEN $6 THEN 'pr_created'::error_group_status ELSE status END,
+         confidence = CASE WHEN $6 THEN 'medium' ELSE confidence END,
+         verification_evidence = $7::jsonb,
+         remediation = CASE WHEN $6 THEN NULL ELSE COALESCE($8, remediation) END,
+         reason_code = CASE WHEN $6 THEN NULL ELSE reason_code END,
+         reason_message = CASE WHEN $6 THEN NULL ELSE reason_message END,
+         candidate_diff = CASE WHEN $6 THEN NULL ELSE candidate_diff END,
+         pr_created_at = CASE WHEN $6 THEN COALESCE(pr_created_at, now()) ELSE pr_created_at END,
+         updated_at = now()
+     WHERE g.id = $1 AND g.project_id = $2 AND g.status = 'pr_draft'
+       AND EXISTS (
+         SELECT 1 FROM error_group_jobs j
+         WHERE j.id = $3 AND j.worker_id = $4
+           AND j.lease_generation = $5::bigint
+           AND j.project_id = $2 AND j.error_group_id = $1
+           AND j.status = 'claimed' AND j.lease_expires_at > now()
+       )`,
+    [
+      errorGroupId,
+      projectId,
+      lease.id,
+      lease.workerId,
+      lease.leaseGeneration,
+      input.promote,
+      JSON.stringify(input.evidence),
+      input.remediation ?? null,
+    ],
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 export interface ErrorEventData {
@@ -661,12 +1015,14 @@ export interface ProjectData {
   github_repo: string;
   default_branch: string;
   friction_autonomy: FrictionAutonomy;
+  pr_posture?: PRPosture;
+  draft_pr_cap?: number;
 }
 
 export async function getProject(projectId: string): Promise<ProjectData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ProjectData>(
-    `SELECT id, name, github_repo, default_branch, friction_autonomy
+    `SELECT id, name, github_repo, default_branch, friction_autonomy, pr_posture, draft_pr_cap
      FROM projects WHERE id = $1`,
     [projectId],
   );

@@ -14,7 +14,7 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `WORKOS_API_KEY` | when `AUTH_PROVIDER=workos` | WorkOS secret API key used for AuthKit code exchange. |
 | `WORKOS_CLIENT_ID` | when `AUTH_PROVIDER=workos` | WorkOS project client ID used for AuthKit authorization. |
 | `DASHBOARD_DIR` | no | Directory of built dashboard SPA to serve (set in the Docker image) |
-| `DASHBOARD_ORIGIN` | no | Allowed dashboard origin for CORS **and** the OAuth redirect target. For the bundled Compose setup, set `http://localhost:8082`. |
+| `DASHBOARD_ORIGIN` | no | Allowed dashboard origin for CORS **and** the OAuth redirect target. For the bundled Compose setup, set `http://localhost:8082`. This is separate from the worker's reader-facing `DASHBOARD_URL`. |
 | `GITHUB_APP_ID` | for GitHub App | App ID |
 | `GITHUB_APP_CLIENT_ID` | for OAuth sign-in | OAuth client ID |
 | `GITHUB_APP_CLIENT_SECRET` | for OAuth sign-in | OAuth client secret |
@@ -43,7 +43,7 @@ Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in i
 | `E2B_API_KEY` | for verification | Sandbox where fixes are tested |
 | `GITHUB_TOKEN` | one of the two GitHub modes | PAT for clone + PR |
 | `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` | the other mode | GitHub App installation tokens |
-| `DASHBOARD_URL` / `DASHBOARD_ORIGIN` | no | Links in PR bodies and notifications |
+| `DASHBOARD_URL` | no | Public or private HTTP(S) dashboard base URL used for reader-facing incident links in PR bodies and notifications. Configure it explicitly; loopback URLs are rejected, and the ingestion service's `DASHBOARD_ORIGIN` is not used as a fallback. |
 | `WORKER_ID` | no (generated) | Stable worker identity for lease ownership |
 | `POLL_INTERVAL_MS` / `LEASE_DURATION_MS` / `REAPER_INTERVAL_MS` / `SILENCE_CHECK_INTERVAL_MS` | no | Queue tuning |
 | `RESOLVE_AGE_DAYS` | no (14) | Days without a new occurrence before `needs_human` and `investigated` issues are auto-resolved |

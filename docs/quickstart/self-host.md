@@ -60,18 +60,18 @@ Expected result:
  needs_human | missing_github_token | Failed to clone repository: GITHUB_TOKEN is not set
 ```
 
-That `needs_human` + reason code is the product's core contract: every investigation ends in an explicit state — a verified fix PR (`pr_created`), a posted root-cause analysis awaiting your go-ahead (`investigated`, for medium/low-confidence results), or a stated reason a human is needed (`needs_human`). Which specific reason code you see depends on which credential the worker misses first; the guarantee is the explicit state, not a particular code.
+That `needs_human` + reason code is part of the product's core contract: every run reaches an explicit state — a ready-for-review fix PR backed by executed evidence (`pr_created`), an opt-in unverified draft awaiting repository CI (`pr_draft`), a posted root-cause analysis awaiting your go-ahead (`investigated`, for medium/low-confidence results), or a stated reason a human is needed (`needs_human`). Which specific reason code you see depends on which credential the worker misses first; the guarantee is the explicit state, not a particular code.
 
 ## Path 2 — full error-to-PR
 
-**What this proves:** the complete loop — error in, investigated, fix written, verified in a sandbox, pull request out.
+**What this proves:** the complete loop — error in, investigated, fix written, evidence collected in a sandbox, pull request out with its verification posture stated explicitly.
 
 Requires all of the following set in your environment **before** `docker compose up`:
 
 | Variable | What it's for | Where to get it |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | AI investigation and fix generation | [console.anthropic.com](https://console.anthropic.com) |
-| `E2B_API_KEY` | Sandbox where fixes are verified before a PR is opened | [e2b.dev](https://e2b.dev) |
+| `E2B_API_KEY` | Sandbox where fixes are built and verification evidence is collected before delivery | [e2b.dev](https://e2b.dev) |
 | `GITHUB_TOKEN` | Cloning the repo and opening the PR | GitHub → Settings → Developer settings → fine-grained PAT with `contents` + `pull_requests` write on the target repo |
 
 You also need a **target repository the worker may open PRs against** — use a fork of a small fixture app (e.g. this repo's `test-fixtures/vue-app` pushed to a scratch repo), never a production repo you aren't ready to receive AI PRs on. Point your project's `github_repo` at it (via the dashboard, or by editing the seeded project row).
@@ -87,7 +87,7 @@ Then send an error that originates from code in that repository (install [`@opsl
 docker compose logs -f worker
 ```
 
-A successful run ends with the error group in `pr_created` and a pull request on the target repo containing the fix and its verification evidence. Medium/low-confidence analyses end in `investigated` — the root cause is posted and the fix waits for you to trigger it from the dashboard. Runs that can't progress end in `needs_human` with the reason. The worker never opens an unverified PR.
+A fully verified run ends with the error group in `pr_created` and a ready-for-review pull request containing the fix and its evidence. When a project's **Draft PRs for unverified fixes** setting is enabled, a judge-approved fix with a passing build and no negative execution evidence may instead end in `pr_draft`; the PR is visibly marked draft and remains unready while the repository's CI is observed. Medium/low-confidence analyses end in `investigated`, and runs that cannot safely progress end in `needs_human` with the reason. The worker never opens a ready-for-review PR without executed verification evidence.
 
 The same contract is exercised by `test-e2e/error-to-pr.test.ts`, which skips itself unless `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are present.
 

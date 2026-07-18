@@ -60,7 +60,7 @@ These are curated tables, not a stability contract — the API is early-stage an
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
 | POST | `/api/v1/projects` | Create project |
-| PATCH | `/api/v1/projects/{projectID}` | Update project (partial: omitted/null fields are preserved, so `github_repo` can no longer be cleared here) |
+| PATCH | `/api/v1/projects/{projectID}` | Update project settings, including `friction_autonomy` and `pr_posture` (partial: omitted/null fields are preserved, so `github_repo` can no longer be cleared here) |
 | GET | `/api/v1/projects/{projectID}/fix-stats` | Per-kind fix generation and PR outcome receipts |
 | GET | `/api/v1/projects/{projectID}/environments` | List environments |
 | POST | `/api/v1/projects/{projectID}/environments` | Create environment |

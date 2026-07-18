@@ -126,6 +126,39 @@ jobs:
       - name: License-boundary check (MIT-published packages)
         run: node scripts/check-licenses.mjs
 
+  sdk-python:
+    name: Python SDK tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    defaults:
+      run:
+        working-directory: packages/sdk-python
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest -v
+      - name: Build and validate artifacts
+        if: matrix.python-version == '3.14'
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install dist/*.whl
+          /tmp/wheelcheck/bin/python -c "import opslane, importlib.metadata as md; assert opslane.__version__ == md.version('opslane'); print('wheel ok', opslane.__version__)"
+          python -m venv /tmp/sdistcheck
+          /tmp/sdistcheck/bin/pip install dist/*.tar.gz
+          /tmp/sdistcheck/bin/python -c "import opslane; print('sdist ok', opslane.__version__)"
+
   compose:
     name: Compose validation
     runs-on: ubuntu-latest
@@ -278,7 +311,7 @@ jobs:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security]
+    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security, sdk-python]
     if: always()
     steps:
       - name: Report job results

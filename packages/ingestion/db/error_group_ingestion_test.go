@@ -544,6 +544,13 @@ func TestRequeueOnRecurrence_NeedsHumanRetriable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateErrorGroupStatus to needs_human: %v", err)
 	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE error_groups
+		 SET verification_evidence = '{"version":1,"tier":"E0","checks":[]}'::jsonb,
+		     candidate_diff = 'diff --git a/src/a.ts b/src/a.ts'
+		 WHERE id = $1`, r1.GroupID); err != nil {
+		t.Fatalf("seed stale verification proof: %v", err)
+	}
 
 	// Second ingest with same fingerprint — should re-queue (retriable reason)
 	r2, err := q.InsertErrorEventAndGroup(ctx, db.IngestParams{
@@ -585,6 +592,12 @@ func TestRequeueOnRecurrence_NeedsHumanRetriable(t *testing.T) {
 	}
 	if group.Remediation != nil {
 		t.Errorf("group.remediation = %q, want nil (cleared on requeue)", *group.Remediation)
+	}
+	if len(group.VerificationEvidence) != 0 {
+		t.Errorf("group.verification_evidence = %s, want nil (cleared on requeue)", group.VerificationEvidence)
+	}
+	if group.CandidateDiff != nil {
+		t.Errorf("group.candidate_diff = %q, want nil (cleared on requeue)", *group.CandidateDiff)
 	}
 
 	// Occurrence count must be 2
@@ -695,12 +708,12 @@ func TestNoRequeueOnRecurrence_NeedsHumanNonRetriable(t *testing.T) {
 }
 
 // TestNoRequeueOnRecurrence_ActiveStates verifies that groups in active processing
-// states (queued, analyzing, pr_created) do NOT get double-queued on recurrence.
+// states (queued, analyzing, pr_created, pr_draft) do NOT get double-queued on recurrence.
 func TestNoRequeueOnRecurrence_ActiveStates(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	activeStates := []string{"queued", "analyzing", "pr_created"}
+	activeStates := []string{"queued", "analyzing", "pr_created", "pr_draft"}
 
 	for _, status := range activeStates {
 		t.Run(status, func(t *testing.T) {

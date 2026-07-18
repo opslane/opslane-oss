@@ -19,7 +19,7 @@ export interface TerminalFieldsIncompleteViolation extends BaseViolation {
   code: 'terminal_fields_incomplete';
   entity: 'error_group';
   errorGroupId: string;
-  status: 'needs_human' | 'pr_created';
+  status: 'needs_human' | 'pr_created' | 'pr_draft';
   missingFields: Array<
     | 'reason_code'
     | 'reason_message'
@@ -27,6 +27,7 @@ export interface TerminalFieldsIncompleteViolation extends BaseViolation {
     | 'pr_url'
     | 'pr_number'
     | 'confidence'
+    | 'external_ci'
   >;
 }
 
@@ -41,7 +42,7 @@ export interface TerminalFieldsIncompatibleViolation extends BaseViolation {
   code: 'terminal_fields_incompatible';
   entity: 'error_group';
   errorGroupId: string;
-  status: 'needs_human' | 'pr_created';
+  status: 'needs_human' | 'pr_created' | 'pr_draft';
   incompatibleFields: Array<'pr_url' | 'pr_number'>;
   invalidFields: Array<'pr_url'>;
 }
@@ -80,6 +81,7 @@ interface TerminalFieldsRow extends QueryResultRow {
   pr_url: string | null;
   pr_number: number | null;
   confidence: string | null;
+  verification_evidence: unknown;
 }
 
 interface GroupWithoutJobRow extends QueryResultRow {
@@ -113,7 +115,7 @@ interface ExpiredJobRow extends QueryResultRow {
 
 const TERMINAL_FIELDS_QUERY = `
   SELECT id, project_id, status, reason_code, reason_message, remediation,
-         pr_url, pr_number, confidence
+         pr_url, pr_number, confidence, verification_evidence
   FROM error_groups
   WHERE (
     status = 'needs_human'
@@ -123,12 +125,14 @@ const TERMINAL_FIELDS_QUERY = `
       OR NULLIF(BTRIM(remediation), '') IS NULL
     )
   ) OR (
-    status = 'pr_created'
+    status IN ('pr_created', 'pr_draft')
     AND (
       NULLIF(BTRIM(pr_url), '') IS NULL
       OR pr_number IS NULL
       OR pr_number <= 0
       OR confidence IS NULL
+      OR (status = 'pr_created' AND confidence = 'medium'
+          AND verification_evidence #>> '{external_ci,outcome}' IS DISTINCT FROM 'passed')
     )
   )
   ORDER BY project_id, id
@@ -154,7 +158,7 @@ const TERMINAL_FIELDS_INCOMPATIBLE_QUERY = `
     status = 'needs_human'
     AND (pr_url IS NOT NULL OR pr_number IS NOT NULL)
   ) OR (
-    status = 'pr_created'
+    status IN ('pr_created', 'pr_draft')
     AND NULLIF(BTRIM(pr_url), '') IS NOT NULL
     AND pr_url !~ '^https://'
   )
@@ -199,6 +203,14 @@ function missingTerminalFields(
   if (isBlank(row.pr_url)) missing.push('pr_url');
   if (row.pr_number === null || row.pr_number <= 0) missing.push('pr_number');
   if (row.confidence === null) missing.push('confidence');
+  const evidence = row.verification_evidence;
+  const externalOutcome = evidence && typeof evidence === 'object'
+    && 'external_ci' in evidence
+    && typeof (evidence as { external_ci?: unknown }).external_ci === 'object'
+    && (evidence as { external_ci?: { outcome?: unknown } }).external_ci?.outcome;
+  if (row.status === 'pr_created' && row.confidence === 'medium' && externalOutcome !== 'passed') {
+    missing.push('external_ci');
+  }
   return missing;
 }
 

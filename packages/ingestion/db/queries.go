@@ -76,6 +76,7 @@ type Project struct {
 	GithubRepo       *string
 	DefaultBranch    string
 	FrictionAutonomy string
+	PrPosture        string
 	CreatedAt        time.Time
 }
 
@@ -128,9 +129,9 @@ func (q *Queries) CreateProject(ctx context.Context, orgID, name string, githubR
 	err := q.pool.QueryRow(ctx,
 		`INSERT INTO projects (org_id, name, github_repo)
 		 VALUES ($1, $2, $3)
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, created_at`,
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
 		orgID, name, githubRepo,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create project: %w", err)
 	}
@@ -214,6 +215,11 @@ var nonRetriableReasonCodes = map[string]struct{}{
 	// writeup terminal on recurrence rather than wiping it and re-investigating.
 	"low_confidence_fix": {},
 	"tests_failed":       {},
+	// The agent produced a writeup but a reproduction could not be constructed.
+	// Keep the writeup terminal on recurrence, like low_confidence_fix.
+	"repro_not_achievable": {},
+	// verification_infra_error is intentionally absent: infrastructure failures
+	// are transient, so recurrence should requeue and retry verification.
 	// These errors cannot be fixed in application code. They remain terminal even
 	// if inactivity resolution changes the group's status from needs_human.
 	"unfixable_infra":       {},
@@ -276,33 +282,35 @@ func (q *Queries) releaseNotOlder(ctx context.Context, tx pgx.Tx, projectID, can
 // === Error groups ===
 
 type ErrorGroup struct {
-	ID                  string
-	ProjectID           string
-	Fingerprint         string
-	Title               string
-	FirstSeen           time.Time
-	LastSeen            time.Time
-	OccurrenceCount     int
-	AffectedUsersCount  int
-	Status              string
-	Kind                string
-	EnvironmentID       *string
-	AdjudicationStatus  *string
-	ReasonCode          *string
-	ReasonMessage       *string
-	Remediation         *string
-	Confidence          *string
-	PrURL               *string
-	RootCause           *string
-	SuggestedMitigation *string
-	SignalType          *string
-	ElementSelector     *string
-	PageURLNormalized   *string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	MergedAt            *time.Time
-	ResolvedAt          *time.Time
-	ArchivedAt          *time.Time
+	ID                   string
+	ProjectID            string
+	Fingerprint          string
+	Title                string
+	FirstSeen            time.Time
+	LastSeen             time.Time
+	OccurrenceCount      int
+	AffectedUsersCount   int
+	Status               string
+	Kind                 string
+	EnvironmentID        *string
+	AdjudicationStatus   *string
+	ReasonCode           *string
+	ReasonMessage        *string
+	Remediation          *string
+	Confidence           *string
+	PrURL                *string
+	RootCause            *string
+	SuggestedMitigation  *string
+	VerificationEvidence []byte
+	CandidateDiff        *string
+	SignalType           *string
+	ElementSelector      *string
+	PageURLNormalized    *string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	MergedAt             *time.Time
+	ResolvedAt           *time.Time
+	ArchivedAt           *time.Time
 }
 
 type IngestParams struct {
@@ -549,6 +557,8 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 				     reason_code = NULL,
 				     reason_message = NULL,
 				     remediation = NULL,
+				     candidate_diff = NULL,
+				     verification_evidence = NULL,
 				     root_cause = NULL,
 				     suggested_mitigation = NULL,
 				     merged_at = NULL,
@@ -789,6 +799,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		        environment_id, adjudication_status,
 		        reason_code, reason_message, remediation,
 		        confidence, pr_url, root_cause, suggested_mitigation,
+		        verification_evidence, candidate_diff,
 		        signal_type, element_selector, page_url_normalized,
 		        created_at, updated_at,
 		        merged_at, resolved_at, archived_at
@@ -802,6 +813,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		&g.EnvironmentID, &g.AdjudicationStatus,
 		&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 		&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
+		&g.VerificationEvidence, &g.CandidateDiff,
 		&g.SignalType, &g.ElementSelector, &g.PageURLNormalized,
 		&g.CreatedAt, &g.UpdatedAt,
 		&g.MergedAt, &g.ResolvedAt, &g.ArchivedAt,
@@ -1173,23 +1185,47 @@ func (q *Queries) UpdateErrorGroupStatus(ctx context.Context, u StatusUpdate) er
 
 // PRWebhookResult reports how a pull_request webhook was applied.
 type PRWebhookResult struct {
-	GroupID   string
-	Duplicate bool // receipt for this github_delivery_id already existed; no transition performed
+	GroupID        string
+	Duplicate      bool // receipt for this github_delivery_id already existed; no transition performed
+	CleanupBranch  string
+	InstallationID *int64
+}
+
+func loadDraftBranchCleanup(ctx context.Context, tx pgx.Tx, groupID string) (string, *int64, error) {
+	var branch string
+	var installationID *int64
+	err := tx.QueryRow(ctx,
+		`SELECT r.branch_name, o.github_installation_id
+		 FROM delivery_reservations r
+		 JOIN projects p ON p.id = r.project_id
+		 JOIN orgs o ON o.id = p.org_id
+		 WHERE r.error_group_id = $1 AND r.posture = 'draft'`,
+		groupID,
+	).Scan(&branch, &installationID)
+	if err == pgx.ErrNoRows {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("load draft branch cleanup: %w", err)
+	}
+	return branch, installationID, nil
 }
 
 // ProcessPRWebhook records an immutable pr_outcomes receipt before transitioning
 // the matched group. GitHub delivery IDs make redeliveries idempotent. A
-// closed-unmerged friction group returns to awaiting_approval; an error group
-// returns to investigated.
+// closed-unmerged ready PR returns to the incident's fix-triggerable state. A
+// closed-unmerged draft returns to needs_human with its original reason and
+// candidate evidence intact.
 //
-// A merge for a PR whose group already left pr_created (closed unmerged, then
+// A merge for a PR whose group already left its PR-owning state (closed
+// unmerged, then
 // reopened and merged) is recovered through the earlier close receipt, which
 // still links repo+pr_number to the group. Without that, the merge would be
 // silently dropped and the incident would stay fix-eligible. A close/merge
-// arriving before the worker records pr_created still no-matches — recovering
+// arriving before the worker records the PR still no-matches — recovering
 // that needs a delivery inbox and is deliberately out of scope here.
 //
-// Matching by github_repo + pr_number + status='pr_created' assumes that tuple
+// Matching by github_repo + pr_number + a PR-owning status assumes that tuple
 // is unique in practice. If multiple projects share the same repo, one arbitrary
 // match is used; revisit this for multi-project-per-repo support.
 func (q *Queries) ProcessPRWebhook(ctx context.Context, githubRepo string, prNumber int, merged bool, deliveryID string, occurredAt time.Time) (PRWebhookResult, error) {
@@ -1200,41 +1236,61 @@ func (q *Queries) ProcessPRWebhook(ctx context.Context, githubRepo string, prNum
 	defer tx.Rollback(ctx)
 
 	// Check idempotency before matching the group: the first delivery moves the
-	// group out of pr_created or clears its PR fields.
-	var seenGroupID string
+	// group out of its PR-owning status or clears its PR fields.
+	var seenGroupID, seenOutcome string
 	err = tx.QueryRow(ctx,
-		`SELECT error_group_id FROM pr_outcomes WHERE github_delivery_id = $1`,
+		`SELECT error_group_id, outcome FROM pr_outcomes WHERE github_delivery_id = $1`,
 		deliveryID,
-	).Scan(&seenGroupID)
+	).Scan(&seenGroupID, &seenOutcome)
 	if err == nil {
-		return PRWebhookResult{GroupID: seenGroupID, Duplicate: true}, nil
+		result := PRWebhookResult{GroupID: seenGroupID, Duplicate: true}
+		if seenOutcome == "closed" {
+			result.CleanupBranch, result.InstallationID, err = loadDraftBranchCleanup(ctx, tx, seenGroupID)
+			if err != nil {
+				return PRWebhookResult{}, err
+			}
+		}
+		return result, nil
 	}
 	if err != pgx.ErrNoRows {
 		return PRWebhookResult{}, fmt.Errorf("check PR webhook delivery id: %w", err)
 	}
 
-	var groupID, projectID, kind string
+	var groupID, projectID, kind, groupStatus string
 	var fixJobID *string
+	var cleanupBranch *string
+	var installationID *int64
 	err = tx.QueryRow(ctx,
-		`SELECT eg.id, eg.project_id, eg.kind, eg.pr_fix_job_id
+		`SELECT eg.id, eg.project_id, eg.kind, eg.status, eg.pr_fix_job_id,
+		        r.branch_name, o.github_installation_id
 		 FROM error_groups eg
 		 JOIN projects p ON eg.project_id = p.id
+		 JOIN orgs o ON o.id = p.org_id
+		 LEFT JOIN delivery_reservations r
+		   ON r.error_group_id = eg.id AND r.project_id = eg.project_id
 		 WHERE p.github_repo = $1
 		   AND eg.pr_number = $2
-		   AND eg.status = 'pr_created'
+		   AND eg.status IN ('pr_created', 'pr_draft')
 		 FOR UPDATE OF eg`,
 		githubRepo, prNumber,
-	).Scan(&groupID, &projectID, &kind, &fixJobID)
+	).Scan(&groupID, &projectID, &kind, &groupStatus, &fixJobID, &cleanupBranch, &installationID)
 	if err == pgx.ErrNoRows {
 		// A concurrent delivery can pass the first receipt check, wait on the
 		// group's row lock, then find that the winner already transitioned it.
 		// Recheck the immutable receipt so that race still reports duplicate.
 		err = tx.QueryRow(ctx,
-			`SELECT error_group_id FROM pr_outcomes WHERE github_delivery_id = $1`,
+			`SELECT error_group_id, outcome FROM pr_outcomes WHERE github_delivery_id = $1`,
 			deliveryID,
-		).Scan(&seenGroupID)
+		).Scan(&seenGroupID, &seenOutcome)
 		if err == nil {
-			return PRWebhookResult{GroupID: seenGroupID, Duplicate: true}, nil
+			result := PRWebhookResult{GroupID: seenGroupID, Duplicate: true}
+			if seenOutcome == "closed" {
+				result.CleanupBranch, result.InstallationID, err = loadDraftBranchCleanup(ctx, tx, seenGroupID)
+				if err != nil {
+					return PRWebhookResult{}, err
+				}
+			}
+			return result, nil
 		}
 		if err != pgx.ErrNoRows {
 			return PRWebhookResult{}, fmt.Errorf("recheck PR webhook delivery id: %w", err)
@@ -1279,6 +1335,20 @@ func (q *Queries) ProcessPRWebhook(ctx context.Context, githubRepo string, prNum
 			 WHERE id = $1`,
 			groupID, occurredAt,
 		)
+	} else if groupStatus == "pr_draft" {
+		// Keep the reason, candidate diff, and verification evidence written when
+		// the draft was opened. They become the actionable needs_human writeup.
+		_, err = tx.Exec(ctx,
+			`UPDATE error_groups
+			 SET status = 'needs_human',
+			     needs_human_at = now(),
+			     pr_url = NULL,
+			     pr_number = NULL,
+			     pr_fix_job_id = NULL,
+			     updated_at = now()
+			 WHERE id = $1`,
+			groupID,
+		)
 	} else {
 		_, err = tx.Exec(ctx,
 			`UPDATE error_groups
@@ -1296,10 +1366,41 @@ func (q *Queries) ProcessPRWebhook(ctx context.Context, githubRepo string, prNum
 	if err != nil {
 		return PRWebhookResult{}, fmt.Errorf("transition on PR %s: %w", outcome, err)
 	}
+
+	// A PR webhook is authoritative for the delivery lifecycle. A draft no
+	// longer needs a live watcher after either merge or close, and the durable
+	// reservation must stop counting toward the project's open-draft cap. Keep
+	// these writes in the same transaction as the incident transition.
+	if groupStatus == "pr_draft" {
+		if _, err := tx.Exec(ctx,
+			`UPDATE error_group_jobs
+			 SET status = 'completed', updated_at = now()
+			 WHERE error_group_id = $1
+			   AND project_id = $2
+			   AND job_type = 'ci_watch'
+			   AND status IN ('pending', 'claimed')`,
+			groupID, projectID,
+		); err != nil {
+			return PRWebhookResult{}, fmt.Errorf("cancel draft CI watcher: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE delivery_reservations
+		 SET state = 'closed', updated_at = now()
+		 WHERE error_group_id = $1 AND project_id = $2`,
+		groupID, projectID,
+	); err != nil {
+		return PRWebhookResult{}, fmt.Errorf("close delivery reservation: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return PRWebhookResult{}, fmt.Errorf("commit PR webhook transaction: %w", err)
 	}
-	return PRWebhookResult{GroupID: groupID}, nil
+	result := PRWebhookResult{GroupID: groupID}
+	if !merged && groupStatus == "pr_draft" && cleanupBranch != nil {
+		result.CleanupBranch = *cleanupBranch
+		result.InstallationID = installationID
+	}
+	return result, nil
 }
 
 // recoverReopenedMerge handles a merge webhook for a PR whose group already
@@ -2197,7 +2298,7 @@ func (q *Queries) ConsumeAuthorizationCode(ctx context.Context, codeHash string)
 // ListProjectsByOrg returns all projects for a given org. Tenant-scoped.
 func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Project, error) {
 	rows, err := q.pool.Query(ctx,
-		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, created_at
+		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at
 		 FROM projects
 		 WHERE org_id = $1
 		 ORDER BY created_at ASC`,
@@ -2211,7 +2312,7 @@ func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Projec
 	var projects []Project
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		projects = append(projects, p)
@@ -2224,10 +2325,10 @@ func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Projec
 func (q *Queries) GetProjectByOrgID(ctx context.Context, orgID, projectID string) (*Project, error) {
 	var p Project
 	err := q.pool.QueryRow(ctx,
-		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, created_at
+		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at
 		 FROM projects WHERE id = $1 AND org_id = $2`,
 		projectID, orgID,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -2239,16 +2340,17 @@ func (q *Queries) GetProjectByOrgID(ctx context.Context, orgID, projectID string
 
 // UpdateProject updates a project's settings. Only non-nil fields are changed.
 // Tenant-scoped by orgID.
-func (q *Queries) UpdateProject(ctx context.Context, orgID, projectID string, githubRepo, frictionAutonomy *string) (*Project, error) {
+func (q *Queries) UpdateProject(ctx context.Context, orgID, projectID string, githubRepo, frictionAutonomy, prPosture *string) (*Project, error) {
 	var p Project
 	err := q.pool.QueryRow(ctx,
 		`UPDATE projects
 		 SET github_repo = COALESCE($3, github_repo),
-		     friction_autonomy = COALESCE($4, friction_autonomy)
+		     friction_autonomy = COALESCE($4, friction_autonomy),
+		     pr_posture = COALESCE($5, pr_posture)
 		 WHERE id = $2 AND org_id = $1
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, created_at`,
-		orgID, projectID, githubRepo, frictionAutonomy,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt)
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
+		orgID, projectID, githubRepo, frictionAutonomy, prPosture,
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -2454,9 +2556,9 @@ func (q *Queries) CreateProjectTx(ctx context.Context, tx pgx.Tx, orgID, name st
 	err := tx.QueryRow(ctx,
 		`INSERT INTO projects (org_id, name, github_repo)
 		 VALUES ($1, $2, $3)
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, created_at`,
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
 		orgID, name, githubRepo,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create project tx: %w", err)
 	}

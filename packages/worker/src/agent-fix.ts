@@ -1,6 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { createAnthropicClient } from './anthropic-client.js';
-import { createSandboxRuntime, type SandboxRuntime } from './harness/sandbox-runtime.js';
+import type { SandboxRuntime } from './harness/sandbox-runtime.js';
 import { runAgentLoop } from './harness/agent-loop.js';
 import { createToolBridge } from './harness/tool-bridge.js';
 import { createDefaultMiddleware } from './harness/tool-middleware.js';
@@ -9,10 +9,26 @@ import { judgeDiff } from './harness/diff-judge.js';
 import { investigateError } from './investigate.js';
 import { logger } from './logger.js';
 import { traceSpan } from './tracing.js';
-import type { ConfidenceLevel, NeedsHumanReason, ReasonCode } from '@opslane/shared';
+import type { CheckOutcome, ConfidenceLevel, EvidenceRecord, NeedsHumanReason, ReasonCode } from '@opslane/shared';
 import { buildReason } from './reason-codes.js';
-import { buildGitNetrc } from './repo-clone.js';
 import type { AgentCompletionResult, VisualAnalysisOutput, SourceFile, AgentState } from './harness/types.js';
+import { scrubSecrets } from './harness/redact.js';
+import { createEvidenceRecorder, type EvidenceRecorder } from './harness/evidence.js';
+import { VerificationInfraError } from './harness/errors.js';
+import { createRepoSandbox, extractDiff, runBuildGate, type RepoSandbox } from './harness/sandbox-repo.js';
+import {
+  compareSuiteRuns,
+  planTests,
+  runSuite,
+  type SuiteRun,
+  type TestPlan,
+} from './harness/test-runner.js';
+import {
+  buildFallbackNarrative,
+  parseFixNarrative,
+  type FixNarrative,
+  type NarrativeFallbackInput,
+} from './narrative.js';
 
 export interface AgentFixInput {
   errorGroupId: string;
@@ -34,6 +50,7 @@ export interface AgentFixInput {
   budgetUsd?: number;
   model?: string;
   frictionEvidence?: string;
+  kind?: 'error' | 'friction';
   /** Shell commands to run after clone+install, before agent starts (e.g. apply bug patch for eval). */
   setupCommands?: string[];
   /** Local repo clone path. When set, investigation uses codebase-aware classification instead of blind triage. */
@@ -53,60 +70,21 @@ export interface AgentFixResult {
   diff?: string;
   confidence?: ConfidenceLevel;
   rootCause?: string;
+  narrative?: FixNarrative;
+  /** Retained for the friction PR format, which is outside the fix-narrative contract. */
   humanSummary?: string;
   affectedFiles?: string[];
   reason?: NeedsHumanReason;
+  evidence?: EvidenceRecord;
+  /** Explicit judge/build disposition used by the delivery policy. */
+  draftEligible?: boolean;
   tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
 const MAX_ERROR_MESSAGE = 500;
 const MAX_STACK_TRACE = 3000;
 const MAX_TEST_RETRIES = 1;
-const MAX_TEST_OUTPUT = 2000;
 const SANDBOX_REPO_PATH = '/home/user/repo';
-
-/** Scrub secrets/tokens from sandbox output before logging or prompt injection. */
-function sanitizeOutput(raw: string): string {
-  return raw
-    .replace(/https:\/\/[^@]+@/g, 'https://***@')
-    .replace(/ghp_[A-Za-z0-9_]+/g, '[REDACTED]')
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[REDACTED]')
-    .slice(-MAX_TEST_OUTPUT);
-}
-
-interface TestGateResult {
-  passed: boolean;
-  skipped: boolean;
-  output: string;
-}
-
-/**
- * Deterministic test gate: runs the project's test suite in the sandbox and
- * checks the exit code. Replaces the fragile regex-based testsRan heuristic.
- */
-async function runTestGate(sandbox: SandboxRuntime): Promise<TestGateResult> {
-  const detectResult = await sandbox.commands.run(
-    'cd /home/user/repo && if [ -f vitest.config.ts ] || [ -f vitest.config.js ]; then echo "vitest"; elif node -e "process.exit(require(\'./package.json\').scripts?.test ? 0 : 1)" 2>/dev/null; then echo "npm-test"; else echo "none"; fi',
-    { timeoutMs: 10_000 },
-  );
-  const runner = (detectResult.stdout ?? '').trim();
-  if (runner === 'none') return { passed: true, skipped: true, output: 'No test runner detected' };
-
-  const cmd = runner === 'vitest' ? 'npx vitest run' : 'npm test';
-  try {
-    const result = await sandbox.commands.run(`cd /home/user/repo && ${cmd}`, { timeoutMs: 120_000 });
-    return { passed: true, skipped: false, output: sanitizeOutput(result.stdout ?? '') };
-  } catch (err: unknown) {
-    const rawMsg = err instanceof Error ? err.message : 'Test run failed';
-    const isTimeout = rawMsg.includes('timed out') || rawMsg.includes('Timeout');
-    if (isTimeout) {
-      // Re-throw timeouts — these are infra failures, not test failures
-      throw new Error(`Test execution timed out: ${sanitizeOutput(rawMsg)}`);
-    }
-    // CommandExitError on non-zero exit = tests failed
-    return { passed: false, skipped: false, output: sanitizeOutput(rawMsg) };
-  }
-}
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '... [truncated]' : s;
@@ -132,7 +110,34 @@ const MODEL_CASCADE: ModelTier[] = [
 ];
 
 const TRIAGE_MODEL = 'claude-haiku-4-5-20251001';
-const HUMAN_SUMMARY_MODEL = 'claude-haiku-4-5-20251001';
+const FIX_NARRATIVE_MODEL = 'claude-haiku-4-5-20251001';
+
+const FIX_NARRATIVE_TOOL: Anthropic.Tool = {
+  name: 'submit_fix_narrative',
+  description: 'Submit the reader-facing commit and pull request narrative for this fix.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      subject: {
+        type: 'string',
+        description: 'Imperative subject naming the affected code unit. Prefer 50 characters; never exceed 72. No period.',
+      },
+      whatHappened: {
+        type: 'string',
+        description: 'One to three sentences describing what the end user experienced.',
+      },
+      whyItBroke: {
+        type: 'string',
+        description: 'One to three sentences explaining the technical cause in plain terms.',
+      },
+      fixApproach: {
+        type: 'string',
+        description: 'One or two sentences explaining the change and why it is safe.',
+      },
+    },
+    required: ['subject', 'whatHappened', 'whyItBroke', 'fixApproach'],
+  },
+};
 
 const TRIAGE_REASON_CODES = [
   'unfixable_no_app_frames',
@@ -269,13 +274,19 @@ ${truncate(input.breadcrumbs ?? '[]', 1000)}
   };
 }
 
-async function generateHumanSummary(
+async function generateFixNarrative(
   apiKey: string,
   input: AgentFixInput,
   rootCause: string,
   diff: string,
-): Promise<string | undefined> {
+  primaryFile?: string,
+): Promise<FixNarrative> {
   const client = createAnthropicClient(apiKey);
+  const fallbackInput: NarrativeFallbackInput = {
+    errorType: input.errorType,
+    errorMessage: input.errorMessage,
+    primaryFile,
+  };
   const visualAnalysis = input.visualAnalysis
     ? [
         `What user saw: ${input.visualAnalysis.whatUserSaw}`,
@@ -284,12 +295,13 @@ async function generateHumanSummary(
       ].join('\n')
     : 'Not available';
 
-  const prompt = `Write exactly 3 plain-English sentences with no markdown headers.
+  const prompt = `Write a concise engineering narrative for a verified production fix.
 
-Explain:
-1. what the user was doing,
-2. what broke,
-3. what this change does.
+Use the submit_fix_narrative tool. The subject must be imperative, name the
+affected code unit, contain no error-string passthrough, have no trailing
+period, and be at most 72 characters. Keep each prose field to the requested
+sentence count. Use no markdown, headings, code fences, or internal Opslane
+jargon. Do not make verification claims; those come from recorded checks.
 
 Use the details below. Do not include raw stack traces, file dumps, markdown headings, or bullet lists.
 
@@ -315,16 +327,20 @@ ${truncate(diff, 4000)}
 </untrusted_data>`;
 
   const response = await client.messages.create({
-    model: HUMAN_SUMMARY_MODEL,
-    max_tokens: 220,
+    model: FIX_NARRATIVE_MODEL,
+    max_tokens: 512,
     messages: [{ role: 'user', content: prompt }],
+    tools: [FIX_NARRATIVE_TOOL],
+    tool_choice: { type: 'tool', name: FIX_NARRATIVE_TOOL.name },
   });
 
-  const text = response.content
-    .map((block) => block.type === 'text' ? block.text : '')
-    .join(' ')
-    .trim();
-  return text || undefined;
+  const toolUse = response.content.find(
+    (block) => block.type === 'tool_use' && block.name === FIX_NARRATIVE_TOOL.name,
+  );
+  return parseFixNarrative(
+    toolUse?.type === 'tool_use' ? toolUse.input : undefined,
+    fallbackInput,
+  );
 }
 
 function buildSystemPrompt(
@@ -531,88 +547,76 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
   }
 
   let sandbox: SandboxRuntime | null = null;
+  let evidence: EvidenceRecorder | null = null;
 
   try {
-    sandbox = await traceSpan('sandbox-create', {}, () => createSandboxRuntime());
-
-    // Configure git identity (E2B sandboxes don't have one by default)
-    await sandbox.commands.run('git config --global user.email "opslane-agent@opslane.com" && git config --global user.name "Opslane Agent"');
-
-    // Clone repo using .netrc for auth (avoids token in clone URL / process list)
-    const githubToken = input.githubToken ?? process.env['GITHUB_TOKEN'] ?? '';
-    const gitNetrc = githubToken ? buildGitNetrc(input.repoUrl, githubToken) : null;
-    if (gitNetrc) {
-      await sandbox.files.write('/home/user/.netrc', gitNetrc);
-      await sandbox.commands.run('chmod 600 /home/user/.netrc');
-    }
-
-    const branchArg = shellEscape(input.defaultBranch);
+    let repoSandbox: RepoSandbox;
     try {
-      await sandbox.commands.run(
-        `git clone --depth 1 --branch ${branchArg} ${shellEscape(input.repoUrl)} /home/user/repo`,
-        { timeoutMs: 120_000 },
+      repoSandbox = await traceSpan(
+        'sandbox-setup',
+        { 'repo.url': input.repoUrl.replace(/https:\/\/[^@]+@/g, 'https://***@') },
+        () => createRepoSandbox({
+          repoUrl: input.repoUrl,
+          defaultBranch: input.defaultBranch,
+          githubToken: input.githubToken,
+          setupCommands: input.setupCommands,
+        }),
       );
-    } catch (cloneErr: unknown) {
-      const rawMsg = cloneErr instanceof Error ? cloneErr.message : String(cloneErr);
-      const errorMsg = rawMsg.replace(/https:\/\/[^@]+@/g, 'https://***@');
-      return {
-        status: 'needs_human',
-        reason: {
-          reason_code: 'repo_access_denied',
-          reason_message: `Failed to clone repository: ${errorMsg}`,
-          remediation: 'Ensure GITHUB_TOKEN has read access to the repository',
-        },
-      };
-    }
-
-    // Remove .netrc after clone (defense in depth)
-    if (gitNetrc) {
-      await sandbox.commands.run('rm -f /home/user/.netrc');
-    }
-
-    // Ensure .gitignore covers universally-safe build artifacts (safety net for repos missing one).
-    // Duplicates are harmless in .gitignore, and this sandbox is ephemeral.
-    // NOTE: dist/build intentionally excluded — some repos track those as source.
-    await sandbox.commands.run(
-      'cd /home/user/repo && printf "\\nnode_modules\\n.cache\\ncoverage\\n" >> .gitignore',
-      { timeoutMs: 10_000 },
-    );
-
-    // Install dependencies + baseline commit (wrapped for observability)
-    // Install is best-effort — repos without a root package.json (monorepos) will skip
-    // and the agent can still read files and suggest fixes without running tests.
-    let installSucceeded = false;
-    await traceSpan('sandbox-install', { 'repo.url': input.repoUrl.replace(/https:\/\/[^@]+@/g, 'https://***@') }, async () => {
-      try {
-        await sandbox!.commands.run(
-          'cd /home/user/repo && if [ -f pnpm-lock.yaml ]; then pnpm install; elif [ -f yarn.lock ]; then yarn install; elif [ -f package.json ]; then npm install; else echo "No package.json found, skipping install"; fi',
-          { timeoutMs: 120_000 },
-        );
-        installSucceeded = true;
-      } catch (installErr: unknown) {
-        logger.warn('Dependency install failed, continuing without tests', {
-          error: installErr instanceof Error ? installErr.message : String(installErr),
-        });
+    } catch (setupError: unknown) {
+      const message = scrubSecrets(setupError instanceof Error ? setupError.message : String(setupError));
+      if (message.includes('clone failed')) {
+        return {
+          status: 'needs_human',
+          reason: {
+            reason_code: 'repo_access_denied',
+            reason_message: `Failed to clone repository: ${message}`,
+            remediation: 'Ensure GITHUB_TOKEN has read access to the repository',
+          },
+        };
       }
+      throw setupError;
+    }
+    sandbox = repoSandbox.sandbox;
+    const installSucceeded = repoSandbox.installSucceeded;
+    evidence = createEvidenceRecorder();
 
-      // Commit baseline (.gitignore + lock files) so git diff only captures the agent's fix
-      await sandbox!.commands.run(
-        'cd /home/user/repo && git add -A && git commit -m "baseline: setup" --allow-empty',
-        { timeoutMs: 30_000 },
-      );
+    let verificationInfraError = false;
+    const withInfraRetry = async <T extends { outcome: CheckOutcome }>(run: () => Promise<T>): Promise<T> => {
+      const first = await run();
+      return first.outcome === 'infra_error' ? run() : first;
+    };
 
-      // Run setup commands (e.g. apply bug patch for eval)
-      if (input.setupCommands) {
-        for (const cmd of input.setupCommands) {
-          await sandbox!.commands.run(`cd /home/user/repo && ${cmd}`, { timeoutMs: 60_000 });
-        }
-        // Commit setup so git diff only captures the agent's fix
-        await sandbox!.commands.run(
-          'cd /home/user/repo && git add -A && git commit -m "eval: setup" --allow-empty',
+    // E1 baseline: establish the pre-patch suite state before the agent edits.
+    let testPlan: TestPlan = { kind: 'none', command: null };
+    let baselineRun: SuiteRun | null = null;
+    if (!installSucceeded) {
+      evidence.addCheck('suite_baseline', 'infra_error', {
+        command: 'dependency install',
+        output: 'npm install failed — the suite cannot run, so no verification claim is possible',
+      });
+      verificationInfraError = true;
+    } else {
+      testPlan = await planTests(sandbox);
+      if (testPlan.kind !== 'none') {
+        baselineRun = await traceSpan(
+          'suite-baseline',
+          { 'suite.kind': testPlan.kind },
+          () => withInfraRetry(() => runSuite(sandbox!, testPlan)),
+        );
+        evidence.addCheck('suite_baseline', baselineRun.outcome, {
+          command: baselineRun.command,
+          exitCode: baselineRun.exitCode,
+          output: baselineRun.output,
+        });
+        if (baselineRun.outcome === 'infra_error') verificationInfraError = true;
+        // Baseline execution may write snapshots, coverage, or fixtures. Restore
+        // HEAD before the agent so those artifacts can never enter its patch.
+        await sandbox.commands.run(
+          `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
           { timeoutMs: 30_000 },
         );
       }
-    });
+    }
 
     // Extract stack trace files early — used for both preloading and agent state
     const stackTraceFiles = extractStackTraceFiles(input.stackTrace);
@@ -709,6 +713,8 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       let result: AgentCompletionResult | null = null;
       let testGatePassed = false;
       let testGateSkipped = false;
+      let buildGatePassed = false;
+      let candidateDiff: { diff: string; affectedFiles: string[] } | null = null;
 
       while (attempt <= MAX_TEST_RETRIES) {
         const baseMsg = preloadedFiles.length > 0
@@ -773,6 +779,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
               reason_message: agentState.giveUpReason.reason_message,
               remediation: agentState.giveUpReason.remediation,
             },
+            evidence: evidence.record(),
             tokenUsage: totalTokenUsage,
           };
         }
@@ -787,24 +794,108 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           break;
         }
 
-        // Deterministic test gate
-        const testResult = installSucceeded
-          ? await traceSpan(
-              'test-gate',
-              { 'test_gate.attempt': attempt, 'test_gate.tier': tierIdx },
-              () => runTestGate(sandbox!),
-            )
-          : { passed: true, skipped: true, output: 'Skipped — dependency install failed' };
+        // Capture the candidate before any gate can write snapshots, coverage,
+        // generated files, or fixtures. This is the only diff used downstream.
+        candidateDiff = await extractDiff(sandbox);
 
-        if (testResult.passed) {
-          testGatePassed = true;
-          testGateSkipped = testResult.skipped;
-          break;
+        let testResult: { passed: boolean; skipped: boolean; output: string };
+        if (!installSucceeded) {
+          testResult = { passed: true, skipped: true, output: 'dependency install failed' };
+          evidence.addCheck('suite_post_patch', 'infra_error', {
+            command: 'dependency install',
+            output: 'npm install failed — post-patch suite cannot run',
+          });
+        } else if (testPlan.kind === 'none') {
+          testResult = { passed: true, skipped: true, output: 'No test runner detected' };
+          evidence.addCheck('suite_post_patch', 'skipped_no_runner', {
+            command: '',
+            output: testResult.output,
+          });
+        } else if (baselineRun?.outcome === 'infra_error') {
+          testResult = { passed: true, skipped: true, output: baselineRun.output };
+          evidence.addCheck('suite_post_patch', 'infra_error', {
+            command: baselineRun.command,
+            output: 'Baseline suite run hit an infrastructure error; comparison not possible',
+          });
+        } else {
+          const post = await traceSpan(
+            'suite-post-patch',
+            { 'suite.attempt': attempt, 'suite.tier': tierIdx },
+            () => withInfraRetry(() => runSuite(sandbox!, testPlan)),
+          );
+          const comparison = compareSuiteRuns(baselineRun, post);
+          const newFailures = [
+            ...comparison.newFailures,
+            ...comparison.missingFromPost.map((id) => `${id} [not collected post-patch]`),
+          ];
+          evidence.setSuiteComparison({
+            baseline_failed_tests: comparison.baselineFailed,
+            new_failures: newFailures,
+          });
+          if (post.outcome === 'infra_error') {
+            verificationInfraError = true;
+            testResult = { passed: true, skipped: true, output: post.output };
+            evidence.addCheck('suite_post_patch', 'infra_error', {
+              command: post.command,
+              exitCode: post.exitCode,
+              output: post.output,
+            });
+          } else {
+            const passed = post.tests
+              ? newFailures.length === 0
+              : comparison.comparable;
+            evidence.addCheck('suite_post_patch', passed ? 'passed' : 'failed', {
+              command: post.command,
+              exitCode: post.exitCode,
+              output: post.output,
+            });
+            testResult = { passed, skipped: false, output: post.output };
+          }
         }
 
-        lastTestOutput = testResult.output;
-        logger.warn('Test gate failed', { attempt, model: tier.model, output: testResult.output.slice(0, 500) });
-        attempt++;
+        if (!testResult.passed) {
+          lastTestOutput = scrubSecrets(testResult.output);
+          logger.warn('Test gate failed', { attempt, model: tier.model, output: testResult.output.slice(0, 500) });
+          await sandbox.commands.run(
+            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
+            { timeoutMs: 30_000 },
+          );
+          attempt++;
+          continue;
+        }
+
+        const buildResult = installSucceeded
+          ? await traceSpan(
+              'build-gate',
+              { 'build_gate.attempt': attempt, 'build_gate.tier': tierIdx },
+              () => withInfraRetry(() => runBuildGate(sandbox!)),
+            )
+          : {
+              outcome: 'infra_error' as const,
+              output: 'dependency install failed — build cannot run',
+            };
+        evidence.addCheck('build', buildResult.outcome, {
+          command: 'build gate (build script or tsc --noEmit)',
+          exitCode: buildResult.exitCode,
+          output: buildResult.output,
+        });
+
+        if (buildResult.outcome === 'failed') {
+          lastTestOutput = `The build/typecheck failed after your change:\n${scrubSecrets(buildResult.output)}`;
+          logger.warn('Build gate failed', { attempt, model: tier.model });
+          await sandbox.commands.run(
+            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
+            { timeoutMs: 30_000 },
+          );
+          attempt++;
+          continue;
+        }
+        if (buildResult.outcome === 'infra_error') verificationInfraError = true;
+        buildGatePassed = buildResult.outcome === 'passed';
+
+        testGatePassed = true;
+        testGateSkipped = testResult.skipped;
+        break;
       }
 
       // Accumulate this tier's token usage
@@ -845,12 +936,14 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
               reason_message: result?.summary ?? 'Agent could not complete',
               remediation: 'Review the error manually — the agent could not complete within budget/turn limits',
             },
+            evidence: evidence.record(),
             tokenUsage: totalTokenUsage,
           };
         }
 
-        // Extract diff even for test failure (for human review)
-        const { diff, affectedFiles } = await extractDiff(sandbox);
+        // The diff was captured before the post-patch gates, so gate output can
+        // never contaminate the candidate retained for human review.
+        const { diff, affectedFiles } = candidateDiff ?? { diff: '', affectedFiles: [] };
         if (diff.trim().length === 0) {
           return {
             status: 'needs_human',
@@ -859,6 +952,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
               reason_message: 'Agent completed but produced no code changes',
               remediation: 'Review the error manually — the agent could not generate a fix',
             },
+            evidence: evidence.record(),
             tokenUsage: totalTokenUsage,
           };
         }
@@ -874,12 +968,19 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
             `Agent produced a fix but tests still fail after ${MAX_TEST_RETRIES + 1} attempts`,
             'Review the diff manually — the fix may be partial or introduce regressions',
           ),
+          evidence: evidence.record(),
           tokenUsage: totalTokenUsage,
         };
       }
 
-      // Tests passed (or were skipped) — extract the candidate diff.
-      const { diff, affectedFiles } = await extractDiff(sandbox);
+      const { diff, affectedFiles } = candidateDiff ?? { diff: '', affectedFiles: [] };
+
+      if (verificationInfraError) {
+        throw new VerificationInfraError(
+          'Verification infrastructure failed (dependency install, test runner, build, or timeout), so the fix could not be proven either way.',
+          evidence.record(),
+        );
+      }
 
       if (diff.trim().length === 0) {
         if (!isLastTier) {
@@ -889,6 +990,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         return {
           status: 'needs_human',
           reason: buildReason('malformed_diff', 'Agent completed but produced no code changes'),
+          evidence: evidence.record(),
           tokenUsage: totalTokenUsage,
         };
       }
@@ -946,15 +1048,20 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       const verified = testGatePassed && !testGateSkipped;
 
       if (verified && qualityConfirmed) {
-        let humanSummary: string | undefined;
+        const fallbackInput: NarrativeFallbackInput = {
+          errorType: input.errorType,
+          errorMessage: input.errorMessage,
+          primaryFile: affectedFiles[0],
+        };
+        let narrative = buildFallbackNarrative(fallbackInput);
         try {
-          humanSummary = await traceSpan(
-            'human-summary',
-            { 'summary.model': HUMAN_SUMMARY_MODEL },
-            () => generateHumanSummary(apiKey, input, result!.summary, diff),
+          narrative = await traceSpan(
+            'fix-narrative',
+            { 'summary.model': FIX_NARRATIVE_MODEL },
+            () => generateFixNarrative(apiKey, input, result!.summary, diff, affectedFiles[0]),
           );
         } catch (summaryErr: unknown) {
-          logger.warn('Human summary generation failed; PR body will use deterministic fallback', {
+          logger.warn('Fix narrative generation failed; using deterministic fallback', {
             error: summaryErr instanceof Error ? summaryErr.message : String(summaryErr),
           });
         }
@@ -964,8 +1071,12 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           diff,
           confidence: 'high',
           rootCause: result!.summary,
-          humanSummary,
+          narrative,
+          humanSummary: input.kind === 'friction'
+            ? `${narrative.whatHappened} ${narrative.fixApproach}`
+            : undefined,
           affectedFiles,
+          evidence: evidence.record(),
           tokenUsage: totalTokenUsage,
         };
       }
@@ -975,7 +1086,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       // confidence: judge-approved-but-unverified → 'medium'; otherwise → 'low'.
       const belowFloorConfidence: ConfidenceLevel = qualityConfirmed ? 'medium' : 'low';
       const reasonMessage = !verified
-        ? 'A candidate fix was generated but its test suite could not be run to verify it, so it did not clear the bar for an automatic PR.'
+        ? 'A candidate fix was generated but no test runner was available to verify it, so it did not clear the bar for an automatic PR.'
         : `A candidate fix was generated but the quality review did not pass${judgeExplanation ? ` (${judgeExplanation})` : ''}, so it did not clear the bar for an automatic PR.`;
 
       return {
@@ -985,6 +1096,8 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         confidence: belowFloorConfidence,
         rootCause: result!.summary,
         reason: buildReason('low_confidence_fix', reasonMessage),
+        evidence: evidence.record(),
+        draftEligible: qualityConfirmed && buildGatePassed && !verified,
         tokenUsage: totalTokenUsage,
       };
     }
@@ -997,8 +1110,10 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         reason_message: 'Model cascade exhausted without result',
         remediation: 'Review the error manually',
       },
+      evidence: evidence.record(),
     };
   } catch (err: unknown) {
+    if (err instanceof VerificationInfraError) throw err;
     const rawMessage = err instanceof Error ? err.message : String(err);
     const message = rawMessage.replace(/https:\/\/[^@]+@/g, 'https://***@');
     return {
@@ -1008,27 +1123,13 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         reason_message: `Agent harness error: ${message}`,
         remediation: 'Review the error manually — the agent harness encountered an unexpected error',
       },
+      ...(evidence ? { evidence: evidence.record() } : {}),
     };
   } finally {
     if (sandbox) {
       try { await sandbox.kill(); } catch { /* best effort */ }
     }
   }
-}
-
-/** Extract diff and affected files from sandbox working tree. */
-async function extractDiff(sandbox: SandboxRuntime): Promise<{ diff: string; affectedFiles: string[] }> {
-  await sandbox.commands.run('cd /home/user/repo && git add -A', { timeoutMs: 30_000 });
-  const diffResult = await sandbox.commands.run('cd /home/user/repo && git diff --cached', { timeoutMs: 30_000 });
-  const raw = (diffResult.stdout ?? '').replace(/\r\n/g, '\n');
-  const diff = raw.endsWith('\n') ? raw : raw + '\n';
-  const affectedFiles: string[] = [];
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('+++ b/')) {
-      affectedFiles.push(line.slice(6));
-    }
-  }
-  return { diff, affectedFiles };
 }
 
 function addTokenUsage(

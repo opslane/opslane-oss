@@ -105,7 +105,7 @@ export async function gitCommitAndPush(
   branchName: string,
   commitMessage: string,
   diff: string,
-): Promise<void> {
+): Promise<string> {
   const opts = {
     cwd: repoDir,
     timeout: 30_000,
@@ -123,6 +123,8 @@ export async function gitCommitAndPush(
   await execFile('git', ['add', '-A'], opts);
   await execFile('git', ['commit', '-m', commitMessage], opts);
   await execFile('git', ['push', 'origin', branchName], opts);
+  const { stdout } = await execFile('git', ['rev-parse', 'HEAD'], opts);
+  return stdout.trim();
 }
 
 /** Apply a diff via stdin to git apply. */

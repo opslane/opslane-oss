@@ -43,6 +43,12 @@ export async function initTracing(): Promise<void> {
     spanProcessors: [new LangfuseSpanProcessor({
       flushAt: 50,
       flushInterval: 5, // seconds
+      // The v5 default filter only exports spans from Langfuse's own tracer,
+      // gen_ai.*-attributed spans, or known LLM scopes. Our 'opslane-worker'
+      // tracer and '@arizeai/openinference-instrumentation-anthropic' match
+      // none of those, so every span is silently dropped. Export everything —
+      // the worker registers no other instrumentations.
+      shouldExportSpan: () => true,
     })],
     instrumentations: [instrumentation],
   });

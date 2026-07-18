@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
 // pullRequestEvent represents the relevant fields from a GitHub pull_request webhook payload.
@@ -96,6 +98,17 @@ func (d *Dependencies) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "failed to process pull_request event")
 		return
 	}
+	if result.CleanupBranch != "" {
+		if err := d.deleteDraftBranch(repo, result.CleanupBranch, result.InstallationID); err != nil {
+			slog.Error("webhook: draft branch cleanup failed",
+				"repo", repo, "pr", prNumber, "branch", result.CleanupBranch, "error", err)
+			// The database transition and receipt are already durable. Returning an
+			// error asks GitHub to redeliver; the duplicate path returns the same
+			// cleanup intent, and a 404 is an idempotent success.
+			writeJSONError(w, http.StatusInternalServerError, "failed to clean up pull-request branch")
+			return
+		}
+	}
 	status := "processed"
 	switch {
 	case result.Duplicate:
@@ -115,6 +128,32 @@ func (d *Dependencies) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		"status": status, "action": action, "group_id": result.GroupID,
 	})
 }
+
+func (d *Dependencies) deleteDraftBranch(repo, branch string, installationID *int64) error {
+	token := strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	if token == "" {
+		if installationID == nil || *installationID <= 0 {
+			return &githubBranchCleanupError{message: "no GitHub token or App installation is available"}
+		}
+		if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 {
+			return &githubBranchCleanupError{message: "GitHub App credentials are not configured"}
+		}
+		appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
+		if err != nil {
+			return err
+		}
+		installationToken, err := gh.GetInstallationToken(appJWT, *installationID)
+		if err != nil {
+			return err
+		}
+		token = installationToken.Token
+	}
+	return gh.DeleteBranch(token, repo, branch)
+}
+
+type githubBranchCleanupError struct{ message string }
+
+func (e *githubBranchCleanupError) Error() string { return e.message }
 
 // verifyWebhookSignature validates the X-Hub-Signature-256 header.
 func verifyWebhookSignature(payload []byte, secret, signature string) bool {

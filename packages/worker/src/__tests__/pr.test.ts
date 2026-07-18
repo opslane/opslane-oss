@@ -8,6 +8,7 @@ import {
   buildPRBody,
   getGitHubClientOptions,
 } from '../pr.js';
+import type { FixNarrative } from '../narrative.js';
 
 const VALID_DIFF = `--- a/src/app.ts
 +++ b/src/app.ts
@@ -15,6 +16,13 @@ const VALID_DIFF = `--- a/src/app.ts
 -  console.log('old');
 +  console.log('new');
 `;
+
+const FIX_NARRATIVE: FixNarrative = {
+  subject: 'Guard missing values in App',
+  whatHappened: 'Submitting the form with missing data crashed the page.',
+  whyItBroke: 'App read the value before checking whether it existed.',
+  fixApproach: 'Guard the nullable value before continuing the submission.',
+};
 
 function makeInput(overrides?: Partial<PRInput>): PRInput {
   return {
@@ -26,6 +34,7 @@ function makeInput(overrides?: Partial<PRInput>): PRInput {
     diff: VALID_DIFF,
     title: 'TypeError: Cannot read property "x" of undefined',
     confidence: 'high',
+    narrative: FIX_NARRATIVE,
     errorType: 'TypeError',
     errorMessage: 'Cannot read property "x" of undefined',
     ...overrides,
@@ -92,6 +101,29 @@ describe('createPR', () => {
     }
   });
 
+  it('creates an opted-in draft and labels it as not locally verified', async () => {
+    const createPullRequest = vi
+      .fn<GitHubClient['createPullRequest']>()
+      .mockResolvedValue({ url: 'https://github.com/org/repo/pull/2', number: 2 });
+    const client = makeMockClient({ createPullRequest });
+    const input = makeInput({
+      draft: true,
+      confidence: 'medium',
+      evidence: {
+        version: 1,
+        tier: 'E0',
+        checks: [{ name: 'build', outcome: 'passed', command: 'pnpm build', output_tail: '' }],
+      },
+    });
+
+    await createPR(input, () => client);
+
+    expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({
+      draft: true,
+      body: expect.stringContaining('NOT verified for review'),
+    }));
+  });
+
   it('returns failed with missing_github_token when no token', async () => {
     const result = await createPR(makeInput(), () => null);
 
@@ -154,6 +186,18 @@ describe('createPR', () => {
     }));
   });
 
+  it('uses the narrative subject as the error pull request title', async () => {
+    const createPullRequest = vi
+      .fn<GitHubClient['createPullRequest']>()
+      .mockResolvedValue({ url: 'https://github.com/org/repo/pull/1', number: 1 });
+
+    await createPR(makeInput(), () => makeMockClient({ createPullRequest }));
+
+    expect(createPullRequest).toHaveBeenCalledWith(expect.objectContaining({
+      title: '🛡️ Guard missing values in App',
+    }));
+  });
+
   it('returns failed for invalid repo format', async () => {
     const client = makeMockClient();
     const result = await createPR(
@@ -213,9 +257,7 @@ describe('GitHub client configuration', () => {
     try {
       const address = server.address();
       if (!address || typeof address === 'string') throw new Error('Recorder did not bind to TCP');
-      process.env['OPSLANE_GITHUB_API_URL'] = `http://127.0.0.1:${address.port}`;
-
-      const client = createGitHubClient('test-token');
+      const client = createGitHubClient('test-token', `http://127.0.0.1:${address.port}`);
       expect(client).not.toBeNull();
       await expect(client!.createPullRequest({
         owner: 'octocat',
@@ -238,6 +280,7 @@ describe('GitHub client configuration', () => {
           body: 'Recorded body',
           head: 'opslane/fix-fixture',
           base: 'main',
+          draft: false,
         },
       }]);
     } finally {
@@ -262,28 +305,34 @@ describe('buildPRBody', () => {
     expect(body).not.toContain('**Confidence:** High · ✅ Tests passing');
   });
 
-  it('uses the explicit human summary as a header-free lede', () => {
+  it('renders the typed narrative in context-first order', () => {
     const body = buildPRBody(makeInput({
-      humanSummary: '### The user submitted the form. The app crashed on submit. The fix guards the missing value.',
+      narrative: {
+        subject: 'Guard missing values in App',
+        whatHappened: '### The user submitted the form. The app crashed on submit.',
+        whyItBroke: 'App assumed the value always existed.',
+        fixApproach: 'Guard the missing value before submission.',
+      },
     }));
 
-    expect(body).toContain('## 🛡️ Opslane fixed TypeError');
-    expect(body).toContain('The user submitted the form. The app crashed on submit. The fix guards the missing value.');
+    expect(body).toContain('## 🛡️ Guard missing values in App');
+    expect(body).toContain('### What happened\n\nThe user submitted the form. The app crashed on submit.');
+    expect(body.indexOf('### What happened')).toBeLessThan(body.indexOf('### Why it broke'));
+    expect(body.indexOf('### Why it broke')).toBeLessThan(body.indexOf('### The fix'));
     expect(body).not.toContain('### The user submitted');
   });
 
-  it('falls back to visual analysis when humanSummary is absent and scrubs dev URLs', () => {
+  it('scrubs dev URLs from narrative prose', () => {
     const body = buildPRBody(makeInput({
-      visualAnalysis: {
-        whatUserSaw: 'The user was on http://localhost:5173/users and saw a blank screen',
-        failureMoment: 'after clicking Save on http://127.0.0.1:5173/users',
-        uxImpact: 'The form could not be submitted',
-        confidence: 'high',
+      narrative: {
+        ...FIX_NARRATIVE,
+        whatHappened: 'The user was on http://localhost:5173/users and saw a blank screen.',
+        whyItBroke: 'The failure started on http://127.0.0.1:5173/users after Save.',
       },
     }));
 
     expect(body).toContain('The user was on /users and saw a blank screen.');
-    expect(body).toContain('after clicking Save on /users.');
+    expect(body).toContain('The failure started on /users after Save.');
     expect(body).not.toContain('localhost');
     expect(body).not.toContain('127.0.0.1');
   });
@@ -291,12 +340,14 @@ describe('buildPRBody', () => {
   it('falls back to error type and message when summary and visual analysis are absent', () => {
     const body = buildPRBody(makeInput({
       humanSummary: '',
+      narrative: undefined,
       visualAnalysis: null,
       errorType: 'ReferenceError',
       errorMessage: 'foo is not defined',
     }));
 
-    expect(body).toContain('Opslane detected a ReferenceError (foo is not defined) and generated a fix.');
+    expect(body).toContain('## 🛡️ Fix ReferenceError in app');
+    expect(body).toContain('The application hit a ReferenceError: foo is not defined.');
   });
 
   it('includes the fix and preserves the dynamic diff fence', () => {
@@ -315,12 +366,32 @@ describe('buildPRBody', () => {
     expect(body).toContain('-const value = "```";');
   });
 
-  it('hardcodes the verified high-confidence line for created PRs', () => {
+  it('degrades honestly when no evidence exists', () => {
     const body = buildPRBody(makeInput({ confidence: 'medium' }));
 
-    expect(body).toContain('**Confidence:** High · ✅ Tests passing');
+    expect(body).toContain('No verification evidence recorded');
     expect(body).not.toContain('medium');
-    expect(body).not.toContain('not verified');
+  });
+
+  it('renders the Verification section from the evidence record', () => {
+    const body = buildPRBody(makeInput({
+      evidence: {
+        version: 1,
+        tier: 'E1',
+        checks: [
+          { name: 'build', outcome: 'passed', command: 'npm run build', output_tail: '' },
+          { name: 'suite_baseline', outcome: 'failed', command: 'vitest run', output_tail: '' },
+          { name: 'suite_post_patch', outcome: 'passed', command: 'vitest run', output_tail: '' },
+        ],
+        suite: { baseline_failed_tests: ['a::t2'], new_failures: [] },
+      },
+    }));
+
+    expect(body).toContain('**Verification:** E1');
+    expect(body).toContain('✅');
+    expect(body).toContain('Pre-existing baseline failures were excluded from the gate');
+    expect(body).not.toContain('1 test(s)');
+    expect(body).not.toContain('Tests passing');
   });
 
   it('includes exactly one dashboard link when DASHBOARD_URL is set', () => {
@@ -328,9 +399,9 @@ describe('buildPRBody', () => {
     process.env['DASHBOARD_URL'] = 'https://app.opslane.com';
     try {
       const body = buildPRBody(makeInput({ replay: makeReplay() }));
-      expect(body).toContain('[Full investigation & session replay →](https://app.opslane.com/incidents/eg-12345678-abcd?project_id=proj-1)');
+      expect(body).toContain('[Watch the session replay and view the full incident in Opslane →](https://app.opslane.com/incidents/eg-12345678-abcd?project_id=proj-1)');
       expect(body.match(/\]\(https:\/\/app\.opslane\.com\/incidents\/eg-12345678-abcd\?project_id=proj-1\)/g)).toHaveLength(1);
-      expect(body).not.toContain('Watch session replay');
+      expect(body).not.toMatch(/crash happens at \d/);
     } finally {
       if (prev === undefined) delete process.env['DASHBOARD_URL'];
       else process.env['DASHBOARD_URL'] = prev;
@@ -341,44 +412,40 @@ describe('buildPRBody', () => {
     const prevUrl = process.env['DASHBOARD_URL'];
     const prevOrigin = process.env['DASHBOARD_ORIGIN'];
     delete process.env['DASHBOARD_URL'];
-    delete process.env['DASHBOARD_ORIGIN'];
+    process.env['DASHBOARD_ORIGIN'] = 'https://cors-origin.example.test';
     try {
       const body = buildPRBody(makeInput({ replay: makeReplay() }));
       expect(body).not.toContain('Full investigation & session replay');
     } finally {
-      if (prevUrl !== undefined) process.env['DASHBOARD_URL'] = prevUrl;
-      if (prevOrigin !== undefined) process.env['DASHBOARD_ORIGIN'] = prevOrigin;
+      if (prevUrl === undefined) delete process.env['DASHBOARD_URL'];
+      else process.env['DASHBOARD_URL'] = prevUrl;
+      if (prevOrigin === undefined) delete process.env['DASHBOARD_ORIGIN'];
+      else process.env['DASHBOARD_ORIGIN'] = prevOrigin;
     }
   });
 
-  it('renders root cause exactly once inside the fix section', () => {
+  it('renders the narrative cause exactly once inside Why it broke', () => {
+    const cause = 'A stale closure read the profile after cleanup.';
     const body = buildPRBody(makeInput({
-      rootCause: 'Null reference in useEffect cleanup due to stale closure',
-      humanSummary: 'The user tried to save a profile. The page crashed. The patch guards the cleanup path.',
+      narrative: { ...FIX_NARRATIVE, whyItBroke: cause },
     }));
 
-    expect(body.match(/Null reference in useEffect cleanup due to stale closure/g)).toHaveLength(1);
-    expect(body).toContain('Addresses Null reference in useEffect cleanup due to stale closure');
+    expect(body.match(/A stale closure read the profile after cleanup\./g)).toHaveLength(1);
+    expect(body).toContain(`### Why it broke\n\n${cause}`);
     expect(body).not.toContain('### Root Cause');
     expect(body).not.toContain('**Explanation:**');
   });
 
-  it('renders root cause once in the visual-analysis fallback (no humanSummary)', () => {
+  it('normalizes the exact malformed fix fixture without a dangling fence', () => {
     const body = buildPRBody(makeInput({
-      humanSummary: '',
-      rootCause: 'Null reference in useEffect cleanup due to stale closure',
-      visualAnalysis: {
-        whatUserSaw: 'a blank profile page',
-        failureMoment: 'right after clicking Save',
-        uxImpact: 'The form could not be submitted',
-        confidence: 'high',
-      },
+      kind: 'friction',
+      rootCause: '## Summary **Root Cause:** The profile is null. ```typescript if (!profile) return; ' + 'unbroken '.repeat(100),
     }));
 
-    // The lede uses the generic fix phrasing; rootCause appears only in `### The fix`.
-    expect(body.match(/Null reference in useEffect cleanup due to stale closure/g)).toHaveLength(1);
-    expect(body).toContain('This change updates the failing code path so the flow can complete.');
-    expect(body).toContain('Addresses Null reference in useEffect cleanup due to stale closure');
+    const fixText = body.slice(body.indexOf('### The fix'), body.indexOf('```diff'));
+    expect(fixText).not.toMatch(/## Summary|```|unbro…/);
+    expect(fixText).toContain('Addresses Summary Root Cause: The profile is null.');
+    expect(fixText).not.toContain('unbroken');
   });
 
   it('demotes technical detail and removes chart, timeline, metadata, and verification noise', () => {

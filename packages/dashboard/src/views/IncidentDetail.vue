@@ -3,8 +3,9 @@ import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import type { Incident, AffectedUser } from '../types/api';
 import { getIncident, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
-import { getProjectId, statusBadgeClass, safeUrl, formatDate, formatAbsolute } from '../utils';
+import { getProjectId, statusBadgeClass, statusLabel, safeUrl, formatDate, formatAbsolute } from '../utils';
 import { kindBadge, fixControlsVisible } from '../components/incident-kind';
+import EvidenceCard from '../components/EvidenceCard.vue';
 import PipelineIndicator from '../components/PipelineIndicator.vue';
 import ReplayPlayer from '../components/ReplayPlayer.vue';
 import type { eventWithTime } from '@rrweb/types';
@@ -227,7 +228,7 @@ onMounted(async () => {
           <span
             class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap mt-1"
             :class="statusBadgeClass(incident.status)"
-            v-text="incident.status.replace('_', ' ')"
+            v-text="statusLabel(incident.status)"
           >
           </span>
         </div>
@@ -345,22 +346,34 @@ onMounted(async () => {
         <!-- PR link -->
         <div
           v-if="safeUrl(incident.pr_url)"
-          class="p-4 bg-green-500/10 border border-green-500/20 border-l-2 border-l-green rounded-lg"
+          class="p-4 border border-l-2 rounded-lg"
+          :class="incident.status === 'pr_draft'
+            ? 'bg-amber-500/10 border-amber-500/20 border-l-amber'
+            : 'bg-green-500/10 border-green-500/20 border-l-green'"
         >
-          <p class="text-sm font-medium text-green">Fix PR created</p>
+          <p
+            class="text-sm font-medium"
+            :class="incident.status === 'pr_draft' ? 'text-amber' : 'text-green'"
+          >
+            {{ incident.status === 'pr_draft' ? 'Draft fix PR — verification pending' : 'Fix PR ready for review' }}
+          </p>
+          <p v-if="incident.status === 'pr_draft'" class="mt-1 text-xs text-amber">
+            Opslane did not reach the ready-for-review evidence bar locally. Review the repository CI results before marking this PR ready.
+          </p>
           <a
             :href="safeUrl(incident.pr_url)"
             target="_blank"
             rel="noopener noreferrer"
-            class="mt-1 inline-flex items-center text-green font-medium hover:underline text-sm"
+            class="mt-1 inline-flex items-center font-medium hover:underline text-sm"
+            :class="incident.status === 'pr_draft' ? 'text-amber' : 'text-green'"
             v-text="incident.pr_url"
           >
           </a>
         </div>
 
-        <!-- Investigation results (investigated, awaiting approval, fixing, or preserved on needs_human) -->
+        <!-- Investigation results, including context preserved on drafts and needs_human -->
         <div
-          v-if="(incident.status === 'investigated' || incident.status === 'awaiting_approval' || incident.status === 'fixing' || incident.status === 'needs_human') && incident.root_cause"
+          v-if="(incident.status === 'investigated' || incident.status === 'awaiting_approval' || incident.status === 'fixing' || incident.status === 'pr_draft' || incident.status === 'needs_human') && incident.root_cause"
           class="p-4 bg-teal-500/10 border border-teal-500/20 border-l-2 border-l-teal rounded-lg space-y-3"
         >
           <div>
@@ -494,6 +507,23 @@ onMounted(async () => {
               Code: <span v-text="incident.reason.reason_code"></span>
             </p>
           </div>
+        </div>
+
+        <EvidenceCard
+          v-if="incident.verification_evidence"
+          :evidence="incident.verification_evidence"
+        />
+
+        <!-- Candidate diff -->
+        <div
+          v-if="incident.status === 'needs_human' && incident.candidate_diff"
+          class="p-4 bg-surface border border-border rounded-lg space-y-2"
+        >
+          <p class="text-xs font-medium text-text-muted uppercase tracking-wide">Candidate diff</p>
+          <pre
+            class="text-xs bg-surface border border-border p-3 rounded overflow-x-auto whitespace-pre text-text max-h-96"
+            v-text="incident.candidate_diff"
+          ></pre>
         </div>
 
         <!-- Metadata -->

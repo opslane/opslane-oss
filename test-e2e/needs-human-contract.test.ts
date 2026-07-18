@@ -31,6 +31,7 @@ import {
 const REASON_CODES = [
   'missing_github_token',
   'repo_access_denied',
+  'token_decrypt_failed',
   'auth_invalid',
   'policy_blocked',
   'missing_llm_key',
@@ -38,9 +39,20 @@ const REASON_CODES = [
   'verification_failed',
   'sourcemap_unresolved',
   'artifact_fetch_failed',
+  'insufficient_context',
   'worker_runtime_error',
+  'lease_lost',
+  'budget_exhausted',
   'tests_failed',
   'low_confidence_fix',
+  'repro_not_achievable',
+  'verification_infra_error',
+  'triage_unfixable',
+  'unfixable_no_app_frames',
+  'unfixable_test_error',
+  'unfixable_third_party',
+  'unfixable_infra',
+  'unfixable_no_sourcemap',
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -113,6 +125,41 @@ describe('needs_human contract (read API)', () => {
       expect(incident.pr_url).toBeUndefined();
     }
   );
+
+  it('exposes candidate_diff and verification_evidence on needs_human incidents', async () => {
+    const evidence = {
+      version: 1,
+      tier: 'E1',
+      checks: [
+        {
+          name: 'build',
+          outcome: 'passed',
+          command: 'npm run build',
+          output_tail: '',
+        },
+      ],
+    };
+    const groupId = await seedErrorGroup({
+      projectId: tenant.projectId,
+      environmentId: tenant.environmentId,
+      status: 'needs_human',
+      title: 'Error with verification evidence',
+      reasonCode: 'low_confidence_fix',
+      reasonMessage: 'The candidate fix requires human review.',
+      remediation: 'Review the candidate diff and verification evidence.',
+      candidateDiff: '--- a/f\n+++ b/f\n',
+      verificationEvidence: evidence,
+    });
+
+    const incident = await getIncident(
+      tenant.apiKey,
+      tenant.projectId,
+      groupId
+    );
+
+    expect(incident.candidate_diff).toContain('+++ b/f');
+    expect(incident.verification_evidence?.tier).toBe('E1');
+  });
 
   it('rejects needs_human without reason fields at DB level', async () => {
     // Try to seed a needs_human group without reason fields via DB

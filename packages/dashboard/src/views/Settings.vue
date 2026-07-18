@@ -62,9 +62,13 @@ const selectedProject = computed(() =>
 const autonomy = ref<Project['friction_autonomy']>('ask_first');
 const autonomySaving = ref(false);
 const autonomyError = ref('');
+const prPosture = ref<Project['pr_posture']>('verified_only');
+const prPostureSaving = ref(false);
+const prPostureError = ref('');
 const fixStats = ref<Record<'error' | 'friction', FixStats> | null>(null);
 let statsRequestToken = 0;
 let autonomySaveToken = 0;
+let prPostureSaveToken = 0;
 let lastLoadedProjectId: string | null = null;
 
 // Environments tab
@@ -115,6 +119,8 @@ watch(selectedProjectId, () => {
   // completion cannot overwrite the new project's displayed state.
   autonomySaveToken += 1;
   autonomySaving.value = false;
+  prPostureSaveToken += 1;
+  prPostureSaving.value = false;
   void loadAutonomyAndStats();
 }, { immediate: true });
 watch(projects, () => {
@@ -123,6 +129,7 @@ watch(projects, () => {
   // project, only friction_autonomy changed — re-sync the toggle without
   // refetching stats, which would flicker the receipts for nothing).
   autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
+  prPosture.value = selectedProject.value?.pr_posture ?? 'verified_only';
   if ((selectedProject.value?.id ?? null) !== lastLoadedProjectId) {
     void loadAutonomyAndStats();
   }
@@ -131,8 +138,10 @@ watch(projects, () => {
 async function loadAutonomyAndStats(): Promise<void> {
   const token = ++statsRequestToken;
   autonomyError.value = '';
+  prPostureError.value = '';
   fixStats.value = null;
   autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
+  prPosture.value = selectedProject.value?.pr_posture ?? 'verified_only';
 
   const id = selectedProjectId.value;
   lastLoadedProjectId = selectedProject.value?.id ?? null;
@@ -146,6 +155,39 @@ async function loadAutonomyAndStats(): Promise<void> {
   } catch {
     // Stats are best-effort; the autonomy setting works without them.
   }
+}
+
+async function savePRPosture(value: Project['pr_posture']): Promise<void> {
+  if (!selectedProject.value) return;
+
+  const projectId = selectedProject.value.id;
+  const saveToken = ++prPostureSaveToken;
+  const previous = prPosture.value;
+  prPosture.value = value;
+  prPostureSaving.value = true;
+  prPostureError.value = '';
+  try {
+    const updated = await updateProject(projectId, { pr_posture: value });
+    projects.value = projects.value.map((project) =>
+      project.id === updated.id ? updated : project,
+    );
+  } catch (err: unknown) {
+    if (saveToken === prPostureSaveToken && selectedProjectId.value === projectId) {
+      prPosture.value = previous;
+      prPostureError.value = err instanceof Error
+        ? err.message
+        : 'Failed to save pull request posture';
+    }
+  } finally {
+    if (saveToken === prPostureSaveToken) {
+      prPostureSaving.value = false;
+    }
+  }
+}
+
+function onPRPostureChange(event: Event): void {
+  const checked = event.target instanceof HTMLInputElement && event.target.checked;
+  void savePRPosture(checked ? 'draft_when_unverified' : 'verified_only');
 }
 
 async function saveAutonomy(value: Project['friction_autonomy']): Promise<void> {
@@ -479,6 +521,13 @@ async function handleCreateKey(): Promise<void> {
             </span>
           </div>
 
+          <div class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber">
+            Draft PR verification requires the GitHub App's <strong>Checks: read</strong>
+            permission. If you installed the App before this permission was added, approve
+            the permission upgrade in GitHub. Until then, drafts stay drafts and show a
+            permission warning instead of being promoted automatically.
+          </div>
+
           <!-- Repo connected -->
           <div v-if="githubConfig?.connected" class="space-y-3">
             <div class="flex items-center gap-3">
@@ -511,6 +560,43 @@ async function handleCreateKey(): Promise<void> {
           </div>
         </div>
       </div>
+
+      <!-- Pull request posture -->
+      <section class="mt-8 p-4 bg-surface border border-border rounded-lg space-y-3">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <h3 id="pr-posture-heading" class="text-sm font-medium text-text">Draft PRs for unverified fixes</h3>
+            <p id="pr-posture-desc" class="mt-1 text-xs text-text-muted">
+              When enabled, a judge-approved fix with a passing build and no negative test
+              evidence can be published as a clearly labeled draft. Repository CI must pass
+              before Opslane marks it ready for review.
+            </p>
+          </div>
+          <label class="relative inline-flex shrink-0 cursor-pointer items-center">
+            <input
+              type="checkbox"
+              class="peer sr-only"
+              role="switch"
+              aria-labelledby="pr-posture-heading"
+              aria-describedby="pr-posture-desc"
+              :checked="prPosture === 'draft_when_unverified'"
+              :disabled="!selectedProject || prPostureSaving"
+              @change="onPRPostureChange"
+            />
+            <span class="h-6 w-11 rounded-full bg-surface-2 transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform peer-checked:after:translate-x-5"></span>
+          </label>
+        </div>
+        <p v-if="!selectedProject" class="text-xs text-text-faint">
+          Select one of your projects above to manage draft PR delivery.
+          (Manually entered project IDs can't be managed here.)
+        </p>
+        <p v-else class="text-xs text-text-faint">
+          {{ prPosture === 'draft_when_unverified'
+            ? 'Enabled — eligible unverified fixes may open as drafts.'
+            : 'Verified only (default) — fixes below the ready bar remain needs-human incidents.' }}
+        </p>
+        <p v-if="prPostureError" class="text-sm text-red" v-text="prPostureError"></p>
+      </section>
 
       <!-- Friction autonomy (Batch 5, issue #57) -->
       <section class="mt-8 p-4 bg-surface border border-border rounded-lg space-y-3">

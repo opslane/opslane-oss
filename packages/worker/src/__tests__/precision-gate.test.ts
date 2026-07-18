@@ -74,4 +74,34 @@ describe('precision gate — directional invariants (C3)', () => {
     expect(r.status).toBe('needs_human');
     expect(mockCreatePR).not.toHaveBeenCalled();
   });
+
+  it('needs_human preserves the candidate diff and evidence for persistence', async () => {
+    const diff = '--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n';
+    mockRunAgentFix.mockResolvedValue({
+      status: 'needs_human',
+      diff,
+      confidence: 'medium',
+      rootCause: 'rc',
+      reason: { reason_code: 'low_confidence_fix', reason_message: 'm', remediation: 'r' },
+      evidence: { version: 1, tier: 'E0', checks: [] },
+    });
+    const r = await runPipeline(input());
+    expect(r.status).toBe('needs_human');
+    expect(r.candidateDiff).toBe(diff);
+    expect(r.evidence?.tier).toBe('E0');
+  });
+
+  it('the hard precision guard also preserves diff + evidence', async () => {
+    mockRunAgentFix.mockResolvedValue({
+      status: 'fix_ready',
+      diff: '--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n',
+      confidence: 'medium',
+      rootCause: 'rc',
+      evidence: { version: 1, tier: 'E1', checks: [] },
+    });
+    const r = await runPipeline(input());
+    expect(r.status).toBe('needs_human');
+    expect(r.candidateDiff).toBeTruthy();
+    expect(r.evidence?.tier).toBe('E1');
+  });
 });
