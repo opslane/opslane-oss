@@ -3,9 +3,13 @@ import type {
   GitHubConfig, GitHubAppStatus, GitHubRepo, SetupPrStatus,
   SessionDetail, SessionFilters, SessionListResponse,
   AdminOverview, AdminJobsResponse, HealthResponse,
-  AuthUser, OrgInvitation,
+  AuthConfig, AuthUser, ForgotPasswordResult, OrgInvitation,
+  PasswordAuthResult, ResetPasswordResult,
 } from './types/api';
-export type { AuthUser, AuthMembership, OrgInvitation } from './types/api';
+export type {
+  AuthConfig, AuthMembership, AuthUser, ForgotPasswordResult, OrgInvitation,
+  PasswordAuthResult, ResetPasswordResult,
+} from './types/api';
 import type { ChunkEnvelope } from './components/session-replay';
 
 const BASE = '/api/v1';
@@ -203,6 +207,114 @@ export interface ReplayRecording {
 
 export function getMe(): Promise<AuthUser> {
   return fetchJSON<AuthUser>('/auth/me');
+}
+
+const AUTH_NETWORK_ERROR = 'Unable to reach the server. Please try again.';
+
+type AuthErrorResult = { status: 'error'; code: number; message: string };
+
+function authErrorResult(code: number, data: unknown): AuthErrorResult {
+  const record = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+  return {
+    status: 'error',
+    code,
+    message: typeof record.error === 'string' ? record.error : 'Something went wrong',
+  };
+}
+
+async function readResponseBody(response: Response): Promise<unknown> {
+  return response.json().catch(() => ({}));
+}
+
+export async function fetchAuthConfig(): Promise<AuthConfig> {
+  const response = await fetch('/auth/config', { credentials: 'include' });
+  const data = await readResponseBody(response);
+  if (!response.ok) {
+    const result = authErrorResult(response.status, data);
+    throw new APIError(result.code, result.message);
+  }
+  return data as AuthConfig;
+}
+
+async function postAuthFlow(path: string, body: unknown): Promise<PasswordAuthResult> {
+  try {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(body),
+    });
+    const data = await readResponseBody(response);
+    const record = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+
+    if (response.ok) {
+      return { status: 'authenticated', user: record.user as AuthUser };
+    }
+    if (response.status === 403 && record.status === 'email_verification_required') {
+      return {
+        status: 'email_verification_required',
+        pending_authentication_token: String(record.pending_authentication_token ?? ''),
+      };
+    }
+    return authErrorResult(response.status, data);
+  } catch {
+    return { status: 'error', code: 0, message: AUTH_NETWORK_ERROR };
+  }
+}
+
+export function passwordLogin(email: string, password: string): Promise<PasswordAuthResult> {
+  return postAuthFlow('/auth/password', { email, password });
+}
+
+export function signup(email: string, password: string): Promise<PasswordAuthResult> {
+  return postAuthFlow('/auth/signup', { email, password });
+}
+
+export function verifyEmail(pendingToken: string, code: string): Promise<PasswordAuthResult> {
+  return postAuthFlow('/auth/verify-email', {
+    pending_authentication_token: pendingToken,
+    code,
+  });
+}
+
+export async function forgotPassword(email: string): Promise<ForgotPasswordResult> {
+  try {
+    const response = await fetch('/auth/password/forgot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email }),
+    });
+    if (response.ok) return { status: 'sent' };
+    const data = await readResponseBody(response);
+    const result = authErrorResult(response.status, data);
+    return result;
+  } catch {
+    return { status: 'error', code: 0, message: AUTH_NETWORK_ERROR };
+  }
+}
+
+export async function resetPassword(
+  token: string,
+  newPassword: string,
+): Promise<ResetPasswordResult> {
+  try {
+    const response = await fetch('/auth/password/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ token, new_password: newPassword }),
+    });
+    if (response.ok) {
+      clearAuth();
+      return { status: 'reset' };
+    }
+    const data = await readResponseBody(response);
+    const result = authErrorResult(response.status, data);
+    return result;
+  } catch {
+    return { status: 'error', code: 0, message: AUTH_NETWORK_ERROR };
+  }
 }
 
 export async function switchOrg(orgID: string): Promise<void> {

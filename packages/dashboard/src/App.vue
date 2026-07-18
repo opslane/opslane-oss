@@ -11,7 +11,7 @@ const user = ref<AuthUser | null>(null);
 const projectName = ref(localStorage.getItem('opslane_project_name') ?? '');
 
 // Routes that hide the header and use full-page layout
-const fullPageRoutes = ['login', 'register', 'setup', 'auth-complete', 'invite-accept'];
+const fullPageRoutes = ['login', 'register', 'setup', 'auth-complete', 'invite-accept', 'reset-password'];
 const isFullPage = computed(() => fullPageRoutes.includes(route.name as string));
 
 function navLinkClass(routeName: string): string {

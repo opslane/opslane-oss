@@ -15,6 +15,26 @@ export interface AuthUser {
   memberships?: AuthMembership[];
 }
 
+export interface AuthConfig {
+  provider: string;
+  supports_password: boolean;
+  supports_signup: boolean;
+  supports_reset: boolean;
+}
+
+export type PasswordAuthResult =
+  | { status: 'authenticated'; user: AuthUser }
+  | { status: 'email_verification_required'; pending_authentication_token: string }
+  | { status: 'error'; code: number; message: string };
+
+export type ResetPasswordResult =
+  | { status: 'reset' }
+  | { status: 'error'; code: number; message: string };
+
+export type ForgotPasswordResult =
+  | { status: 'sent' }
+  | { status: 'error'; code: number; message: string };
+
 export interface OrgInvitation {
   id: string;
   org_id: string;
