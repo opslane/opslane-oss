@@ -77,7 +77,7 @@ Requires all of the following set in your environment **before** `docker compose
 You also need a **target repository the worker may open PRs against** — use a fork of a small fixture app (e.g. this repo's `test-fixtures/vue-app` pushed to a scratch repo), never a production repo you aren't ready to receive AI PRs on. Point your project's `github_repo` at it (via the dashboard, or by editing the seeded project row).
 
 ```bash
-export ANTHROPIC_API_KEY=... E2B_API_KEY=... GITHUB_TOKEN=...
+# export the three variables above in your shell, then:
 docker compose up -d
 ```
 
