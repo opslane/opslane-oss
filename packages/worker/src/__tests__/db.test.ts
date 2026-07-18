@@ -15,6 +15,9 @@ import {
   recordSetupPrResult,
   getPool,
   closePool,
+  reserveDelivery,
+  recordDeliveryPushed,
+  finalizeDelivery,
 } from '../db.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'];
@@ -140,6 +143,67 @@ describeDb('db.ts integration tests', () => {
     await testPool.query(`DELETE FROM error_group_jobs WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_events WHERE project_id = $1`, [testProjectId]);
     await testPool.query(`DELETE FROM error_groups WHERE project_id = $1`, [testProjectId]);
+  });
+
+  describe('draft delivery lifecycle', () => {
+    it('reserves before delivery and atomically opens a draft with one CI watcher', async () => {
+      const { errorGroupId, jobId } = await seedErrorGroupAndJob();
+      const claim = await claimJob('draft-worker', 60_000);
+      expect(claim?.id).toBe(jobId);
+      await testPool.query(
+        `UPDATE error_groups SET status = 'fixing' WHERE id = $1`,
+        [errorGroupId],
+      );
+
+      const reservation = await reserveDelivery(errorGroupId, testProjectId, {
+        operationKey: `fix:${errorGroupId}`,
+        branchName: `opslane/fix-${errorGroupId.slice(0, 8)}`,
+        posture: 'draft',
+        diffHash: 'abc123',
+        candidateDiff: '--- a/a\n+++ b/a\n',
+      }, claim!);
+      expect(reservation.status).toBe('reserved');
+
+      await recordDeliveryPushed(errorGroupId, testProjectId, 'head-sha-1', claim!);
+      await finalizeDelivery(errorGroupId, testProjectId, {
+        status: 'pr_draft',
+        prUrl: 'https://github.com/octocat/hello/pull/7',
+        prNumber: 7,
+        headSha: 'head-sha-1',
+        confidence: 'medium',
+        fixJobId: jobId,
+        reason: {
+          reason_code: 'low_confidence_fix',
+          reason_message: 'No repository test runner was available.',
+          remediation: 'Review repository CI before marking the draft ready.',
+        },
+        candidateDiff: '--- a/a\n+++ b/a\n',
+        evidence: { version: 1, tier: 'E0', checks: [] },
+      }, claim!);
+
+      const group = await testPool.query<{
+        status: string;
+        pr_number: number;
+        reason_code: string;
+      }>(`SELECT status, pr_number, reason_code FROM error_groups WHERE id = $1`, [errorGroupId]);
+      expect(group.rows[0]).toMatchObject({
+        status: 'pr_draft',
+        pr_number: 7,
+        reason_code: 'low_confidence_fix',
+      });
+      const delivery = await testPool.query<{ state: string; head_sha: string }>(
+        `SELECT state, head_sha FROM delivery_reservations WHERE error_group_id = $1`,
+        [errorGroupId],
+      );
+      expect(delivery.rows[0]).toEqual({ state: 'open', head_sha: 'head-sha-1' });
+      const watchers = await testPool.query<{ payload: { prNumber: number; headSha: string } }>(
+        `SELECT payload FROM error_group_jobs
+         WHERE error_group_id = $1 AND job_type = 'ci_watch' AND status = 'pending'`,
+        [errorGroupId],
+      );
+      expect(watchers.rows).toHaveLength(1);
+      expect(watchers.rows[0]?.payload).toMatchObject({ prNumber: 7, headSha: 'head-sha-1' });
+    });
   });
 
   describe('group lifecycle timestamps', () => {
@@ -848,6 +912,7 @@ describeDb('db.ts integration tests', () => {
         'investigated',
         'new',
         'pr_created',
+        'pr_draft',
         'analyzing',
         'queued',
         'fixing',

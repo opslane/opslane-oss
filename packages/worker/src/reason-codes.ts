@@ -38,6 +38,12 @@ export const DEFAULT_REMEDIATION: Record<ReasonCode, string> = {
     'Review the candidate diff manually — the agent produced a fix but the test suite still fails, so it may be partial or cause regressions.',
   low_confidence_fix:
     'Review the candidate diff and root-cause writeup, then apply or refine the fix manually — it did not clear the bar for an automatic PR.',
+  repro_not_achievable:
+    'Review the candidate diff and evidence manually — Opslane could not construct a reliable reproduction test for this error, so the fix is verified only against the existing suite.',
+  verification_infra_error:
+    'No immediate action needed — verification infrastructure failed (dependency install, test runner crash, or timeout), so the fix could not be proven either way. It will be retried on recurrence; if it persists, check worker logs.',
+  draft_cap_reached:
+    'Review or close an existing Opslane draft PR, then retry this fix. The candidate diff remains available on the incident.',
   triage_unfixable:
     'Review the error manually — triage determined it cannot be fixed with application code changes.',
   unfixable_no_app_frames:

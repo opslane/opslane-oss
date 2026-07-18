@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ClaimedJob, ErrorGroupData, ErrorEventData, ProjectData } from '../db.js';
+import { VerificationInfraError } from '../harness/errors.js';
 
 // index.ts is the worker entrypoint: it imports the whole world and calls main()
 // at module load. We mock every dependency so importing it is side-effect free,
@@ -31,6 +32,9 @@ vi.mock('../db.js', () => ({
   getSessionForAnalysis: vi.fn(),
   setSessionAnalysisStatus: vi.fn(),
   assertJobLease: vi.fn(),
+  reserveDelivery: vi.fn(),
+  recordDeliveryPushed: vi.fn(),
+  finalizeDelivery: vi.fn(),
 }));
 vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
@@ -272,15 +276,50 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
   it('sets pr_created on a successful high-confidence fix', async () => {
     mockRunPipeline.mockResolvedValue({
       status: 'pr_created', confidence: 'high',
-      pr_url: 'https://github.com/org/app/pull/7', pr_number: 7,
+      pr_url: 'https://github.com/org/app/pull/7', pr_number: 7, head_sha: 'head-7',
     });
 
     await processFixJob(fixJob(), new AbortController().signal);
 
-    const call = mockUpdateGroupStatus.mock.calls.find((c) => c[2] === 'pr_created');
+    const call = vi.mocked(db.finalizeDelivery).mock.calls[0];
     expect(call).toBeTruthy();
-    expect(call![3]?.pr_url).toBe('https://github.com/org/app/pull/7');
-    expect(call![3]?.pr_fix_job_id).toBe('j1');
+    expect(call![2]).toEqual(expect.objectContaining({
+      status: 'pr_created',
+      prUrl: 'https://github.com/org/app/pull/7',
+      prNumber: 7,
+      headSha: 'head-7',
+      fixJobId: 'j1',
+    }));
+  });
+
+  it('rethrows verification infrastructure errors while the job has retries remaining', async () => {
+    const evidence = { version: 1 as const, tier: 'E0' as const, checks: [] };
+    mockRunPipeline.mockRejectedValue(new VerificationInfraError('runner crashed', evidence));
+
+    await expect(processJobInner(
+      { ...fixJob(), attempts: 0, maxAttempts: 3 },
+      new AbortController().signal,
+    )).rejects.toBeInstanceOf(VerificationInfraError);
+
+    expect(mockUpdateGroupStatus.mock.calls.some(
+      (call) => call[3]?.reason?.reason_code === 'verification_infra_error',
+    )).toBe(false);
+  });
+
+  it('converts a final verification infrastructure failure to needs_human with evidence', async () => {
+    const evidence = { version: 1 as const, tier: 'E0' as const, checks: [] };
+    mockRunPipeline.mockRejectedValue(new VerificationInfraError('runner crashed', evidence));
+
+    await processJobInner(
+      { ...fixJob(), attempts: 2, maxAttempts: 3 },
+      new AbortController().signal,
+    );
+
+    const call = mockUpdateGroupStatus.mock.calls.find(
+      (entry) => entry[3]?.reason?.reason_code === 'verification_infra_error',
+    );
+    expect(call?.[2]).toBe('needs_human');
+    expect(call?.[3]?.evidence).toEqual(evidence);
   });
 
   it('prefers session-pointer evidence fetched through ingestion', async () => {
@@ -309,6 +348,7 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     vi.stubGlobal('fetch', fetchMock);
     mockRunPipeline.mockResolvedValue({
       status: 'pr_created', confidence: 'high', pr_url: 'https://github.com/org/app/pull/8', pr_number: 8,
+      head_sha: 'head-8',
     });
 
     await processFixJob(fixJob(), new AbortController().signal);
@@ -340,6 +380,10 @@ describe('friction worker path', () => {
     vi.mocked(db.getProjectGitHubInstallation).mockResolvedValue(null);
     mockCloneRepo.mockResolvedValue({ repoDir: '/tmp/repo', cleanup: vi.fn() } as never);
     vi.mocked(gatherFrictionEvidence).mockResolvedValue({ signals: [], timeline: '', truncated: false });
+    mockRunPipeline.mockResolvedValue({
+      status: 'pr_created', confidence: 'high', pr_url: 'https://github.com/org/app/pull/9', pr_number: 9,
+      head_sha: 'head-9',
+    });
   });
 
   it('parks code-caused friction under ask-first autonomy', async () => {

@@ -76,7 +76,8 @@ async function close(server: Server): Promise<void> {
 async function readJsonRequest(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+  const raw = Buffer.concat(chunks).toString('utf8');
+  return raw ? JSON.parse(raw) as Record<string, unknown> : {};
 }
 
 function anthropicMessage(
@@ -206,6 +207,18 @@ export async function startProviderRecorders(options: ProviderTwinOptions = {}):
           explanation: 'The change is minimal and covers the failing null input.',
         },
       }], 'tool_use');
+    } else if (names.includes('submit_fix_narrative')) {
+      message = anthropicMessage(body, [{
+        type: 'tool_use',
+        id: 'tool_fix_narrative',
+        name: 'submit_fix_narrative',
+        input: {
+          subject: 'Guard missing values in value',
+          whatHappened: 'Rendering a record with missing data crashed the page.',
+          whyItBroke: 'The value function dereferenced nullable input before checking it.',
+          fixApproach: 'Render a narrow fallback when the value is absent.',
+        },
+      }], 'tool_use');
     } else if (names.includes('edit')) {
       const results = toolResultCount(body);
       if (results === 0) {
@@ -256,7 +269,12 @@ export async function startProviderRecorders(options: ProviderTwinOptions = {}):
     // Stateful slice of GitHub's REST API: pulls.create. Response shape from
     // GitHub's spec — the twin remembers the PR so a later merge/close can
     // deliver the matching webhook.
-    const pullsMatch = /^\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(request.url ?? '');
+    const pullsMatch = /^\/repos\/([^/]+)\/([^/?]+)\/pulls(?:\?.*)?$/.exec(request.url ?? '');
+    if (request.method === 'GET' && pullsMatch) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify([]));
+      return;
+    }
     if (request.method === 'POST' && pullsMatch) {
       const pull: TwinPullRequest = {
         number: nextPullNumber++,

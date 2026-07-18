@@ -165,7 +165,9 @@ export async function processSetupPrJob(
       },
       clone: (opts) => cloneRepo(opts),
       runAgentSetup: (input) => runAgentSetup(input),
-      commitAndPush: (repoDir, branch, message, diff) => gitCommitAndPush(repoDir, branch, message, diff),
+      commitAndPush: async (repoDir, branch, message, diff) => {
+        await gitCommitAndPush(repoDir, branch, message, diff);
+      },
       createPr: async (token, params) => {
         const client = createGitHubClient(token);
         if (!client) throw new Error('GitHub client unavailable');

@@ -147,7 +147,8 @@ export async function runAgentSetup(input: AgentSetupInput): Promise<AgentSetupR
     }
 
     const gate = await runBuildGate(sandbox);
-    if (!gate.passed) {
+    const buildAccepted = gate.outcome === 'passed' || gate.outcome === 'skipped_no_runner';
+    if (!buildAccepted) {
       return {
         status: 'needs_human',
         reason: {
@@ -170,7 +171,7 @@ export async function runAgentSetup(input: AgentSetupInput): Promise<AgentSetupR
       };
     }
 
-    const confidence: ConfidenceLevel = gate.skipped ? 'medium' : 'high';
+    const confidence: ConfidenceLevel = gate.outcome === 'skipped_no_runner' ? 'medium' : 'high';
     return { status: 'setup_ready', diff, confidence, affectedFiles };
   } finally {
     await sandbox.kill().catch(() => {});

@@ -1,4 +1,5 @@
-import type { NeedsHumanReason, ConfidenceLevel } from '@opslane/shared';
+import { createHash } from 'node:crypto';
+import type { NeedsHumanReason, ConfidenceLevel, EvidenceRecord } from '@opslane/shared';
 import type { VisualAnalysisOutput } from './harness/types.js';
 import type { ReplayInput } from './pr.js';
 import { runAgentFix } from './agent-fix.js';
@@ -7,6 +8,13 @@ import { gitCommitAndPush, validateDiffPaths } from './repo-clone.js';
 import { buildReason } from './reason-codes.js';
 import { logger } from './logger.js';
 import { traceSpan } from './tracing.js';
+import { scrubSecrets } from './harness/redact.js';
+import {
+  buildFallbackNarrative,
+  buildIncidentUrl,
+  renderCommitMessage,
+  type FixNarrative,
+} from './narrative.js';
 
 export interface PipelineInput {
   jobId: string;
@@ -38,14 +46,49 @@ export interface PipelineInput {
     suggestedMitigation: string;
     guidance?: string;
   };
+  prPosture?: 'verified_only' | 'draft_when_unverified';
+  reserveDelivery?: (input: {
+    operationKey: string;
+    branchName: string;
+    posture: 'ready' | 'draft';
+    diffHash: string;
+    candidateDiff: string;
+  }) => Promise<
+    | { status: 'cap_reached' }
+    | { status: 'reserved'; reservation: {
+        branchName: string;
+        posture: 'ready' | 'draft';
+        candidateDiff: string;
+        state: 'reserved' | 'pushed' | 'open' | 'closed';
+        headSha?: string;
+        prUrl?: string;
+        prNumber?: number;
+      } }
+  >;
+  recordDeliveryPushed?: (headSha: string) => Promise<void>;
 }
 
 export interface PipelineResult {
-  status: 'pr_created' | 'needs_human';
+  status: 'pr_created' | 'pr_draft' | 'needs_human';
   pr_url?: string;
   pr_number?: number;
   confidence?: ConfidenceLevel;
   reason?: NeedsHumanReason;
+  /** Scrubbed and bounded candidate diff preserved for manual review. */
+  candidateDiff?: string;
+  evidence?: EvidenceRecord;
+  head_sha?: string;
+  narrative?: FixNarrative;
+}
+
+const MAX_STORED_DIFF = 262_144;
+
+function boundDiff(diff: string | undefined): string | undefined {
+  if (!diff || diff.trim().length === 0) return undefined;
+  const scrubbed = scrubSecrets(diff);
+  return scrubbed.length > MAX_STORED_DIFF
+    ? `${scrubbed.slice(0, MAX_STORED_DIFF)}\n... [truncated]`
+    : scrubbed;
 }
 
 export async function runPipeline(input: PipelineInput): Promise<PipelineResult> {
@@ -69,17 +112,27 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     investigation: input.investigation,
     abortSignal: input.abortSignal,
     frictionEvidence: input.frictionEvidence,
+    kind: input.kind,
   });
 
-  if (fixResult.status === 'needs_human') {
-    return { status: 'needs_human', reason: fixResult.reason, confidence: fixResult.confidence };
+  const publishDraft = fixResult.status === 'needs_human'
+    && fixResult.draftEligible === true
+    && input.prPosture === 'draft_when_unverified';
+
+  if (fixResult.status === 'needs_human' && !publishDraft) {
+    return {
+      status: 'needs_human',
+      reason: fixResult.reason,
+      confidence: fixResult.confidence,
+      candidateDiff: boundDiff(fixResult.diff),
+      evidence: fixResult.evidence,
+    };
   }
 
-  // Hard precision guard (independent of agent-fix): only a HIGH-confidence fix may
-  // proceed to push + PR. Anything else terminates as needs_human, preserving the
-  // reason + confidence (root_cause was persisted during investigation; the candidate
-  // diff itself is not stored). This is the product's core invariant — enforce it here too.
-  if (fixResult.confidence !== 'high') {
+  // Ready-for-review PRs require the high-confidence local gate. A separate,
+  // explicit candidate disposition may publish a medium-confidence draft when
+  // project policy opts in; judge-rejected and negative-evidence fixes never do.
+  if (!publishDraft && fixResult.confidence !== 'high') {
     return {
       status: 'needs_human',
       confidence: fixResult.confidence,
@@ -87,10 +140,13 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
         'low_confidence_fix',
         'A candidate fix was generated but did not clear the confidence bar for an automatic PR.',
       ),
+      candidateDiff: boundDiff(fixResult.diff),
+      evidence: fixResult.evidence,
     };
   }
 
-  const diff = fixResult.diff!;
+  let diff = fixResult.diff!;
+  let deliveryPosture: 'ready' | 'draft' = publishDraft ? 'draft' : 'ready';
 
   logger.info('Agent fix complete', {
     error_group_id: input.errorGroupId,
@@ -110,31 +166,126 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
         reason_message: pathCheck.error ?? 'Diff contains unsafe paths',
         remediation: 'Review the generated diff manually — it contains path traversal',
       },
+      candidateDiff: boundDiff(diff),
+      evidence: fixResult.evidence,
     };
   }
 
-  // Stage 2: Apply diff to local clone, commit + push
-  const branchName = `opslane/fix-${input.errorGroupId.slice(0, 8)}-${Date.now()}`;
-  await input.assertLeaseOwned?.();
-  try {
-    await traceSpan('git-push', { 'git.branch': branchName }, () =>
-      gitCommitAndPush(
-        input.repoPath,
-        branchName,
-        `fix: ${input.title.slice(0, 72)}`,
-        diff,
-      ),
-    );
-  } catch (err: unknown) {
+  const narrative = input.kind === 'friction'
+    ? undefined
+    : fixResult.narrative ?? buildFallbackNarrative({
+        errorType: input.errorType,
+        errorMessage: input.errorMessage,
+        primaryFile: fixResult.affectedFiles?.[0],
+      });
+  const incidentUrl = buildIncidentUrl(
+    process.env['DASHBOARD_URL'],
+    input.errorGroupId,
+    input.projectId,
+  );
+  const commitMessage = input.kind === 'friction'
+    ? `fix: ${input.title.slice(0, 72)}`
+    : renderCommitMessage(narrative!, fixResult.evidence, incidentUrl);
+
+  // Stage 2: reserve a stable logical delivery before any provider write.
+  let branchName = `opslane/fix-${input.errorGroupId.slice(0, 8)}`;
+  const operationKey = `fix:${input.errorGroupId}`;
+  if (input.reserveDelivery) {
+    const reservation = await input.reserveDelivery({
+      operationKey,
+      branchName,
+      posture: deliveryPosture,
+      diffHash: createHash('sha256').update(diff).digest('hex'),
+      candidateDiff: boundDiff(diff) ?? diff,
+    });
+    if (reservation.status === 'cap_reached') {
+      return {
+        status: 'needs_human',
+        confidence: fixResult.confidence,
+        reason: buildReason(
+          'draft_cap_reached',
+          'This project has reached its open Opslane draft PR limit.',
+        ),
+        candidateDiff: boundDiff(diff),
+        evidence: fixResult.evidence,
+      };
+    }
+    branchName = reservation.reservation.branchName;
+    deliveryPosture = reservation.reservation.posture;
+    diff = reservation.reservation.candidateDiff;
+    if (
+      reservation.reservation.state === 'open'
+      && reservation.reservation.prUrl
+      && reservation.reservation.prNumber
+      && reservation.reservation.headSha
+    ) {
+      return {
+        status: deliveryPosture === 'draft' ? 'pr_draft' : 'pr_created',
+        pr_url: reservation.reservation.prUrl,
+        pr_number: reservation.reservation.prNumber,
+        head_sha: reservation.reservation.headSha,
+        confidence: deliveryPosture === 'draft' ? 'medium' : fixResult.confidence,
+        reason: deliveryPosture === 'draft' ? fixResult.reason : undefined,
+        candidateDiff: deliveryPosture === 'draft' ? boundDiff(diff) : undefined,
+        evidence: fixResult.evidence,
+        narrative,
+      };
+    }
+  }
+
+  const githubClient = createGitHubClient(input.githubToken);
+  const [owner, repo] = input.githubRepo.split('/');
+  if (!owner || !repo) {
     return {
       status: 'needs_human',
-      reason: {
-        reason_code: 'repo_access_denied',
-        reason_message: `Failed to push branch: ${err instanceof Error ? err.message : String(err)}`,
-        remediation: 'Ensure GITHUB_TOKEN has push access to the repository',
-      },
+      reason: buildReason('repo_access_denied', `Invalid repository format: ${input.githubRepo}`),
+      candidateDiff: boundDiff(diff),
+      evidence: fixResult.evidence,
+      narrative,
     };
   }
+
+  const existingPR = await githubClient?.listOpenPullsByHead?.({ owner, repo, head: branchName });
+  if (existingPR) {
+    await input.recordDeliveryPushed?.(existingPR.headSha);
+    return {
+      status: deliveryPosture === 'draft' ? 'pr_draft' : 'pr_created',
+      pr_url: existingPR.url,
+      pr_number: existingPR.number,
+      head_sha: existingPR.headSha,
+      confidence: deliveryPosture === 'draft' ? 'medium' : fixResult.confidence,
+      reason: deliveryPosture === 'draft' ? fixResult.reason : undefined,
+      candidateDiff: deliveryPosture === 'draft' ? boundDiff(diff) : undefined,
+      evidence: fixResult.evidence,
+    };
+  }
+
+  let headSha = await githubClient?.getBranchHead?.({ owner, repo, branch: branchName }) ?? undefined;
+  await input.assertLeaseOwned?.();
+  if (!headSha) {
+    try {
+      headSha = await traceSpan('git-push', { 'git.branch': branchName }, () =>
+        gitCommitAndPush(
+          input.repoPath,
+          branchName,
+          commitMessage,
+          diff,
+        ),
+      );
+    } catch (err: unknown) {
+      return {
+        status: 'needs_human',
+        reason: {
+          reason_code: 'repo_access_denied',
+          reason_message: `Failed to push branch: ${err instanceof Error ? err.message : String(err)}`,
+          remediation: 'Ensure GITHUB_TOKEN has push access to the repository',
+        },
+        candidateDiff: boundDiff(diff),
+        evidence: fixResult.evidence,
+      };
+    }
+  }
+  await input.recordDeliveryPushed?.(headSha);
 
   // Stage 3: Create PR
   await input.assertLeaseOwned?.();
@@ -150,6 +301,8 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       diff,
       title: input.title,
       confidence: fixResult.confidence!,
+      narrative,
+      incidentUrl,
       rootCause: fixResult.rootCause,
       humanSummary: fixResult.humanSummary,
       stackTrace: input.stackTrace,
@@ -158,17 +311,29 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       errorType: input.errorType,
       errorMessage: input.errorMessage,
       kind: input.kind,
-    }, input.githubToken ? () => createGitHubClient(input.githubToken) : undefined),
+      evidence: fixResult.evidence ?? null,
+      draft: deliveryPosture === 'draft',
+    }, () => githubClient),
   );
 
   if (prResult.status === 'failed') {
-    return { status: 'needs_human', reason: prResult.reason };
+    return {
+      status: 'needs_human',
+      reason: prResult.reason,
+      candidateDiff: boundDiff(diff),
+      evidence: fixResult.evidence,
+    };
   }
 
   return {
-    status: 'pr_created',
+    status: deliveryPosture === 'draft' ? 'pr_draft' : 'pr_created',
     pr_url: prResult.prUrl,
     pr_number: prResult.prNumber,
-    confidence: fixResult.confidence,
+    head_sha: headSha,
+    confidence: deliveryPosture === 'draft' ? 'medium' : fixResult.confidence,
+    reason: deliveryPosture === 'draft' ? fixResult.reason : undefined,
+    candidateDiff: deliveryPosture === 'draft' ? boundDiff(diff) : undefined,
+    evidence: fixResult.evidence,
+    narrative,
   };
 }

@@ -79,27 +79,44 @@ describe('deterministic reliability tracer', () => {
       },
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'pr_created',
       pr_url: 'https://github.test/e2e/reliability/pull/42',
       pr_number: 42,
       confidence: 'high',
+      evidence: {
+        version: 1,
+        tier: 'E1',
+        checks: expect.arrayContaining([
+          expect.objectContaining({ name: 'suite_baseline', outcome: 'failed' }),
+          expect.objectContaining({ name: 'suite_post_patch', outcome: 'passed' }),
+          expect.objectContaining({ name: 'build', outcome: 'skipped_no_runner' }),
+        ]),
+      },
     });
     expect(anthropicJournal).toHaveLength(5);
     expect(anthropicJournal.every((entry) => entry.path === '/v1/messages')).toBe(true);
     expect(anthropicJournal.every((entry) => entry.authorization === 'test-anthropic-key')).toBe(true);
     expect(toolNames(anthropicJournal[0]!.body)).toContain('edit');
     expect(toolNames(anthropicJournal[3]!.body)).toEqual(['score_diff']);
-    expect(anthropicJournal[4]!.body['max_tokens']).toBe(220);
+    expect(toolNames(anthropicJournal[4]!.body)).toEqual(['submit_fix_narrative']);
+    expect(anthropicJournal[4]!.body['max_tokens']).toBe(512);
 
-    expect(githubJournal).toHaveLength(1);
-    expect(githubJournal[0]).toMatchObject({
+    expect(githubJournal).toHaveLength(4);
+    expect(githubJournal[0]?.path).toContain('/pulls?');
+    expect(githubJournal[1]?.path).toContain('/git/ref/heads%2F');
+    expect(githubJournal[2]?.path).toContain('/pulls?');
+    expect(githubJournal[3]).toMatchObject({
       path: '/repos/e2e/reliability/pulls',
       authorization: 'token test-github-token',
       body: {
-        head: expect.stringMatching(/^opslane\/fix-error-gr-/),
+        head: 'opslane/fix-error-gr',
         base: 'main',
       },
+    });
+    expect(githubJournal[3]?.body).toMatchObject({
+      title: '🛡️ Guard missing values in value',
+      body: expect.stringContaining('### What happened\n\nRendering a record with missing data crashed the page.'),
     });
 
     const refs = await execFile('git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads/opslane/'], {
@@ -108,6 +125,19 @@ describe('deterministic reliability tracer', () => {
     });
     const pushedBranches = refs.stdout.trim().split('\n').filter(Boolean);
     expect(pushedBranches).toHaveLength(1);
+    const pushedCommit = await execFile(
+      'git',
+      ['log', '-1', '--pretty=%B', pushedBranches[0]!],
+      { cwd: remote, env: GIT_ENV },
+    );
+    expect(pushedCommit.stdout.trim()).toContain([
+      'Guard missing values in value',
+      '',
+      'Rendering a record with missing data crashed the page.',
+    ].join('\n'));
+    expect(pushedCommit.stdout).toContain(
+      'Verified: no new test failures compared with the pre-fix baseline.',
+    );
     const pushedSource = await execFile('git', ['show', `${pushedBranches[0]}:src/value.js`], {
       cwd: remote,
       env: GIT_ENV,

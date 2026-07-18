@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { NeedsHumanReason, ConfidenceLevel } from '@opslane/shared';
 import type { PipelineInput } from '../pipeline.js';
 import { updateGroupStatus } from '../db.js';
+import type { FixNarrative } from '../narrative.js';
 
 // === Mock agent-fix, repo-clone, pr modules ===
 
@@ -21,15 +22,22 @@ vi.mock('../pr.js', () => ({
 
 const { runAgentFix } = await import('../agent-fix.js');
 const { gitCommitAndPush, validateDiffPaths } = await import('../repo-clone.js');
-const { createPR } = await import('../pr.js');
+const { createPR, createGitHubClient } = await import('../pr.js');
 const { runPipeline } = await import('../pipeline.js');
 
 const mockRunAgentFix = vi.mocked(runAgentFix);
 const mockGitCommitAndPush = vi.mocked(gitCommitAndPush);
 const mockValidateDiffPaths = vi.mocked(validateDiffPaths);
 const mockCreatePR = vi.mocked(createPR);
+const mockCreateGitHubClient = vi.mocked(createGitHubClient);
 
 const VALID_DIFF = '--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-old\n+new\n';
+const FIX_NARRATIVE: FixNarrative = {
+  subject: 'Guard null values in f',
+  whatHappened: 'Opening the page with missing data crashed the view.',
+  whyItBroke: 'The view read a nullable value without checking it.',
+  fixApproach: 'Guard the value before using it so the page remains available.',
+};
 
 /** Helper to build a valid PipelineInput with all required fields. */
 function makePipelineInput(overrides?: Partial<PipelineInput>): PipelineInput {
@@ -144,6 +152,8 @@ describe('runPipeline', () => {
     vi.clearAllMocks();
     // Default: path validation passes
     mockValidateDiffPaths.mockReturnValue({ valid: true });
+    mockCreateGitHubClient.mockReturnValue(null);
+    mockGitCommitAndPush.mockResolvedValue('head-sha');
   });
 
   it('happy path: agent fix succeeds → git push succeeds → PR created', async () => {
@@ -153,17 +163,29 @@ describe('runPipeline', () => {
       diff: VALID_DIFF,
       confidence: 'high' as ConfidenceLevel,
       rootCause: 'Null reference in main()',
-      humanSummary: 'The user opened the page. The app crashed on render. The fix guards the null value.',
+      narrative: FIX_NARRATIVE,
       affectedFiles: ['f.ts'],
+      evidence: {
+        version: 1,
+        tier: 'E1',
+        checks: [
+          { name: 'suite_baseline', outcome: 'passed', command: 'pnpm test', output_tail: '' },
+          { name: 'suite_post_patch', outcome: 'passed', command: 'pnpm test', output_tail: '' },
+          { name: 'build', outcome: 'passed', command: 'pnpm build', output_tail: '' },
+        ],
+      },
     });
-    mockGitCommitAndPush.mockResolvedValueOnce(undefined);
     mockCreatePR.mockResolvedValueOnce({
       status: 'created',
       prUrl: 'https://github.com/org/repo/pull/99',
       prNumber: 99,
     });
 
+    const previousDashboardUrl = process.env['DASHBOARD_URL'];
+    process.env['DASHBOARD_URL'] = 'https://app.opslane.com';
     const result = await runPipeline(makePipelineInput({ assertLeaseOwned }));
+    if (previousDashboardUrl === undefined) delete process.env['DASHBOARD_URL'];
+    else process.env['DASHBOARD_URL'] = previousDashboardUrl;
 
     expect(result.status).toBe('pr_created');
     expect(result.pr_url).toBe('https://github.com/org/repo/pull/99');
@@ -176,12 +198,39 @@ describe('runPipeline', () => {
     expect(mockGitCommitAndPush).toHaveBeenCalledTimes(1);
     expect(mockCreatePR).toHaveBeenCalledTimes(1);
     expect(assertLeaseOwned).toHaveBeenCalledTimes(2);
-    expect(mockCreatePR).toHaveBeenCalledWith(
-      expect.objectContaining({
-        humanSummary: 'The user opened the page. The app crashed on render. The fix guards the null value.',
-      }),
-      undefined,
-    );
+    const commitMessage = mockGitCommitAndPush.mock.calls[0]?.[2];
+    expect(commitMessage).toContain('Guard null values in f\n\n');
+    expect(commitMessage).toContain('Verified: no new test failures compared with the pre-fix baseline;');
+    expect(commitMessage).toContain('https://app.opslane.com/incidents/group-12345678?project_id=project-1');
+    expect(mockCreatePR).toHaveBeenCalledWith(expect.objectContaining({
+      narrative: FIX_NARRATIVE,
+      incidentUrl: 'https://app.opslane.com/incidents/group-12345678?project_id=project-1',
+    }), expect.any(Function));
+    expect(result.narrative).toEqual(FIX_NARRATIVE);
+  });
+
+  it('preserves the friction commit subject and suggestion PR contract', async () => {
+    mockRunAgentFix.mockResolvedValueOnce({
+      status: 'fix_ready',
+      diff: VALID_DIFF,
+      confidence: 'high',
+      rootCause: 'The Save button has no handler',
+      narrative: FIX_NARRATIVE,
+      affectedFiles: ['f.ts'],
+    });
+    mockCreatePR.mockResolvedValueOnce({
+      status: 'created',
+      prUrl: 'https://github.com/org/repo/pull/100',
+      prNumber: 100,
+    });
+
+    await runPipeline(makePipelineInput({ kind: 'friction', title: 'Dead Save button' }));
+
+    expect(mockGitCommitAndPush.mock.calls[0]?.[2]).toBe('fix: Dead Save button');
+    expect(mockCreatePR).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'friction',
+      narrative: undefined,
+    }), expect.any(Function));
   });
 
   it('does not push or create a PR when the authoritative lease check fails', async () => {
@@ -243,6 +292,99 @@ describe('runPipeline', () => {
     expect(result.confidence).toBe('medium');
     expect(result.reason?.reason_code).toBe('low_confidence_fix');
     expect(mockCreatePR).not.toHaveBeenCalled();
+  });
+
+  it('publishes a judge-approved build-positive candidate as an opted-in draft', async () => {
+    const reserveDelivery = vi.fn().mockResolvedValue({
+      status: 'reserved',
+      reservation: {
+        branchName: 'opslane/fix-group-12',
+        posture: 'draft',
+        candidateDiff: VALID_DIFF,
+        state: 'reserved',
+      },
+    });
+    const recordDeliveryPushed = vi.fn().mockResolvedValue(undefined);
+    mockRunAgentFix.mockResolvedValueOnce({
+      status: 'needs_human',
+      diff: VALID_DIFF,
+      confidence: 'medium',
+      draftEligible: true,
+      reason: {
+        reason_code: 'low_confidence_fix',
+        reason_message: 'No test runner was available',
+        remediation: 'Review CI before using the draft',
+      },
+      evidence: {
+        version: 1,
+        tier: 'E0',
+        checks: [
+          { name: 'build', outcome: 'passed', command: 'pnpm build', output_tail: '' },
+          { name: 'suite_post_patch', outcome: 'skipped_no_runner', command: '', output_tail: '' },
+        ],
+      },
+    });
+    mockGitCommitAndPush.mockResolvedValueOnce('draft-head-sha');
+    mockCreatePR.mockResolvedValueOnce({
+      status: 'created',
+      prUrl: 'https://github.com/org/repo/pull/100',
+      prNumber: 100,
+    });
+
+    const result = await runPipeline(makePipelineInput({
+      prPosture: 'draft_when_unverified',
+      reserveDelivery,
+      recordDeliveryPushed,
+    }));
+
+    expect(result).toMatchObject({
+      status: 'pr_draft',
+      pr_number: 100,
+      head_sha: 'draft-head-sha',
+      confidence: 'medium',
+    });
+    expect(reserveDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      operationKey: 'fix:group-12345678',
+      branchName: 'opslane/fix-group-12',
+      posture: 'draft',
+    }));
+    expect(recordDeliveryPushed).toHaveBeenCalledWith('draft-head-sha');
+    expect(mockCreatePR).toHaveBeenCalledWith(
+      expect.objectContaining({ draft: true, branchName: 'opslane/fix-group-12' }),
+      expect.any(Function),
+    );
+  });
+
+  it('keeps the same candidate in needs_human under verified-only policy', async () => {
+    mockRunAgentFix.mockResolvedValueOnce({
+      status: 'needs_human',
+      diff: VALID_DIFF,
+      confidence: 'medium',
+      draftEligible: true,
+      reason: {
+        reason_code: 'low_confidence_fix',
+        reason_message: 'No runner',
+        remediation: 'Review manually',
+      },
+    });
+    const result = await runPipeline(makePipelineInput({ prPosture: 'verified_only' }));
+    expect(result.status).toBe('needs_human');
+    expect(mockGitCommitAndPush).not.toHaveBeenCalled();
+    expect(mockCreatePR).not.toHaveBeenCalled();
+  });
+
+  it('returns draft_cap_reached without provider writes', async () => {
+    mockRunAgentFix.mockResolvedValueOnce({
+      status: 'needs_human', diff: VALID_DIFF, confidence: 'medium', draftEligible: true,
+      reason: { reason_code: 'low_confidence_fix', reason_message: 'No runner', remediation: 'Review' },
+    });
+    const result = await runPipeline(makePipelineInput({
+      prPosture: 'draft_when_unverified',
+      reserveDelivery: vi.fn().mockResolvedValue({ status: 'cap_reached' }),
+    }));
+    expect(result.status).toBe('needs_human');
+    expect(result.reason?.reason_code).toBe('draft_cap_reached');
+    expect(mockGitCommitAndPush).not.toHaveBeenCalled();
   });
 
   it('GUARD: a fix_ready result with non-high confidence never opens a PR', async () => {
@@ -314,7 +456,7 @@ describe('runPipeline', () => {
       rootCause: 'Bug in main()',
       affectedFiles: ['f.ts'],
     });
-    mockGitCommitAndPush.mockResolvedValueOnce(undefined);
+    mockGitCommitAndPush.mockResolvedValueOnce('head-sha');
     mockCreatePR.mockResolvedValueOnce({
       status: 'failed',
       reason: {
