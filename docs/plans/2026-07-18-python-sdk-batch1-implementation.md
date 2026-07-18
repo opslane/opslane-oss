@@ -266,18 +266,41 @@ func TestIsExceptionGroupTraceback(t *testing.T) {
 	}
 }
 
-func TestPythonFrames_CapsAtFive(t *testing.T) {
+func TestPythonFrames_CapsAtFiveNewestFirst(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("Traceback (most recent call last):\n")
 	for _, f := range []string{"a", "b", "c", "d", "e", "f", "g"} {
 		b.WriteString("  File \"/app/" + f + ".py\", line 1, in fn_" + f + "\n    x()\n")
 	}
 	b.WriteString("ValueError: x")
-	if got := pythonFrames(b.String()); len(got) != 5 {
-		t.Fatalf("expected 5 frames, got %d: %v", len(got), got)
+	// Not just length: the five NEWEST frames (bottom of traceback), reversed.
+	want := []string{"g.py:fn_g", "f.py:fn_f", "e.py:fn_e", "d.py:fn_d", "c.py:fn_c"}
+	if got := pythonFrames(b.String()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestPythonFrames_NestedDeploymentPrefixes(t *testing.T) {
+	// /usr/src/app/x.py must normalize the same as /app/x.py — prefixes are
+	// stripped iteratively, not once.
+	a := pythonFrames("Traceback (most recent call last):\n  File \"/usr/src/app/x.py\", line 1, in fn\n    x()\nValueError: x")
+	b := pythonFrames("Traceback (most recent call last):\n  File \"/app/x.py\", line 1, in fn\n    x()\nValueError: x")
+	if !reflect.DeepEqual(a, b) {
+		t.Fatalf("nested prefix mismatch: %v vs %v", a, b)
+	}
+}
+
+func TestPythonFrames_ChainMarkerInMessageIgnored(t *testing.T) {
+	// A marker phrase inside an exception MESSAGE (not on its own line
+	// between tracebacks) must not segment the traceback.
+	stack := "Traceback (most recent call last):\n  File \"/app/x.py\", line 1, in fn\n    x()\nValueError: saw 'During handling of the above exception, another exception occurred:' in logs"
+	if got := pythonFrames(stack); len(got) != 1 {
+		t.Fatalf("message containing marker text segmented the traceback: %v", got)
 	}
 }
 ```
+
+The new tests use `strings` and `reflect`; `fingerprint_test.go` currently imports only `testing` — extend imports in whichever file these land.
 
 **Step 2: Run to verify failure**
 
@@ -308,14 +331,19 @@ var (
 	// `  File "/app/x.py", line 42, in get_user`
 	rePyFrame = regexp.MustCompile(`(?m)^\s*File "([^"]+)", line \d+, in (.+)$`)
 	// Deployment roots stripped from frame identity. Shared by contract with
-	// the worker's stack-trace mapping (Batch 3).
-	rePyDeployPrefix = regexp.MustCompile(`^/(?:app|srv|opt|usr/src)/|^/home/[^/]+/`)
+	// the worker's stack-trace mapping (Batch 3). Leading slash optional so
+	// iterative stripping reduces /usr/src/app/x.py and /app/x.py to the
+	// same identity.
+	rePyDeployPrefix = regexp.MustCompile(`^/?(?:app|srv|opt|usr/src)/|^/?home/[^/]+/`)
 	rePyLibPath      = regexp.MustCompile(`(?:site-packages|dist-packages)/|/venv/|\.tox/|lib/python\d+(?:\.\d+)?/`)
 )
 
+// Markers are matched as standalone lines ("\n"+marker+"\n"), never as
+// substrings — an exception MESSAGE quoting the phrase must not segment
+// the traceback.
 var pyChainMarkers = []string{
-	"During handling of the above exception, another exception occurred:",
-	"The above exception was the direct cause of the following exception:",
+	"\nDuring handling of the above exception, another exception occurred:\n",
+	"\nThe above exception was the direct cause of the following exception:\n",
 }
 
 func isPythonTraceback(stack string) bool {
@@ -350,7 +378,17 @@ func pythonFrames(stack string) []string {
 		if rePyLibPath.MatchString(file) {
 			continue
 		}
-		id := rePyDeployPrefix.ReplaceAllString(file, "") + ":" + strings.TrimSpace(fn)
+		// Strip deployment roots ITERATIVELY: /usr/src/app/x.py needs two
+		// passes to match /app/x.py's single pass.
+		rel := file
+		for {
+			next := rePyDeployPrefix.ReplaceAllString(rel, "")
+			if next == rel {
+				break
+			}
+			rel = next
+		}
+		id := rel + ":" + strings.TrimSpace(fn)
 		if seen[id] { // RecursionError and mutual-recursion dedup
 			continue
 		}
@@ -425,6 +463,8 @@ func TestFingerprint_PythonMalformedFallsBackToRawString(t *testing.T) {
 	}
 }
 ```
+
+These tests use `strings.ReplaceAll`; `fingerprint_test.go` imports only `testing` today — add `strings` to its imports.
 
 **Step 2: Run to verify failure**
 
@@ -525,7 +565,7 @@ func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
 }
 ```
 
-Write them fully against the file's existing helpers (`postEvent`, DB assertions — mirror neighboring tests' style). Run: expected FAIL (platform column never written; no platform parsing).
+Write them fully mirroring the file's existing helper/setup style (read `error_event_test.go` first — use whatever request-posting and DB-assertion helpers actually exist there; don't invent names). **These are DB-backed tests: `testDeps` silently `t.Skip`s without `DATABASE_URL`**, so every verification run below must export it against a migrated database — a skipped test is not a passing test. Run: expected FAIL (platform column never written; no platform parsing).
 
 **Step 2: Parse the new fields in `error_event.go`**
 
@@ -536,10 +576,13 @@ Platform string          `json:"platform"`
 Runtime  json.RawMessage `json:"runtime"`
 ```
 
-After unmarshal, default the platform (before fingerprinting):
+After unmarshal, normalize the platform (before fingerprinting). Absent → `javascript`; a well-formed unknown token (future SDK) is stored as-is per append-only tolerance; garbage is clamped:
 
 ```go
-if payload.Platform == "" {
+// rePlatformToken at package level:
+var rePlatformToken = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+
+if payload.Platform == "" || !rePlatformToken.MatchString(payload.Platform) {
 	payload.Platform = "javascript"
 }
 ```
@@ -550,15 +593,27 @@ Fingerprint call becomes:
 fingerprint := grouping.Fingerprint(payload.Platform, payload.Error.Type, payload.Error.Message, payload.Error.Stack)
 ```
 
-Fold `runtime` into the context JSONB (design: runtime is stored inside the event's context), after the redaction block so it can't be redacted away:
+Fold `runtime` into the context JSONB (design: runtime is stored inside the event's context). Two review-driven constraints: validate the shape (never persist arbitrary client JSON), and merge **before** the redaction block so RedactContext sees the merged object. `"context": null` unmarshals into a **nil map** without error — assigning into it panics, so guard:
 
 ```go
+// BEFORE the masking.RedactContext call:
 if len(payload.Runtime) > 0 {
-	var ctxMap map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(ctx), &ctxMap); err == nil {
-		ctxMap["runtime"] = payload.Runtime
-		if merged, err := json.Marshal(ctxMap); err == nil {
-			ctx = string(merged)
+	var rt struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(payload.Runtime, &rt); err == nil && rt.Name != "" && rt.Version != "" {
+		var ctxMap map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(ctx), &ctxMap); err == nil {
+			if ctxMap == nil { // "null" decodes to a nil map — writable it is not
+				ctxMap = map[string]json.RawMessage{}
+			}
+			if clean, err := json.Marshal(rt); err == nil {
+				ctxMap["runtime"] = clean
+				if merged, err := json.Marshal(ctxMap); err == nil {
+					ctx = string(merged)
+				}
+			}
 		}
 	}
 }
@@ -568,28 +623,49 @@ Pass `Platform: payload.Platform` in the `IngestParams` literal.
 
 **Step 3: Store it in `queries.go`**
 
-- Add `Platform string` to `IngestParams` (with a comment: `"javascript" | "python"; handler defaults it`).
-- Event insert gains the column:
-  ```sql
-  INSERT INTO error_events (project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, breadcrumbs, context, release, session_id, platform)
-  VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)
+- Add `Platform string` to `IngestParams` (comment: `"javascript" | "python" | future tokens; empty is defaulted here`).
+- **Default inside `InsertErrorEventAndGroup`**, next to the existing Breadcrumbs/Context defaulting — ~20 other `IngestParams` construction sites (tests, webhook paths) omit `Platform`, and an explicit `""` INSERT would bypass the column's SQL default:
+  ```go
+  if p.Platform == "" {
+  	p.Platform = "javascript"
+  }
   ```
-- Group upsert gains it (never flip an existing group's platform):
-  ```sql
-  INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id, platform)
-  VALUES ($1, $2, $3, $4, $4, 1, $5, $6)
-  ON CONFLICT (project_id, fingerprint) DO UPDATE
-    SET ...,
-        platform = COALESCE(error_groups.platform, EXCLUDED.platform)
+- Event insert gains the column AND the argument (the placeholder is useless without the matching arg in the `QueryRow` call):
+  ```go
+  err = tx.QueryRow(ctx,
+  	`INSERT INTO error_events (project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, breadcrumbs, context, release, session_id, platform)
+  	 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)
+  	 RETURNING id`,
+  	p.ProjectID, p.EnvironmentID, eventTime, p.ErrorType, p.ErrorMessage, p.StackTraceRaw, p.Breadcrumbs, p.Context, nilIfEmpty(p.Release), nilIfEmpty(p.SessionID), p.Platform,
+  ).Scan(&eventID)
+  ```
+- Group upsert gains column + argument (never flip an existing group's platform):
+  ```go
+  err = tx.QueryRow(ctx,
+  	`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id, platform)
+  	 VALUES ($1, $2, $3, $4, $4, 1, $5, $6)
+  	 ON CONFLICT (project_id, fingerprint) DO UPDATE
+  	   SET first_seen = LEAST(error_groups.first_seen, $4),
+  	       last_seen = GREATEST(error_groups.last_seen, $4),
+  	       occurrence_count = error_groups.occurrence_count + 1,
+  	       sample_event_id = $5,
+  	       platform = COALESCE(error_groups.platform, EXCLUDED.platform),
+  	       updated_at = now()
+  	 RETURNING id, (xmax = 0) AS is_new`,
+  	p.ProjectID, p.Fingerprint, p.Title, eventTime, eventID, p.Platform,
+  ).Scan(&groupID, &isNew)
   ```
 
-**Step 4: Run the suite**
+**Step 4: Run the suite — with a real database, or the handler/db tests skip vacuously**
 
 ```bash
+docker run -d --name b1-test-db -e POSTGRES_USER=opslane -e POSTGRES_PASSWORD=x -e POSTGRES_DB=opslane -p 5499:5432 postgres:16 && sleep 3
+export DATABASE_URL=postgres://opslane:x@localhost:5499/opslane
+MIGRATION_DIR=db/migrations ../../scripts/run-migrations.sh   # from packages/ingestion
 cd packages/ingestion && go build ./... && go test ./handler ./db ./grouping -v 2>&1 | tail -30
 ```
 
-Expected: new tests PASS; `wire_compat_test.go` still green (old fixtures default to javascript).
+Expected: new tests PASS (verify they RAN — grep the output for the test names, not just `ok`); `wire_compat_test.go` still green (old fixtures default to javascript). Keep `b1-test-db` running for Task 13; remove it after.
 
 **Step 5: Commit**
 
@@ -764,6 +840,13 @@ Run → FAIL.
 Safe for threaded Flask (each request thread gets isolated state) and async
 views. Adapters call push_scope() at request start and reset_scope() at
 teardown; the token-based reset cleans up even when the handler raised.
+
+Known v1 limitations (documented, accepted for sync-Flask scope): a COPIED
+context (contextvars.copy_context) shares the mutable BreadcrumbBuffer with
+its origin, so sibling async tasks spawned from one request see each other's
+breadcrumbs; and the foreign-context fallback in reset_scope clears the
+executing context, not the originating one. Both are inert under the
+supported deployment model (one request per thread/context).
 """
 import contextvars
 from typing import Any, Optional
@@ -1144,11 +1227,14 @@ def test_send_success_drains_queue():
 
 
 def test_queue_cap_drops_oldest():
-    t = make_transport(lambda p: None, queue_size=3)
+    sent = []
+    t = make_transport(lambda p: sent.append(p), queue_size=3)
     for i in range(5):
         t.enqueue({"n": i})
-    t._drain()
-    # oldest (0, 1) dropped
+    for _ in range(3):
+        t._drain()
+    # Not just emptiness: the SURVIVORS are the newest three; 0 and 1 dropped.
+    assert [p["n"] for p in sent] == [2, 3, 4]
     assert t.queue_size() == 0
 
 
@@ -1251,6 +1337,20 @@ def test_flush_returns_true_on_empty_and_false_on_stuck():
     assert t2.flush(timeout=0.3) is False
 
 
+def test_flush_does_not_defeat_retry_after():
+    # A flush that clears backoff would burn all attempts in milliseconds,
+    # drop the event, and report a "successful" drain. Backoff is honored.
+    def failing(p):
+        raise RetryableSendError(status=429, retry_after=30.0)
+
+    t = make_transport(failing)
+    t.enqueue({"n": 1})
+    t._drain()
+    before = t._backoff_until
+    assert t.flush(timeout=0.2) is False
+    assert t._backoff_until == before
+
+
 def test_enqueue_never_raises():
     def exploding(p):
         raise RuntimeError("unexpected")
@@ -1261,14 +1361,13 @@ def test_enqueue_never_raises():
     assert t.queue_size() == 0
 
 
-def test_fork_detection_restarts_thread():
+def test_fork_reset_reinitializes_state():
     t = make_transport(lambda p: None)
-    t._thread_enabled = True
     t.enqueue({"n": 1})
-    assert t._pid is not None
-    t._pid = t._pid + 1                    # simulate: we are a forked child
-    t.enqueue({"n": 2})                    # must not raise; thread restarted
-    assert t._pid is not None
+    t._reset_after_fork()          # what os.register_at_fork runs in the child
+    assert t.queue_size() == 0     # inherited events belong to the parent
+    t.enqueue({"n": 2})            # child transport works immediately, fresh locks
+    assert t.queue_size() == 1
 ```
 
 Run → FAIL.
@@ -1296,6 +1395,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from collections import deque
 
 logger = logging.getLogger("opslane")
@@ -1350,33 +1450,61 @@ class Transport:
         self._send_fn = self._http_send
         self._thread_enabled = True  # tests set False and drive _drain() directly
 
+        # Fork safety: PID checks alone are insufficient — inherited locks may
+        # have been HELD by parent threads that don't exist in the child, so
+        # first touch would deadlock. register_at_fork rebuilds all sync
+        # primitives in the child before anything uses them. weakref so a
+        # replaced transport can be collected. POSIX-only (fork is too).
+        if hasattr(os, "register_at_fork"):
+            self_ref = weakref.ref(self)
+
+            def _after_fork_in_child():
+                t = self_ref()
+                if t is not None:
+                    t._reset_after_fork()
+
+            os.register_at_fork(after_in_child=_after_fork_in_child)
+
     # -- public ----------------------------------------------------------
 
     def enqueue(self, payload):
-        """Queue an event for delivery. Never raises, never blocks."""
+        """Queue an event for delivery. Never raises, never blocks.
+
+        Order matters: the thread/fork check runs BEFORE the put, so the
+        event lands in the queue that will actually be drained (a put into
+        an inherited pre-fork queue would be silently lost on replacement).
+        """
         try:
-            if not self._check_rate_limit():
+            self._ensure_thread()
+            if not self._rate_limit_exceeded():
                 logger.warning("opslane: client-side rate limit hit; event dropped")
                 return
             self._put_dropping_oldest([payload, 0])
-            self._ensure_thread()
+            self._record_admission()
             self._wake.set()
         except Exception:
             logger.warning("opslane: enqueue failed; event dropped", exc_info=True)
 
     def flush(self, timeout=5.0):
-        """Drain the queue. Returns True if fully drained in time. Never raises."""
+        """Drain the queue. Returns True if fully drained in time. Never raises.
+
+        Honors active backoff — flush must NOT reset pacing (that would defeat
+        Retry-After, burn the attempt budget in milliseconds, drop the event,
+        and then report a "successful" drain). Under backoff longer than the
+        timeout this correctly returns False: best-effort, honestly reported.
+        """
         try:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                if self._queue.empty() and not self._in_flight:
-                    return True
-                if self._thread_enabled and (self._thread is None or not self._thread.is_alive()):
-                    return self._queue.empty() and not self._in_flight
-                self._backoff_until = 0.0  # flush overrides pacing
+                with self._lock:
+                    if self._queue.empty() and not self._in_flight:
+                        return True
+                if self._thread_enabled and not self._queue.empty():
+                    self._ensure_thread()
                 self._wake.set()
                 time.sleep(0.05)
-            return self._queue.empty() and not self._in_flight
+            with self._lock:
+                return self._queue.empty() and not self._in_flight
         except Exception:
             logger.warning("opslane: flush failed", exc_info=True)
             return False
@@ -1386,15 +1514,36 @@ class Transport:
 
     # -- internals -------------------------------------------------------
 
-    def _check_rate_limit(self):
+    def _reset_after_fork(self):
+        """Rebuild every synchronization primitive in the forked child.
+
+        Inherited queue contents belong to the parent (it still owns them);
+        inherited locks may be held by threads that no longer exist here.
+        """
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._queue = queue.Queue(maxsize=self._queue_size)
+        self._sent_stamps = deque()
+        self._thread = None
+        self._pid = None
+        self._in_flight = False
+        self._backoff_until = 0.0
+        logger.debug("opslane: fork detected; transport state reinitialized")
+
+    def _rate_limit_exceeded(self):
+        # Admission-time accounting: the stamp is recorded only after the put
+        # succeeds (_record_admission), so rejected events don't consume
+        # budget. Known approximation, accepted: an admitted event later
+        # displaced by queue overflow is not refunded.
         now = time.monotonic()
         with self._lock:
             while self._sent_stamps and now - self._sent_stamps[0] > 60.0:
                 self._sent_stamps.popleft()
-            if len(self._sent_stamps) >= self._max_per_minute:
-                return False
-            self._sent_stamps.append(now)
-            return True
+            return len(self._sent_stamps) < self._max_per_minute
+
+    def _record_admission(self):
+        with self._lock:
+            self._sent_stamps.append(time.monotonic())
 
     def _put_dropping_oldest(self, item):
         try:
@@ -1418,11 +1567,6 @@ class Transport:
             pid = os.getpid()
             if self._thread is not None and self._thread.is_alive() and self._pid == pid:
                 return
-            if self._pid is not None and self._pid != pid:
-                # Forked child: the inherited thread is dead and inherited
-                # queue contents belong to the parent. Start clean.
-                self._queue = queue.Queue(maxsize=self._queue_size)
-                logger.debug("opslane: fork detected; transport restarted")
             self._pid = pid
             self._thread = threading.Thread(
                 target=self._run, name="opslane-transport", daemon=True
@@ -1442,12 +1586,15 @@ class Transport:
         for _ in range(BATCH_SIZE):
             if time.monotonic() < self._backoff_until:
                 return
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                return
+            # Dequeue and mark in-flight under ONE lock so flush() can never
+            # observe the empty-queue/not-in-flight gap mid-send.
+            with self._lock:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    return
+                self._in_flight = True
             payload, attempts = item
-            self._in_flight = True
             try:
                 self._send_fn(payload)
             except RetryableSendError as e:
@@ -1469,7 +1616,8 @@ class Transport:
             except Exception:
                 logger.warning("opslane: unexpected send error; event dropped", exc_info=True)
             finally:
-                self._in_flight = False
+                with self._lock:
+                    self._in_flight = False
 
     def _http_send(self, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -1515,6 +1663,7 @@ git commit -m "feat(sdk-python): background transport with full retry contract (
 **Files:**
 - Create: `packages/sdk-python/tests/test_public_api.py`
 - Modify: `packages/sdk-python/opslane/__init__.py`
+- Modify: `packages/sdk-python/pyproject.toml` — bump `version = "0.1.0a2"` **in the same commit** as `__version__`; `test_version_matches_distribution_metadata` fails on any mismatch (then `pip install -e '.[dev]'` again to refresh metadata)
 - Modify: `packages/sdk-python/tests/test_package.py`
 
 **Step 1: Failing tests** — `tests/test_public_api.py`:
@@ -1529,11 +1678,13 @@ from opslane import _state
 class StubTransport:
     def __init__(self):
         self.sent = []
+        self.flushed = False
 
     def enqueue(self, payload):
         self.sent.append(payload)
 
     def flush(self, timeout=5.0):
+        self.flushed = True
         return True
 
 
@@ -1578,12 +1729,13 @@ def test_set_and_clear_user_flow():
     assert "user" not in transport.sent[-1]["context"]
 
 
-def test_reinit_warns_and_replaces(caplog):
-    _init_with_stub()
+def test_reinit_warns_flushes_old_client_and_replaces(caplog):
+    transport = _init_with_stub()
     first = _state.client
     with caplog.at_level(logging.WARNING, logger="opslane"):
         opslane.init(api_key="k2", endpoint="https://y.example")
     assert _state.client is not first
+    assert transport.flushed    # old queue drained, not silently abandoned
     assert any("already initialized" in r.message for r in caplog.records)
 
 
@@ -1633,11 +1785,17 @@ _state = _State()
 
 def init(api_key, endpoint, release=None, **options):
     """Configure the SDK. Call once, post-fork (in the app factory under
-    Gunicorn). Calling again replaces the client and logs a warning."""
+    Gunicorn). Calling again drains the old client, then replaces it.
+
+    Known limitation (documented, accepted): atexit runs LIFO, so callbacks
+    registered BEFORE opslane.init() run after our flush — events they
+    capture are lost. Register opslane early.
+    """
     from opslane.client import Client
 
     with _state.lock:
-        if _state.client is not None:
+        old = _state.client
+        if old is not None:
             logger.warning("opslane: already initialized; replacing client")
         _state.client = Client(
             api_key=api_key, endpoint=endpoint, release=release, **options
@@ -1645,6 +1803,10 @@ def init(api_key, endpoint, release=None, **options):
         if not _state.atexit_registered:
             atexit.register(flush)
             _state.atexit_registered = True
+    if old is not None:
+        # Best-effort drain OUTSIDE the lock — the old queue and its daemon
+        # thread would otherwise be silently abandoned with events aboard.
+        old.transport.flush(timeout=2.0)
 
 
 def set_user(user):
@@ -1741,6 +1903,10 @@ def app_and_transport():
     def recover(e):
         return {"recovered": True}, 200
 
+    @app.errorhandler(500)
+    def custom_500(e):
+        return {"custom_500": True}, 500
+
     @app.get("/gone")
     def gone():
         abort(404)
@@ -1787,6 +1953,15 @@ def test_errorhandler_recovered_not_captured(app_and_transport):
     resp = app.test_client().get("/handled")
     assert resp.status_code == 200
     assert transport.sent == []             # design: recovered => not captured
+
+
+def test_custom_500_handler_still_captured(app_and_transport):
+    # The signal fires before a 500 handler renders: the exception WAS
+    # unhandled; the handler only shapes the response. Capture is correct.
+    app, transport = app_and_transport
+    resp = app.test_client().get("/boom")
+    assert resp.get_json() == {"custom_500": True}
+    assert len(transport.sent) == 1
 
 
 def test_http_exception_not_captured(app_and_transport):
@@ -1837,9 +2012,18 @@ Capture contract (design doc §3): only genuinely unhandled exceptions —
 Flask emits got_request_exception solely from handle_exception, which runs
 only when no user error handler recovered the exception. Recovered
 exceptions and HTTPExceptions are the app's business; use
-opslane.capture_exception() to record them. The event snapshot is fully
-serialized at signal time, before response finalization, so there is no
-response breadcrumb (a request-scoped buffer could never carry one anyway).
+opslane.capture_exception() to record them. Nuance: a registered
+@app.errorhandler(500) / InternalServerError handler runs AFTER the signal,
+so those exceptions are (correctly) still captured — the error was
+unhandled; the 500 handler only renders the response. The event snapshot is
+fully serialized at signal time, before response finalization, so there is
+no response breadcrumb (a request-scoped buffer could never carry one
+anyway).
+
+Log breadcrumbs: the handler is attached to app.logger and sees only records
+that logger EMITS — if the app configures app.logger above WARNING, no log
+breadcrumbs are captured. That is the app's logging policy; the SDK does not
+override logger levels.
 """
 import logging
 from datetime import datetime, timezone
@@ -1896,13 +2080,17 @@ class OpslaneFlask:
         app.logger.addHandler(self._log_handler)
 
     def _before_request(self):
+        if getattr(g, _TOKENS_KEY, None) is not None:
+            return  # scope already pushed for this request context
         meta = {
             "method": request.method,
             "path": request.path,
             "headers": dict(request.headers),
             "remote_addr": request.remote_addr,
         }
-        g.setdefault(_TOKENS_KEY, _context.push_scope(meta))
+        # NOT g.setdefault(key, push_scope(...)): setdefault evaluates its
+        # default eagerly, pushing a second scope and orphaning its tokens.
+        setattr(g, _TOKENS_KEY, _context.push_scope(meta))
         _context.add_breadcrumb({
             "type": "http",
             "timestamp": _now_iso(),
@@ -1941,21 +2129,24 @@ git commit -m "feat(sdk-python): Flask integration with unhandled-only capture (
 - Create: `packages/sdk-python/tests/test_gunicorn_smoke.py`
 - Modify: `docs/plans/2026-07-17-python-sdk-design.md` (timeout note)
 
-**Step 1: Write the smoke test** — spawns a real Gunicorn worker serving a tiny SDK-wrapped app, with a mock ingestion server (stdlib `http.server` on an ephemeral port) capturing POSTs:
+**Step 1: Write the smoke test** — spawns real Gunicorn workers serving a tiny SDK-wrapped app, with a mock ingestion server (stdlib `http.server` on an ephemeral port) capturing POSTs. Review-driven design points: no stderr parsing (a blocking `readline()` with no newline hangs forever, and the log format is not a contract) — the port is pre-selected and readiness is polled with request retries; teardown escalates terminate → kill; a second case runs `--preload` so `init()` happens PRE-fork and the `os.register_at_fork` recovery path is exercised for real:
 
 ```python
-"""End-to-end smoke: Gunicorn (post-fork worker) -> SDK -> mock ingestion.
+"""End-to-end smoke: Gunicorn -> SDK -> mock ingestion.
 
-Proves the lazy transport thread works in a forked worker and events arrive
-with the X-API-Key header. Skipped where gunicorn can't run (non-POSIX).
+Two cases: post-fork init (the documented pattern) and --preload (init
+before fork), which exercises the transport's at-fork state reset.
+Skipped where gunicorn can't run (non-POSIX).
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -1963,60 +2154,85 @@ import pytest
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="gunicorn is POSIX-only")
 
-received = []
+APP_TEMPLATE = """
+import opslane
+from flask import Flask
+from opslane.integrations.flask import OpslaneFlask
+
+opslane.init(api_key="smoke-key", endpoint="http://127.0.0.1:{ingest_port}")
+app = Flask(__name__)
+OpslaneFlask(app)
+
+@app.get("/boom")
+def boom():
+    raise ValueError("gunicorn smoke")
+"""
 
 
-class _Capture(BaseHTTPRequestHandler):
-    def do_POST(self):
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        received.append((self.path, dict(self.headers), json.loads(body)))
-        self.send_response(202)
-        self.end_headers()
-        self.wfile.write(b"{}")
-
-    def log_message(self, *a):
-        pass
+def _free_port():
+    # Bind-then-close; tiny reuse race is acceptable for a test.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def test_gunicorn_worker_delivers_events(tmp_path):
+def _terminate(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@pytest.fixture
+def capture_server():
+    received = []
+
+    class _Capture(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.append((self.path, dict(self.headers), json.loads(body)))
+            self.send_response(202)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
     server = HTTPServer(("127.0.0.1", 0), _Capture)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    ingest_port = server.server_address[1]
+    yield server.server_address[1], received
+    server.shutdown()
 
-    app_py = tmp_path / "smoke_app.py"
-    app_py.write_text(textwrap.dedent(f"""
-        import opslane
-        from flask import Flask
-        from opslane.integrations.flask import OpslaneFlask
 
-        opslane.init(api_key="smoke-key", endpoint="http://127.0.0.1:{ingest_port}")
-        app = Flask(__name__)
-        OpslaneFlask(app)
-
-        @app.get("/boom")
-        def boom():
-            raise ValueError("gunicorn smoke")
-    """))
-
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "gunicorn", "--workers", "1",
-         "--bind", "127.0.0.1:0", "smoke_app:app"],
-        cwd=tmp_path, stderr=subprocess.PIPE, text=True,
+@pytest.mark.parametrize("preload", [False, True], ids=["postfork", "preload"])
+def test_gunicorn_worker_delivers_events(tmp_path, capture_server, preload):
+    ingest_port, received = capture_server
+    (tmp_path / "smoke_app.py").write_text(
+        textwrap.dedent(APP_TEMPLATE.format(ingest_port=ingest_port))
     )
-    try:
-        # Parse the bound port from gunicorn's startup line.
-        port = None
-        deadline = time.time() + 15
-        while time.time() < deadline and port is None:
-            line = proc.stderr.readline()
-            if "Listening at" in line:
-                port = int(line.rsplit(":", 1)[1].split()[0])
-        assert port, "gunicorn did not start"
 
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/boom", timeout=5)
-        except urllib.error.HTTPError as e:
-            assert e.code == 500
+    port = _free_port()
+    args = [sys.executable, "-m", "gunicorn", "--workers", "1",
+            "--bind", f"127.0.0.1:{port}", "smoke_app:app"]
+    if preload:
+        args.insert(-1, "--preload")   # init() runs PRE-fork: at-fork reset path
+    proc = subprocess.Popen(args, cwd=tmp_path,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # Readiness = a request succeeds; retry until deadline, no log parsing.
+        deadline = time.time() + 20
+        status = None
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/boom", timeout=3)
+            except urllib.error.HTTPError as e:
+                status = e.code
+                break
+            except (urllib.error.URLError, ConnectionError, OSError):
+                time.sleep(0.25)
+        assert status == 500, f"gunicorn never answered /boom (last={status})"
 
         deadline = time.time() + 10
         while time.time() < deadline and not received:
@@ -2028,9 +2244,7 @@ def test_gunicorn_worker_delivers_events(tmp_path):
         assert payload["platform"] == "python"
         assert payload["error"]["type"] == "ValueError"
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
-        server.shutdown()
+        _terminate(proc)
 ```
 
 Run: `.venv/bin/pytest tests/test_gunicorn_smoke.py -v` → 1 passed (it runs in CI's linux matrix too).
@@ -2056,14 +2270,20 @@ git commit -m "test(sdk-python): gunicorn post-fork delivery smoke (#87)"
 - Create: `packages/sdk-python/tests/test_wire_shape.py`
 - Modify: `test-fixtures/wire/events/README.md` (append provenance lines — README is not a frozen fixture)
 
-**Step 1: Write the wire-shape test** (it both generates and then locks the fixtures — mirroring `packages/sdk/src/__tests__/wire-shape.test.ts`):
+**Step 1: Write the wire-shape test** (it both generates and then locks the fixtures — mirroring `packages/sdk/src/__tests__/wire-shape.test.ts`).
+
+Review-driven fixture rule: **fixtures contain only real, replayable values** — a genuine RFC3339 timestamp, a realistic frozen Python traceback, a pinned runtime version. Sentinel placeholders like `<TS>` would fail the compat test's RFC3339 parsing, and a `<STACK>` placeholder would mean the server replay never exercises the Python traceback parser (the very thing the fixture exists to lock). Volatile fields are normalized **to those same frozen constants** on the SDK side before comparison — the frozen file itself is valid wire JSON end to end.
 
 ```python
 """The SDK's real payload must match the frozen python-v* wire fixtures.
 
-Timestamps and stacks vary per run, so the comparison normalizes them; every
-other byte is contract. To regenerate after a DELIBERATE contract change
-(new SDK version = new fixture pair; never edit existing files):
+Volatile per-run fields (timestamp, traceback text, interpreter version,
+user agent) are replaced with FROZEN REALISTIC constants before comparison;
+the rest of the payload is byte-for-byte contract. The frozen files are
+valid wire payloads — the Go compat test replays them against the real
+handler, exercising the Python traceback parser.
+
+To generate for a NEW SDK version (never edit existing files):
     OPSLANE_WRITE_FIXTURES=1 .venv/bin/pytest tests/test_wire_shape.py
 """
 import json
@@ -2071,11 +2291,21 @@ import os
 import pathlib
 
 import opslane
-from opslane import _state, context as ctx
+from opslane import context as ctx
 from opslane.client import Client
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[3] / "test-fixtures" / "wire" / "events"
 VERSION = opslane.__version__
+
+FROZEN_TS = "2026-07-18T00:00:00.000Z"
+FROZEN_STACK = (
+    "Traceback (most recent call last):\n"
+    '  File "/app/api/routes/users.py", line 42, in get_user\n'
+    "    user = db.query(User).filter_by(id=user_id).one()\n"
+    "ValueError: No row was found\n"
+)
+FROZEN_PYVER = "3.12.1"
+FROZEN_UA = f"Python/{FROZEN_PYVER} opslane/{VERSION}"
 
 
 class StubTransport:
@@ -2086,14 +2316,16 @@ class StubTransport:
         self.sent.append(payload)
 
 
-def _normalize(payload):
+def _freeze_volatile(payload):
+    """Replace per-run values with frozen REALISTIC constants (never sentinels
+    — the fixture must stay a valid, parseable wire payload)."""
     payload = json.loads(json.dumps(payload))
-    payload["timestamp"] = "<TS>"
-    payload["error"]["stack"] = "<STACK>"
-    payload["runtime"]["version"] = "<PYVER>"
-    payload["context"]["user_agent"] = "<UA>"
+    payload["timestamp"] = FROZEN_TS
+    payload["error"]["stack"] = FROZEN_STACK
+    payload["runtime"]["version"] = FROZEN_PYVER
+    payload["context"]["user_agent"] = FROZEN_UA
     for crumb in payload["breadcrumbs"]:
-        crumb["timestamp"] = "<TS>"
+        crumb["timestamp"] = FROZEN_TS
     return payload
 
 
@@ -2105,17 +2337,20 @@ def _build(full: bool):
         "headers": {"Content-Type": "application/json"},
         "remote_addr": "10.0.1.50",
     } if full else None)
-    if full:
-        ctx.set_user({"id": "user-123", "email": "jane@example.com",
-                      "account": {"id": "acct-42", "name": "Example Inc"}})
-        ctx.add_breadcrumb({"type": "log", "timestamp": "t", "category": "app.auth",
-                            "level": "warning", "message": "Token near expiry"})
     try:
-        raise ValueError("No row was found")
-    except ValueError as e:
-        client.capture_exception(e)
-    ctx.reset_scope(tokens)
-    return _normalize(client.transport.sent[0])
+        if full:
+            ctx.set_user({"id": "user-123", "email": "jane@example.com",
+                          "account": {"id": "acct-42", "name": "Example Inc"}})
+            ctx.add_breadcrumb({"type": "log", "timestamp": FROZEN_TS,
+                                "category": "app.auth", "level": "warning",
+                                "message": "Token near expiry"})
+        try:
+            raise ValueError("No row was found")
+        except ValueError as e:
+            client.capture_exception(e)
+    finally:
+        ctx.reset_scope(tokens)   # a failure above must not poison later tests
+    return _freeze_volatile(client.transport.sent[0])
 
 
 def _check(name: str, payload: dict):
@@ -2142,17 +2377,26 @@ OPSLANE_WRITE_FIXTURES=1 .venv/bin/pytest tests/test_wire_shape.py -v   # writes
 .venv/bin/pytest tests/test_wire_shape.py -v                            # now passes read-only
 ```
 
-Inspect both generated files by eye against the design's payload example (platform, runtime, context.request, lowercase levels, message on every breadcrumb, no nulls for absent fields).
+Inspect both generated files by eye against the design's payload example (platform, runtime, context.request, lowercase levels, message on every breadcrumb, no nulls for absent fields, and the stack is the realistic frozen traceback).
 
-**Step 3: Confirm the server replays them** — `wire_compat_test.go` picks up every `.json` in the dir automatically:
+**Step 3: Extend `wire_compat_test.go` for the Python fixtures, then replay everything**
+
+The compat test compares stored context **exactly** against the fixture's context and models neither `platform` nor `runtime` — the Python fixtures would fail round-trip without these extensions (Task 5 folds `runtime` INTO stored context):
+
+- Add `Platform string` and `Runtime json.RawMessage` fields to the `wireFixture` struct.
+- Where stored context is compared: when the fixture has a top-level `runtime`, the expected stored context is the fixture's context **plus** the folded `runtime` key.
+- Add assertions: stored `error_events.platform` and the group's `platform` equal the fixture's `platform` (default `javascript` when absent) — so persistence can't regress unnoticed.
+
+Then replay with the real test names (there is no `TestWireCompat`; the suite is `TestWireFixtures_*`) against the Task 5 database:
 
 ```bash
-cd packages/ingestion && go test ./handler -run TestWireCompat -v
+export DATABASE_URL=postgres://opslane:x@localhost:5499/opslane
+cd packages/ingestion && go test ./handler -run 'TestWireFixtures' -v
 ```
 
-Expected: PASS including both python fixtures (202 + stored round-trip). If the compat test asserts fields the python fixtures lack (e.g. `session_id`), extend the test's per-fixture expectations following its existing pattern — do not change the fixtures to appease the test.
+Expected: PASS including both python fixtures (202 + stored round-trip + platform assertions), and the output shows the python fixture subtests actually RAN. If the compat test asserts other fields the python fixtures lack (e.g. `session_id`), extend the per-fixture expectations following its existing pattern — do not change the fixtures to appease the test.
 
-**Step 4: Append provenance to the README** (how each python fixture was produced, mirroring the existing entries), then commit:
+**Step 4: Update the README** — two changes, then commit: append provenance lines for both python fixtures (how they were produced, mirroring existing entries), and amend the naming rule itself to document the platform prefix (`v<version>-*.json` for the browser SDK, `python-v<version>-*.json` for the Python SDK) — the rule text must match what the directory actually contains. The README is not a frozen fixture; editing it is fine:
 
 ```bash
 git add test-fixtures/wire/events packages/sdk-python/tests/test_wire_shape.py
@@ -2174,10 +2418,15 @@ psql "postgres://opslane:opslane_dev@localhost:5434/opslane" -f scripts/seed-e2e
 
 (The seed creates a project + API key — read `scripts/seed-e2e.sql` for the key value.)
 
-**Step 2: Fire a real SDK-captured error at it**
+**Step 2: Fire a real SDK-captured error at it** — the error message carries a per-run identifier so the verification queries can't match leftover rows from earlier runs against this shared database:
 
 ```bash
-cd packages/sdk-python && .venv/bin/python - <<'EOF'
+# Letters-only id: the fingerprint normalizer collapses digits/hex/UUIDs, so a
+# numeric id would make every run's events fingerprint identically and join
+# ONE cross-run group, breaking the exactly-one-new-group assertion below.
+export SMOKE_ID="smoke$(LC_ALL=C tr -dc 'a-z' </dev/urandom | head -c 8)"
+cd packages/sdk-python && .venv/bin/python - <<EOF
+import os
 import opslane
 from flask import Flask
 from opslane.integrations.flask import OpslaneFlask
@@ -2188,26 +2437,28 @@ OpslaneFlask(app)
 
 @app.get("/boom")
 def boom():
-    raise ValueError("live smoke failure")
+    raise ValueError("live smoke failure ${SMOKE_ID}")
 
 client = app.test_client()
-client.get("/boom")            # from /app/-style path? no — local paths; still groups
+client.get("/boom")
 client.get("/boom")            # second occurrence: must join the same group
 assert opslane.flush(timeout=10), "flush did not drain"
-print("sent")
+print("sent ${SMOKE_ID}")
 EOF
 ```
 
-**Step 3: Verify the database state**
+**Step 3: Verify the database state — assert, don't eyeball**
 
 ```bash
-psql "postgres://opslane:opslane_dev@localhost:5434/opslane" -c \
-  "SELECT platform, error_type, context ? 'runtime' AS has_runtime FROM error_events ORDER BY created_at DESC LIMIT 2;"
-psql "postgres://opslane:opslane_dev@localhost:5434/opslane" -c \
-  "SELECT platform, occurrence_count, title FROM error_groups WHERE platform = 'python';"
+EVENTS=$(psql -t -A "postgres://opslane:opslane_dev@localhost:5434/opslane" -c \
+  "SELECT count(*) FROM error_events WHERE platform='python' AND context ? 'runtime' AND error_message LIKE '%${SMOKE_ID}%';")
+GROUPS=$(psql -t -A "postgres://opslane:opslane_dev@localhost:5434/opslane" -c \
+  "SELECT count(*) || ':' || COALESCE(max(occurrence_count),0) FROM error_groups WHERE platform='python' AND title LIKE '%${SMOKE_ID}%';")
+echo "events=$EVENTS groups=$GROUPS"
+[ "$EVENTS" = "2" ] && [ "$GROUPS" = "1:2" ] && echo "LIVE SMOKE PASS" || echo "LIVE SMOKE FAIL"
 ```
 
-Expected: two events `platform=python`, `has_runtime=t`; ONE group, `platform=python`, `occurrence_count=2` — this is Batch 1's acceptance gate observed live.
+Expected: `events=2 groups=1:2` then `LIVE SMOKE PASS` — exactly two THIS-run events with `platform=python` and folded runtime, in exactly ONE group with `occurrence_count=2`. This is Batch 1's acceptance gate observed live: same-run events group together (identical message + stack), while the letters-only run id keeps each run's group distinct from earlier runs' leftovers.
 
 **Step 4: Tear down** (only what this smoke started; leave shared services if another session owns them):
 
@@ -2236,3 +2487,19 @@ All green, plus the Task 14 live-smoke evidence.
 **Step 3: Push (user), PR, and close**
 
 Ask the user to `! git push`; open the PR referencing #87 with the acceptance-criteria checklist filled in with real evidence (test output, live-smoke rows). Close #87 only after merge, mirroring Batch 0's close-out discipline.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | not run | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 2 | issues_found → addressed | 31 findings (16 P1, 15 P2), 28 incorporated, 3 rejected with rationale |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | not run | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | not run | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | not run | — |
+
+**CODEX:** Two scoped passes (server-side Go/SQL, Python SDK). All P1s fixed in the plan: SQL args added to match placeholders, nil-map runtime-merge panic guarded + merged pre-redaction, platform defaulted inside `InsertErrorEventAndGroup`, fixtures redesigned to real frozen values (no sentinels), `TestWireFixtures` selector + `DATABASE_URL` gates, `os.register_at_fork` transport reset, enqueue-before-swap ordering, `_in_flight` under one lock, flush no longer defeats Retry-After, old-client drain on re-init, version sync `0.1.0a2`, Gunicorn smoke rewritten (no stderr parsing, kill fallback, `--preload` case). Rejected: JS fingerprint re-hash concern (settled user decision + deployment gate), Windows-path normalization and site-packages app-wheel handling (out of v1 scope).
+
+**VERDICT:** CODEX ADDRESSED — plan revised; eng review not run (user-triggered if wanted).
+
+NO UNRESOLVED DECISIONS
