@@ -98,6 +98,16 @@ func main() {
 		slog.Error("invalid auth provider configuration", "error", err)
 		os.Exit(1)
 	}
+	socialProviders, err := auth.ParseSocialProviders(os.Getenv("AUTH_WORKOS_SOCIAL"))
+	if err != nil {
+		slog.Error("invalid AUTH_WORKOS_SOCIAL", "error", err)
+		os.Exit(1)
+	}
+	if len(socialProviders.Ordered()) > 0 && authProvider.Name() != "workos" {
+		slog.Warn("AUTH_WORKOS_SOCIAL is set but AUTH_PROVIDER is not workos; ignoring social buttons",
+			"provider", authProvider.Name())
+		socialProviders, _ = auth.ParseSocialProviders("")
+	}
 	authCallbackOrigin := os.Getenv("AUTH_CALLBACK_ORIGIN")
 	if authCallbackOrigin == "" {
 		if authProvider.Name() == "workos" {
@@ -114,6 +124,7 @@ func main() {
 		MinIO:                 minioClient,
 		JWTSecret:             []byte(jwtSecret),
 		AuthProvider:          authProvider,
+		SocialProviders:       socialProviders,
 		AuthCallbackOrigin:    authCallbackOrigin,
 		GitHubAppID:           githubAppID,
 		GitHubAppClientID:     githubAppClientID,
