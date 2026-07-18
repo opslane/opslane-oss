@@ -28,6 +28,8 @@ type wireFixture struct {
 	} `json:"error"`
 	Breadcrumbs json.RawMessage `json:"breadcrumbs"`
 	Context     json.RawMessage `json:"context"`
+	Platform    string          `json:"platform"`
+	Runtime     json.RawMessage `json:"runtime"`
 	SDKVersion  string          `json:"sdk_version"`
 	Release     string          `json:"release"`
 	SessionID   string          `json:"session_id"`
@@ -37,6 +39,30 @@ type wireFixture struct {
 		AccountID   string `json:"account_id"`
 		AccountName string `json:"account_name"`
 	} `json:"-"`
+}
+
+func expectedStoredContext(t *testing.T, fixture wireFixture) json.RawMessage {
+	t.Helper()
+	if len(fixture.Runtime) == 0 {
+		return fixture.Context
+	}
+	var contextObject map[string]json.RawMessage
+	contextJSON := fixture.Context
+	if len(contextJSON) == 0 {
+		contextJSON = json.RawMessage(`{}`)
+	}
+	if err := json.Unmarshal(contextJSON, &contextObject); err != nil {
+		t.Fatalf("parse fixture context: %v", err)
+	}
+	if contextObject == nil {
+		contextObject = map[string]json.RawMessage{}
+	}
+	contextObject["runtime"] = fixture.Runtime
+	merged, err := json.Marshal(contextObject)
+	if err != nil {
+		t.Fatalf("merge expected runtime: %v", err)
+	}
+	return merged
 }
 
 func fixturePaths(t *testing.T) []string {
@@ -141,19 +167,19 @@ func TestWireFixtures_AcceptedAndStored(t *testing.T) {
 			}
 
 			var (
-				timestamp                                          time.Time
-				errorType, errorMessage, stack, release, sessionID string
-				breadcrumbsText, contextText, groupID              string
-				endUserID                                          *string
+				timestamp                                                         time.Time
+				errorType, errorMessage, stack, release, sessionID, eventPlatform string
+				breadcrumbsText, contextText, groupID                             string
+				endUserID                                                         *string
 			)
 			if err := pool.QueryRow(context.Background(), `
 				SELECT "timestamp", error_type, error_message, stack_trace_raw,
 				       COALESCE(release,''), COALESCE(session_id,''),
 				       breadcrumbs::text, context::text,
-				       error_group_id::text, end_user_id::text
+				       error_group_id::text, end_user_id::text, platform
 				FROM error_events WHERE id = $1`, eventID).
 				Scan(&timestamp, &errorType, &errorMessage, &stack, &release, &sessionID,
-					&breadcrumbsText, &contextText, &groupID, &endUserID); err != nil {
+					&breadcrumbsText, &contextText, &groupID, &endUserID, &eventPlatform); err != nil {
 				t.Fatalf("query stored event: %v", err)
 			}
 
@@ -187,7 +213,22 @@ func TestWireFixtures_AcceptedAndStored(t *testing.T) {
 				t.Errorf("stored error_group_id %q != response group_id %q", groupID, response["group_id"])
 			}
 			semanticJSONEqual(t, "breadcrumbs", breadcrumbsText, fixture.Breadcrumbs)
-			semanticJSONEqual(t, "context", contextText, fixture.Context)
+			semanticJSONEqual(t, "context", contextText, expectedStoredContext(t, fixture))
+
+			wantPlatform := fixture.Platform
+			if wantPlatform == "" {
+				wantPlatform = "javascript"
+			}
+			if eventPlatform != wantPlatform {
+				t.Errorf("event platform = %q, want %q", eventPlatform, wantPlatform)
+			}
+			var groupPlatform *string
+			if err := pool.QueryRow(context.Background(), `SELECT platform FROM error_groups WHERE id = $1`, groupID).Scan(&groupPlatform); err != nil {
+				t.Fatalf("query group platform: %v", err)
+			}
+			if groupPlatform == nil || *groupPlatform != wantPlatform {
+				t.Errorf("group platform = %v, want %q", groupPlatform, wantPlatform)
+			}
 
 			if fixture.ContextUser == nil {
 				if endUserID != nil {

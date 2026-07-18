@@ -37,6 +37,11 @@ export interface User {
 
 export interface ErrorEventPayload {
   timestamp: string; // ISO 8601
+  platform?: 'javascript' | 'python';
+  runtime?: {
+    name: string;
+    version: string;
+  };
   error: {
     type: string;
     message: string;
@@ -46,6 +51,12 @@ export interface ErrorEventPayload {
   context: {
     url?: string;
     user_agent?: string;
+    request?: {
+      method: string;
+      path: string;
+      headers: Record<string, string>;
+      remote_addr?: string;
+    };
     user?: {
       id: string;
       email?: string;
@@ -73,7 +84,9 @@ export type BreadcrumbType =
   | 'xhr'
   | 'console'
   | 'click'
-  | 'navigation';
+  | 'navigation'
+  | 'http'
+  | 'log';
 
 // === Error group statuses ===
 

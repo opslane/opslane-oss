@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/grouping"
 	"github.com/opslane/opslane/packages/ingestion/masking"
 )
+
+var rePlatformToken = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 // IngestEvent handles POST /api/v1/events (error events only).
 func (d *Dependencies) IngestEvent(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +65,8 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 		} `json:"error"`
 		Breadcrumbs json.RawMessage `json:"breadcrumbs"`
 		Context     json.RawMessage `json:"context"`
+		Platform    string          `json:"platform"`
+		Runtime     json.RawMessage `json:"runtime"`
 		SDKVersion  string          `json:"sdk_version"`
 		Release     string          `json:"release"`
 		SessionID   string          `json:"session_id"`
@@ -87,6 +92,9 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 	if payload.Error.Type == "" {
 		payload.Error.Type = "Error"
 	}
+	if payload.Platform == "" || !rePlatformToken.MatchString(payload.Platform) {
+		payload.Platform = "javascript"
+	}
 
 	// Track stackless events so we can measure recovery volume in prod.
 	if payload.Error.Stack == "" {
@@ -94,7 +102,7 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Compute fingerprint
-	fingerprint := grouping.Fingerprint(payload.Error.Type, payload.Error.Message, payload.Error.Stack)
+	fingerprint := grouping.Fingerprint(payload.Platform, payload.Error.Type, payload.Error.Message, payload.Error.Stack)
 
 	// Generate title: "Type: Message" truncated to 200 chars
 	title := payload.Error.Type + ": " + payload.Error.Message
@@ -110,6 +118,31 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 	ctx := "{}"
 	if len(payload.Context) > 0 {
 		ctx = string(payload.Context)
+	}
+
+	// Runtime is a structured top-level wire field, but event context is the
+	// existing JSONB persistence boundary. Normalize context to an object and
+	// reserve context.runtime for a validated top-level runtime value. This
+	// prevents callers from bypassing validation through context.runtime and
+	// preserves valid runtime metadata when context is null or non-object JSON.
+	var contextMap map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(ctx), &contextMap); err != nil || contextMap == nil {
+		contextMap = map[string]json.RawMessage{}
+	}
+	delete(contextMap, "runtime")
+	if len(payload.Runtime) > 0 {
+		var runtime struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(payload.Runtime, &runtime); err == nil && runtime.Name != "" && runtime.Version != "" {
+			if clean, err := json.Marshal(runtime); err == nil {
+				contextMap["runtime"] = clean
+			}
+		}
+	}
+	if merged, err := json.Marshal(contextMap); err == nil {
+		ctx = string(merged)
 	}
 
 	// Extract end-user identity from context.user (B2B tracking)
@@ -157,6 +190,7 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 		Context:            ctx,
 		Release:            payload.Release,
 		SessionID:          payload.SessionID,
+		Platform:           payload.Platform,
 		EndUserID:          endUser.ID,
 		EndUserEmail:       endUser.Email,
 		EndUserAccountID:   endUser.AccountID,
