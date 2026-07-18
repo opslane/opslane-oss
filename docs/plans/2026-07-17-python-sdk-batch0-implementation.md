@@ -4,9 +4,9 @@
 
 **Goal:** Scaffold `packages/sdk-python` (PyPI package `opslane`) with CI + TestPyPI publishing, and run the E2B Python template spike that validates Batch 3's install-timeout budget. Closes issue #86.
 
-**Architecture:** A stdlib-only Python package living beside the pnpm workspace (not a member of it), tested by a new SHA-pinned CI job on a 3.9/3.12 matrix and published via PyPI trusted publishing (OIDC) with build and publish in **separate jobs** — build-backend code never runs with the OIDC token, per PyPI's trusted-publisher security guidance. The spike builds the repo's first custom E2B template (with pytest preinstalled — Batch 3's test gate depends on it) and benchmarks sandbox boot + `pip install` + pytest against a complete fixture Flask app committed to the repo.
+**Architecture:** A stdlib-only Python package living beside the pnpm workspace (not a member of it), tested by a new SHA-pinned CI job on Python 3.11 through 3.14 and published via PyPI trusted publishing (OIDC) with build and publish in **separate jobs** — build-backend code never runs with the OIDC token, per PyPI's trusted-publisher security guidance. The spike builds the repo's first custom E2B template (with pytest preinstalled — Batch 3's test gate depends on it) and benchmarks sandbox boot + `pip install` + pytest against a complete fixture Flask app committed to the repo.
 
-**Tech Stack:** Python 3.9+, hatchling (build backend), pytest, twine, GitHub Actions, E2B CLI (pinned) + `e2b@2.33.1` JS SDK (already a worker dependency).
+**Tech Stack:** Python 3.11+, hatchling (build backend), pytest, twine, GitHub Actions, E2B CLI (pinned) + `e2b@2.33.1` JS SDK (already a worker dependency).
 
 **Design doc:** `docs/plans/2026-07-17-python-sdk-design.md`
 
@@ -123,16 +123,16 @@ description = "Opslane Python SDK: backend error capture for the Opslane error-r
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [{ name = "Opslane" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Debuggers",
 ]
 dependencies = []
@@ -252,23 +252,23 @@ git commit -m "feat(sdk-python): scaffold opslane package (Batch 0, #86)"
 
 ---
 
-### Task 2: Sanity-check the 3.9 floor locally
+### Task 2: Sanity-check the 3.11 floor locally
 
-CI is the real 3.9 gate, but catch syntax issues before pushing.
+CI is the real 3.11 gate, but catch syntax issues before pushing.
 
-**Step 1: Find a 3.9 interpreter and run the suite under it**
+**Step 1: Find a 3.11 interpreter and run the suite under it**
 
 ```bash
-if command -v python3.9 >/dev/null; then
-  python3.9 -m venv /tmp/ops39
-  /tmp/ops39/bin/pip install -e 'packages/sdk-python[dev]'
-  /tmp/ops39/bin/pytest packages/sdk-python/tests -v
+if command -v python3.11 >/dev/null; then
+  python3.11 -m venv /tmp/ops311
+  /tmp/ops311/bin/pip install -e 'packages/sdk-python[dev]'
+  /tmp/ops311/bin/pytest packages/sdk-python/tests -v
 elif command -v uv >/dev/null; then
-  uv venv --python 3.9 /tmp/ops39
-  uv pip install --python /tmp/ops39/bin/python -e 'packages/sdk-python[dev]'
-  /tmp/ops39/bin/pytest packages/sdk-python/tests -v
+  uv venv --python 3.11 /tmp/ops311
+  uv pip install --python /tmp/ops311/bin/python -e 'packages/sdk-python[dev]'
+  /tmp/ops311/bin/pytest packages/sdk-python/tests -v
 else
-  echo "no local 3.9 — CI matrix covers it"
+  echo "no local 3.11 — CI matrix covers it"
 fi
 ```
 
@@ -293,7 +293,7 @@ Save the 40-char SHA. (`scripts/check-action-pins.mjs` fails CI on unpinned acti
 
 **Step 2: Add the job**
 
-After the `js:` job in `.github/workflows/ci.yml` (checkout SHA copied from the existing jobs). The 3.12 leg also validates the **built artifacts** — sdist and wheel build, `twine check` metadata, clean-venv installs from both, version/metadata equality — so packaging breaks surface in CI, not at publish time:
+After the `js:` job in `.github/workflows/ci.yml` (checkout SHA copied from the existing jobs). The 3.14 leg also validates the **built artifacts** — sdist and wheel build, `twine check` metadata, clean-venv installs from both, version/metadata equality — so packaging breaks surface in CI, not at publish time:
 
 ```yaml
   sdk-python:
@@ -303,7 +303,7 @@ After the `js:` job in `.github/workflows/ci.yml` (checkout SHA copied from the 
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.12']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     defaults:
       run:
         working-directory: packages/sdk-python
@@ -317,7 +317,7 @@ After the `js:` job in `.github/workflows/ci.yml` (checkout SHA copied from the 
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest -v
       - name: Build and validate artifacts
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.14'
         run: |
           python -m pip install build twine
           python -m build
@@ -351,7 +351,7 @@ Expected: pins pass; `dist/` contains `opslane-0.1.0a1.tar.gz` + `opslane-0.1.0a
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: test and validate Python SDK on 3.9/3.12 (#86)"
+git commit -m "ci: test and validate Python SDK on 3.11-3.14 (#86)"
 ```
 
 ---
@@ -709,7 +709,7 @@ git commit -m "docs: E2B Python template spike findings (#86)"
 
 The scaffold only counts as landed when it's on `main` with `main`'s checks green:
 
-- [ ] PR merged; `sdk-python` job green on `main` for 3.9 and 3.12 (`gh run list --branch main --workflow CI`)
+- [ ] PR merged; `sdk-python` job green on `main` for Python 3.11 through 3.14 (`gh run list --branch main --workflow CI`)
 - [ ] TestPyPI install verified in a clean venv (Task 5 output — the publish itself already required merge)
 - [ ] Sandbox boot < 60s across Task 8's three runs
 - [ ] Benchmark + template ID + owning team documented (findings doc)

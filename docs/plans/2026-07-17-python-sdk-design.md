@@ -52,7 +52,7 @@ Every design partner runs a Python backend (Flask, FastAPI, Django). Expanding t
 | `error_groups.platform` | **Nullable; set only for `kind='error'`** | The incidents table also holds friction incidents; defaulting them to `'javascript'` would misclassify them. Platform filtering applies to error incidents only. |
 | SDK architecture | No monkey-patching | Flask signals + `logging.Handler` only. Predictable, debuggable, no import-order surprises. |
 | SDK dependencies | Zero runtime deps (stdlib `urllib.request`, `threading`, `queue`, `logging`, `contextvars`) | Minimal footprint. No `requests` dependency to conflict with customer pins. Framework adapters import their framework only when the user imports the adapter. |
-| Minimum Python | 3.9+ | `contextvars` stable since 3.7; 3.9 is the oldest sensible floor. CI matrix: 3.9 and 3.12. |
+| Minimum Python | 3.11+ | Python 3.9 is end-of-life and Python 3.10 reaches end-of-life in October 2026. CI covers every supported minor version, 3.11 through 3.14. |
 | Transport model | Individual POSTs (not batched array) | Reuse the existing single-event `POST /api/v1/events` endpoint. The wire contract is frozen/append-only; no new endpoint. |
 
 ## Framework adapters
@@ -349,7 +349,7 @@ claim job → load error group → check platform
 
 **E2B sandbox:** custom template with Python 3.12 + `build-essential`, `libpq-dev` (psycopg2), `libffi-dev` (cffi). Built and benchmarked in Batch 0 (spike validates the 300s install budget). No virtualenv — install into system Python; the sandbox is the isolation.
 
-**Runtime fidelity — explicit v1 policy:** the sandbox runs Python 3.12 regardless of the customer's interpreter, while the SDK supports 3.9+. This is a documented approximation with known failure modes: a fix could use 3.10+ syntax that fails on the customer's 3.9, or a dependency set could resolve differently. Mitigations in v1: the captured `runtime.version` is (a) surfaced in the agent prompt ("the application runs CPython 3.9.18 — do not use syntax newer than 3.9"), and (b) recorded on the PR description so reviewers see the verification gap. Per-version sandbox templates are deferred until a design partner actually runs a pre-3.12 interpreter in production.
+**Runtime fidelity — explicit v1 policy:** the sandbox runs Python 3.12 regardless of the customer's interpreter, while the SDK supports 3.11+. This is a documented approximation with known failure modes: a fix could use syntax newer than the customer's runtime, or a dependency set could resolve differently. Mitigations in v1: the captured `runtime.version` is (a) surfaced in the agent prompt ("the application runs CPython 3.11 — do not use syntax newer than 3.11"), and (b) recorded on the PR description so reviewers see the verification gap. Per-version sandbox templates are deferred until a design partner requires them.
 
 **Install detection** (deliberately dumb):
 1. `requirements.txt` → `pip install -r requirements.txt --no-cache-dir`
@@ -393,7 +393,7 @@ No special headers or session linking. Both SDKs call `set_user({id})` independe
 
 ## CI and release
 
-- **CI**: new job in `.github/workflows/ci.yml` — pytest matrix on Python 3.9 and 3.12 for `packages/sdk-python`
+- **CI**: new job in `.github/workflows/ci.yml` — pytest matrix on Python 3.11 through 3.14 for `packages/sdk-python`
 - **Release**: new `release-pypi.yml` modeled on `release-npm.yml`, using PyPI trusted publishing; Batch 0 proves the TestPyPI path end-to-end
 - The package is not a pnpm workspace member; JS tooling ignores it
 
@@ -425,7 +425,7 @@ Tracked as issues in `opslane/opslane-oss` (#86–#89, re-filed from `opslane/de
 ### Batch 0 (#86): scaffold + E2B Python template spike
 - `packages/sdk-python/` skeleton, `pyproject.toml`, pytest wiring, CI job, TestPyPI publish
 - E2B Python template spike: build the custom template, clone a representative Flask app (SQLAlchemy + psycopg2), benchmark `pip install`, document time/failures/template ID
-- **Gate:** `pip install -i https://test.pypi.org/simple/ opslane` works in a clean venv; CI pytest green on 3.9 and 3.12; E2B template sandbox ready in <60s; install benchmark documented
+- **Gate:** `pip install -i https://test.pypi.org/simple/ opslane` works in a clean venv; CI pytest green on Python 3.11 through 3.14; E2B template sandbox ready in <60s; install benchmark documented
 
 ### Batch 1 (#87): SDK + ingestion ("events flow in")
 - Public API + `OpslaneFlask` + transport (full contract above) + privacy deny-list
