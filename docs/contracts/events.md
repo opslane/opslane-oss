@@ -2,7 +2,7 @@
 
 `POST /api/v1/events` is **append-only and backward-compatible, forever.**
 
-The SDK ships to npm and runs in customers' apps on their upgrade schedule; the
+The SDKs ship to npm and PyPI and run in customers' apps on their upgrade schedule; the
 ingestion API deploys on ours. Old SDK versions POST to our newest server
 indefinitely and we cannot force-upgrade them. A break is a silent customer
 outage we cannot hotfix.
