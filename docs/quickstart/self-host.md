@@ -42,7 +42,7 @@ docker compose exec -T postgres psql -U opslane -d opslane < scripts/seed-e2e.sq
 
 curl -X POST http://localhost:8082/api/v1/events \
   -H 'Content-Type: application/json' -H 'X-API-Key: e2e-test-key-plaintext' \
-  -d '{"timestamp":"2026-01-01T00:00:00Z","error":{"type":"ReferenceError","message":"demo is not defined","stack":"ReferenceError: demo is not defined\n  at app.js:1:1"},"breadcrumbs":[],"context":{"url":"https://example.com","user_agent":"smoke test"},"sdk_version":"0.0.1"}'
+  -d '{"timestamp":"2026-01-01T00:00:00Z","error":{"type":"ReferenceError","message":"demo is not defined","stack":"ReferenceError: demo is not defined\n  at app.js:1:1"},"breadcrumbs":[],"context":{"url":"https://example.com","user_agent":"smoke test"},"sdk_version":"0.0.1","platform":"javascript"}'
 ```
 
 You should get HTTP `202` with an `error_group_id`. Within ~30 seconds the worker claims the investigation job and — because it has no credentials to clone your repo or run AI analysis — closes it honestly:
@@ -77,7 +77,7 @@ Requires all of the following set in your environment **before** `docker compose
 You also need a **target repository the worker may open PRs against** — use a fork of a small fixture app (e.g. this repo's `test-fixtures/vue-app` pushed to a scratch repo), never a production repo you aren't ready to receive AI PRs on. Point your project's `github_repo` at it (via the dashboard, or by editing the seeded project row).
 
 ```bash
-export ANTHROPIC_API_KEY=... E2B_API_KEY=... GITHUB_TOKEN=...
+# export the three variables above in your shell, then:
 docker compose up -d
 ```
 

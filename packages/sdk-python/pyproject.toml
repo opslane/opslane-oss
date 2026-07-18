@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opslane"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Opslane Python SDK: backend error capture for the Opslane error-resolution engine"
 readme = "README.md"
 license = "MIT"
@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "flask>=3", "gunicorn>=22"]
 
 [project.urls]
 Homepage = "https://github.com/opslane/opslane-oss"
