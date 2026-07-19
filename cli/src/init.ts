@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { chmod, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
@@ -14,8 +14,9 @@ function formatPatchPreview(patches: FilePatch[]): string {
   const lines: string[] = [];
 
   for (const patch of patches) {
-    if (patch.action === 'create') {
-      lines.push(chalk.green(`+ CREATE ${patch.filePath}`));
+    if (patch.action === 'create' || patch.action === 'replace') {
+      const label = patch.action === 'create' ? '+ CREATE' : '~ REPLACE';
+      lines.push(chalk.green(`${label} ${patch.filePath}`));
       if (patch.content) {
         for (const line of patch.content.split('\n').slice(0, 10)) {
           lines.push(chalk.green(`  + ${line}`));
@@ -45,17 +46,21 @@ function formatPatchPreview(patches: FilePatch[]): string {
 /**
  * Apply patches to the project filesystem.
  */
-async function applyPatches(
+export async function applyPatches(
   projectRoot: string,
   patches: FilePatch[],
 ): Promise<void> {
   for (const patch of patches) {
     const fullPath = join(projectRoot, patch.filePath);
 
-    if (patch.action === 'create') {
+    if (patch.action === 'create' || patch.action === 'replace') {
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, patch.content ?? '', 'utf-8');
-    } else if (patch.action === 'modify' && patch.insertAfter && patch.insertContent) {
+    } else if (
+      patch.action === 'modify' &&
+      patch.insertAfter !== undefined &&
+      patch.insertContent !== undefined
+    ) {
       const existing = await readFile(fullPath, 'utf-8');
       const idx = existing.indexOf(patch.insertAfter);
 
@@ -69,10 +74,13 @@ async function applyPatches(
       }
 
       const insertPos = idx + patch.insertAfter.length;
+      const beforeContent = insertPos === 0 ? '' : '\n';
+      const afterContent = insertPos === 0 ? '\n' : '';
       const patched =
         existing.slice(0, insertPos) +
-        '\n' +
+        beforeContent +
         patch.insertContent +
+        afterContent +
         existing.slice(insertPos);
 
       await writeFile(fullPath, patched, 'utf-8');
@@ -86,8 +94,37 @@ export interface InitOptions {
   nonInteractive?: boolean;
   /** Project ID to use (skips prompt). */
   projectId?: string;
-  /** API key to bake into generated code (skips placeholder). */
+  /** API key supplied by legacy callers. It is never written to source or config. */
   apiKey?: string;
+}
+
+function apiKeyEnvironmentVariable(framework: Framework): string {
+  if (framework === 'react-vite' || framework === 'vue-vite') return 'VITE_OPSLANE_API_KEY';
+  if (framework === 'nextjs') return 'NEXT_PUBLIC_OPSLANE_API_KEY';
+  if (framework === 'nuxt') return 'NUXT_PUBLIC_OPSLANE_API_KEY';
+  return 'OPSLANE_API_KEY';
+}
+
+async function persistApiKeyEnvironment(cwd: string, framework: Framework, apiKey: string): Promise<void> {
+  const envPath = join(cwd, '.env.local');
+  const variable = apiKeyEnvironmentVariable(framework);
+  let current = '';
+  try { current = await readFile(envPath, 'utf8'); } catch { /* create below */ }
+  const line = `${variable}=${apiKey}`;
+  const pattern = new RegExp(`^${variable}=.*$`, 'm');
+  const next = pattern.test(current)
+    ? current.replace(pattern, line)
+    : `${current}${current && !current.endsWith('\n') ? '\n' : ''}${line}\n`;
+  await writeFile(envPath, next, { encoding: 'utf8', mode: 0o600 });
+  await chmod(envPath, 0o600);
+
+  const gitignorePath = join(cwd, '.gitignore');
+  let gitignore = '';
+  try { gitignore = await readFile(gitignorePath, 'utf8'); } catch { /* create below */ }
+  if (!gitignore.split(/\r?\n/).includes('.env.local')) {
+    gitignore += `${gitignore && !gitignore.endsWith('\n') ? '\n' : ''}.env.local\n`;
+    await writeFile(gitignorePath, gitignore, 'utf8');
+  }
 }
 
 /**
@@ -118,18 +155,6 @@ export async function init(options: InitOptions = {}): Promise<void> {
       ),
     );
     patches = await generateFallbackPatches(cwd);
-  }
-
-  // Bake in the API key if provided via --api-key
-  if (options.apiKey) {
-    for (const patch of patches) {
-      if (patch.content) {
-        patch.content = patch.content.replace(/<YOUR_API_KEY>/g, options.apiKey);
-      }
-      if (patch.insertContent) {
-        patch.insertContent = patch.insertContent.replace(/<YOUR_API_KEY>/g, options.apiKey);
-      }
-    }
   }
 
   // Show diff preview
@@ -178,15 +203,16 @@ export async function init(options: InitOptions = {}): Promise<void> {
     framework,
   };
 
-  if (options.apiKey) {
-    config.apiKey = options.apiKey;
-  }
-
   await writeFile(
     join(cwd, '.opslane.json'),
     JSON.stringify(config, null, 2) + '\n',
     'utf-8',
   );
+
+  if (options.apiKey) {
+    await persistApiKeyEnvironment(cwd, framework, options.apiKey);
+    console.log(chalk.green('Saved API key to git-ignored .env.local'));
+  }
 
   console.log(chalk.green('Created .opslane.json'));
   console.log(chalk.bold('\nOpslane initialized successfully!'));
