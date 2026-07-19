@@ -159,6 +159,13 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/github", deps.GetGitHubConfig)
 		r.With(deps.AuthenticateUserSession).Delete("/projects/{projectID}/github", deps.DeleteGitHubConfig)
 
+		// Per-project notification destinations
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/notification-destinations", deps.ListNotificationDestinationsEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.requireIntegrationAdmin).Post("/projects/{projectID}/notification-destinations", deps.CreateNotificationDestinationEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.requireIntegrationAdmin).Patch("/projects/{projectID}/notification-destinations/{destID}", deps.UpdateNotificationDestinationEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.requireIntegrationAdmin).Delete("/projects/{projectID}/notification-destinations/{destID}", deps.DeleteNotificationDestinationEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.requireIntegrationAdmin).Post("/projects/{projectID}/notification-destinations/{destID}/test", deps.TestNotificationDestinationEndpoint)
+
 		// Setup PR
 		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/setup-pr", deps.SetupPR)
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/setup-pr", deps.GetSetupPR)

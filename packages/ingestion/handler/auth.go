@@ -10,6 +10,7 @@ import (
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
+	"github.com/opslane/opslane/packages/ingestion/notify"
 )
 
 // contextKey is an unexported type for context keys in this package.
@@ -84,6 +85,9 @@ type Dependencies struct {
 	GitHubAppSlug         string
 	DashboardOrigin       string // e.g. "http://localhost:3000"
 	AdminEmails           map[string]struct{}
+	ConfigCipher          *notify.ConfigCipher
+	NotifyExtraHosts      []string
+	NotifySender          *notify.Sender
 }
 
 func (d *Dependencies) provider() auth.AuthProvider {
