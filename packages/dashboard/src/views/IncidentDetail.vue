@@ -200,7 +200,7 @@ onMounted(async () => {
 
     <div
       v-else-if="error"
-      class="mt-4 rounded-md bg-red-500/10 border border-red-500/20 p-4 text-sm text-red"
+      class="mt-4 rounded-md bg-red/10 border border-red/20 p-4 text-sm text-red"
     >
       <p v-text="error"></p>
     </div>
@@ -234,7 +234,7 @@ onMounted(async () => {
         </div>
         <div
           v-if="incident.adjudication_status === 'unchecked'"
-          class="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 border-l-2 border-l-amber-500 rounded-lg text-sm text-amber-800"
+          class="mt-3 p-3 bg-amber/10 border border-amber/20 border-l-2 border-l-amber rounded-lg text-sm text-amber"
         >
           The automated friction check for this detection could not complete
           (it exhausted its retries). It is shown for visibility only: it has
@@ -283,17 +283,17 @@ onMounted(async () => {
       </div>
 
       <!-- Tabs -->
-      <div class="border-b border-border">
-        <nav class="-mb-px flex gap-6">
+      <div class="border-b border-border pb-3">
+        <nav class="flex gap-2">
           <button
-            class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+            class="text-sm font-medium transition-colors"
             :class="activeTab === 'overview' ? 'tab-active' : 'tab-inactive'"
             @click="switchTab('overview')"
           >
             Overview
           </button>
           <button
-            class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+            class="text-sm font-medium transition-colors"
             :class="activeTab === 'affected-users' ? 'tab-active' : 'tab-inactive'"
             @click="switchTab('affected-users')"
           >
@@ -309,10 +309,10 @@ onMounted(async () => {
           <p class="text-xs font-medium text-text-muted uppercase tracking-wide">Session Replay</p>
           <template v-if="incident.session_pointer && !sessionTerminalUnavailable">
             <div v-if="sessionReplayState === 'loading'" class="text-sm text-text-muted">Loading replay...</div>
-            <div v-else-if="sessionReplayState === 'processing'" class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber">
+            <div v-else-if="sessionReplayState === 'processing'" class="rounded-md border border-amber/20 bg-amber/10 p-3 text-sm text-amber">
               Recording is processing. Checking again shortly (attempt {{ sessionPollAttempt }}/24, {{ sessionPollsRemaining }} remaining).
             </div>
-            <div v-else-if="sessionReplayState === 'error'" class="text-sm text-red-500">Replay unavailable: {{ sessionReplayError }}</div>
+            <div v-else-if="sessionReplayState === 'error'" class="text-sm text-red">Replay unavailable: {{ sessionReplayError }}</div>
             <template v-else-if="sessionReplayState === 'ready' || sessionReplayState === 'partial'">
               <div v-if="sessionReplayState === 'partial'" class="text-sm text-amber">
                 {{ sessionMissingChunks.missing }} of {{ sessionMissingChunks.total }} chunks unavailable.
@@ -331,7 +331,7 @@ onMounted(async () => {
           </template>
           <template v-else-if="incident.replay_id">
             <div v-if="replayLoading" class="text-sm text-text-muted">Loading replay...</div>
-            <div v-else-if="replayError" class="text-sm text-red-500">Replay unavailable: {{ replayError }}</div>
+            <div v-else-if="replayError" class="text-sm text-red">Replay unavailable: {{ replayError }}</div>
             <ReplayPlayer
               v-else-if="replay && replay.events && replay.events.length"
               :events="(replay.events as eventWithTime[])"
@@ -348,8 +348,8 @@ onMounted(async () => {
           v-if="safeUrl(incident.pr_url)"
           class="p-4 border border-l-2 rounded-lg"
           :class="incident.status === 'pr_draft'
-            ? 'bg-amber-500/10 border-amber-500/20 border-l-amber'
-            : 'bg-green-500/10 border-green-500/20 border-l-green'"
+            ? 'bg-amber/10 border-amber/20 border-l-amber'
+            : 'bg-green/10 border-green/20 border-l-green'"
         >
           <p
             class="text-sm font-medium"
@@ -374,7 +374,7 @@ onMounted(async () => {
         <!-- Investigation results, including context preserved on drafts and needs_human -->
         <div
           v-if="(incident.status === 'investigated' || incident.status === 'awaiting_approval' || incident.status === 'fixing' || incident.status === 'pr_draft' || incident.status === 'needs_human') && incident.root_cause"
-          class="p-4 bg-teal-500/10 border border-teal-500/20 border-l-2 border-l-teal rounded-lg space-y-3"
+          class="p-4 bg-teal/10 border border-teal/20 border-l-2 border-l-teal rounded-lg space-y-3"
         >
           <div>
             <p class="text-xs font-medium text-teal uppercase tracking-wide">
@@ -399,7 +399,7 @@ onMounted(async () => {
         <!-- Insight card (friction, no code cause — terminal, never a PR; design v4-4) -->
         <div
           v-if="incident.status === 'insight'"
-          class="p-4 bg-purple-500/10 border border-purple-500/20 border-l-2 border-l-purple rounded-lg space-y-3"
+          class="p-4 bg-purple/10 border border-purple/20 border-l-2 border-l-purple rounded-lg space-y-3"
         >
           <p class="text-sm font-medium text-purple">Insight — no code cause</p>
           <p class="text-xs text-text-muted">
@@ -461,7 +461,7 @@ onMounted(async () => {
         <!-- Fixing indicator -->
         <div
           v-if="incident.status === 'fixing'"
-          class="p-4 bg-indigo-500/10 border border-indigo-500/20 border-l-2 border-l-indigo rounded-lg"
+          class="p-4 bg-indigo/10 border border-indigo/20 border-l-2 border-l-indigo rounded-lg"
         >
           <div v-if="fixTimedOut">
             <p class="text-sm font-medium text-amber">This is taking longer than expected.</p>
@@ -482,7 +482,7 @@ onMounted(async () => {
         <!-- Needs human reason -->
         <div
           v-if="incident.status === 'needs_human' && incident.reason"
-          class="p-4 bg-amber-500/10 border border-amber-500/20 border-l-2 border-l-amber rounded-lg space-y-3"
+          class="p-4 bg-amber/10 border border-amber/20 border-l-2 border-l-amber rounded-lg space-y-3"
         >
           <div>
             <p class="text-xs font-medium text-amber uppercase tracking-wide">

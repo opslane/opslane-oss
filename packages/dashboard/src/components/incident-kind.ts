@@ -15,10 +15,10 @@ export function kindBadge(
   adjudicationStatus: string | undefined,
 ): KindBadge {
   if (kind === 'friction' && adjudicationStatus === 'unchecked') {
-    return { label: 'Unchecked', class: 'bg-amber-100 text-amber-800' };
+    return { label: 'Unchecked', class: 'bg-amber/10 text-amber' };
   }
   if (kind === 'friction') {
-    return { label: 'Friction', class: 'bg-purple-100 text-purple-800' };
+    return { label: 'Friction', class: 'bg-purple/10 text-purple' };
   }
   return { label: 'Error', class: 'bg-surface-2 text-text' };
 }

@@ -48,18 +48,18 @@ function duration(): string {
     <div class="mt-4 flex flex-col gap-6 xl:flex-row">
       <main class="min-w-0 flex-1">
         <div v-if="state === 'loading'" class="text-text-muted">Loading session...</div>
-        <div v-else-if="state === 'processing'" class="rounded-lg border border-amber-500/20 bg-amber-500/10 p-5">
+        <div v-else-if="state === 'processing'" class="rounded-lg border border-amber/20 bg-amber/10 p-5">
           <p class="font-medium text-amber">Recording is still processing</p>
           <p class="mt-1 text-sm text-text-muted">Checking every 5 seconds (attempt {{ pollAttempt }}/24, {{ pollsRemaining }} remaining).</p>
         </div>
-        <div v-else-if="state === 'error'" class="rounded-lg border border-red-500/20 bg-red-500/10 p-5 text-red">
+        <div v-else-if="state === 'error'" class="rounded-lg border border-red/20 bg-red/10 p-5 text-red">
           <p v-text="error || 'Failed to load session.'"></p>
         </div>
         <div v-else-if="state === 'unavailable'" class="rounded-lg border border-border bg-surface p-5 text-text-muted">
           This recording is unavailable or contains no playable events.
         </div>
         <div v-else class="space-y-4">
-          <div v-if="state === 'partial'" class="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber">
+          <div v-if="state === 'partial'" class="rounded-md border border-amber/20 bg-amber/10 p-3 text-sm text-amber">
             {{ missingChunks.missing }} of {{ missingChunks.total }} chunks unavailable. Playing the remaining recording.
           </div>
           <div v-if="approximate" class="text-sm text-amber">Playback position is approximate.</div>

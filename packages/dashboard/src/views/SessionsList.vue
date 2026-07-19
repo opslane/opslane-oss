@@ -77,10 +77,10 @@ function formatBytes(bytes: number): string {
 }
 
 function sessionBadge(status: string): string {
-  if (status === 'recording') return 'bg-teal-500/10 text-teal';
-  if (status === 'analysis_failed') return 'bg-red-500/10 text-red';
-  if (status === 'analyzing') return 'bg-indigo-500/10 text-indigo';
-  if (status === 'analyzed') return 'bg-green-500/10 text-green';
+  if (status === 'recording') return 'bg-teal/10 text-teal';
+  if (status === 'analysis_failed') return 'bg-red/10 text-red';
+  if (status === 'analyzing') return 'bg-indigo/10 text-indigo';
+  if (status === 'analyzed') return 'bg-green/10 text-green';
   return 'bg-surface-2 text-text-muted';
 }
 
@@ -119,7 +119,7 @@ onMounted(() => {
     </form>
 
     <div v-if="loading" class="text-text-muted">Loading sessions...</div>
-    <div v-else-if="error" class="rounded-md bg-red-500/10 border border-red-500/20 p-4 text-sm text-red">
+    <div v-else-if="error" class="rounded-md bg-red/10 border border-red/20 p-4 text-sm text-red">
       <p v-text="error"></p>
     </div>
     <div v-else-if="sessions.length === 0" class="py-16 text-center">

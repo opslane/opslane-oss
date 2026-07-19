@@ -1,47 +1,77 @@
-/* === Self-hosted fonts === */
+/* === Self-hosted fonts: Geist + Geist Mono (OFL; latin variable subsets) === */
 
 @font-face {
-  font-family: 'DM Sans';
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/geist-variable.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Geist Mono';
   font-style: normal;
   font-weight: 400 600;
   font-display: swap;
-  src: url('/fonts/dm-sans-variable.woff2') format('woff2');
+  src: url('/fonts/geist-mono-variable.woff2') format('woff2');
 }
 
-@font-face {
-  font-family: 'JetBrains Mono';
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url('/fonts/jetbrains-mono-400.woff2') format('woff2');
-}
-
-/* === Design tokens === */
+/* === Design tokens — light default, dark via [data-theme="dark"] === */
 
 :root {
-  /* Surfaces */
-  --color-background: #080c0f;
-  --color-surface: #0f1419;
-  --color-surface-2: #161d24;
-  --color-border: #1e2a35;
-  --color-border-subtle: #121920;
+  /* Surfaces — pure white, warm grays */
+  --color-background: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-2: #f6f6f4;
+  --color-border: #ebebe9;
+  --color-border-subtle: #f3f3f1;
 
   /* Text */
-  --color-text: #f0ede8;
-  --color-text-muted: #8a9aa6;
-  --color-text-faint: #5a6b78; /* decorative/disabled only — fails WCAG AA on all surfaces */
+  --color-text: #1a1a1a;
+  --color-text-muted: #6b6f76;
+  --color-text-faint: #a3a7ad; /* decorative/disabled only — fails WCAG AA */
 
-  /* Semantic */
-  --color-teal: #2dd4bf;
-  --color-indigo: #818cf8;
-  --color-green: #4ade80;
-  --color-amber: #f5a623;
-  --color-red: #ff4d4d;
-  --color-purple: #c084fc; /* insight status */
+  /* Semantic.
+     NOTE: the custom property is still named --color-teal because every Vue
+     template uses Tailwind's `teal` key; the VALUE is now the brand blue.
+     Same for --color-purple → teal-cyan (insight). Rename at leisure. */
+  --color-teal: #2563eb;   /* brand accent — actions, links, active nav */
+  --color-indigo: #0369a1; /* in-progress */
+  --color-green: #166534;  /* success */
+  --color-amber: #92400e;  /* attention */
+  --color-red: #b91c1c;    /* failure */
+  --color-purple: #0f766e; /* insight (no purple in the palette) */
+  --color-on-accent: #ffffff; /* text on solid accent fills (btn-primary) */
+
+  /* Elevation — soft, barely-there */
+  --shadow-card: 0 1px 2px rgba(20,20,20,.04), 0 4px 12px rgba(20,20,20,.05);
 
   /* Typography */
-  --font-sans: 'DM Sans', system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: 'Geist', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, monospace;
+}
+
+[data-theme="dark"] {
+  --color-background: #0a0a0a;
+  --color-surface: #111113;
+  --color-surface-2: #18181b;
+  --color-border: #26262a;
+  --color-border-subtle: #1c1c1f;
+  --color-text: #fafafa;
+  --color-text-muted: #a1a1aa;
+  --color-text-faint: #63636b;
+  --color-teal: #6ea2ff;
+  --color-indigo: #38bdf8;
+  --color-green: #4ade80;
+  --color-amber: #fbbf24;
+  --color-red: #f87171;
+  --color-purple: #2dd4bf;
+  --color-on-accent: #0a0a0a; /* dark accents are light; near-black keeps ~8:1 */
+  --shadow-card: none;
+}
+
+[data-theme="dark"] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%23a1a1aa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 @tailwind base;
@@ -52,30 +82,32 @@
 
 @layer components {
   .btn-primary {
-    @apply rounded-md bg-teal px-4 py-2 text-sm font-medium text-background hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50;
+    @apply rounded-lg bg-teal px-4 py-2 text-sm font-medium text-on-accent hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50;
   }
 
   .btn-secondary {
-    @apply rounded-md bg-surface-2 border border-border px-4 py-2 text-sm font-medium text-text hover:bg-border focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background;
+    @apply rounded-lg bg-surface border border-border px-4 py-2 text-sm font-medium text-text shadow-sm hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-teal focus:ring-offset-2 focus:ring-offset-background;
   }
 
+  /* Active nav/tab is a tinted pill, not an underline */
   .tab-active {
-    @apply border-teal text-teal;
+    @apply rounded-lg bg-teal/10 px-3 py-1.5 text-teal font-medium;
   }
 
   .tab-inactive {
-    @apply border-transparent text-text-muted hover:text-text hover:border-text-faint;
+    @apply rounded-lg px-3 py-1.5 text-text-muted hover:text-text hover:bg-surface-2;
   }
 }
 
-/* === Global dark select styling === */
+/* === Global select styling (light) === */
 
 select {
   appearance: none;
-  background-color: var(--color-surface-2);
+  background-color: var(--color-surface);
   border: 1px solid var(--color-border);
+  border-radius: 8px;
   color: var(--color-text);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%238a9aa6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%236b6f76' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   padding-right: 28px;

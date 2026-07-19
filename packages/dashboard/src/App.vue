@@ -21,8 +21,8 @@ function navLinkClass(routeName: string): string {
   };
   const isActive = route.name === routeName || (detailRoutes[routeName]?.includes(route.name as string) ?? false);
   return isActive
-    ? 'text-sm text-teal border-b-2 border-teal pb-[14px]'
-    : 'text-sm text-text-muted hover:text-text pb-[14px] border-b-2 border-transparent';
+    ? 'rounded-lg bg-teal/10 px-3 py-1.5 text-sm font-medium text-teal'
+    : 'rounded-lg px-3 py-1.5 text-sm text-text-muted hover:text-text hover:bg-surface-2';
 }
 
 // Project selection prompt state
@@ -133,7 +133,7 @@ watch(
           :active-org-id="user.active_org_id ?? user.org_id"
         />
       </div>
-      <nav class="flex items-center gap-6 h-14">
+      <nav class="flex items-center gap-2 h-14">
         <router-link to="/" :class="navLinkClass('activity')">
           Incidents
         </router-link>
