@@ -9,5 +9,9 @@
  * hosts that arrive with mixed case.
  */
 export function canonicalOrigin(input: string): string {
-  return new URL(input).origin.toLowerCase();
+  const url = new URL(input);
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin === 'null') {
+    throw new TypeError('API URL must use http or https');
+  }
+  return url.origin.toLowerCase();
 }

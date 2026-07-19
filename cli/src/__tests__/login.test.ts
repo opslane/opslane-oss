@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, readFile, stat, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, stat, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -63,16 +63,18 @@ describe('persistTokens / loadTokens / clearTokens', () => {
       expiresAt: Date.now() + 3600_000,
     };
 
-    await persistTokensTo(credFile, tokens);
+    await persistTokensTo(credFile, 'https://api.opslane.com', tokens);
 
     const stats = await stat(credFile);
     // Check file permissions (owner read/write only)
     const mode = stats.mode & 0o777;
     expect(mode).toBe(0o600);
 
-    const contents = JSON.parse(await readFile(credFile, 'utf-8')) as TokenPair;
-    expect(contents.accessToken).toBe('access-123');
-    expect(contents.refreshToken).toBe('refresh-456');
+    const contents = JSON.parse(await readFile(credFile, 'utf-8')) as {
+      version: number; tokens: Record<string, TokenPair>;
+    };
+    expect(contents.version).toBe(2);
+    expect(contents.tokens['https://api.opslane.com']?.accessToken).toBe('access-123');
   });
 
   it('loadTokens returns tokens when file exists and not expired', async () => {
@@ -82,17 +84,15 @@ describe('persistTokens / loadTokens / clearTokens', () => {
       expiresAt: Date.now() + 3600_000,
     };
 
-    await persistTokensTo(credFile, tokens);
-    const loaded = await loadTokensFrom(credFile);
+    await persistTokensTo(credFile, 'https://api.opslane.com', tokens);
+    const loaded = await loadTokensFrom(credFile, 'https://api.opslane.com');
 
     expect(loaded).not.toBeNull();
     expect(loaded?.accessToken).toBe('access-abc');
   });
 
   it('loadTokens returns null for missing file', async () => {
-    const loaded = await loadTokensFrom(
-      join(tmpDir, 'nonexistent.json'),
-    );
+    const loaded = await loadTokensFrom(join(tmpDir, 'nonexistent.json'), 'https://api.opslane.com');
     expect(loaded).toBeNull();
   });
 
@@ -103,8 +103,8 @@ describe('persistTokens / loadTokens / clearTokens', () => {
       expiresAt: Date.now() - 1000, // expired 1 second ago
     };
 
-    await persistTokensTo(credFile, tokens);
-    const loaded = await loadTokensFrom(credFile);
+    await persistTokensTo(credFile, 'https://api.opslane.com', tokens);
+    const loaded = await loadTokensFrom(credFile, 'https://api.opslane.com');
 
     expect(loaded).toBeNull();
   });
@@ -116,10 +116,10 @@ describe('persistTokens / loadTokens / clearTokens', () => {
       expiresAt: Date.now() + 3600_000,
     };
 
-    await persistTokensTo(credFile, tokens);
-    await clearTokensAt(credFile);
+    await persistTokensTo(credFile, 'https://api.opslane.com', tokens);
+    await clearTokensAt(credFile, 'https://api.opslane.com');
 
-    const loaded = await loadTokensFrom(credFile);
+    const loaded = await loadTokensFrom(credFile, 'https://api.opslane.com');
     expect(loaded).toBeNull();
   });
 
@@ -137,8 +137,28 @@ describe('persistTokens / loadTokens / clearTokens', () => {
       expiresAt: Date.now() + 3600_000,
     };
 
-    await persistTokensTo(nestedFile, tokens);
-    const loaded = await loadTokensFrom(nestedFile);
+    await persistTokensTo(nestedFile, 'https://api.opslane.com', tokens);
+    const loaded = await loadTokensFrom(nestedFile, 'https://api.opslane.com');
     expect(loaded?.accessToken).toBe('nested-token');
+  });
+
+  it('keeps tokens scoped by canonical origin', async () => {
+    const tokens: TokenPair = {
+      accessToken: 'self-hosted', refreshToken: 'refresh', expiresAt: Date.now() + 3600_000,
+    };
+    await persistTokensTo(credFile, 'HTTP://LOCALHOST:8082/path', tokens);
+    await expect(loadTokensFrom(credFile, 'http://localhost:8082')).resolves.toMatchObject({ accessToken: 'self-hosted' });
+    await expect(loadTokensFrom(credFile, 'https://api.opslane.com')).resolves.toBeNull();
+  });
+
+  it('never associates legacy originless tokens with a server', async () => {
+    await writeFile(credFile, JSON.stringify({
+      accessToken: 'legacy', refreshToken: 'legacy-refresh', expiresAt: Date.now() + 3600_000,
+    }));
+    await expect(loadTokensFrom(credFile, 'https://api.opslane.com')).resolves.toBeNull();
+    await persistTokensTo(credFile, 'https://api.opslane.com', {
+      accessToken: 'fresh', refreshToken: 'fresh-refresh', expiresAt: Date.now() + 3600_000,
+    });
+    await expect(loadTokensFrom(credFile, 'https://api.opslane.com')).resolves.toMatchObject({ accessToken: 'fresh' });
   });
 });

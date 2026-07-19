@@ -20,10 +20,11 @@ export function exitWithError(message: string, details?: Record<string, unknown>
  * Exactly one JSON document is printed per invocation.
  */
 export function exitWithStatus(
-  status: string,
+  status: AgentStatus,
   data: Record<string, unknown> = {},
   code = 1,
 ): never {
   jsonOutput({ status, ...data });
   process.exit(code);
 }
+import type { AgentStatus } from './contract.js';

@@ -1,7 +1,9 @@
 import { randomBytes, createHash } from 'node:crypto';
-import { readFile, writeFile, unlink, mkdir } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { canonicalOrigin } from './origin.js';
+import { withFileLock, writeFileAtomic } from './fsutil.js';
 
 export interface AuthConfig {
   apiUrl: string;
@@ -19,88 +21,106 @@ export interface PKCEPair {
   codeChallenge: string;
 }
 
-const CREDENTIALS_DIR = join(homedir(), '.opslane');
-const CREDENTIALS_FILE = join(CREDENTIALS_DIR, 'credentials.json');
+interface TokenFileV2 {
+  version: 2;
+  tokens: Record<string, TokenPair>;
+}
 
-/**
- * Generate a PKCE code_verifier and code_challenge (S256).
- * code_verifier: 43-128 chars from unreserved URL-safe characters.
- * code_challenge: Base64url-encoded SHA256 of the verifier.
- */
+const CREDENTIALS_FILE = join(homedir(), '.opslane', 'credentials.json');
+let legacyNoticePrinted = false;
+
 export function generatePKCE(): PKCEPair {
-  // Generate 32 random bytes -> 43 base64url chars
-  const codeVerifier = randomBytes(32)
-    .toString('base64url')
-    .slice(0, 43);
-
+  const codeVerifier = randomBytes(32).toString('base64url').slice(0, 43);
   const hash = createHash('sha256').update(codeVerifier).digest();
-  const codeChallenge = hash.toString('base64url');
-
-  return { codeVerifier, codeChallenge };
+  return { codeVerifier, codeChallenge: hash.toString('base64url') };
 }
 
-/**
- * Persist tokens to ~/.opslane/credentials.json with mode 0o600.
- */
-export async function persistTokens(tokens: TokenPair): Promise<void> {
-  await persistTokensTo(CREDENTIALS_FILE, tokens);
+function isTokenPair(value: unknown): value is TokenPair {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record['accessToken'] === 'string' &&
+    typeof record['refreshToken'] === 'string' &&
+    typeof record['expiresAt'] === 'number';
 }
 
-/**
- * Load tokens from disk. Returns null if file missing or tokens expired.
- */
-export async function loadTokens(): Promise<TokenPair | null> {
-  return loadTokensFrom(CREDENTIALS_FILE);
+function isTokenFileV2(value: unknown): value is TokenFileV2 {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (record['version'] !== 2 || typeof record['tokens'] !== 'object' || record['tokens'] === null) {
+    return false;
+  }
+  return Object.values(record['tokens'] as Record<string, unknown>).every(isTokenPair);
 }
 
-/**
- * Delete credentials file.
- */
-export async function clearTokens(): Promise<void> {
-  await clearTokensAt(CREDENTIALS_FILE);
+async function readTokenFile(filePath: string, warnLegacy: boolean): Promise<TokenFileV2> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(filePath, 'utf8'));
+    if (isTokenFileV2(parsed)) return parsed;
+    if (isTokenPair(parsed) && warnLegacy && !legacyNoticePrinted) {
+      legacyNoticePrinted = true;
+      console.error('Legacy login credentials have no server origin and cannot be reused safely. Run "opslane login" again.');
+    }
+  } catch {
+    // Missing or malformed files are treated as empty.
+  }
+  return { version: 2, tokens: {} };
 }
 
-/**
- * Persist tokens to a specific path (for testing / custom config).
- */
+export async function persistTokens(apiUrl: string, tokens: TokenPair): Promise<void> {
+  await persistTokensTo(CREDENTIALS_FILE, apiUrl, tokens);
+}
+
+export async function loadTokens(apiUrl: string): Promise<TokenPair | null> {
+  return loadTokensFrom(CREDENTIALS_FILE, apiUrl);
+}
+
+export async function clearTokens(apiUrl: string): Promise<void> {
+  await clearTokensAt(CREDENTIALS_FILE, apiUrl);
+}
+
 export async function persistTokensTo(
   filePath: string,
+  apiUrl: string,
   tokens: TokenPair,
 ): Promise<void> {
-  const dir = filePath.substring(0, filePath.lastIndexOf('/'));
-  await mkdir(dir, { recursive: true });
-  await writeFile(filePath, JSON.stringify(tokens, null, 2), {
-    mode: 0o600,
+  await withFileLock(filePath, async () => {
+    const current = await readTokenFile(filePath, false);
+    current.tokens[canonicalOrigin(apiUrl)] = tokens;
+    await writeFileAtomic(filePath, `${JSON.stringify(current, null, 2)}\n`);
   });
 }
 
-/**
- * Load tokens from a specific path (for testing / custom config).
- */
 export async function loadTokensFrom(
   filePath: string,
+  apiUrl: string,
 ): Promise<TokenPair | null> {
-  try {
-    const raw = await readFile(filePath, 'utf-8');
-    const tokens = JSON.parse(raw) as TokenPair;
-
-    if (Date.now() >= tokens.expiresAt) {
-      return null;
-    }
-
-    return tokens;
-  } catch {
-    return null;
-  }
+  const file = await readTokenFile(filePath, true);
+  const tokens = file.tokens[canonicalOrigin(apiUrl)];
+  if (!tokens || Date.now() >= tokens.expiresAt) return null;
+  return tokens;
 }
 
-/**
- * Clear tokens at a specific path (for testing / custom config).
- */
-export async function clearTokensAt(filePath: string): Promise<void> {
-  try {
-    await unlink(filePath);
-  } catch {
-    // File may not exist; that's fine
+export async function clearTokensAt(filePath: string, apiUrl?: string): Promise<void> {
+  if (!apiUrl) {
+    await unlink(filePath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    return;
   }
+
+  await withFileLock(filePath, async () => {
+    const current = await readTokenFile(filePath, false);
+    delete current.tokens[canonicalOrigin(apiUrl)];
+    if (Object.keys(current.tokens).length === 0) {
+      await unlink(filePath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+    } else {
+      await writeFileAtomic(filePath, `${JSON.stringify(current, null, 2)}\n`);
+    }
+  });
+}
+
+export function defaultTokenPath(): string {
+  return CREDENTIALS_FILE;
 }

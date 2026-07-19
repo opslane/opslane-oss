@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from 'node:fs';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { login } from './login.js';
 import { init } from './init.js';
 import { doctor } from './doctor.js';
@@ -10,6 +10,8 @@ import { snippet } from './snippet.js';
 import { verify } from './verify.js';
 import { status } from './status.js';
 import { listErrors, getError } from './errors.js';
+import { AGENT_STATUSES } from './contract.js';
+import { jsonOutput } from './output.js';
 
 // Derive the version from package.json so Changesets bumps propagate to
 // `opslane --version` without a hand edit (dist/index.js -> ../package.json).
@@ -25,9 +27,19 @@ program
   .version(pkg.version);
 
 program
+  .addOption(new Option('--contract', 'Print the machine-readable agent contract').hideHelp())
+  .action((opts: { contract?: boolean }) => {
+    if (opts.contract) jsonOutput({ statuses: AGENT_STATUSES });
+  });
+
+program
   .command('login')
   .description('Authenticate with Opslane and connect GitHub')
-  .action(() => login());
+  .option('--api-url <url>', 'Opslane API URL')
+  .action((opts: { apiUrl?: string }) => login({
+    apiUrl: opts.apiUrl ?? process.env['OPSLANE_API_URL'] ?? 'https://api.opslane.com',
+    clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
+  }));
 
 program
   .command('init')
@@ -39,19 +51,29 @@ program
   .command('doctor')
   .description('Check Opslane setup health')
   .option('--fix', 'Attempt to auto-fix common issues')
-  .action(async (opts: { fix?: boolean }) => {
-    await doctor({ fix: opts.fix });
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (opts: { fix?: boolean; apiUrl?: string; repo?: string }) => {
+    await doctor(opts);
   });
 
 // Agent-first onboarding commands
 program
   .command('setup')
   .description('Set up Opslane for this repo (agent-first onboarding)')
+  .option('--start', 'Create a setup session without polling')
   .option('--poll <id>', 'Resume polling an existing setup session')
+  .option('--timeout <seconds>', 'Polling timeout in seconds')
+  .option('--force', 'Bypass local credential validation')
+  .option('--relink', 'Mint a replacement key using an authenticated login')
   .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Override auto-detected repository')
   .option('--repo-url <url>', 'Override auto-detected repo URL')
   .option('--agent-name <name>', 'Agent identifier (e.g., "claude-code")')
-  .action(async (opts: { poll?: string; apiUrl?: string; repoUrl?: string; agentName?: string }) => {
+  .action(async (opts: {
+    start?: boolean; poll?: string; timeout?: string; force?: boolean; relink?: boolean;
+    apiUrl?: string; repo?: string; repoUrl?: string; agentName?: string;
+  }) => {
     await setup(opts);
   });
 
@@ -60,22 +82,28 @@ program
   .description('Get framework-specific SDK init code')
   .option('--framework <name>', 'Override auto-detected framework')
   .option('--api-key <key>', 'API key to embed in snippet')
-  .action(async (opts: { framework?: string; apiKey?: string }) => {
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (opts: { framework?: string; apiKey?: string; apiUrl?: string; repo?: string }) => {
     await snippet(opts);
   });
 
 program
   .command('verify')
   .description('Check if Opslane is connected and receiving events')
-  .action(async () => {
-    await verify();
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (opts: { apiUrl?: string; repo?: string }) => {
+    await verify(opts);
   });
 
 program
   .command('status')
   .description('Show current Opslane project and auth state')
-  .action(async () => {
-    await status();
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (opts: { apiUrl?: string; repo?: string }) => {
+    await status(opts);
   });
 
 const errorsCmd = program
@@ -87,15 +115,19 @@ errorsCmd
   .description('List error groups')
   .option('--status <status>', 'Filter by status')
   .option('--limit <n>', 'Maximum results', '25')
-  .action(async (opts: { status?: string; limit?: string }) => {
-    await listErrors({ status: opts.status, limit: parseInt(opts.limit ?? '25', 10) });
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (opts: { status?: string; limit?: string; apiUrl?: string; repo?: string }) => {
+    await listErrors({ ...opts, limit: parseInt(opts.limit ?? '25', 10) });
   });
 
 errorsCmd
   .command('get <id>')
   .description('Get error group details')
-  .action(async (id: string) => {
-    await getError(id);
+  .option('--api-url <url>', 'Opslane API URL')
+  .option('--repo <owner/repo>', 'Repository to inspect')
+  .action(async (id: string, opts: { apiUrl?: string; repo?: string }) => {
+    await getError(id, opts);
   });
 
 program.parse();

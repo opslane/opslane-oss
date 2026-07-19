@@ -1,8 +1,11 @@
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import chalk from 'chalk';
-import { loadTokens } from './auth.js';
+import { defaultTokenPath, loadTokensFrom } from './auth.js';
+import { defaultCredentialsPath, resolveCredentials } from './agent-credentials.js';
 import { defaultApiUrl } from './config.js';
+import { detectRepoFromGit } from './setup.js';
+import { canonicalOrigin } from './origin.js';
 
 export interface DoctorOptions {
   fix?: boolean;
@@ -12,6 +15,9 @@ export interface DoctorOptions {
   cwd?: string;
   /** Injectable fetch for testing. */
   fetchFn?: typeof fetch;
+  repo?: string;
+  credentialsPath?: string;
+  tokenPath?: string;
 }
 
 export interface CheckResult {
@@ -24,7 +30,7 @@ export interface CheckResult {
 type CheckFn = () => Promise<CheckResult>;
 
 function getApiUrl(options: DoctorOptions): string {
-  return options.apiUrl ?? defaultApiUrl();
+  return canonicalOrigin(options.apiUrl ?? defaultApiUrl());
 }
 
 /**
@@ -34,9 +40,19 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
   const cwd = options.cwd ?? process.cwd();
   const apiUrl = getApiUrl(options);
   const fetchImpl = options.fetchFn ?? fetch;
+  const repo = options.repo ?? detectRepoFromGit(cwd);
+  const resolveAgentCredentials = () => resolveCredentials({
+    apiUrl,
+    repo,
+    filePath: options.credentialsPath ?? defaultCredentialsPath(),
+  });
+  const resolveLoginTokens = () => loadTokensFrom(
+    options.tokenPath ?? defaultTokenPath(),
+    apiUrl,
+  );
 
   return [
-    // Check 1: .opslane.json exists
+    // Check 1: .opslane.json is optional for agent-first setup.
     async (): Promise<CheckResult> => {
       try {
         await access(join(cwd, '.opslane.json'));
@@ -48,21 +64,23 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
       } catch {
         return {
           name: 'Project config',
-          passed: false,
-          message: '.opslane.json not found in current directory',
-          remediation: 'Run `opslane init`',
+          passed: true,
+          message: '.opslane.json not found (optional for agent-first setup)',
         };
       }
     },
 
     // Check 2: Credentials exist and not expired
     async (): Promise<CheckResult> => {
-      const tokens = await loadTokens();
-      if (tokens) {
+      const [agentCredentials, tokens] = await Promise.all([
+        resolveAgentCredentials(),
+        resolveLoginTokens(),
+      ]);
+      if (agentCredentials || tokens) {
         return {
           name: 'Authentication',
           passed: true,
-          message: 'Valid credentials found',
+          message: agentCredentials ? 'Agent API credentials found' : 'Valid login credentials found',
         };
       }
       return {
@@ -107,8 +125,9 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
     // Check 4: API key valid
     async (): Promise<CheckResult> => {
       try {
-        const tokens = await loadTokens();
-        if (!tokens) {
+        const agentCredentials = await resolveAgentCredentials();
+        const tokens = agentCredentials ? null : await resolveLoginTokens();
+        if (!agentCredentials && !tokens) {
           return {
             name: 'API key',
             passed: false,
@@ -116,10 +135,12 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
             remediation: 'Run `opslane login` first',
           };
         }
-        const response = await fetchImpl(`${apiUrl}/api/v1/auth/verify`, {
-          headers: {
-            Authorization: `Bearer ${tokens.accessToken}`,
-          },
+        const response = await fetchImpl(agentCredentials
+          ? `${agentCredentials.api_url}/api/v1/projects/${encodeURIComponent(agentCredentials.project_id)}/event-count`
+          : `${apiUrl}/api/v1/auth/verify`, {
+          headers: agentCredentials
+            ? { 'X-API-Key': agentCredentials.api_key }
+            : { Authorization: `Bearer ${tokens?.accessToken ?? ''}` },
           signal: AbortSignal.timeout(5000),
         });
         if (response.ok) {
@@ -134,7 +155,7 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
           passed: false,
           message: `Auth verification failed (status ${response.status})`,
           remediation:
-            'Check environment API key in .opslane.json',
+            agentCredentials ? 'Run `opslane setup --force` or `opslane setup --relink`' : 'Run `opslane login` again',
         };
       } catch {
         return {
@@ -142,7 +163,7 @@ function buildChecks(options: DoctorOptions): CheckFn[] {
           passed: false,
           message: 'Could not verify API key',
           remediation:
-            'Check environment API key in .opslane.json',
+            'Run `opslane setup --relink` or `opslane login` again',
         };
       }
     },

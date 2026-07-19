@@ -19,4 +19,9 @@ describe('canonicalOrigin', () => {
   it('throws on a non-URL', () => {
     expect(() => canonicalOrigin('not a url')).toThrow();
   });
+
+  it.each(['file:///tmp/opslane', 'data:text/plain,opslane', 'ftp://api.opslane.com'])(
+    'rejects non-HTTP origin %s',
+    (input) => expect(() => canonicalOrigin(input)).toThrow(/http or https/),
+  );
 });
