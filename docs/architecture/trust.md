@@ -13,7 +13,7 @@ What Opslane can touch, what leaves your infrastructure, how credentials are han
 The worker needs to **read repository contents** (clone, source maps context) and **write pull requests**. Two credential modes:
 
 - **Personal access token** (`GITHUB_TOKEN`): a fine-grained PAT with `contents` and `pull_requests` write on the repositories you connect.
-- **GitHub App**: the worker mints short-lived installation tokens from `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`. Installation tokens expire on the order of an hour and are scoped to the repositories the App is installed on. The App also powers dashboard sign-in (OAuth) and webhooks (HMAC-verified).
+- **GitHub App**: the worker mints short-lived installation tokens from `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`. Installation tokens expire on the order of an hour and are scoped to the repositories the App is installed on. The App powers webhooks (HMAC-verified). Dashboard sign-in uses OAuth with a configured identity provider; social providers such as GitHub and Google may be enabled.
 
 The worker pushes exactly one thing: a newly created fix branch (`git push origin <branch>`, no force flags anywhere in the pipeline), then opens a PR from it. It never pushes to existing branches; merging is always yours.
 
@@ -24,7 +24,8 @@ The worker pushes exactly one thing: a newly created fix branch (`git push origi
 | Anthropic API | Error details, stack traces, relevant source file contents, test output | Only during investigation, only with `ANTHROPIC_API_KEY` set |
 | E2B sandbox | A clone of the connected repository, the candidate fix, dependency installs, test runs | Only during fix verification, only with `E2B_API_KEY` set |
 | GitHub (worker) | The fix branch (pushed **before** PR creation — if the PR call then fails, the pushed branch remains and the incident ends `needs_human`), then the PR body (root cause, diff, verification evidence). The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery and setup-PR |
-| GitHub (ingestion) | OAuth code exchange and user/email lookup (sign-in); installation and repository listing (App setup) | During dashboard sign-in and GitHub setup |
+| Configured identity provider | OAuth code exchange and user/email lookup (sign-in) | During dashboard sign-in |
+| GitHub (ingestion) | Installation and repository listing (App setup) | During GitHub App setup |
 
 With no credentials configured, **nothing leaves your host** — the stack ingests, groups, and files `needs_human` incidents entirely locally.
 
@@ -83,4 +84,3 @@ These are known, tracked, and stated here so you can make an informed deployment
 ## Why the prompts are public
 
 The investigation and fix prompts live in this repository (`packages/worker/src`), not behind an API. That is intentional: you can read exactly what instructions the agent operates under, what it is told never to do, and how untrusted error text is fenced (`<untrusted_user_data>` delimiters in the fix loop) before you let it near your code.
-</content>
