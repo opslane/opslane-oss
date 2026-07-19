@@ -462,3 +462,76 @@ func TestGitHubProvisioningResolvesIdentityFirstAndWritesFreshIdentity(t *testin
 		t.Fatalf("fresh identity user=%q err=%v, want %s", gotUserID, err, fresh.ID)
 	}
 }
+
+func TestProvisionGitHubIdentityGrantsOwnerMembership(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	deps := &Dependencies{Queries: q}
+	request := httptest.NewRequest("GET", "/auth/callback", nil)
+
+	freshID := time.Now().UnixNano()
+	fresh, err := deps.provisionGitHubIdentity(request, auth.Identity{
+		Provider: "github", ProviderSubject: strconv.FormatInt(freshID, 10),
+		Email:         fmt.Sprintf("github-owner-%d@example.com", freshID),
+		EmailVerified: true, Name: "Owner", Username: fmt.Sprintf("owner-%d", freshID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupGitHubOAuthOrg(t, pool, fresh.OrgID) })
+	role, err := q.GetMembership(ctx, fresh.ID, fresh.OrgID)
+	if err != nil || role != "owner" {
+		t.Fatalf("new GitHub user role=%q err=%v, want owner", role, err)
+	}
+}
+
+func TestProvisionGitHubIdentityHealsMissingMembership(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	org, err := q.CreateOrg(ctx, fmt.Sprintf("github-heal-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupGitHubOAuthOrg(t, pool, org.ID) })
+	githubID := time.Now().UnixNano()
+	user, err := q.CreateUserGitHub(ctx, org.ID, fmt.Sprintf("github-heal-%d@example.com", githubID), "Heal", githubID, "heal", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := strconv.FormatInt(githubID, 10)
+	if err := q.UpsertIdentity(ctx, user.ID, "github", subject); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a legacy account created before membership rows existed.
+	if _, err := pool.Exec(ctx, `DELETE FROM memberships WHERE user_id = $1 AND org_id = $2`, user.ID, org.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &Dependencies{Queries: q}
+	request := httptest.NewRequest("GET", "/auth/callback", nil)
+	identity := auth.Identity{
+		Provider: "github", ProviderSubject: subject, Email: user.Email,
+		EmailVerified: true, Name: "Heal", Username: "heal",
+	}
+	if _, err := deps.provisionGitHubIdentity(request, identity); err != nil {
+		t.Fatal(err)
+	}
+	role, err := q.GetMembership(ctx, user.ID, org.ID)
+	if err != nil || role != "owner" {
+		t.Fatalf("healed role=%q err=%v, want owner", role, err)
+	}
+
+	// A deliberately downgraded role must survive later logins.
+	if err := q.SetMembershipRole(ctx, user.ID, org.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deps.provisionGitHubIdentity(request, identity); err != nil {
+		t.Fatal(err)
+	}
+	role, err = q.GetMembership(ctx, user.ID, org.ID)
+	if err != nil || role != "member" {
+		t.Fatalf("downgraded role=%q err=%v, want member preserved", role, err)
+	}
+}

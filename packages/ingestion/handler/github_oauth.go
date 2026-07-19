@@ -279,6 +279,19 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 			}
 		}
 	}
+	// RequireMembership 403s any session without a memberships row; GitHub
+	// accounts created before membership rows existed have none, so grant the
+	// home-org owner row here without touching an existing (possibly
+	// downgraded) role.
+	role, err := d.Queries.GetMembership(r.Context(), user.ID, user.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		if err := d.Queries.CreateMembership(r.Context(), user.ID, user.OrgID, "owner"); err != nil {
+			return nil, err
+		}
+	}
 	if err := d.Queries.UpdateUserGitHub(r.Context(), user.ID, identity.Username, identity.AvatarURL, identity.Email); err != nil {
 		slog.Warn("refresh GitHub profile failed", "user_id", user.ID, "error", err)
 	}
