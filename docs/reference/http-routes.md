@@ -1,6 +1,6 @@
 # HTTP routes
 
-All routes registered by the ingestion API (`packages/ingestion/handler/routes.go`). Auth column legend: **none** (public), **SDK** (`X-API-Key` per-environment key; browser endpoints also origin-gated and rate-limited per project), **session** (dashboard JWT cookie or CLI token), **either** (session or SDK).
+All routes registered by the ingestion API (`packages/ingestion/handler/routes.go`). Auth column legend: **none** (public), **poll token** (`X-Opslane-Poll-Token` for one agent session), **SDK** (`X-API-Key` per-environment key; browser endpoints also origin-gated and rate-limited per project), **session** (dashboard JWT cookie or CLI token), **either** (session or SDK).
 
 These are curated tables, not a stability contract — the API is early-stage and may change. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `routes.go` disagree.
 
@@ -18,10 +18,12 @@ These are curated tables, not a stability contract — the API is early-stage an
 | GET+POST | `/oauth/authorize` | none | CLI PKCE authorization |
 | POST | `/oauth/token` | none | CLI PKCE token exchange |
 | POST | `/api/v1/agent/setup` | none | Agent-first onboarding start |
-| GET | `/api/v1/agent/poll/{sessionID}` | none | Agent onboarding poll |
+| GET | `/api/v1/agent/poll/{sessionID}` | poll token (`X-Opslane-Poll-Token`) | Agent onboarding poll |
 | GET | `/agent/auth/{sessionID}` | none | Agent onboarding browser auth |
 | GET | `/agent/auth/callback` | none | Agent onboarding callback |
 | POST | `/api/v1/github/webhook` | HMAC | GitHub webhook receiver — requires `X-GitHub-Delivery` (400 without it); responds `processed`, `no_match`, or `duplicate` (idempotent on redelivery) |
+
+The agent callback requires `code`, `installation_id`, and UUID `state`; definitive failures are returned by polling as machine-readable reasons. `/auth/callback` dispatches UUID-state GitHub App installs to the agent flow and handles other states through the existing browser-login/install flow.
 
 ## SDK (X-API-Key)
 

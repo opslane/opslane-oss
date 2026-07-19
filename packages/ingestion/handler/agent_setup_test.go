@@ -91,6 +91,30 @@ func TestAgentSetup_OversizedBody(t *testing.T) {
 	}
 }
 
+func TestAgentSetup_RateLimitContract(t *testing.T) {
+	deps := &Dependencies{}
+	var last *httptest.ResponseRecorder
+	for range 6 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/setup", bytes.NewBufferString(`{}`))
+		req.Header.Set("X-Forwarded-For", "198.51.100.77")
+		last = httptest.NewRecorder()
+		deps.AgentSetup(last, req)
+	}
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", last.Code)
+	}
+	if got := last.Header().Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(last.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "rate_limited" {
+		t.Fatalf("body = %v", body)
+	}
+}
+
 func TestAgentPoll_InvalidSessionID(t *testing.T) {
 	deps := &Dependencies{}
 	req := httptest.NewRequest("GET", "/api/v1/agent/poll/not-a-uuid", nil)
@@ -120,6 +144,25 @@ func TestAgentPoll_MissingSessionID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for missing session ID, got %d", w.Code)
+	}
+}
+
+func TestAgentPoll_MissingTokenIs404NotFoundBody(t *testing.T) {
+	deps := &Dependencies{}
+	req := httptest.NewRequest("GET", "/api/v1/agent/poll/00000000-0000-0000-0000-000000000001", nil)
+	req.Header.Set("X-Forwarded-For", "198.51.100.78")
+	req = req.WithContext(newChiRouteContext(map[string]string{"sessionID": "00000000-0000-0000-0000-000000000001"}))
+	w := httptest.NewRecorder()
+	deps.AgentPoll(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if body["status"] != "not_found" {
+		t.Fatalf("body = %v, want status not_found", body)
 	}
 }
 

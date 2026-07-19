@@ -54,7 +54,7 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 	r.HandleFunc("/oauth/authorize", deps.OAuthAuthorize) // GET + POST
 	r.Post("/oauth/token", deps.OAuthToken)
 
-	// Agent-first onboarding (unauthenticated — session ID is the secret)
+	// Agent-first onboarding (unauthenticated start; polling uses a split token)
 	r.Post("/api/v1/agent/setup", deps.AgentSetup)
 	r.Get("/api/v1/agent/poll/{sessionID}", deps.AgentPoll)
 	r.Get("/agent/auth/{sessionID}", deps.AgentAuthRedirect)

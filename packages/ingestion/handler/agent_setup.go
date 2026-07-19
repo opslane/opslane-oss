@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
@@ -25,6 +28,13 @@ var agentPollLimiter = newRateLimiter(30) // 30/min per IP — polling
 // repoURLPattern validates owner/repo format
 var repoURLPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
 
+// agentJSON writes the stable response shape consumed by the agent CLI.
+func agentJSON(w http.ResponseWriter, code int, body map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
 // AgentSetup creates a new agent session for a CLI-initiated auth flow.
 // No auth required — this initiates the auth flow.
 //
@@ -33,7 +43,11 @@ func (d *Dependencies) AgentSetup(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	if !agentSetupLimiter.allow(ip) {
 		slog.Warn("agent setup rate limit exceeded", "ip", ip)
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests, try again later")
+		w.Header().Set("Retry-After", "60")
+		agentJSON(w, http.StatusTooManyRequests, map[string]any{
+			"status": "rate_limited", "retry_after": 60,
+			"message": "too many requests, try again later",
+		})
 		return
 	}
 
@@ -60,18 +74,25 @@ func (d *Dependencies) AgentSetup(w http.ResponseWriter, r *http.Request) {
 	existingProject, err := d.Queries.FindProjectByRepoURL(r.Context(), req.RepoURL)
 	if err != nil {
 		slog.Error("agent setup: find project by repo", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		agentJSON(w, http.StatusInternalServerError, map[string]any{
+			"status": "internal_error", "message": "internal error",
+		})
 		return
 	}
 	if existingProject != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "already_configured",
-			"project_id": existingProject.ID,
-			"org_id":     existingProject.OrgID,
-			"repo":       req.RepoURL,
-			"message":    "This repo already has a Opslane project. Run 'opslane login' to authenticate.",
+		agentJSON(w, http.StatusOK, map[string]any{
+			"status":  "already_configured",
+			"repo":    req.RepoURL,
+			"message": "This repo already has an Opslane project. Run 'opslane login' then 'opslane setup --relink' to get a fresh key.",
+		})
+		return
+	}
+
+	pollToken, tokenHash, agentKeyPub, err := auth.NewAgentPollToken()
+	if err != nil {
+		slog.Error("agent setup: generate poll token", "error", err)
+		agentJSON(w, http.StatusInternalServerError, map[string]any{
+			"status": "internal_error", "message": "internal error",
 		})
 		return
 	}
@@ -80,34 +101,46 @@ func (d *Dependencies) AgentSetup(w http.ResponseWriter, r *http.Request) {
 	if req.AgentName != "" {
 		agentName = &req.AgentName
 	}
-	session, err := d.Queries.CreateAgentSession(r.Context(), req.RepoURL, agentName)
+	session, err := d.Queries.CreateAgentSession(r.Context(), db.CreateAgentSessionParams{
+		RepoURL: req.RepoURL, AgentName: agentName,
+		PollTokenHash: tokenHash, AgentKeyPub: agentKeyPub,
+	})
 	if err != nil {
 		slog.Error("agent setup: create session", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "failed to create setup session")
+		agentJSON(w, http.StatusInternalServerError, map[string]any{
+			"status": "internal_error", "message": "failed to create setup session",
+		})
 		return
 	}
 
 	// Build the auth URL — human clicks this to install the GitHub App
-	authURL := fmt.Sprintf("%s/agent/auth/%s", backendOrigin(r), session.ID)
+	origin := d.AuthCallbackOrigin
+	if origin == "" {
+		origin = backendOrigin(r)
+	}
+	authURL := fmt.Sprintf("%s/agent/auth/%s", origin, session.ID)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":   "auth_required",
-		"auth_url": authURL,
-		"poll_id":  session.ID,
-		"message":  fmt.Sprintf("Authorize Opslane: %s", authURL),
+	agentJSON(w, http.StatusCreated, map[string]any{
+		"status":     "auth_required",
+		"auth_url":   authURL,
+		"poll_id":    session.ID,
+		"poll_token": pollToken,
+		"message":    fmt.Sprintf("Authorize Opslane: %s", authURL),
 	})
 }
 
 // AgentPoll checks the status of an agent session.
-// No auth required — the poll_id (UUID) acts as the secret.
+// The session UUID is a routing identifier; X-Opslane-Poll-Token is the secret.
 //
 // GET /api/v1/agent/poll/{sessionID}
 func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	if !agentPollLimiter.allow(ip) {
-		writeJSONError(w, http.StatusTooManyRequests, "too many requests, try again later")
+		w.Header().Set("Retry-After", "60")
+		agentJSON(w, http.StatusTooManyRequests, map[string]any{
+			"status": "rate_limited", "retry_after": 60,
+			"message": "too many requests, try again later",
+		})
 		return
 	}
 
@@ -123,14 +156,23 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pollToken := r.Header.Get("X-Opslane-Poll-Token")
+	if pollToken == "" {
+		agentJSON(w, http.StatusNotFound, map[string]any{"status": "not_found"})
+		return
+	}
+
 	session, err := d.Queries.GetAgentSession(r.Context(), sessionID)
 	if err != nil {
 		slog.Error("agent poll: get session", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		agentJSON(w, http.StatusInternalServerError, map[string]any{
+			"status": "internal_error", "message": "internal error",
+		})
 		return
 	}
-	if session == nil {
-		writeJSONError(w, http.StatusNotFound, "session not found")
+	if session == nil || session.PollTokenHash == nil ||
+		!hmac.Equal([]byte(auth.HashToken(pollToken)), []byte(*session.PollTokenHash)) {
+		agentJSON(w, http.StatusNotFound, map[string]any{"status": "not_found"})
 		return
 	}
 
@@ -147,26 +189,41 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 			resp["project_id"] = *session.ProjectID
 		}
 
-		// Atomically claim the key — only first poll gets it
-		apiKey, claimErr := d.Queries.ClaimAgentSessionKey(r.Context(), sessionID)
-		if claimErr != nil {
-			slog.Error("agent poll: claim key", "error", claimErr)
+		if session.APIKeySealed == nil || time.Now().After(session.ExpiresAt) {
+			resp["message"] = "key delivery window closed; re-run setup to mint a new key"
+		} else {
+			apiKey, openErr := auth.OpenAgentKey(pollToken, session.ID, *session.APIKeySealed)
+			if openErr != nil {
+				slog.Error("agent poll: open sealed key", "error", openErr, "session_id", session.ID)
+				agentJSON(w, http.StatusInternalServerError, map[string]any{
+					"status": "internal_error", "message": "internal error",
+				})
+				return
+			}
+			resp["api_key"] = apiKey
+			if err := d.Queries.MarkAgentKeyDelivered(r.Context(), session.ID); err != nil {
+				slog.Warn("agent poll: mark delivered", "error", err)
+			}
 		}
-		if apiKey != nil {
-			resp["api_key"] = *apiKey
-		}
+		agentJSON(w, http.StatusOK, resp)
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+	case "failed":
+		reason := ""
+		if session.FailureReason != nil {
+			reason = *session.FailureReason
+		}
+		agentJSON(w, http.StatusOK, map[string]any{
+			"status": "failed", "failure_reason": reason,
+			"message": agentFailureMessage(reason),
+		})
 
 	case "expired":
-		writeJSONError(w, http.StatusGone, "session expired")
+		agentJSON(w, http.StatusGone, map[string]any{
+			"status": "expired", "message": "session expired; re-run setup",
+		})
 
 	default: // pending
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "pending",
-		})
+		agentJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 	}
 }
 
@@ -210,6 +267,9 @@ func (d *Dependencies) AgentAuthRedirect(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusGone, "session expired")
 		return
 	}
+	if err := d.Queries.MarkAgentSessionAuthClicked(r.Context(), sessionID); err != nil {
+		slog.Warn("agent auth redirect: stamp click", "error", err)
+	}
 
 	// Redirect to GitHub App installation with state=sessionID
 	installURL := fmt.Sprintf(
@@ -220,275 +280,229 @@ func (d *Dependencies) AgentAuthRedirect(w http.ResponseWriter, r *http.Request)
 	http.Redirect(w, r, installURL, http.StatusFound)
 }
 
-// AgentAuthCallback handles the GitHub App installation callback.
-// Auto-provisions org + project + env + API key, then completes the agent session.
-//
-// GET /agent/auth/callback?installation_id=X&setup_action=install&state={sessionID}
+func agentFailureMessage(reason string) string {
+	switch reason {
+	case "identity_unverified":
+		return "Your GitHub account has no verified email. Verify an email on GitHub, then re-run setup."
+	case "installation_not_yours":
+		return "The GitHub App installation could not be verified as yours. Re-run setup and complete the authorization yourself."
+	case "repo_not_granted":
+		return "The GitHub App installation does not include this repository. Add the repo to the installation on GitHub, then re-run setup."
+	case "org_exists_needs_invite":
+		return "This GitHub org already has an Opslane organization. Ask an Opslane admin of that org to invite you, then use the dashboard for a key."
+	case "repo_already_configured":
+		return "This repo already has an Opslane project. Run 'opslane login' then 'opslane setup --relink'."
+	default:
+		return "Setup failed. Re-run setup to try again."
+	}
+}
+
+// AgentAuthCallback completes an agent session after GitHub authorizes the
+// human and installs the App. Transient failures leave the session pending;
+// only definitive business outcomes mark it failed.
 func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("state")
 	installationIDStr := r.URL.Query().Get("installation_id")
-
 	if sessionID == "" || installationIDStr == "" {
 		http.Error(w, "Missing required parameters", http.StatusBadRequest)
 		return
 	}
-
 	if _, err := uuid.Parse(sessionID); err != nil {
 		http.Error(w, "Invalid session ID", http.StatusBadRequest)
 		return
 	}
+	installationID, parseErr := strconv.ParseInt(installationIDStr, 10, 64)
+	if parseErr != nil || installationID <= 0 {
+		agentResultPage(w, http.StatusBadRequest, "Invalid installation",
+			"GitHub sent an invalid installation reference. Reopen the authorization link to retry.")
+		return
+	}
 
-	// Get the session — status + expiry checked here to fail fast.
-	// CompleteAgentSession also checks WHERE status='pending' AND expires_at > now()
-	// as the authoritative guard against double-completion.
 	session, err := d.Queries.GetAgentSession(r.Context(), sessionID)
 	if err != nil {
-		slog.Error("agent auth callback: get session", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		slog.Error("agent callback: get session", "error", err)
+		agentResultPage(w, http.StatusInternalServerError, "Something went wrong", "Reopen the authorization link to retry.")
 		return
 	}
-	if session == nil || session.Status != "pending" {
-		writeJSONError(w, http.StatusBadRequest, "invalid or expired session")
-		return
-	}
-
-	var installationID int64
-	if _, scanErr := fmt.Sscanf(installationIDStr, "%d", &installationID); scanErr != nil || installationID <= 0 {
-		writeJSONError(w, http.StatusBadRequest, "invalid installation_id")
+	if session == nil || session.Status != "pending" || time.Now().After(session.ExpiresAt) {
+		agentResultPage(w, http.StatusGone, "Session expired",
+			"This setup session is no longer active. Ask your agent to run setup again.")
 		return
 	}
 
-	// If the callback also has a code param, exchange it for a user token
-	// to get the GitHub user identity (for org/user creation).
-	code := r.URL.Query().Get("code")
-	var ghUser *gh.GitHubUser
-	var email string
-
-	if code != "" && d.GitHubAppClientID != "" {
-		token, tokenErr := gh.ExchangeOAuthCode(d.GitHubAppClientID, d.GitHubAppClientSecret, code)
-		if tokenErr != nil {
-			slog.Error("agent auth callback: code exchange failed", "error", tokenErr)
-		} else {
-			ghUser, _ = gh.GetUser(token.AccessToken)
-			if ghUser != nil {
-				email = ghUser.Email
-				if email == "" {
-					emails, _ := gh.GetUserEmails(token.AccessToken)
-					for _, e := range emails {
-						if e.Primary && e.Verified {
-							email = e.Email
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Verify the installation with GitHub
-	if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 {
+	if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 || d.GitHubAppClientID == "" {
 		writeJSONError(w, http.StatusServiceUnavailable, "GitHub App not configured")
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		agentResultPage(w, http.StatusBadRequest, "Authorization incomplete",
+			"GitHub did not return an authorization code. Reopen the authorization link and approve access.")
+		return
+	}
+	token, err := gh.ExchangeOAuthCode(d.GitHubAppClientID, d.GitHubAppClientSecret, code)
+	if err != nil {
+		slog.Warn("agent callback: code exchange failed", "error", err)
+		agentResultPage(w, http.StatusBadGateway, "GitHub authorization failed",
+			"Could not confirm your GitHub identity. Reopen the authorization link to retry.")
+		return
+	}
+	ghUser, err := gh.GetUser(token.AccessToken)
+	if err != nil || ghUser == nil {
+		agentResultPage(w, http.StatusBadGateway, "GitHub authorization failed",
+			"Could not load your GitHub profile. Reopen the authorization link to retry.")
+		return
+	}
+	email, emailVerified, err := pickVerifiedEmail(token.AccessToken)
+	if err != nil {
+		agentResultPage(w, http.StatusBadGateway, "GitHub check failed",
+			"Could not load your GitHub email addresses. Reopen the authorization link to retry.")
+		return
+	}
+
+	userInstalls, err := gh.ListUserInstallations(token.AccessToken)
+	if err != nil {
+		agentResultPage(w, http.StatusBadGateway, "GitHub check failed",
+			"Could not verify the installation. Reopen the authorization link to retry.")
+		return
+	}
+	if !containsInstallation(userInstalls, installationID) {
+		d.failAgentSession(r.Context(), sessionID, "installation_not_yours")
+		agentResultPage(w, http.StatusForbidden, "Installation mismatch",
+			agentFailureMessage("installation_not_yours"))
 		return
 	}
 
 	appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
 	if err != nil {
-		slog.Error("agent auth callback: generate app JWT", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		slog.Error("agent callback: app jwt", "error", err)
+		agentResultPage(w, http.StatusInternalServerError, "Something went wrong", "Reopen the authorization link to retry.")
 		return
 	}
-
 	installInfo, err := gh.VerifyInstallation(appJWT, installationID)
 	if err != nil {
-		slog.Warn("agent auth callback: installation verification failed",
-			"error", err, "installation_id", installationID)
-		writeJSONError(w, http.StatusBadRequest, "invalid or unauthorized installation")
+		agentResultPage(w, http.StatusBadRequest, "Installation not recognized",
+			"This installation does not belong to the Opslane app. Reopen the authorization link to retry.")
 		return
 	}
-
-	// Check session expiry before provisioning to avoid creating orphaned resources.
-	// CompleteAgentSession also enforces this via WHERE expires_at > now(),
-	// but checking here prevents wasted work.
-	if time.Now().After(session.ExpiresAt) {
-		writeJSONError(w, http.StatusGone, "session expired")
-		return
-	}
-
-	// Auto-provision: find or create org, project, env, API key
-	orgID, projectID, apiKey, provisionErr := d.autoProvision(
-		r.Context(), session, installInfo, installationID, ghUser, email,
-	)
-	if provisionErr != nil {
-		slog.Error("agent auth callback: auto-provision failed", "error", provisionErr)
-		writeJSONError(w, http.StatusInternalServerError, "failed to set up project")
-		return
-	}
-
-	// Complete the agent session — atomic WHERE status='pending' AND expires_at > now()
-	// prevents double-completion even if two callbacks race.
-	completed, err := d.Queries.CompleteAgentSession(
-		r.Context(), sessionID, orgID, projectID, apiKey, installationID,
-	)
+	instToken, err := gh.GetInstallationToken(appJWT, installationID)
 	if err != nil {
-		slog.Error("agent auth callback: complete session", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "failed to complete setup")
+		agentResultPage(w, http.StatusBadGateway, "GitHub check failed", "Reopen the authorization link to retry.")
 		return
 	}
-	if !completed {
-		// Session was completed by another request or expired between our check and the UPDATE.
-		// Resources were provisioned but session won't deliver the key — acceptable for pilot.
-		slog.Warn("agent auth callback: session already completed or expired",
-			"session_id", sessionID)
+	repos, err := gh.ListInstallationRepos(instToken.Token)
+	if err != nil {
+		agentResultPage(w, http.StatusBadGateway, "GitHub check failed", "Reopen the authorization link to retry.")
+		return
+	}
+	canonical := ""
+	for _, repo := range repos {
+		if strings.EqualFold(repo.FullName, session.RepoURL) {
+			canonical = repo.FullName
+			break
+		}
+	}
+	if canonical == "" {
+		d.failAgentSession(r.Context(), sessionID, "repo_not_granted")
+		agentResultPage(w, http.StatusForbidden, "Repository not granted",
+			agentFailureMessage("repo_not_granted"))
+		return
 	}
 
-	slog.Info("agent session completed",
-		"session_id", sessionID,
-		"org_id", orgID,
-		"project_id", projectID,
-		"repo", session.RepoURL)
-
-	// Show confirmation page to the human
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html><head><title>Opslane Setup Complete</title></head>
-<body style="font-family: system-ui; max-width: 600px; margin: 100px auto; text-align: center;">
-<h1>Done!</h1>
-<p>Opslane is set up for <strong>%s</strong>.</p>
-<p>Your agent is finishing the integration. You can close this tab.</p>
-</body></html>`, template.HTMLEscapeString(session.RepoURL))
+	agentKeyPub := ""
+	if session.AgentKeyPub != nil {
+		agentKeyPub = *session.AgentKeyPub
+	}
+	res, err := d.Queries.ProvisionAgentSession(r.Context(), db.AgentProvisionInput{
+		SessionID:      sessionID,
+		InstallationID: installationID,
+		CanonicalRepo:  canonical,
+		GitHubOrgName:  installInfo.Account.Login,
+		GitHubOrgID:    installInfo.Account.ID,
+		GitHubUserID:   ghUser.ID,
+		GitHubLogin:    ghUser.Login,
+		DisplayName:    ghUser.Name,
+		Email:          email,
+		EmailVerified:  emailVerified,
+		AvatarURL:      ghUser.AvatarURL,
+		SealKey: func(rawKey string) (string, error) {
+			return auth.SealAgentKey(agentKeyPub, sessionID, rawKey)
+		},
+	})
+	switch {
+	case err == nil:
+		slog.Info("agent session completed", "session_id", sessionID,
+			"org_id", res.OrgID, "project_id", res.ProjectID, "repo", canonical)
+		agentResultPage(w, http.StatusOK, "Done!",
+			fmt.Sprintf("Opslane is set up for <strong>%s</strong>. Your agent is finishing the integration — you can close this tab.",
+				template.HTMLEscapeString(canonical)))
+	case errors.Is(err, db.ErrAgentIdentityUnverified),
+		errors.Is(err, db.ErrAgentOrgExistsNeedsInvite),
+		errors.Is(err, db.ErrAgentRepoAlreadyConfigured):
+		reason := agentReasonForErr(err)
+		agentResultPage(w, http.StatusForbidden, "Setup could not finish", agentFailureMessage(reason))
+	case errors.Is(err, db.ErrAgentSessionNotPending):
+		agentResultPage(w, http.StatusGone, "Session already handled",
+			"This setup session was already completed or expired. Check back with your agent.")
+	default:
+		slog.Error("agent callback: provision failed", "error", err)
+		agentResultPage(w, http.StatusInternalServerError, "Something went wrong", "Reopen the authorization link to retry.")
+	}
 }
 
-// autoProvision finds or creates org + project + env + API key for the agent session.
-func (d *Dependencies) autoProvision(
-	ctx context.Context,
-	session *db.AgentSession,
-	installInfo *gh.InstallationInfo,
-	installationID int64,
-	ghUser *gh.GitHubUser,
-	email string,
-) (orgID, projectID, apiKey string, err error) {
+func (d *Dependencies) failAgentSession(ctx context.Context, sessionID, reason string) {
+	if _, err := d.Queries.MarkAgentSessionFailed(ctx, sessionID, reason); err != nil {
+		slog.Error("agent callback: mark failed", "error", err, "reason", reason)
+	}
+}
 
-	// Check if there's an existing installation → existing org
-	existingInstall, err := d.Queries.GetGitHubAppInstallationByID(ctx, installationID)
+func agentReasonForErr(err error) string {
+	switch {
+	case errors.Is(err, db.ErrAgentIdentityUnverified):
+		return "identity_unverified"
+	case errors.Is(err, db.ErrAgentOrgExistsNeedsInvite):
+		return "org_exists_needs_invite"
+	case errors.Is(err, db.ErrAgentRepoAlreadyConfigured):
+		return "repo_already_configured"
+	default:
+		return ""
+	}
+}
+
+func pickVerifiedEmail(userToken string) (string, bool, error) {
+	emails, err := gh.GetUserEmails(userToken)
 	if err != nil {
-		return "", "", "", fmt.Errorf("check existing installation: %w", err)
+		return "", false, fmt.Errorf("fetch user emails: %w", err)
 	}
-
-	if existingInstall != nil {
-		// Existing org — create project under it
-		orgID = existingInstall.OrgID
-	} else {
-		// New installation — need to create or find org
-		var identityUser *db.User
-
-		// Resolve the provider-neutral identity before the legacy GitHub column.
-		if ghUser != nil {
-			subject := strconv.FormatInt(ghUser.ID, 10)
-			identityUserID, lookupErr := d.Queries.GetUserIDByIdentity(ctx, "github", subject)
-			if lookupErr == nil && identityUserID != "" {
-				identityUser, lookupErr = d.Queries.GetUserByID(ctx, identityUserID)
-			}
-			if lookupErr == nil && identityUser == nil {
-				identityUser, lookupErr = d.Queries.GetUserByGitHubID(ctx, ghUser.ID)
-			}
-			if lookupErr == nil && identityUser != nil {
-				orgID = identityUser.OrgID
-			}
-		}
-
-		if orgID == "" && email != "" {
-			existingUser, lookupErr := d.Queries.GetUserByEmail(ctx, email)
-			if lookupErr == nil && existingUser != nil {
-				orgID = existingUser.OrgID
-			}
-		}
-
-		if orgID == "" {
-			// Truly new — create org
-			orgName := installInfo.Account.Login
-			if orgName == "" {
-				orgName = session.RepoURL
-			}
-			org, createErr := d.Queries.CreateOrg(ctx, orgName)
-			if createErr != nil {
-				return "", "", "", fmt.Errorf("create org: %w", createErr)
-			}
-			orgID = org.ID
-
-			// Create user if we have GitHub identity
-			if ghUser != nil {
-				name := ghUser.Name
-				if name == "" {
-					name = ghUser.Login
-				}
-				if email == "" {
-					email = ghUser.Login + "@users.noreply.github.com"
-				}
-				identityUser, createErr = d.Queries.CreateUserGitHub(
-					ctx, orgID, email, name, ghUser.ID, ghUser.Login, ghUser.AvatarURL,
-				)
-				if createErr != nil {
-					slog.Warn("agent auth: create user failed (non-fatal)", "error", createErr)
-				}
-			}
-		}
-		if identityUser != nil && ghUser != nil {
-			if identityErr := d.Queries.UpsertIdentityDetails(ctx, identityUser.ID, "github",
-				strconv.FormatInt(ghUser.ID, 10), email, false); identityErr != nil {
-				return "", "", "", fmt.Errorf("record GitHub identity: %w", identityErr)
-			}
-		}
-
-		// Store the installation record
-		if installInfo.Account.Login != "" {
-			repos, _ := json.Marshal([]string{session.RepoURL})
-			_, upsertErr := d.Queries.UpsertGitHubAppInstallation(
-				ctx, installationID, installInfo.Account.Login,
-				installInfo.Account.ID, orgID, repos,
-			)
-			if upsertErr != nil {
-				slog.Warn("agent auth: upsert installation failed (non-fatal)", "error", upsertErr)
-			}
-		}
-
-		// Also store on org for backward compat with existing code
-		if storeErr := d.Queries.SetOrgGitHubInstallation(ctx, orgID, installationID); storeErr != nil {
-			slog.Warn("agent auth: set org installation failed (non-fatal)", "error", storeErr)
+	for _, email := range emails {
+		if email.Primary && email.Verified {
+			return email.Email, true, nil
 		}
 	}
-
-	// Create project + env + API key in a transaction (reuse onboarding pattern)
-	tx, err := d.Queries.Pool().Begin(ctx)
-	if err != nil {
-		return "", "", "", fmt.Errorf("begin tx: %w", err)
+	for _, email := range emails {
+		if email.Verified {
+			return email.Email, true, nil
+		}
 	}
-	defer tx.Rollback(ctx)
+	return "", false, nil
+}
 
-	// Derive project name from repo (e.g., "acme/my-app" → "my-app")
-	projectName := session.RepoURL
-	if idx := strings.LastIndex(session.RepoURL, "/"); idx >= 0 {
-		projectName = session.RepoURL[idx+1:]
+func containsInstallation(ids []int64, id int64) bool {
+	for _, candidate := range ids {
+		if candidate == id {
+			return true
+		}
 	}
+	return false
+}
 
-	githubRepo := session.RepoURL
-	project, err := d.Queries.CreateProjectTx(ctx, tx, orgID, projectName, &githubRepo)
-	if err != nil {
-		return "", "", "", fmt.Errorf("create project: %w", err)
-	}
-
-	env, err := d.Queries.CreateEnvironmentTx(ctx, tx, project.ID, "production")
-	if err != nil {
-		return "", "", "", fmt.Errorf("create environment: %w", err)
-	}
-
-	key, err := d.Queries.CreateAPIKeyTx(ctx, tx, env.ID)
-	if err != nil {
-		return "", "", "", fmt.Errorf("create api key: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return "", "", "", fmt.Errorf("commit tx: %w", err)
-	}
-
-	return orgID, project.ID, key.RawKey, nil
+func agentResultPage(w http.ResponseWriter, status int, title, bodyHTML string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html><head><title>Opslane Setup</title></head>
+<body style="font-family: system-ui; max-width: 600px; margin: 100px auto; text-align: center;">
+<h1>%s</h1><p>%s</p>
+</body></html>`, template.HTMLEscapeString(title), bodyHTML)
 }
