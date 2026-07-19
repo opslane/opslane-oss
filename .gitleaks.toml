@@ -31,6 +31,10 @@ paths = [
   # token to prove assertSecretFree() rejects them; a token gitleaks ignores
   # would prove nothing.
   '''scripts/__tests__/publish\.test\.mjs''',
+  # The Slack formatter test asserts a Stripe-shaped token in an issue title
+  # is masked before it reaches a webhook payload; a token gitleaks ignores
+  # would prove nothing.
+  '''packages/ingestion/notify/slack_test\.go''',
 ]
 regexes = [
   # Deterministic canary values planted by the keyless E2E lane's token-leak
@@ -38,4 +42,8 @@ regexes = [
   '''OPSLANE-E2E-CANARY-[a-z]+-[0-9a-f]+''',
   # Documentation placeholder API key used in README/docs curl examples.
   '''e2e-test-key-plaintext''',
+  # Synthetic 32-byte cipher key used by the notify crypto tests and quoted
+  # in the notifications implementation plan. An obvious hex counter, not a
+  # secret.
+  '''0123456789abcdef0123456789abcdef''',
 ]
