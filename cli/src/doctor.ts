@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import chalk from 'chalk';
 import { loadTokens } from './auth.js';
+import { defaultApiUrl } from './config.js';
 
 export interface DoctorOptions {
   fix?: boolean;
@@ -23,11 +24,7 @@ export interface CheckResult {
 type CheckFn = () => Promise<CheckResult>;
 
 function getApiUrl(options: DoctorOptions): string {
-  return (
-    options.apiUrl ??
-    process.env['OPSLANE_API_URL'] ??
-    'http://localhost:8082'
-  );
+  return options.apiUrl ?? defaultApiUrl();
 }
 
 /**

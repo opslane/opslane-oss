@@ -1,8 +1,8 @@
 import { execSync } from 'node:child_process';
 import { jsonOutput, exitWithError } from './output.js';
 import { saveAgentCredentials, loadAgentCredentials } from './agent-credentials.js';
+import { defaultApiUrl } from './config.js';
 
-const DEFAULT_API_URL = process.env['OPSLANE_API_URL'] ?? 'http://localhost:8082';
 const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -56,7 +56,7 @@ export function detectRepoFromGit(cwd?: string): string | null {
  * - Otherwise, detect repo, check for existing credentials, initiate new session.
  */
 export async function setup(options: SetupOptions = {}): Promise<void> {
-  const apiUrl = options.apiUrl ?? DEFAULT_API_URL;
+  const apiUrl = options.apiUrl ?? defaultApiUrl();
 
   // Resume polling mode
   if (options.poll) {

@@ -7,9 +7,10 @@ import {
   type AuthConfig,
   type TokenPair,
 } from './auth.js';
+import { defaultApiUrl } from './config.js';
 
 const DEFAULT_AUTH_CONFIG: AuthConfig = {
-  apiUrl: process.env['OPSLANE_API_URL'] ?? 'http://localhost:8082',
+  apiUrl: defaultApiUrl(),
   clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
 };
 
