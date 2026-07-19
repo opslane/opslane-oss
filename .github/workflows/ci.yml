@@ -203,8 +203,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The friction e2e gate runs the worker's session-analysis pipeline
-      # in-process (issue #56), so the built worker package must exist.
-      - run: pnpm --filter @opslane/shared --filter @opslane/worker build
+      # in-process (issue #56), so the built worker package must exist. The
+      # login browser smoke serves the dashboard's dist via vite preview, so
+      # the dashboard build must exist too.
+      - run: pnpm --filter @opslane/shared --filter @opslane/worker --filter @opslane/dashboard build
       - name: Install Playwright chromium (browser smoke)
         run: pnpm --filter @opslane/test-e2e exec playwright install --with-deps chromium
       - name: Assert the LLM key is absent

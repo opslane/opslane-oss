@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { afterAll, beforeAll, describe, it } from 'vitest';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { chromium, expect, type Browser, type Page } from '@playwright/test';
 import { preview, type PreviewServer } from 'vite';
@@ -14,6 +15,11 @@ describe.skipIf(!playwrightAvailable)('login social buttons', () => {
   let origin: string;
 
   beforeAll(async () => {
+    if (!existsSync(resolve(DASHBOARD, 'dist/index.html'))) {
+      throw new Error(
+        'packages/dashboard/dist is missing; run `pnpm --filter @opslane/dashboard build` before this suite'
+      );
+    }
     server = await preview({
       root: DASHBOARD,
       appType: 'spa',
