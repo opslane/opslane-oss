@@ -13,6 +13,7 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | `AUTH_CALLBACK_ORIGIN` | no | Public ingestion origin used to construct the allowlisted `/auth/callback` URL. Never derived from the request Host header. Defaults to the local ingestion port; Compose sets `http://localhost:8082`. |
 | `WORKOS_API_KEY` | when `AUTH_PROVIDER=workos` | WorkOS secret API key used for AuthKit code exchange. |
 | `WORKOS_CLIENT_ID` | when `AUTH_PROVIDER=workos` | WorkOS project client ID used for AuthKit authorization. |
+| `AUTH_WORKOS_SOCIAL` | no | Comma-separated social login buttons to show under `AUTH_PROVIDER=workos` (e.g. `google,github`). UI capability only; the WorkOS dashboard governs which methods actually work. |
 | `DASHBOARD_DIR` | no | Directory of built dashboard SPA to serve (set in the Docker image) |
 | `DASHBOARD_ORIGIN` | no | Allowed dashboard origin for CORS **and** the OAuth redirect target. For the bundled Compose setup, set `http://localhost:8082`. This is separate from the worker's reader-facing `DASHBOARD_URL`. |
 | `DASHBOARD_URL` | no | Public or private HTTP(S) dashboard base URL used for reader-facing notification links. Configure it explicitly; loopback URLs are rejected, and `DASHBOARD_ORIGIN` is not used as a fallback. This mirrors the worker variable of the same name. |

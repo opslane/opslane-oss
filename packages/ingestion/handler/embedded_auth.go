@@ -127,6 +127,7 @@ func (d *Dependencies) AuthConfig(w http.ResponseWriter, _ *http.Request) {
 		"supports_password": supportsPassword,
 		"supports_signup":   supportsSignup,
 		"supports_reset":    supportsReset,
+		"social_providers":  d.SocialProviders.Ordered(),
 	})
 }
 

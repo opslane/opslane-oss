@@ -7,6 +7,9 @@ import "context"
 type AuthRequest struct {
 	State       string
 	RedirectURI string
+	// SocialProvider, when set, selects a specific WorkOS social connection
+	// and skips the hosted AuthKit picker. Empty uses AuthKit.
+	SocialProvider SocialProvider
 }
 
 // Identity is the normalized result of authenticating with an identity provider.

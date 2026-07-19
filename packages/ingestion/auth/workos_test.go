@@ -219,3 +219,67 @@ func TestWorkOSSDKAuthorizationURLRequestsAuthKit(t *testing.T) {
 		t.Fatalf("unexpected authorize URL: %s", got)
 	}
 }
+
+func TestWorkOSAuthorizeURLUsesSocialProvider(t *testing.T) {
+	provider, err := NewWorkOSProvider("sk_test", "client_test")
+	if err != nil {
+		t.Fatalf("NewWorkOSProvider: %v", err)
+	}
+	raw, err := provider.AuthorizeURL(AuthRequest{
+		State:          "s",
+		RedirectURI:    "https://app.example/auth/callback",
+		SocialProvider: SocialProviderGoogle,
+	})
+	if err != nil {
+		t.Fatalf("AuthorizeURL: %v", err)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := parsed.Query().Get("provider"); got != "GoogleOAuth" {
+		t.Fatalf("provider=%q, want GoogleOAuth", got)
+	}
+
+	raw, err = provider.AuthorizeURL(AuthRequest{
+		State:          "s",
+		RedirectURI:    "https://app.example/auth/callback",
+		SocialProvider: SocialProviderGitHub,
+	})
+	if err != nil {
+		t.Fatalf("AuthorizeURL for GitHub: %v", err)
+	}
+	parsed, err = url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse GitHub URL: %v", err)
+	}
+	if got := parsed.Query().Get("provider"); got != "GitHubOAuth" {
+		t.Fatalf("provider=%q, want GitHubOAuth", got)
+	}
+
+	raw, err = provider.AuthorizeURL(AuthRequest{State: "s", RedirectURI: "https://app.example/auth/callback"})
+	if err != nil {
+		t.Fatalf("AuthorizeURL without social provider: %v", err)
+	}
+	parsed, err = url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := parsed.Query().Get("provider"); got != "authkit" {
+		t.Fatalf("empty SocialProvider must default to authkit, got %q", got)
+	}
+}
+
+func TestWorkOSAuthorizeURLRejectsUnknownSocialProvider(t *testing.T) {
+	provider, err := NewWorkOSProvider("sk_test", "client_test")
+	if err != nil {
+		t.Fatalf("NewWorkOSProvider: %v", err)
+	}
+	if _, err := provider.AuthorizeURL(AuthRequest{
+		State:          "s",
+		RedirectURI:    "https://app.example/auth/callback",
+		SocialProvider: SocialProvider("myspace"),
+	}); err == nil {
+		t.Fatal("expected error for unmapped social provider")
+	}
+}

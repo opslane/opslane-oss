@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
 	"crypto/sha256"
@@ -19,14 +20,31 @@ import (
 	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
+type oauthLoginStateStore interface {
+	StoreOAuthLoginState(ctx context.Context, tokenHash string, expiresAt time.Time) error
+}
+
 // OAuthLoginStart begins the configured browser identity-provider flow.
 func (d *Dependencies) OAuthLoginStart(w http.ResponseWriter, r *http.Request) {
+	var socialProvider auth.SocialProvider
+	if values, present := r.URL.Query()["provider"]; present {
+		if len(values) != 1 {
+			writeJSONError(w, http.StatusBadRequest, "unsupported sign-in provider")
+			return
+		}
+		provider, ok := auth.DecodeSocialProvider(values[0])
+		if !ok || !d.SocialProviders.Allows(provider) {
+			writeJSONError(w, http.StatusBadRequest, "unsupported sign-in provider")
+			return
+		}
+		socialProvider = provider
+	}
 	state, err := generateOAuthState(d.JWTSecret)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if err := d.redirectToProvider(w, r, state); err != nil {
+	if err := d.redirectToProvider(w, r, state, socialProvider); err != nil {
 		slog.Error("build provider authorization URL failed", "provider", d.provider().Name(), "error", err)
 		writeJSONError(w, http.StatusServiceUnavailable, "authentication provider is not configured")
 	}
@@ -38,20 +56,25 @@ func (d *Dependencies) GitHubOAuthStart(w http.ResponseWriter, r *http.Request) 
 	d.OAuthLoginStart(w, r)
 }
 
-func (d *Dependencies) redirectToProvider(w http.ResponseWriter, r *http.Request, state string) error {
+func (d *Dependencies) redirectToProvider(w http.ResponseWriter, r *http.Request, state string, socialProvider auth.SocialProvider) error {
 	callbackOrigin := d.AuthCallbackOrigin
 	if callbackOrigin == "" {
 		callbackOrigin = "http://localhost:8080"
 	}
 	redirectURL, err := d.provider().AuthorizeURL(auth.AuthRequest{
-		State:       state,
-		RedirectURI: callbackOrigin + "/auth/callback",
+		State:          state,
+		RedirectURI:    callbackOrigin + "/auth/callback",
+		SocialProvider: socialProvider,
 	})
 	if err != nil {
 		return err
 	}
-	if d.Queries != nil {
-		if err := d.Queries.StoreOAuthLoginState(r.Context(), auth.HashToken(state), time.Now().Add(5*time.Minute)); err != nil {
+	store := d.oauthStateStore
+	if store == nil && d.Queries != nil {
+		store = d.Queries
+	}
+	if store != nil {
+		if err := store.StoreOAuthLoginState(r.Context(), auth.HashToken(state), time.Now().Add(5*time.Minute)); err != nil {
 			return err
 		}
 	}
@@ -254,6 +277,19 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+	// RequireMembership 403s any session without a memberships row; GitHub
+	// accounts created before membership rows existed have none, so grant the
+	// home-org owner row here without touching an existing (possibly
+	// downgraded) role.
+	role, err := d.Queries.GetMembership(r.Context(), user.ID, user.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		if err := d.Queries.CreateMembership(r.Context(), user.ID, user.OrgID, "owner"); err != nil {
+			return nil, err
 		}
 	}
 	if err := d.Queries.UpdateUserGitHub(r.Context(), user.ID, identity.Username, identity.AvatarURL, identity.Email); err != nil {
