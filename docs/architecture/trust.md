@@ -23,8 +23,9 @@ The worker pushes only to a reserved Opslane fix branch (`opslane/fix-<group-id>
 | --- | --- | --- |
 | Anthropic API | Error details, stack traces, relevant source file contents, test output | Only during investigation, only with `ANTHROPIC_API_KEY` set |
 | E2B sandbox | A clone of the connected repository, the candidate fix, dependency installs, test runs | Only during fix verification, only with `E2B_API_KEY` set |
-| GitHub (worker) | The reserved fix branch, PR body (root cause, diff, verification evidence), and Checks/commit-status reads for the exact draft head SHA. A write-ahead delivery reservation lets a retry reconcile an ambiguous push or PR result instead of creating a duplicate. The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery, draft CI observation, and setup-PR |
-| GitHub (ingestion) | OAuth code exchange and user/email lookup (sign-in); installation and repository listing (App setup) | During dashboard sign-in and GitHub setup |
+| GitHub (worker) | The fix branch (pushed **before** PR creation — if the PR call then fails, the pushed branch remains and the incident ends `needs_human`), then the PR body (root cause, diff, verification evidence). The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery and setup-PR |
+| GitHub (ingestion) | OAuth code exchange and user/email lookup (sign-in); installation and repository listing (App setup) | During GitHub OAuth sign-in and GitHub App setup |
+| WorkOS (ingestion) | Email addresses, passwords, verification codes, reset tokens | Only when password authentication is enabled; during sign-in, signup, email verification, and password reset |
 
 With no credentials configured, **nothing leaves your host** — the stack ingests, groups, and files `needs_human` incidents entirely locally.
 
@@ -69,6 +70,7 @@ See [replay privacy and masking](../guides/replay-privacy.md) for what replay da
 
 - **Ingest API keys** are stored as SHA-256 hashes; the raw key is shown once at creation.
 - **User sessions** are JWTs signed with `JWT_SECRET`, mated with rotating refresh-token families (token hashes only in the database).
+- **Passwords** (when password authentication is enabled) are not stored locally — registration, authentication, and reset are handled by the configured identity provider (WorkOS).
 - **GitHub App private key** and worker credentials are environment variables — supplied by your deployment, never written to the database.
 
 ## Honest gaps (current state)
@@ -83,4 +85,3 @@ These are known, tracked, and stated here so you can make an informed deployment
 ## Why the prompts are public
 
 The investigation and fix prompts live in this repository (`packages/worker/src`), not behind an API. That is intentional: you can read exactly what instructions the agent operates under, what it is told never to do, and how untrusted error text is fenced (`<untrusted_user_data>` delimiters in the fix loop) before you let it near your code.
-</content>

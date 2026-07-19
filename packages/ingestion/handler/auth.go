@@ -65,10 +65,13 @@ func AllowedOriginsFromCtx(ctx context.Context) []string {
 
 // Dependencies holds shared service dependencies (DB, etc.) for handlers.
 type Dependencies struct {
-	Queries   *db.Queries
-	Health    *HealthChecker
-	MinIO     *minioPkg.Client
-	JWTSecret []byte
+	Queries *db.Queries
+	// resetSessionStore is a narrow test seam for password-reset session
+	// revocation. Production falls back to Queries.
+	resetSessionStore passwordResetSessionStore
+	Health            *HealthChecker
+	MinIO             *minioPkg.Client
+	JWTSecret         []byte
 	// AuthProvider is selected explicitly at boot. Nil retains the OSS GitHub
 	// default for narrow tests that construct Dependencies directly.
 	AuthProvider       auth.AuthProvider

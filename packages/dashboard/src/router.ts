@@ -4,6 +4,7 @@ import ActivityFeed from './views/ActivityFeed.vue';
 import AuthCallback from './views/AuthCallback.vue';
 import IncidentDetail from './views/IncidentDetail.vue';
 import Login from './views/Login.vue';
+import ResetPassword from './views/ResetPassword.vue';
 import SetupWizard from './views/SetupWizard.vue';
 import Settings from './views/Settings.vue';
 import AccountsList from './views/AccountsList.vue';
@@ -15,6 +16,7 @@ export const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/login', name: 'login', component: Login, meta: { public: true } },
+    { path: '/reset-password', name: 'reset-password', component: ResetPassword, meta: { public: true } },
     { path: '/auth/complete', name: 'auth-complete', component: AuthCallback, meta: { public: true } },
     { path: '/invite/accept', name: 'invite-accept', component: AcceptInvitation },
     { path: '/setup', name: 'setup', component: SetupWizard },

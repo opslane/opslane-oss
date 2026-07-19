@@ -1,31 +1,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import { getMe, listProjects, markAuthed } from '../api';
+import { completePostAuth } from '../post-auth';
 
 const router = useRouter();
 const error = ref('');
 
 onMounted(async () => {
   try {
-    await getMe();
-    markAuthed();
-
-    const returnPath = sessionStorage.getItem('opslane_post_auth_path');
-    if (returnPath) {
-      sessionStorage.removeItem('opslane_post_auth_path');
-      router.push(returnPath);
-      return;
-    }
-
-    const projects = await listProjects();
-    if (projects.length > 0) {
-      localStorage.setItem('opslane_project_id', projects[0].id);
-      localStorage.setItem('opslane_project_name', projects[0].name);
-      router.push('/');
-    } else {
-      router.push('/setup');
-    }
+    await completePostAuth(router);
   } catch {
     error.value = 'Authentication failed — please try signing in again.';
   }

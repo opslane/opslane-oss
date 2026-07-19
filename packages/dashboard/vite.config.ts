@@ -18,6 +18,22 @@ export default defineConfig({
         target: process.env.VITE_API_URL || 'http://localhost:8082',
         changeOrigin: true,
       },
+      '/auth/config': {
+        target: process.env.VITE_API_URL || 'http://localhost:8082',
+        changeOrigin: true,
+      },
+      '/auth/password': {
+        target: process.env.VITE_API_URL || 'http://localhost:8082',
+        changeOrigin: true,
+      },
+      '/auth/signup': {
+        target: process.env.VITE_API_URL || 'http://localhost:8082',
+        changeOrigin: true,
+      },
+      '/auth/verify-email': {
+        target: process.env.VITE_API_URL || 'http://localhost:8082',
+        changeOrigin: true,
+      },
       '/auth/refresh': {
         target: process.env.VITE_API_URL || 'http://localhost:8082',
         changeOrigin: true,
