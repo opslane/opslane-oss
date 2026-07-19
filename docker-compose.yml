@@ -73,6 +73,10 @@ services:
       NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS: ${NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS:-}
       INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
       ADMIN_EMAILS: ${OPSLANE_ADMIN_EMAILS:-}
+    # Lets the e2e webhook sink on the host be reached from the container on
+    # Linux; Docker Desktop resolves host.docker.internal natively.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
