@@ -18,9 +18,25 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
 const agentKeySeedContext = "opslane-agent-key-v1:"
+
+// deriveKey runs HKDF-SHA256 over a high-entropy secret (a poll token or an
+// X25519 shared secret) to produce a 32-byte key. HKDF is the correct KDF for
+// cryptographic secrets; a bare hash is not (it also invites length-extension
+// and concatenation ambiguity for the multi-input AEAD case).
+func deriveKey(secret, info []byte) ([32]byte, error) {
+	var out [32]byte
+	r := hkdf.New(sha256.New, secret, []byte(agentKeySeedContext), info)
+	if _, err := io.ReadFull(r, out[:]); err != nil {
+		return out, fmt.Errorf("hkdf: %w", err)
+	}
+	return out, nil
+}
 
 // NewAgentPollToken returns (raw token, sha256 hash, base64 X25519 public key).
 // The raw token is shown to the CLI exactly once; only hash + pub are stored.
@@ -38,7 +54,10 @@ func NewAgentPollToken() (raw, hash, pubB64 string, err error) {
 }
 
 func agentKeyPrivate(pollToken string) (*ecdh.PrivateKey, error) {
-	seed := sha256.Sum256([]byte(agentKeySeedContext + pollToken))
+	seed, err := deriveKey([]byte(pollToken), []byte("x25519-seed"))
+	if err != nil {
+		return nil, err
+	}
 	return ecdh.X25519().NewPrivateKey(seed[:])
 }
 
@@ -108,8 +127,12 @@ func agentKeyAEAD(priv *ecdh.PrivateKey, peer *ecdh.PublicKey, ephPub, recipient
 	if err != nil {
 		return nil, fmt.Errorf("ecdh: %w", err)
 	}
-	kdfInput := append(append(append([]byte(agentKeySeedContext), shared...), ephPub...), recipientPub...)
-	key := sha256.Sum256(kdfInput)
+	// Bind both public keys into the KDF info so the derived key is unique to
+	// this ephemeral/recipient pair.
+	key, err := deriveKey(shared, append(append([]byte("aead:"), ephPub...), recipientPub...))
+	if err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, err
