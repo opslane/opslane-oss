@@ -1,319 +1,282 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { reactViteCodemod } from '../codemods/react-vite.js';
-import { nextjsCodemod } from '../codemods/nextjs.js';
-import { vueViteCodemod } from '../codemods/vue-vite.js';
-import { nuxtCodemod } from '../codemods/nuxt.js';
-import { getCodemod } from '../codemods/registry.js';
+import { join } from 'node:path';
 import { generateFallbackPatches } from '../ai-fallback.js';
+import { nextjsCodemod } from '../codemods/nextjs.js';
+import { nuxtCodemod } from '../codemods/nuxt.js';
+import { reactViteCodemod } from '../codemods/react-vite.js';
+import { getCodemod } from '../codemods/registry.js';
+import type { Codemod, FilePatch } from '../codemods/types.js';
+import { vueViteCodemod } from '../codemods/vue-vite.js';
+import { applyPatches } from '../init.js';
 
-describe('react-vite codemod', () => {
-  let tmpDir: string;
+async function patchAndRead(
+  root: string,
+  codemod: Codemod,
+  file: string,
+): Promise<{ content: string; patches: FilePatch[] }> {
+  const patches = await codemod.generate(root);
+  await applyPatches(root, patches);
+  return { content: await readFile(join(root, file), 'utf-8'), patches };
+}
+
+describe('structural codemods', () => {
+  let root: string;
 
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-codemod-'));
-    await mkdir(join(tmpDir, 'src'), { recursive: true });
+    root = await mkdtemp(join(tmpdir(), 'opslane-codemod-'));
   });
 
   afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   });
 
-  it('has correct framework name', () => {
-    expect(reactViteCodemod.framework).toBe('react-vite');
-  });
-
-  it('generates patches for src/main.tsx', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.tsx'), 'import React from "react";\n');
-
-    const patches = await reactViteCodemod.generate(tmpDir);
-
-    const mainPatch = patches.find((p) => p.filePath === 'src/main.tsx');
-    expect(mainPatch).toBeDefined();
-    expect(mainPatch?.action).toBe('modify');
-    expect(mainPatch?.insertContent).toContain('@opslane/sdk');
-    expect(mainPatch?.insertContent).toContain('OpslaneSDK.init');
-    expect(mainPatch?.insertContent).toContain('apiKey');
-    expect(mainPatch?.insertContent).not.toContain('dsn');
-    expect(mainPatch?.insertContent).not.toContain('@opslane/browser-sdk');
-  });
-
-  it('does not generate opslane.config.ts', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.tsx'), '');
-
-    const patches = await reactViteCodemod.generate(tmpDir);
-
-    const configPatch = patches.find(
-      (p) => p.filePath === 'opslane.config.ts',
+  it('patches React after the complete import block with the real env-based API', async () => {
+    await mkdir(join(root, 'src'));
+    await writeFile(
+      join(root, 'src/main.tsx'),
+      [
+        "import React from 'react';",
+        'import {',
+        '  createRoot,',
+        "} from 'react-dom/client'; // adjacent comment",
+        '',
+        "createRoot(document.getElementById('root')!).render(<div />);",
+        '',
+      ].join('\n'),
     );
-    expect(configPatch).toBeUndefined();
+
+    const { content } = await patchAndRead(root, reactViteCodemod, 'src/main.tsx');
+    expect(content).toContain("import { init } from '@opslane/sdk';");
+    expect(content).toContain('apiKey: import.meta.env.VITE_OPSLANE_API_KEY');
+    expect(content.indexOf("from 'react-dom/client'"))
+      .toBeLessThan(content.indexOf("from '@opslane/sdk'"));
+    expect(content).not.toContain('OpslaneSDK');
+    expect(content).not.toContain('environment:');
+    expect(content).not.toContain('<YOUR_API_KEY>');
+    expect(await reactViteCodemod.generate(root)).toEqual([]);
   });
 
-  it('prefers main.tsx over main.jsx when both exist', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.tsx'), '');
-    await writeFile(join(tmpDir, 'src', 'main.jsx'), '');
+  it('handles React import-only, init-only, unrelated SDK imports, and aliases per aspect', async () => {
+    const cases = [
+      {
+        source: "import { init } from '@opslane/sdk';\nexport {};\n",
+        expected: 'init({',
+      },
+      {
+        source: "import React from 'react';\ninit({ apiKey: import.meta.env.VITE_OPSLANE_API_KEY });\n",
+        expected: "import { init } from '@opslane/sdk';",
+      },
+      {
+        source: "import { captureException } from '@opslane/sdk';\nexport {};\n",
+        expected: "import { init } from '@opslane/sdk';",
+      },
+      {
+        source: "import { init as startOpslane } from '@opslane/sdk';\nstartOpslane({ apiKey: import.meta.env.VITE_OPSLANE_API_KEY });\n",
+        expected: null,
+      },
+    ];
 
-    const patches = await reactViteCodemod.generate(tmpDir);
-    const mainPatch = patches.find((p) => p.filePath.includes('main'));
-    expect(mainPatch?.filePath).toBe('src/main.tsx');
+    for (const [index, testCase] of cases.entries()) {
+      const caseRoot = join(root, String(index));
+      await mkdir(join(caseRoot, 'src'), { recursive: true });
+      await writeFile(join(caseRoot, 'src/main.tsx'), testCase.source);
+      const patches = await reactViteCodemod.generate(caseRoot);
+      if (testCase.expected === null) expect(patches).toEqual([]);
+      else expect(patches.some((patch) => patch.insertContent?.includes(testCase.expected!))).toBe(true);
+    }
   });
 
-  it('falls back to main.jsx when main.tsx does not exist', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.jsx'), '');
-
-    const patches = await reactViteCodemod.generate(tmpDir);
-    const mainPatch = patches.find((p) => p.filePath.includes('main'));
-    expect(mainPatch?.filePath).toBe('src/main.jsx');
-  });
-});
-
-describe('nextjs codemod', () => {
-  let tmpDir: string;
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-codemod-'));
-  });
-
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
-  });
-
-  it('has correct framework name', () => {
-    expect(nextjsCodemod.framework).toBe('nextjs');
-  });
-
-  it('generates patches for app/layout.tsx (app router)', async () => {
-    await mkdir(join(tmpDir, 'app'), { recursive: true });
-    await writeFile(join(tmpDir, 'app', 'layout.tsx'), 'export default function RootLayout() {}\n');
-
-    const patches = await nextjsCodemod.generate(tmpDir);
-
-    const layoutPatch = patches.find(
-      (p) => p.filePath === 'app/layout.tsx',
+  it('anchors Vue plugin registration after a multiline createApp statement', async () => {
+    await mkdir(join(root, 'src'));
+    await writeFile(
+      join(root, 'src/main.ts'),
+      [
+        "import { createApp } from 'vue';",
+        "import App from './App.vue';",
+        '',
+        'const app = createApp(',
+        '  App,',
+        '); // preserve this comment',
+        "app.mount('#app');",
+        '',
+      ].join('\n'),
     );
-    expect(layoutPatch).toBeDefined();
-    expect(layoutPatch?.action).toBe('modify');
-    expect(layoutPatch?.insertContent).toContain('OpslaneSDK');
-  });
 
-  it('falls back to pages/_app.tsx when app router not found', async () => {
-    await mkdir(join(tmpDir, 'pages'), { recursive: true });
-    await writeFile(join(tmpDir, 'pages', '_app.tsx'), 'export default function App() {}\n');
-
-    const patches = await nextjsCodemod.generate(tmpDir);
-
-    const appPatch = patches.find(
-      (p) => p.filePath === 'pages/_app.tsx',
+    const { content } = await patchAndRead(root, vueViteCodemod, 'src/main.ts');
+    expect(content).toContain("import { init, opslaneVuePlugin } from '@opslane/sdk';");
+    expect(content).toContain('apiKey: import.meta.env.VITE_OPSLANE_API_KEY');
+    expect(content).toContain(
+      "); // preserve this comment\napp.use(opslaneVuePlugin);\napp.mount('#app')",
     );
-    expect(appPatch).toBeDefined();
-    expect(appPatch?.action).toBe('modify');
+    expect(await vueViteCodemod.generate(root)).toEqual([]);
   });
 
-  it('uses @opslane/sdk and apiKey', async () => {
-    const patches = await nextjsCodemod.generate(tmpDir);
-    const layoutPatch = patches.find((p) => p.action === 'modify');
-    expect(layoutPatch?.insertContent).toContain('@opslane/sdk');
-    expect(layoutPatch?.insertContent).toContain('apiKey');
-    expect(layoutPatch?.insertContent).not.toContain('dsn');
-    expect(layoutPatch?.insertContent).not.toContain('@opslane/browser-sdk');
-  });
-
-  it('does not generate opslane.config.ts', async () => {
-    const patches = await nextjsCodemod.generate(tmpDir);
-
-    const configPatch = patches.find(
-      (p) => p.filePath === 'opslane.config.ts',
+  it('respects aliased Vue SDK imports and independently adds missing registration', async () => {
+    await mkdir(join(root, 'src'));
+    await writeFile(
+      join(root, 'src/main.ts'),
+      [
+        "import { createApp } from 'vue';",
+        "import { init as boot, opslaneVuePlugin as plugin } from '@opslane/sdk';",
+        'boot({ apiKey: import.meta.env.VITE_OPSLANE_API_KEY });',
+        'const client = createApp({});',
+        "client.mount('#app');",
+      ].join('\n'),
     );
-    expect(configPatch).toBeUndefined();
-  });
-});
-
-describe('vue-vite codemod', () => {
-  let tmpDir: string;
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-codemod-'));
-    await mkdir(join(tmpDir, 'src'), { recursive: true });
+    const { content } = await patchAndRead(root, vueViteCodemod, 'src/main.ts');
+    expect(content).toContain('client.use(plugin);');
+    expect(content.match(/boot\s*\(/g)).toHaveLength(1);
+    expect(content.match(/@opslane\/sdk/g)).toHaveLength(1);
   });
 
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
-  });
-
-  it('has correct framework name', () => {
-    expect(vueViteCodemod.framework).toBe('vue-vite');
-  });
-
-  it('generates patches for src/main.ts', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.ts'), "import { createApp } from 'vue';\n");
-
-    const patches = await vueViteCodemod.generate(tmpDir);
-
-    const mainPatch = patches.find((p) => p.filePath === 'src/main.ts');
-    expect(mainPatch).toBeDefined();
-    expect(mainPatch?.action).toBe('modify');
-  });
-
-  it('includes OpslaneSDK and opslaneVuePlugin import from @opslane/sdk', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.ts'), '');
-
-    const patches = await vueViteCodemod.generate(tmpDir);
-    const importPatch = patches.find(
-      (p) =>
-        p.action === 'modify' &&
-        p.insertContent?.includes('opslaneVuePlugin'),
+  it('creates and renders a client component for the Next App Router', async () => {
+    await mkdir(join(root, 'app'));
+    await writeFile(
+      join(root, 'app/layout.tsx'),
+      [
+        "import type { ReactNode } from 'react';",
+        '',
+        'export default function RootLayout({ children }: { children: ReactNode }) {',
+        '  return <html><body className="app">{children}</body></html>;',
+        '}',
+        '',
+      ].join('\n'),
     );
-    expect(importPatch).toBeDefined();
-    expect(importPatch?.insertContent).toContain('@opslane/sdk');
-    expect(importPatch?.insertContent).toContain('OpslaneSDK');
-    expect(importPatch?.insertContent).toContain('apiKey');
-    expect(importPatch?.insertContent).not.toContain('@opslane/browser-sdk');
+
+    const patches = await nextjsCodemod.generate(root);
+    expect(JSON.stringify(patches)).not.toContain('RegExp');
+    await applyPatches(root, patches);
+    const client = await readFile(join(root, 'app/opslane-client.tsx'), 'utf-8');
+    const layout = await readFile(join(root, 'app/layout.tsx'), 'utf-8');
+    expect(client.startsWith("'use client';")).toBe(true);
+    expect(client).toContain("import { init } from '@opslane/sdk';");
+    expect(client).toContain('process.env.NEXT_PUBLIC_OPSLANE_API_KEY');
+    expect(client).toContain('if (!initialized && apiKey');
+    expect(layout).toContain("import { OpslaneClient } from './opslane-client';");
+    expect(layout).toContain('<body className="app">\n<OpslaneClient />');
+    expect(layout).not.toContain("from '@opslane/sdk'");
+    expect(await nextjsCodemod.generate(root)).toEqual([]);
   });
 
-  it('includes app.use(opslaneVuePlugin) call without arguments', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.ts'), '');
-
-    const patches = await vueViteCodemod.generate(tmpDir);
-    const usePatch = patches.find(
-      (p) =>
-        p.action === 'modify' &&
-        p.insertContent?.includes('app.use(opslaneVuePlugin)'),
+  it('initializes from a public env var in the Next Pages Router', async () => {
+    await mkdir(join(root, 'pages'));
+    await writeFile(
+      join(root, 'pages/_app.tsx'),
+      "import type { AppProps } from 'next/app';\nexport default function App({ Component, pageProps }: AppProps) { return <Component {...pageProps} />; }\n",
     );
-    expect(usePatch).toBeDefined();
+    const { content } = await patchAndRead(root, nextjsCodemod, 'pages/_app.tsx');
+    expect(content).toContain("import { init } from '@opslane/sdk';");
+    expect(content).toContain('process.env.NEXT_PUBLIC_OPSLANE_API_KEY');
+    expect(content).not.toContain('environment:');
+    expect(await nextjsCodemod.generate(root)).toEqual([]);
   });
 
-  it('does not generate opslane.config.ts', async () => {
-    await writeFile(join(tmpDir, 'src', 'main.ts'), '');
-
-    const patches = await vueViteCodemod.generate(tmpDir);
-    const configPatch = patches.find(
-      (p) => p.filePath === 'opslane.config.ts',
+  it('repairs a partial Next client component without discarding custom code', async () => {
+    await mkdir(join(root, 'app'));
+    await writeFile(
+      join(root, 'app/layout.tsx'),
+      "import { OpslaneClient } from './opslane-client';\nexport default function Layout() { return <body><OpslaneClient /></body>; }\n",
     );
-    expect(configPatch).toBeUndefined();
-  });
-});
-
-describe('nuxt codemod', () => {
-  let tmpDir: string;
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-codemod-'));
-  });
-
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
-  });
-
-  it('has correct framework name', () => {
-    expect(nuxtCodemod.framework).toBe('nuxt');
-  });
-
-  it('creates plugins/opslane.client.ts with correct SDK import and config', async () => {
-    const patches = await nuxtCodemod.generate(tmpDir);
-
-    const pluginPatch = patches.find(
-      (p) => p.filePath === 'plugins/opslane.client.ts',
+    await writeFile(
+      join(root, 'app/opslane-client.tsx'),
+      [
+        "'use client';",
+        "import { captureException } from '@opslane/sdk';",
+        'export function OpslaneClient() {',
+        "  const keepMe = () => captureException(new Error('custom'));",
+        '  void keepMe;',
+        '  return null;',
+        '}',
+        '',
+      ].join('\n'),
     );
-    expect(pluginPatch).toBeDefined();
-    expect(pluginPatch?.action).toBe('create');
-    expect(pluginPatch?.content).toContain('defineNuxtPlugin');
-    expect(pluginPatch?.content).toContain('OpslaneSDK.init');
-    expect(pluginPatch?.content).toContain('@opslane/sdk');
-    expect(pluginPatch?.content).toContain('apiKey');
-    expect(pluginPatch?.content).not.toContain('dsn');
-    expect(pluginPatch?.content).not.toContain('@opslane/browser-sdk');
+
+    const { content, patches } = await patchAndRead(root, nextjsCodemod, 'app/opslane-client.tsx');
+    expect(patches).toContainEqual(expect.objectContaining({ action: 'replace' }));
+    expect(content).toContain('captureException');
+    expect(content).toContain('void keepMe;');
+    expect(content).toContain("import { init } from '@opslane/sdk';");
+    expect(content).toContain('process.env.NEXT_PUBLIC_OPSLANE_API_KEY');
+    expect(content).toContain('if (!initialized && apiKey');
+    expect(await nextjsCodemod.generate(root)).toEqual([]);
   });
 
-  it('does not create opslane.config.ts', async () => {
-    const patches = await nuxtCodemod.generate(tmpDir);
-
-    const configPatch = patches.find(
-      (p) => p.filePath === 'opslane.config.ts',
+  it('removes a stale literal key from an existing Next client component', async () => {
+    await mkdir(join(root, 'app'));
+    await writeFile(
+      join(root, 'app/layout.tsx'),
+      "import { OpslaneClient } from './opslane-client';\nexport default function Layout() { return <body><OpslaneClient /></body>; }\n",
     );
-    expect(configPatch).toBeUndefined();
+    await writeFile(
+      join(root, 'app/opslane-client.tsx'),
+      "'use client';\nimport { init } from '@opslane/sdk';\nexport function OpslaneClient() {\n  init({ apiKey: 'literal-secret' });\n  return null;\n}\n",
+    );
+
+    const { content } = await patchAndRead(root, nextjsCodemod, 'app/opslane-client.tsx');
+    expect(content).not.toContain('literal-secret');
+    expect(content).toContain('process.env.NEXT_PUBLIC_OPSLANE_API_KEY');
+    expect(content).toContain('if (!initialized && apiKey');
+    expect(await nextjsCodemod.generate(root)).toEqual([]);
+  });
+
+  it('creates a Nuxt client plugin backed by public runtime config', async () => {
+    await writeFile(
+      join(root, 'nuxt.config.ts'),
+      "export default defineNuxtConfig({\n  devtools: { enabled: true },\n});\n",
+    );
+    const patches = await nuxtCodemod.generate(root);
+    await applyPatches(root, patches);
+    const plugin = await readFile(join(root, 'plugins/opslane.client.ts'), 'utf-8');
+    const config = await readFile(join(root, 'nuxt.config.ts'), 'utf-8');
+    expect(plugin).toContain("import { init } from '@opslane/sdk';");
+    expect(plugin).toContain('useRuntimeConfig()');
+    expect(plugin).toContain('config.public.opslaneApiKey');
+    expect(config).toContain("runtimeConfig: { public: { opslaneApiKey: '' } }");
+    expect(await nuxtCodemod.generate(root)).toEqual([]);
+  });
+
+  it('adds missing Nuxt initialization inside an existing plugin callback', async () => {
+    await mkdir(join(root, 'plugins'));
+    await writeFile(
+      join(root, 'plugins/opslane.client.ts'),
+      "export default defineNuxtPlugin(() => {\n  // existing client setup\n});\n",
+    );
+    await writeFile(
+      join(root, 'nuxt.config.ts'),
+      "export default defineNuxtConfig({ runtimeConfig: { public: { opslaneApiKey: '' } } });\n",
+    );
+    const { content } = await patchAndRead(root, nuxtCodemod, 'plugins/opslane.client.ts');
+    expect(content).toContain("import { init } from '@opslane/sdk';");
+    expect(content).toContain('defineNuxtPlugin(() => {\n  const config = useRuntimeConfig();');
+    expect(content).toContain('init({ apiKey: config.public.opslaneApiKey });');
+    expect(await nuxtCodemod.generate(root)).toEqual([]);
+  });
+
+  it('emits a real, env-based SDK fallback with no placeholder API', async () => {
+    const [patch] = await generateFallbackPatches(root);
+    expect(patch?.content).toContain(
+      "import { captureException, init } from '@opslane/sdk';",
+    );
+    expect(patch?.content).toContain('process.env.OPSLANE_API_KEY');
+    expect(patch?.content).toContain('init({');
+    expect(patch?.content).not.toContain('OpslaneSDK');
+    expect(patch?.content).not.toContain('<YOUR_API_KEY>');
   });
 });
 
 describe('codemod registry', () => {
-  it('returns react-vite codemod', () => {
-    const codemod = getCodemod('react-vite');
-    expect(codemod).not.toBeNull();
-    expect(codemod?.framework).toBe('react-vite');
+  it.each([
+    ['react-vite', reactViteCodemod],
+    ['nextjs', nextjsCodemod],
+    ['vue-vite', vueViteCodemod],
+    ['nuxt', nuxtCodemod],
+  ])('returns the %s codemod', (framework, expected) => {
+    expect(getCodemod(framework)).toBe(expected);
   });
 
-  it('returns nextjs codemod', () => {
-    const codemod = getCodemod('nextjs');
-    expect(codemod).not.toBeNull();
-    expect(codemod?.framework).toBe('nextjs');
-  });
-
-  it('returns vue-vite codemod', () => {
-    const codemod = getCodemod('vue-vite');
-    expect(codemod).not.toBeNull();
-    expect(codemod?.framework).toBe('vue-vite');
-  });
-
-  it('returns nuxt codemod', () => {
-    const codemod = getCodemod('nuxt');
-    expect(codemod).not.toBeNull();
-    expect(codemod?.framework).toBe('nuxt');
-  });
-
-  it('returns null for unknown framework', () => {
-    const codemod = getCodemod('unknown');
-    expect(codemod).toBeNull();
-  });
-
-  it('returns null for arbitrary string', () => {
-    const codemod = getCodemod('angular');
-    expect(codemod).toBeNull();
-  });
-});
-
-describe('AI fallback', () => {
-  let tmpDir: string;
-
-  beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-fallback-'));
-  });
-
-  afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
-  });
-
-  it('creates a opslane-init.ts template file', async () => {
-    const patches = await generateFallbackPatches(tmpDir);
-
-    expect(patches).toHaveLength(1);
-    expect(patches[0].filePath).toBe('opslane-init.ts');
-    expect(patches[0].action).toBe('create');
-  });
-
-  it('template includes SDK import', async () => {
-    const patches = await generateFallbackPatches(tmpDir);
-
-    expect(patches[0].content).toContain(
-      "import { OpslaneSDK } from '@opslane/sdk'",
-    );
-    expect(patches[0].content).not.toContain('@opslane/browser-sdk');
-  });
-
-  it('template includes init call with apiKey', async () => {
-    const patches = await generateFallbackPatches(tmpDir);
-
-    expect(patches[0].content).toContain('OpslaneSDK.init');
-    expect(patches[0].content).toContain('apiKey');
-    expect(patches[0].content).not.toContain('dsn');
-  });
-
-  it('template includes setup instructions as comments', async () => {
-    const patches = await generateFallbackPatches(tmpDir);
-
-    expect(patches[0].content).toContain('npm install @opslane/sdk');
-    expect(patches[0].content).toContain(
-      'Your framework was not automatically detected',
-    );
+  it('returns null for unknown frameworks', () => {
+    expect(getCodemod('angular')).toBeNull();
   });
 });

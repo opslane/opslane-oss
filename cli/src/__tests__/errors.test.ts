@@ -44,6 +44,8 @@ describe('listErrors', () => {
 
     await listErrors({
       credentialsPath: credFile,
+      apiUrl: 'http://localhost:8082',
+      repo: 'acme/app',
       fetchFn: async () => new Response(JSON.stringify(incidents), { status: 200 }),
     });
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('TypeError'));
@@ -81,6 +83,8 @@ describe('getError', () => {
 
     await getError('1', {
       credentialsPath: credFile,
+      apiUrl: 'http://localhost:8082',
+      repo: 'acme/app',
       fetchFn: async () => new Response(JSON.stringify(incident), { status: 200 }),
     });
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('TypeError'));

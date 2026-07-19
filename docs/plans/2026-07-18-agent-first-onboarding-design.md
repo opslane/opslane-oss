@@ -213,6 +213,10 @@ Gates (all must hold before merge):
 | R4-7 (P1) | Poll error bodies used `writeJSONError`'s `{"error"}` shape, not the documented `{"status"}` contract | `agentJSON` helper; exact-body assertions for `not_found`, `expired`, `rate_limited`, `failed`; setup 429 included |
 | R4-8 (P1) | `identity_required` vs transient-pending contradiction across design/plan | State machine settled: no `identity_required` state; missing/failed code = transient (pending + retry page); definitive vocabulary fixed at five reasons; design + quickstart table updated |
 
+### Round 5 — PR 2 (CLI) plan feedback (R5-1–R5-8)
+
+All plan-scoped (no design decision changed); dispositions live in the "Round-5 amendments" section of `2026-07-18-agent-onboarding-pr2-cli-plan.md`. Summary: `--force` never deletes credentials before a replacement is saved (R5-1); `completed`-without-key is a terminal `key_unavailable` state, not "re-run setup" (R5-2); legacy PKCE tokens are never reused across origins (R5-3); the one-JSON invariant holds by routing interim `auth_required` to stderr, and `already_configured` is exit 0 (R5-4); credential single-entry fallback only when repo detection fails and origin matches, all six consumers updated (R5-5); every wrong-key path fixed incl. `ai-fallback.ts` and `init.ts` plaintext persistence, Next layout must render the client component (R5-6); `--relink` cross-org returns a specific `project_not_in_active_org` (R5-7); the contract is made drift-proof via a machine-readable status enum + drift test (R5-8). Plus smaller corrections: export `applyPatches`, hermetic subprocess tests (temp HOME/cwd), unique-temp-file credential writes, poll-ID/timeout validation, added setup error-body tests.
+
 ## Launch blockers (outside this repo's code)
 
 1. Hosted domains live: `api.opslane.com`, `docs.opslane.com`.

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { doctor, type CheckResult } from '../doctor.js';
 import { persistTokensTo } from '../auth.js';
+import { saveAgentCredentials } from '../agent-credentials.js';
 
 // Suppress console output during tests
 vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -65,19 +66,19 @@ describe('doctor', () => {
     expect(configCheck?.message).toContain('.opslane.json found');
   });
 
-  it('reports FAIL with remediation when .opslane.json missing', async () => {
+  it('reports optional info when .opslane.json is missing', async () => {
     const results = await doctor({
       cwd: tmpDir,
       fetchFn: mockFetch('error', 'error'),
     });
 
     const configCheck = results.find((r) => r.name === 'Project config');
-    expect(configCheck?.passed).toBe(false);
-    expect(configCheck?.remediation).toContain('opslane init');
+    expect(configCheck?.passed).toBe(true);
+    expect(configCheck?.message).toContain('optional');
   });
 
   it('reports PASS when credentials exist and valid', async () => {
-    await persistTokensTo(credFile, {
+    await persistTokensTo(credFile, 'https://api.opslane.com', {
       accessToken: 'valid-token',
       refreshToken: 'valid-refresh',
       expiresAt: Date.now() + 3600_000,
@@ -90,15 +91,39 @@ describe('doctor', () => {
     // We'll verify the auth check is present and reports correctly for the real path.
     const results = await doctor({
       cwd: tmpDir,
+      tokenPath: credFile,
       fetchFn: mockFetch('error', 'error'),
     });
 
     const authCheck = results.find((r) => r.name === 'Authentication');
     expect(authCheck).toBeDefined();
-    // The result depends on whether ~/.opslane/credentials.json exists on the system.
-    // We verify the check runs and produces a valid CheckResult.
-    expect(typeof authCheck?.passed).toBe('boolean');
-    expect(typeof authCheck?.message).toBe('string');
+    expect(authCheck?.passed).toBe(true);
+    expect(authCheck?.message).toContain('login credentials');
+  });
+
+  it('accepts repo-scoped agent credentials and validates their API key', async () => {
+    const agentPath = join(credDir, 'agent-credentials.json');
+    await saveAgentCredentials({
+      org_id: 'org', project_id: 'project', api_key: 'agent-key',
+      repo: 'acme/app', api_url: 'https://api.opslane.com',
+    }, agentPath);
+    const results = await doctor({
+      cwd: tmpDir,
+      repo: 'acme/app',
+      credentialsPath: agentPath,
+      tokenPath: join(credDir, 'missing-login.json'),
+      fetchFn: (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return new Response(null, { status: 200 });
+        if (url.endsWith('/event-count')) {
+          expect(init?.headers).toEqual({ 'X-API-Key': 'agent-key' });
+          return new Response(JSON.stringify({ has_events: false }), { status: 200 });
+        }
+        return new Response(null, { status: 404 });
+      }) as typeof fetch,
+    });
+    expect(results.find((result) => result.name === 'Authentication')?.passed).toBe(true);
+    expect(results.find((result) => result.name === 'API key')?.passed).toBe(true);
   });
 
   it('reports FAIL when credentials missing', async () => {

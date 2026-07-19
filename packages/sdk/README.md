@@ -92,7 +92,7 @@ All `init` options, from the SDK's `SdkInitOptions` type:
 | `flushInterval` | `number` | `5000` | Milliseconds between batched event flushes. |
 | `maxBatchSize` | `number` | `10` | Maximum events per flush batch. |
 | `debug` | `boolean` | `false` | Log SDK-internal problems to the console. |
-| `replay.enabled` | `boolean` | `false` | Capture session replays around errors. **Off by default.** |
+| `replay.enabled` | `boolean` | `true` | Capture session replays around errors. **On by default.** |
 | `sampleRate` | `number` | `1` | Fraction of events sent, clamped to `[0, 1]`. |
 | `errorThrottleMs` | `number` | `1000` | Minimum milliseconds between reports of the same error. |
 | `beforeSend` | `(event) => event \| null` | — | Inspect/modify every event before sending; return `null` to drop it. |

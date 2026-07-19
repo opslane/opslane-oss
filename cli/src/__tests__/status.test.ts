@@ -20,9 +20,9 @@ describe('getStatus', () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it('returns not_configured when no credentials', async () => {
+  it('returns no_credentials when no credentials match', async () => {
     const result = await getStatus({ credentialsPath: join(tmpDir, 'missing.json') });
-    expect(result.status).toBe('not_configured');
+    expect(result.status).toBe('no_credentials');
   });
 
   it('returns configured when credentials exist', async () => {
@@ -34,7 +34,7 @@ describe('getStatus', () => {
       api_url: 'http://localhost:8082',
     }, credFile);
 
-    const result = await getStatus({ credentialsPath: credFile });
+    const result = await getStatus({ credentialsPath: credFile, apiUrl: 'http://localhost:8082', repo: 'acme/app' });
     expect(result.status).toBe('configured');
     expect(result.repo).toBe('acme/app');
   });
