@@ -13,7 +13,6 @@ export function adminStatusBadgeClass(status: string): string {
     case 'completed':
     case 'insight':
     case 'resolved':
-      return 'bg-green/10 text-green';
     case 'merged':
     case 'pr_created':
       return 'bg-green/10 text-green';

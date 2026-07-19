@@ -388,24 +388,24 @@ async function handleCreateKey(): Promise<void> {
     <h2 class="text-lg font-medium text-text mb-4">Settings</h2>
 
     <!-- Tabs -->
-    <div class="border-b border-border mb-6">
-      <nav class="-mb-px flex gap-6">
+    <div class="border-b border-border mb-6 pb-3">
+      <nav class="flex gap-2">
         <button
-          class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+          class="text-sm font-medium transition-colors"
           :class="activeTab === 'project' ? 'tab-active' : 'tab-inactive'"
           @click="switchTab('project')"
         >
           Project
         </button>
         <button
-          class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+          class="text-sm font-medium transition-colors"
           :class="activeTab === 'environments' ? 'tab-active' : 'tab-inactive'"
           @click="switchTab('environments')"
         >
           Environments
         </button>
         <button
-          class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+          class="text-sm font-medium transition-colors"
           :class="activeTab === 'api-keys' ? 'tab-active' : 'tab-inactive'"
           @click="switchTab('api-keys')"
         >
@@ -413,7 +413,7 @@ async function handleCreateKey(): Promise<void> {
         </button>
         <button
           v-if="activeRole"
-          class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+          class="text-sm font-medium transition-colors"
           :class="activeTab === 'organization' ? 'tab-active' : 'tab-inactive'"
           @click="switchTab('organization')"
         >
@@ -583,7 +583,7 @@ async function handleCreateKey(): Promise<void> {
               :disabled="!selectedProject || prPostureSaving"
               @change="onPRPostureChange"
             />
-            <span class="h-6 w-11 rounded-full bg-surface-2 transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform peer-checked:after:translate-x-5"></span>
+            <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
           </label>
         </div>
         <p v-if="!selectedProject" class="text-xs text-text-faint">

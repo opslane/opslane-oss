@@ -283,17 +283,17 @@ onMounted(async () => {
       </div>
 
       <!-- Tabs -->
-      <div class="border-b border-border">
-        <nav class="-mb-px flex gap-6">
+      <div class="border-b border-border pb-3">
+        <nav class="flex gap-2">
           <button
-            class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+            class="text-sm font-medium transition-colors"
             :class="activeTab === 'overview' ? 'tab-active' : 'tab-inactive'"
             @click="switchTab('overview')"
           >
             Overview
           </button>
           <button
-            class="py-2 px-1 text-sm font-medium border-b-2 transition-colors"
+            class="text-sm font-medium transition-colors"
             :class="activeTab === 'affected-users' ? 'tab-active' : 'tab-inactive'"
             @click="switchTab('affected-users')"
           >

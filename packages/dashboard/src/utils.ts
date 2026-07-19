@@ -26,12 +26,10 @@ export function statusBadgeClass(status: ErrorGroupStatus): string {
   switch (status) {
     case 'insight':
     case 'resolved':
-      return 'bg-green/10 text-green';
     case 'merged':
     case 'pr_created':
       return 'bg-green/10 text-green';
     case 'pr_draft':
-      return 'bg-amber/10 text-amber';
     case 'needs_human':
       return 'bg-amber/10 text-amber';
     case 'analyzing':
