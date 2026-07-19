@@ -7,6 +7,7 @@ const embeddedConfig: AuthConfig = {
   supports_password: true,
   supports_signup: true,
   supports_reset: true,
+  social_providers: [],
 };
 
 function authResult(result: PasswordAuthResult): () => Promise<PasswordAuthResult> {

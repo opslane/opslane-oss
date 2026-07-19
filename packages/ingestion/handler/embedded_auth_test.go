@@ -132,6 +132,32 @@ func TestEmbeddedAuthConfigNegotiatesCapabilities(t *testing.T) {
 	})
 }
 
+func TestAuthConfigReportsSocialProviders(t *testing.T) {
+	cfg, err := auth.ParseSocialProviders("google,github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	(&Dependencies{AuthProvider: &embeddedAuthProvider{}, SocialProviders: cfg}).AuthConfig(
+		recorder,
+		embeddedRequest(http.MethodGet, "/auth/config", ""),
+	)
+	if !strings.Contains(recorder.Body.String(), `"social_providers":["google","github"]`) {
+		t.Fatalf("body=%s", recorder.Body.String())
+	}
+}
+
+func TestAuthConfigSocialProvidersEmptyIsArrayNotNull(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	(&Dependencies{AuthProvider: &embeddedAuthProvider{}}).AuthConfig(
+		recorder,
+		embeddedRequest(http.MethodGet, "/auth/config", ""),
+	)
+	if !strings.Contains(recorder.Body.String(), `"social_providers":[]`) {
+		t.Fatalf("empty must serialize as [], body=%s", recorder.Body.String())
+	}
+}
+
 func TestEmbeddedAuthPasswordErrorContracts(t *testing.T) {
 	tests := []struct {
 		name       string

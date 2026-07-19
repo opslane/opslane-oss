@@ -590,7 +590,7 @@ func (d *Dependencies) oauthAuthorizeGET(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if err := d.redirectToProvider(w, r, providerState); err != nil {
+		if err := d.redirectToProvider(w, r, providerState, ""); err != nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "authentication provider is not configured")
 		}
 		return
