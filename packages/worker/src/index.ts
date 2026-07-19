@@ -31,6 +31,8 @@ import { analyzeSession, RULE_VERSION } from './friction/analyzer.js';
 import { writeFrictionSignals } from './friction/persist.js';
 import { processFrictionOutcomes } from './friction/promotion.js';
 import { createAnthropicAdjudicator, type Adjudicator } from './friction/adjudicator.js';
+import { VerificationInfraError } from './harness/errors.js';
+import { processCIWatchJob } from './ci-watch.js';
 
 /** Injectable seam: unit tests and the e2e gate substitute a deterministic
  * adjudicator; production uses the real Anthropic-backed one. */
@@ -155,6 +157,12 @@ export async function processJobInner(job: ClaimedJob, signal: AbortSignal): Pro
     return;
   }
 
+  if (job.jobType === 'ci_watch') {
+    if (!job.errorGroupId) throw new Error(`Job ${job.id} missing error_group_id`);
+    await processCIWatchJob(job as ClaimedJob & { errorGroupId: string }, signal);
+    return;
+  }
+
   if (!job.errorGroupId) {
     throw new Error(`Job ${job.id} missing error_group_id`);
   }
@@ -173,6 +181,33 @@ export async function processJobInner(job: ClaimedJob, signal: AbortSignal): Pro
       // otherwise be misclassified as lease-loss and requeued instead of handed to a human.
       if (signal.aborted || message.includes('lease lost')) {
         throw err;
+      }
+      if (err instanceof VerificationInfraError) {
+        const finalAttempt = errorJob.attempts + 1 >= (errorJob.maxAttempts ?? 3);
+        if (!finalAttempt) {
+          // The poller will call failJob, which requeues with the existing
+          // attempts/backoff machinery. Infrastructure errors are not patch evidence.
+          throw err;
+        }
+        try {
+          await updateGroupStatus(
+            errorJob.errorGroupId,
+            errorJob.projectId,
+            'needs_human',
+            {
+              reason: buildReason('verification_infra_error', err.message),
+              evidence: err.evidence,
+            },
+            errorJob,
+          );
+        } catch (writeErr: unknown) {
+          if (!(writeErr instanceof db.LeaseLostError)) throw writeErr;
+        }
+        logger.error('Verification infrastructure retries exhausted', {
+          job_id: errorJob.id,
+          attempt: errorJob.attempts + 1,
+        });
+        return;
       }
       // Genuine error: terminate as needs_human (preserve reason; root_cause untouched)
       // and DO NOT rethrow, so the poller completes the job rather than requeuing it
@@ -625,6 +660,15 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
 
+  if (group.status === 'pr_created' || group.status === 'pr_draft') {
+    logger.info('Fix delivery already committed; adopting existing state', {
+      job_id: job.id,
+      error_group_id: job.errorGroupId,
+      status: group.status,
+    });
+    return;
+  }
+
   if (group.kind === 'friction' && job.triggeredBy !== 'human') {
     // Settings can change after enqueue, so enforce the current project rung
     // when the job is claimed. Legacy jobs without attribution stay parked.
@@ -848,20 +892,54 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
         suggestedMitigation: investigation.suggestedMitigation ?? '',
         guidance: job.guidance ?? undefined,
       } : undefined,
+      prPosture: project.pr_posture ?? 'verified_only',
+      reserveDelivery: (delivery) => db.reserveDelivery(
+        job.errorGroupId,
+        job.projectId,
+        delivery,
+        job,
+      ),
+      recordDeliveryPushed: (headSha) => db.recordDeliveryPushed(
+        job.errorGroupId,
+        job.projectId,
+        headSha,
+        job,
+      ),
     });
     checkAbort(signal);
 
     const durationMs = Date.now() - jobStart;
 
-    if (result.status === 'pr_created') {
-      await updateGroupStatus(job.errorGroupId, job.projectId, 'pr_created', {
-        confidence: result.confidence,
-        pr_url: result.pr_url,
-        pr_number: result.pr_number,
-        pr_fix_job_id: job.id,
-      }, job);
+    if (result.status === 'pr_created' || result.status === 'pr_draft') {
+      if (!result.pr_url || !result.pr_number) {
+        throw new Error(`Delivery result ${result.status} is missing PR identity`);
+      }
+      if (!result.head_sha && result.status === 'pr_created') {
+        // Compatibility path for older injected pipeline implementations. The
+        // production pipeline always returns a reserved delivery head SHA.
+        await updateGroupStatus(job.errorGroupId, job.projectId, 'pr_created', {
+          confidence: result.confidence,
+          pr_url: result.pr_url,
+          pr_number: result.pr_number,
+          pr_fix_job_id: job.id,
+          evidence: result.evidence,
+        }, job);
+      } else {
+        if (!result.head_sha) throw new Error('Draft delivery result is missing head SHA');
+        await db.finalizeDelivery(job.errorGroupId, job.projectId, {
+          status: result.status,
+          confidence: result.confidence ?? (result.status === 'pr_draft' ? 'medium' : 'high'),
+          prUrl: result.pr_url,
+          prNumber: result.pr_number,
+          headSha: result.head_sha,
+          fixJobId: job.id,
+          reason: result.reason,
+          candidateDiff: result.candidateDiff,
+          evidence: result.evidence,
+        }, job);
+      }
       jobsProcessed++;
-      logger.info('Fix job completed: pr_created', {
+      logger.info(`Fix job completed: ${result.status}`, {
         job_id: job.id, duration_ms: durationMs, pr_url: result.pr_url,
       });
     } else {
@@ -870,6 +948,8 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
         reason: result.reason ?? buildReason('worker_runtime_error', 'Fix pipeline failed without a reason'),
         confidence: result.confidence,
+        candidate_diff: result.candidateDiff,
+        evidence: result.evidence,
       }, job);
       jobsFailed++;
       logger.warn('Fix job completed: needs_human (writeup preserved)', {

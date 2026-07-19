@@ -17,29 +17,31 @@ import (
 // incidentJSON is the JSON representation of an incident, matching the
 // Incident type in shared/src/types.ts. Fields use snake_case.
 type incidentJSON struct {
-	ID                  string              `json:"id"`
-	ProjectID           string              `json:"project_id"`
-	Fingerprint         string              `json:"fingerprint"`
-	Title               string              `json:"title"`
-	Status              string              `json:"status"`
-	Kind                string              `json:"kind"`
-	EnvironmentID       *string             `json:"environment_id,omitempty"`
-	AdjudicationStatus  *string             `json:"adjudication_status,omitempty"`
-	FirstSeen           string              `json:"first_seen"`
-	LastSeen            string              `json:"last_seen"`
-	OccurrenceCount     int                 `json:"occurrence_count"`
-	AffectedUsersCount  int                 `json:"affected_users_count"`
-	Confidence          *string             `json:"confidence,omitempty"`
-	PrURL               *string             `json:"pr_url,omitempty"`
-	ReplayID            *string             `json:"replay_id,omitempty"`
-	SessionPointer      *sessionPointerJSON `json:"session_pointer,omitempty"`
-	Reason              *needsHumanReason   `json:"reason,omitempty"`
-	RootCause           *string             `json:"root_cause,omitempty"`
-	SuggestedMitigation *string             `json:"suggested_mitigation,omitempty"`
-	MergedAt            *string             `json:"merged_at,omitempty"`
-	ResolvedAt          *string             `json:"resolved_at,omitempty"`
-	ArchivedAt          *string             `json:"archived_at,omitempty"`
-	TraceURL            *string             `json:"trace_url,omitempty"`
+	ID                   string              `json:"id"`
+	ProjectID            string              `json:"project_id"`
+	Fingerprint          string              `json:"fingerprint"`
+	Title                string              `json:"title"`
+	Status               string              `json:"status"`
+	Kind                 string              `json:"kind"`
+	EnvironmentID        *string             `json:"environment_id,omitempty"`
+	AdjudicationStatus   *string             `json:"adjudication_status,omitempty"`
+	FirstSeen            string              `json:"first_seen"`
+	LastSeen             string              `json:"last_seen"`
+	OccurrenceCount      int                 `json:"occurrence_count"`
+	AffectedUsersCount   int                 `json:"affected_users_count"`
+	Confidence           *string             `json:"confidence,omitempty"`
+	PrURL                *string             `json:"pr_url,omitempty"`
+	ReplayID             *string             `json:"replay_id,omitempty"`
+	SessionPointer       *sessionPointerJSON `json:"session_pointer,omitempty"`
+	Reason               *needsHumanReason   `json:"reason,omitempty"`
+	RootCause            *string             `json:"root_cause,omitempty"`
+	SuggestedMitigation  *string             `json:"suggested_mitigation,omitempty"`
+	VerificationEvidence json.RawMessage     `json:"verification_evidence,omitempty"`
+	CandidateDiff        *string             `json:"candidate_diff,omitempty"`
+	MergedAt             *string             `json:"merged_at,omitempty"`
+	ResolvedAt           *string             `json:"resolved_at,omitempty"`
+	ArchivedAt           *string             `json:"archived_at,omitempty"`
+	TraceURL             *string             `json:"trace_url,omitempty"`
 }
 
 type sessionPointerJSON struct {
@@ -80,9 +82,13 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 		PrURL:               g.PrURL,
 		RootCause:           g.RootCause,
 		SuggestedMitigation: g.SuggestedMitigation,
+		CandidateDiff:       g.CandidateDiff,
 		MergedAt:            fmtTimePtr(g.MergedAt),
 		ResolvedAt:          fmtTimePtr(g.ResolvedAt),
 		ArchivedAt:          fmtTimePtr(g.ArchivedAt),
+	}
+	if len(g.VerificationEvidence) > 0 {
+		inc.VerificationEvidence = json.RawMessage(g.VerificationEvidence)
 	}
 	if g.ReasonCode != nil && g.ReasonMessage != nil && g.Remediation != nil {
 		inc.Reason = &needsHumanReason{
@@ -100,6 +106,7 @@ type projectJSON struct {
 	Name             string  `json:"name"`
 	GithubRepo       *string `json:"github_repo"`
 	FrictionAutonomy string  `json:"friction_autonomy"`
+	PrPosture        string  `json:"pr_posture"`
 	CreatedAt        string  `json:"created_at"`
 }
 
@@ -109,6 +116,7 @@ func toProjectJSON(p db.Project) projectJSON {
 		Name:             p.Name,
 		GithubRepo:       p.GithubRepo,
 		FrictionAutonomy: p.FrictionAutonomy,
+		PrPosture:        p.PrPosture,
 		CreatedAt:        p.CreatedAt.Format(time.RFC3339),
 	}
 }
@@ -461,6 +469,7 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		GithubRepo       *string `json:"github_repo"`
 		FrictionAutonomy *string `json:"friction_autonomy"`
+		PrPosture        *string `json:"pr_posture"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -476,9 +485,18 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	if req.PrPosture != nil {
+		switch *req.PrPosture {
+		case "verified_only", "draft_when_unverified":
+		default:
+			writeJSONError(w, http.StatusBadRequest,
+				"pr_posture must be one of verified_only, draft_when_unverified")
+			return
+		}
+	}
 
 	project, err := d.Queries.UpdateProject(
-		r.Context(), orgID, projectID, req.GithubRepo, req.FrictionAutonomy,
+		r.Context(), orgID, projectID, req.GithubRepo, req.FrictionAutonomy, req.PrPosture,
 	)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to update project")

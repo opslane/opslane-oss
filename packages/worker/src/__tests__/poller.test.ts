@@ -3,6 +3,7 @@ import type { ClaimedJob } from '../db.js';
 
 // Mock the db module before importing poller
 vi.mock('../db.js', () => ({
+  JobRescheduledError: class JobRescheduledError extends Error {},
   claimJob: vi.fn(),
   heartbeat: vi.fn(),
   completeJob: vi.fn(),

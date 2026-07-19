@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue';
 import { useRoute } from 'vue-router';
 import type { Account, Incident } from '../types/api';
 import { getAccount, listAccountIncidents } from '../api';
-import { getProjectId, statusBadgeClass, formatDate } from '../utils';
+import { getProjectId, statusBadgeClass, statusLabel, formatDate } from '../utils';
 
 const route = useRoute();
 const accountId = route.params['accountId'] as string;
@@ -109,7 +109,7 @@ onMounted(async () => {
                   <span
                     class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
                     :class="statusBadgeClass(incident.status)"
-                    v-text="incident.status.replace('_', ' ')"
+                    v-text="statusLabel(incident.status)"
                   ></span>
                 </td>
                 <td class="py-2.5 px-4 text-right text-text-muted tabular-nums">{{ incident.occurrence_count }}</td>

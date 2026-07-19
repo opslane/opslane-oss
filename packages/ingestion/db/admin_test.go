@@ -43,6 +43,9 @@ func TestAdminOverviewHourlyBucketsAreZeroFilledAndBoundarySafe(t *testing.T) {
 	if len(before.Events.Hourly) != 48 {
 		t.Fatalf("got %d hourly buckets, want 48", len(before.Events.Hourly))
 	}
+	if _, ok := before.Jobs.ByType["ci_watch"]; !ok {
+		t.Fatal("admin job overview omitted ci_watch")
+	}
 	for i := 1; i < len(before.Events.Hourly); i++ {
 		if before.Events.Hourly[i].Hour.Sub(before.Events.Hourly[i-1].Hour) != time.Hour {
 			t.Fatalf("buckets %d and %d are not one hour apart", i-1, i)

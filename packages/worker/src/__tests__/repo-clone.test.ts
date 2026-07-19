@@ -177,13 +177,22 @@ describe('gitCommitAndPush', () => {
       '',
     ].join('\n');
 
-    await gitCommitAndPush(workDir, 'opslane/fix-123', 'fix: greet correctly', diff);
+    const commitMessage = [
+      'Guard missing names in greeting',
+      '',
+      'Opening the greeting without a name crashed the page.',
+      '',
+      'Guard the nullable name before rendering the greeting.',
+      '',
+      'Verified: no new test failures compared with the pre-fix baseline.',
+    ].join('\n');
+    await gitCommitAndPush(workDir, 'opslane/fix-123', commitMessage, diff);
 
     // Branch exists on the remote with the expected commit message.
     const remoteBranches = await git(remoteDir, 'branch', '--list');
     expect(remoteBranches).toContain('opslane/fix-123');
-    const message = await git(remoteDir, 'log', '-1', '--format=%s', 'opslane/fix-123');
-    expect(message).toBe('fix: greet correctly');
+    const message = await git(remoteDir, 'log', '-1', '--format=%B', 'opslane/fix-123');
+    expect(message).toBe(commitMessage);
 
     // The pushed commit contains the applied diff.
     const content = await git(remoteDir, 'show', 'opslane/fix-123:app.txt');

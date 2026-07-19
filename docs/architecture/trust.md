@@ -10,12 +10,12 @@ What Opslane can touch, what leaves your infrastructure, how credentials are han
 
 ## GitHub permissions
 
-The worker needs to **read repository contents** (clone, source maps context) and **write pull requests**. Two credential modes:
+The worker needs to **read repository contents** (clone, source maps context), **write pull requests**, and **read checks and commit statuses** when observing CI on a draft. Two credential modes:
 
-- **Personal access token** (`GITHUB_TOKEN`): a fine-grained PAT with `contents` and `pull_requests` write on the repositories you connect.
-- **GitHub App**: the worker mints short-lived installation tokens from `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`. Installation tokens expire on the order of an hour and are scoped to the repositories the App is installed on. The App powers webhooks (HMAC-verified). Dashboard sign-in uses OAuth with a configured identity provider; social providers such as GitHub and Google may be enabled.
+- **Personal access token** (`GITHUB_TOKEN`): a classic token with `repo`, or a fine-grained PAT with `contents` and `pull_requests` write plus checks/status read access on the repositories you connect.
+- **GitHub App**: the worker mints short-lived installation tokens from `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`. The App requires Contents read/write, Pull requests read/write, and Checks read. Installation tokens expire on the order of an hour and are scoped to the repositories the App is installed on. The App powers webhooks (HMAC-verified). Dashboard sign-in uses OAuth with a configured identity provider; social providers such as GitHub and Google may be enabled.
 
-The worker pushes exactly one thing: a newly created fix branch (`git push origin <branch>`, no force flags anywhere in the pipeline), then opens a PR from it. It never pushes to existing branches; merging is always yours.
+The worker pushes only to a reserved Opslane fix branch (`opslane/fix-<group-id>`, no force flags anywhere in the pipeline), then opens a PR from it. The branch name and delivery operation key are stable for one error group. Before a retry writes to GitHub, it reconciles the reservation, remote branch, and existing open PR so a crash cannot create a second delivery. It never pushes to a customer's pre-existing branch; merging is always yours.
 
 ## Data flow: what leaves your host
 
@@ -26,6 +26,7 @@ The worker pushes exactly one thing: a newly created fix branch (`git push origi
 | GitHub (worker) | The fix branch (pushed **before** PR creation — if the PR call then fails, the pushed branch remains and the incident ends `needs_human`), then the PR body (root cause, diff, verification evidence). The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery and setup-PR |
 | Configured identity provider | OAuth code exchange and user/email lookup (sign-in) | During dashboard sign-in |
 | GitHub (ingestion) | Installation and repository listing (App setup) | During GitHub App setup |
+| WorkOS (ingestion) | Email addresses, passwords, verification codes, reset tokens | Only when password authentication is enabled; during sign-in, signup, email verification, and password reset |
 
 With no credentials configured, **nothing leaves your host** — the stack ingests, groups, and files `needs_human` incidents entirely locally.
 
@@ -70,6 +71,7 @@ See [replay privacy and masking](../guides/replay-privacy.md) for what replay da
 
 - **Ingest API keys** are stored as SHA-256 hashes; the raw key is shown once at creation.
 - **User sessions** are JWTs signed with `JWT_SECRET`, mated with rotating refresh-token families (token hashes only in the database).
+- **Passwords** (when password authentication is enabled) are not stored locally — registration, authentication, and reset are handled by the configured identity provider (WorkOS).
 - **GitHub App private key** and worker credentials are environment variables — supplied by your deployment, never written to the database.
 
 ## Honest gaps (current state)

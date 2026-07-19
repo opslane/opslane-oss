@@ -36,6 +36,12 @@ func TestAdminJobsRejectsInvalidFiltersBeforeQuerying(t *testing.T) {
 	}
 }
 
+func TestAdminJobsAllowsCIWatchFilter(t *testing.T) {
+	if _, ok := adminJobTypes["ci_watch"]; !ok {
+		t.Fatal("ci_watch is missing from the admin job-type allowlist")
+	}
+}
+
 func TestRedactAdminError(t *testing.T) {
 	raw := "ghp_abcdefghijklmnopqrstuvwxyz github_pat_abc_DEF123 sk-secret Bearer top-secret https://user:pass@example.com/path"
 	got := redactAdminError(raw)

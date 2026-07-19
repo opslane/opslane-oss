@@ -242,8 +242,16 @@ describe('event-to-pr reliability system tracer', () => {
     expect(providers.anthropicJournal).toHaveLength(6);
     expect(toolNames(providers.anthropicJournal[0]!.body)).toContain('classify_error');
     expect(toolNames(providers.anthropicJournal[4]!.body)).toEqual(['score_diff']);
-    expect(providers.githubJournal).toHaveLength(1);
-    expect(providers.githubJournal[0]).toMatchObject({
+    // Durable delivery reconciles before it creates: the pipeline looks for an
+    // existing open PR on the stable branch, probes the branch head (absent →
+    // push), and createPR runs its own idempotency lookup before the one POST.
+    expect(providers.githubJournal).toHaveLength(4);
+    const journalPaths = providers.githubJournal.map((entry) => entry.path);
+    expect(journalPaths[0]).toMatch(new RegExp(`^/repos/${githubRepo}/pulls\\?`));
+    expect(journalPaths[0]).toContain('state=open');
+    expect(journalPaths[1]).toMatch(new RegExp(`^/repos/${githubRepo}/git/ref/heads`));
+    expect(journalPaths[2]).toMatch(new RegExp(`^/repos/${githubRepo}/pulls\\?`));
+    expect(providers.githubJournal[3]).toMatchObject({
       path: `/repos/${githubRepo}/pulls`,
       authorization: 'token test-github-token',
       body: {

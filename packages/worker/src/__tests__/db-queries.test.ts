@@ -78,6 +78,20 @@ describe('group lifecycle timestamp queries', () => {
     expect(query).toContain('ELSE needs_human_at');
     expect(mockQuery.mock.calls[0]?.[1]?.[2]).toBe('needs_human');
   });
+
+  it('persists candidate_diff and verification_evidence on needs_human', async () => {
+    mockQuery.mockResolvedValue({ rowCount: 1, rows: [{ id: 'g1' }] });
+    await updateGroupStatus('g1', 'p1', 'needs_human', {
+      reason: { reason_code: 'low_confidence_fix', reason_message: 'm', remediation: 'r' },
+      candidate_diff: 'DIFF',
+      evidence: { version: 1, tier: 'E0', checks: [] },
+    });
+    const [sql, params] = mockQuery.mock.calls.at(-1) as [string, unknown[]];
+    expect(sql).toContain('candidate_diff');
+    expect(sql).toContain('verification_evidence');
+    expect(params).toContain('DIFF');
+    expect(params).toContain(JSON.stringify({ version: 1, tier: 'E0', checks: [] }));
+  });
 });
 
 describe('getErrorGroup', () => {

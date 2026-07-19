@@ -47,6 +47,14 @@ checkPermissions@http://localhost:5175/src/App.vue:16:16`;
     const files = extractStackTraceFiles(stack);
     expect(files).toEqual(['src/utils/helpers.ts']);
   });
+
+  it('handles bare URL frames from anonymous top-level throws (no parens)', () => {
+    const stack = `Error: Watcher validation failed: counter 3 exceeded max limit of 2
+    at http://localhost:5174/src/components/WatcherBug.vue:10:15
+    at callWithErrorHandling (http://localhost:5174/node_modules/.vite/deps/vue.js?v=9a83a401:2377:19)`;
+    const files = extractStackTraceFiles(stack);
+    expect(files).toEqual(['src/components/WatcherBug.vue']);
+  });
 });
 
 describe('hasNoAppFrames', () => {

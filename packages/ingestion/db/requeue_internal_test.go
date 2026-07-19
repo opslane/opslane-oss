@@ -16,6 +16,8 @@ func TestIsRequeueEligible_StacklessReasonCodesAreNonRetriable(t *testing.T) {
 		{"triage_unfixable is terminal", "needs_human", "triage_unfixable", false},
 		{"low_confidence_fix is terminal (preserve writeup)", "needs_human", "low_confidence_fix", false},
 		{"tests_failed is terminal (preserve writeup)", "needs_human", "tests_failed", false},
+		{"repro_not_achievable is terminal (preserve writeup)", "needs_human", "repro_not_achievable", false},
+		{"verification_infra_error requeues", "needs_human", "verification_infra_error", true},
 		{"policy_blocked still terminal", "needs_human", "policy_blocked", false},
 		{"a fixable needs_human reason still requeues", "needs_human", "missing_github_token", true},
 		{"resolved still requeues", "resolved", "", true},

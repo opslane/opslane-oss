@@ -109,6 +109,10 @@ export function createPoller(options: PollerOptions): Poller {
           error_group_id: job.errorGroupId,
         });
       } catch (err: unknown) {
+        if (err instanceof Error && err.name === 'JobRescheduledError') {
+          logger.info('Job rescheduled', { job_id: job.id });
+          return;
+        }
         const message =
           err instanceof Error ? err.message : String(err);
         logger.error('Job failed', {

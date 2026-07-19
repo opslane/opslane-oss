@@ -145,6 +145,7 @@ export interface Project {
   name: string;
   github_repo: string | null;
   friction_autonomy: 'ask_first' | 'auto_fix' | 'auto_fix_ux';
+  pr_posture: 'verified_only' | 'draft_when_unverified';
   created_at: string;
 }
 
@@ -391,7 +392,11 @@ export function createProject(name: string, githubRepo: string): Promise<Project
 
 export function updateProject(
   projectId: string,
-  data: { github_repo?: string; friction_autonomy?: Project['friction_autonomy'] }
+  data: {
+    github_repo?: string;
+    friction_autonomy?: Project['friction_autonomy'];
+    pr_posture?: Project['pr_posture'];
+  }
 ): Promise<Project> {
   return patchJSON<Project>(`/projects/${projectId}`, data);
 }

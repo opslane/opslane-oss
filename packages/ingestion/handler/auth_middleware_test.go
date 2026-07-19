@@ -286,20 +286,27 @@ func TestUpdateProjectEndpoint_FrictionAutonomy(t *testing.T) {
 	if response := patch(`{"friction_autonomy":"yolo"}`); response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid autonomy status = %d, want 400: %s", response.Code, response.Body.String())
 	}
+	if response := patch(`{"pr_posture":"publish_everything"}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid PR posture status = %d, want 400: %s", response.Code, response.Body.String())
+	}
 
-	response := patch(`{"friction_autonomy":"auto_fix"}`)
+	response := patch(`{"friction_autonomy":"auto_fix","pr_posture":"draft_when_unverified"}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("valid autonomy status = %d, want 200: %s", response.Code, response.Body.String())
 	}
 	var project struct {
 		GithubRepo       *string `json:"github_repo"`
 		FrictionAutonomy string  `json:"friction_autonomy"`
+		PrPosture        string  `json:"pr_posture"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&project); err != nil {
 		t.Fatalf("decode project response: %v", err)
 	}
 	if project.FrictionAutonomy != "auto_fix" {
 		t.Fatalf("friction_autonomy = %q, want auto_fix", project.FrictionAutonomy)
+	}
+	if project.PrPosture != "draft_when_unverified" {
+		t.Fatalf("pr_posture = %q, want draft_when_unverified", project.PrPosture)
 	}
 
 	response = patch(`{"github_repo":"org/other"}`)
@@ -311,6 +318,9 @@ func TestUpdateProjectEndpoint_FrictionAutonomy(t *testing.T) {
 	}
 	if project.FrictionAutonomy != "auto_fix" {
 		t.Fatalf("github-only PATCH reset autonomy to %q", project.FrictionAutonomy)
+	}
+	if project.PrPosture != "draft_when_unverified" {
+		t.Fatalf("github-only PATCH reset PR posture to %q", project.PrPosture)
 	}
 	if project.GithubRepo == nil || *project.GithubRepo != "org/other" {
 		t.Fatalf("github_repo = %v, want org/other", project.GithubRepo)
