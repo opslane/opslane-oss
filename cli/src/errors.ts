@@ -1,11 +1,17 @@
-import { loadAgentCredentials, defaultCredentialsPath } from './agent-credentials.js';
-import { jsonOutput, exitWithError } from './output.js';
+import { resolveCredentials, defaultCredentialsPath } from './agent-credentials.js';
+import { jsonOutput, exitWithError, exitWithStatus } from './output.js';
+import { defaultApiUrl } from './config.js';
+import { detectRepoFromGit } from './setup.js';
+import { canonicalOrigin } from './origin.js';
 
 export interface ErrorsOptions {
   status?: string;
   limit?: number;
   credentialsPath?: string;
   fetchFn?: typeof fetch;
+  apiUrl?: string;
+  repo?: string;
+  cwd?: string;
 }
 
 async function fetchAndOutput(fetchFn: typeof fetch, url: string, apiKey: string): Promise<void> {
@@ -28,11 +34,20 @@ async function fetchAndOutput(fetchFn: typeof fetch, url: string, apiKey: string
 export async function listErrors(options: ErrorsOptions = {}): Promise<void> {
   const credPath = options.credentialsPath ?? defaultCredentialsPath();
   const fetchFn = options.fetchFn ?? fetch;
+  let apiUrl: string;
+  try {
+    apiUrl = canonicalOrigin(options.apiUrl ?? defaultApiUrl());
+  } catch {
+    return exitWithStatus('usage_error', { message: '--api-url must be a valid http(s) URL' }, 1);
+  }
 
-  const creds = await loadAgentCredentials(credPath);
+  const creds = await resolveCredentials({
+    filePath: credPath,
+    apiUrl,
+    repo: options.repo ?? detectRepoFromGit(options.cwd),
+  });
   if (!creds) {
-    exitWithError('No credentials found. Run "opslane setup" first.');
-    return;
+    return exitWithStatus('no_credentials', { message: 'Run "opslane setup" in this repo first.' }, 1);
   }
 
   const params = new URLSearchParams();
@@ -46,11 +61,20 @@ export async function listErrors(options: ErrorsOptions = {}): Promise<void> {
 export async function getError(errorId: string, options: ErrorsOptions = {}): Promise<void> {
   const credPath = options.credentialsPath ?? defaultCredentialsPath();
   const fetchFn = options.fetchFn ?? fetch;
+  let apiUrl: string;
+  try {
+    apiUrl = canonicalOrigin(options.apiUrl ?? defaultApiUrl());
+  } catch {
+    return exitWithStatus('usage_error', { message: '--api-url must be a valid http(s) URL' }, 1);
+  }
 
-  const creds = await loadAgentCredentials(credPath);
+  const creds = await resolveCredentials({
+    filePath: credPath,
+    apiUrl,
+    repo: options.repo ?? detectRepoFromGit(options.cwd),
+  });
   if (!creds) {
-    exitWithError('No credentials found. Run "opslane setup" first.');
-    return;
+    return exitWithStatus('no_credentials', { message: 'Run "opslane setup" in this repo first.' }, 1);
   }
 
   const url = `${creds.api_url}/api/v1/projects/${creds.project_id}/incidents/${encodeURIComponent(errorId)}`;

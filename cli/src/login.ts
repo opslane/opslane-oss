@@ -7,11 +7,15 @@ import {
   type AuthConfig,
   type TokenPair,
 } from './auth.js';
+import { defaultApiUrl } from './config.js';
+import { canonicalOrigin } from './origin.js';
 
-const DEFAULT_AUTH_CONFIG: AuthConfig = {
-  apiUrl: process.env['OPSLANE_API_URL'] ?? 'http://localhost:8082',
-  clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
-};
+function defaultAuthConfig(): AuthConfig {
+  return {
+    apiUrl: defaultApiUrl(),
+    clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
+  };
+}
 
 /**
  * Exchange an authorization code for tokens.
@@ -116,8 +120,9 @@ function waitForCallback(port: number, expectedState: string): Promise<string> {
  * Run the PKCE-based login flow.
  */
 export async function login(
-  config: AuthConfig = DEFAULT_AUTH_CONFIG,
+  config: AuthConfig = defaultAuthConfig(),
 ): Promise<void> {
+  const apiUrl = canonicalOrigin(config.apiUrl);
   const { codeVerifier, codeChallenge } = generatePKCE();
   const state = randomBytes(16).toString('hex');
 
@@ -126,7 +131,7 @@ export async function login(
   const redirectUri = `http://localhost:${port}/callback`;
 
   const authUrl = [
-    `${config.apiUrl}/oauth/authorize`,
+    `${apiUrl}/oauth/authorize`,
     `?client_id=${encodeURIComponent(config.clientId)}`,
     `&code_challenge=${encodeURIComponent(codeChallenge)}`,
     '&code_challenge_method=S256',
@@ -146,14 +151,14 @@ export async function login(
     console.log(chalk.dim('Exchanging authorization code for tokens...'));
 
     const tokens = await exchangeCode(
-      config.apiUrl,
+      apiUrl,
       config.clientId,
       code,
       codeVerifier,
       redirectUri,
     );
 
-    await persistTokens(tokens);
+    await persistTokens(apiUrl, tokens);
 
     console.log(
       chalk.green('\nLogin successful! Credentials saved to ~/.opslane/credentials.json'),

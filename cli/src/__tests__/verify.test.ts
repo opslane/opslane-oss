@@ -25,7 +25,7 @@ describe('verifyConnection', () => {
       credentialsPath: join(tmpDir, 'missing.json'),
       fetchFn: async () => new Response(null, { status: 200 }),
     });
-    expect(result.status).toBe('error');
+    expect(result.status).toBe('no_credentials');
     expect(result.message).toContain('credentials');
   });
 
@@ -40,6 +40,8 @@ describe('verifyConnection', () => {
 
     const result = await verifyConnection({
       credentialsPath: credFile,
+      apiUrl: 'http://localhost:8082',
+      repo: 'acme/app',
       fetchFn: async (input: string | URL | Request) => {
         const url = typeof input === 'string' ? input : '';
         if (url.includes('/health')) {
@@ -68,6 +70,8 @@ describe('verifyConnection', () => {
 
     const result = await verifyConnection({
       credentialsPath: credFile,
+      apiUrl: 'http://localhost:8082',
+      repo: 'acme/app',
       fetchFn: async (input: string | URL | Request) => {
         const url = typeof input === 'string' ? input : '';
         if (url.includes('/health')) {

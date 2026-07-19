@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["next-env.d.ts", "app"]
+}

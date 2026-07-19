@@ -1,13 +1,19 @@
-import { loadAgentCredentials, defaultCredentialsPath } from './agent-credentials.js';
-import { jsonOutput } from './output.js';
+import { resolveCredentials, defaultCredentialsPath } from './agent-credentials.js';
+import { jsonOutput, exitWithStatus } from './output.js';
+import { defaultApiUrl } from './config.js';
+import { detectRepoFromGit } from './setup.js';
+import { canonicalOrigin } from './origin.js';
 
 export interface VerifyOptions {
   credentialsPath?: string;
   fetchFn?: typeof fetch;
+  apiUrl?: string;
+  repo?: string;
+  cwd?: string;
 }
 
 export interface VerifyResult {
-  status: 'ok' | 'error';
+  status: 'ok' | 'error' | 'no_credentials';
   api_reachable: boolean;
   has_events: boolean;
   message: string;
@@ -17,10 +23,14 @@ export async function verifyConnection(options: VerifyOptions = {}): Promise<Ver
   const credPath = options.credentialsPath ?? defaultCredentialsPath();
   const fetchFn = options.fetchFn ?? fetch;
 
-  const creds = await loadAgentCredentials(credPath);
+  const creds = await resolveCredentials({
+    filePath: credPath,
+    apiUrl: options.apiUrl ?? defaultApiUrl(),
+    repo: options.repo ?? detectRepoFromGit(options.cwd),
+  });
   if (!creds) {
     return {
-      status: 'error',
+      status: 'no_credentials',
       api_reachable: false,
       has_events: false,
       message: 'No credentials found. Run "opslane setup" first.',
@@ -76,7 +86,16 @@ export async function verifyConnection(options: VerifyOptions = {}): Promise<Ver
 }
 
 export async function verify(options: VerifyOptions = {}): Promise<void> {
-  const result = await verifyConnection(options);
+  let apiUrl: string;
+  try {
+    apiUrl = canonicalOrigin(options.apiUrl ?? defaultApiUrl());
+  } catch {
+    return exitWithStatus('usage_error', { message: '--api-url must be a valid http(s) URL' }, 1);
+  }
+  const result = await verifyConnection({ ...options, apiUrl });
+  if (result.status === 'no_credentials') {
+    return exitWithStatus('no_credentials', { message: 'Run "opslane setup" in this repo first.' }, 1);
+  }
   jsonOutput(result);
   if (result.status === 'error') {
     process.exit(1);

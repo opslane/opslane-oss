@@ -3,6 +3,7 @@ import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getSnippet } from '../snippet.js';
+import { saveAgentCredentials } from '../agent-credentials.js';
 
 vi.spyOn(console, 'log').mockImplementation(() => {});
 
@@ -31,6 +32,9 @@ describe('getSnippet', () => {
     const result = await getSnippet({ cwd: tmpDir, apiKey: 'def_test' });
     expect(result.framework).toBe('react-vite');
     expect(result.install).toContain('@opslane/sdk');
+    expect(result.env).toEqual({
+      var: 'VITE_OPSLANE_API_KEY', value: 'def_test', file: '.env.local', gitignore: true,
+    });
   });
 
   it('returns unknown framework when no package.json', async () => {
@@ -46,5 +50,23 @@ describe('getSnippet', () => {
 
     const result = await getSnippet({ cwd: tmpDir, framework: 'vue-vite', apiKey: 'def_test' });
     expect(result.framework).toBe('vue-vite');
+  });
+
+  it('detects the package manager and emits a self-hosted endpoint', async () => {
+    await writeFile(join(tmpDir, 'package.json'), JSON.stringify({ dependencies: { react: '^18' }, devDependencies: { vite: '^5' } }));
+    await writeFile(join(tmpDir, 'pnpm-lock.yaml'), 'lockfileVersion: 9');
+    await writeFile(join(tmpDir, 'src', 'main.tsx'), "import React from 'react';\n");
+    const credentialsPath = join(tmpDir, 'agent-credentials.json');
+    await saveAgentCredentials({
+      org_id: 'org', project_id: 'project', api_key: 'self-key', repo: 'acme/app', api_url: 'http://localhost:8082',
+    }, credentialsPath);
+
+    const result = await getSnippet({
+      cwd: tmpDir, repo: 'acme/app', apiUrl: 'http://localhost:8082', credentialsPath,
+    });
+    expect(result.install).toBe('pnpm add @opslane/sdk');
+    expect(result.endpoint).toBe('http://localhost:8082');
+    expect(JSON.stringify(result.patches)).toContain("endpoint: 'http://localhost:8082'");
+    expect(result.env.value).toBe('self-key');
   });
 });

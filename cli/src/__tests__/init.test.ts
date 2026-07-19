@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { detectFramework } from '../detect.js';
+import { applyPatches, init } from '../init.js';
+import type { FilePatch } from '../codemods/types.js';
 
 describe('detectFramework', () => {
   let tmpDir: string;
@@ -187,5 +189,66 @@ describe('detectFramework', () => {
 
     const result = await detectFramework(tmpDir);
     expect(result).toBe('nextjs');
+  });
+});
+
+describe('init patch application', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'opslane-init-'));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('exports applyPatches and supports a JSON-serializable start-of-file anchor', async () => {
+    await writeFile(join(tmpDir, 'entry.ts'), 'export {};\n');
+    const patches: FilePatch[] = [{
+      filePath: 'entry.ts',
+      action: 'modify',
+      insertAfter: '',
+      insertContent: "import { init } from '@opslane/sdk';",
+    }];
+    expect(() => JSON.stringify(patches)).not.toThrow();
+    await applyPatches(tmpDir, patches);
+    expect(await readFile(join(tmpDir, 'entry.ts'), 'utf-8')).toMatch(
+      /^import \{ init \}.*\nexport \{\};/,
+    );
+  });
+
+  it('never writes a supplied API key into generated source or .opslane.json', async () => {
+    await mkdir(join(tmpDir, 'src'));
+    await writeFile(
+      join(tmpDir, 'package.json'),
+      JSON.stringify({
+        dependencies: { react: '^18.0.0' },
+        devDependencies: { vite: '^5.0.0' },
+      }),
+    );
+    await writeFile(
+      join(tmpDir, 'src/main.tsx'),
+      "import React from 'react';\nexport {};\n",
+    );
+
+    const secret = 'def_must-never-be-generated';
+    await init({
+      cwd: tmpDir,
+      nonInteractive: true,
+      projectId: 'project-1',
+      apiKey: secret,
+    });
+
+    const source = await readFile(join(tmpDir, 'src/main.tsx'), 'utf-8');
+    const config = await readFile(join(tmpDir, '.opslane.json'), 'utf-8');
+    const env = await readFile(join(tmpDir, '.env.local'), 'utf-8');
+    const gitignore = await readFile(join(tmpDir, '.gitignore'), 'utf-8');
+    expect(source).toContain('import.meta.env.VITE_OPSLANE_API_KEY');
+    expect(source).not.toContain(secret);
+    expect(config).not.toContain(secret);
+    expect(JSON.parse(config)).not.toHaveProperty('apiKey');
+    expect(env).toBe(`VITE_OPSLANE_API_KEY=${secret}\n`);
+    expect(gitignore).toContain('.env.local');
   });
 });
