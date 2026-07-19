@@ -31,7 +31,7 @@ test('real docs tree has explicit policy coverage', () => {
   const result = checkDocsScope({ root: ROOT });
 
   assert.deepEqual(result.problems, []);
-  assert.equal(result.published.length, 19);
+  assert.equal(result.published.length, 20);
   assert.equal(result.navigable.length, parseSidebarSlugs(SIDEBAR_SOURCE).length);
   assert.equal(result.policies.get('docs/contracts/events.md'), 'manual');
 });
