@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   fetchAuthConfig,
@@ -8,6 +8,8 @@ import {
   signup,
   verifyEmail,
 } from '../api';
+import SocialLoginButtons from '../components/SocialLoginButtons.vue';
+import { socialProviderButtons } from '../composables/socialProviders';
 import { useLoginFlow } from '../composables/useLoginFlow';
 import { completePostAuth } from '../post-auth';
 
@@ -35,6 +37,8 @@ const {
   forgotPassword,
   completeAuthentication: () => completePostAuth(router),
 });
+
+const socialButtons = computed(() => socialProviderButtons(config.value?.social_providers ?? []));
 
 function redirectSignIn(): void {
   window.location.href = '/auth/login';
@@ -76,6 +80,8 @@ onMounted(loadConfig);
         <p class="text-sm text-text-muted mb-8">
           Continue with your configured identity provider.
         </p>
+
+        <SocialLoginButtons :buttons="socialButtons" divider-label="or" />
 
         <button
           @click="redirectSignIn"
@@ -199,6 +205,8 @@ onMounted(loadConfig);
             Sign up
           </button>
         </div>
+
+        <SocialLoginButtons :buttons="socialButtons" divider-label="or continue with email" />
 
         <form class="space-y-4" @submit.prevent="submitCredentials">
           <div>

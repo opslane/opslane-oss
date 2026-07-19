@@ -74,7 +74,13 @@ type Dependencies struct {
 	JWTSecret         []byte
 	// AuthProvider is selected explicitly at boot. Nil retains the OSS GitHub
 	// default for narrow tests that construct Dependencies directly.
-	AuthProvider       auth.AuthProvider
+	AuthProvider auth.AuthProvider
+	// SocialProviders is the deployment's enabled embedded social logins. Empty
+	// for non-WorkOS providers.
+	SocialProviders auth.SocialProviderConfig
+	// oauthStateStore is a narrow test seam for OAuth login-state persistence.
+	// Production falls back to Queries.
+	oauthStateStore    oauthLoginStateStore
 	AuthCallbackOrigin string
 	// GitHub App OAuth
 	GitHubAppID           string
