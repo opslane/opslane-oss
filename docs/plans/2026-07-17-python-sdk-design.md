@@ -134,7 +134,8 @@ A lazily-started daemon thread drains a `queue.Queue` and POSTs events individua
 - Client-side rate limit: 100 events/minute per process (configurable via `init(max_events_per_minute=...)`); events beyond the limit are dropped at enqueue time.
 
 **HTTP semantics:**
-- Timeouts: 3s connect, 5s read (configurable via `init(http_timeout=...)`).
+- One 5s total timeout (configurable via `init(http_timeout=...)`) — stdlib
+  `urllib.request` exposes a single timeout, not separate connect/read phases.
 - **Retryable:** network errors, HTTP 429, and 5xx. Exponential backoff 1s, 2s, 4s … capped at 60s, with jitter. A `Retry-After` header, when present, overrides the computed backoff (capped at 60s).
 - **Not retryable:** all other 4xx (bad API key, malformed event). The event is dropped immediately and the failure logged — retrying can't fix it.
 - **Bounded retries:** an event is dropped after 5 failed attempts. A failing event never blocks the queue indefinitely; after its attempts are exhausted, draining continues with the next event.

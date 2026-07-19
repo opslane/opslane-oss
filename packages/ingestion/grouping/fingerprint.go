@@ -20,11 +20,29 @@ var (
 )
 
 // Fingerprint generates a stable fingerprint for error grouping.
-// Algorithm: hash(error_type + normalized_top_5_frames + error_message_template)
-func Fingerprint(errorType, errorMessage, stackTrace string) string {
+// Algorithm: first 128 bits of
+// SHA256(platform | error_type | normalized_message | frames).
+// Python tracebacks use stable, prefix-stripped file:function identities;
+// malformed and ExceptionGroup tracebacks fall back to the raw stack string.
+func Fingerprint(platform, errorType, errorMessage, stackTrace string) string {
+	if platform == "" {
+		platform = "javascript"
+	}
 	template := normalizeMessage(errorMessage)
-	frames := topFrames(stackTrace, 5)
-	input := fmt.Sprintf("%s|%s|%s", errorType, template, strings.Join(frames, "|"))
+
+	var frames []string
+	if platform == "python" {
+		if isPythonTraceback(stackTrace) && !isExceptionGroupTraceback(stackTrace) {
+			frames = pythonFrames(stackTrace)
+		}
+		if len(frames) == 0 && stackTrace != "" {
+			frames = []string{stackTrace}
+		}
+	} else {
+		frames = topFrames(stackTrace, 5)
+	}
+
+	input := fmt.Sprintf("%s|%s|%s|%s", platform, errorType, template, strings.Join(frames, "|"))
 	hash := sha256.Sum256([]byte(input))
 	return fmt.Sprintf("%x", hash[:16])
 }

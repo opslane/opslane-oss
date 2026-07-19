@@ -3,9 +3,11 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -158,6 +160,217 @@ func TestIngestEvent_ResponseIncludesErrorGroupID(t *testing.T) {
 	}
 	if resp["event_id"] == "" {
 		t.Errorf("response missing event_id: %v", resp)
+	}
+}
+
+func postErrorPayload(t *testing.T, deps *handler.Dependencies, rawKey, body string) map[string]string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", rawKey)
+	recorder := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d (%s)", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]string
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return response
+}
+
+func TestIngest_PythonPlatformStored(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+
+	body := `{
+		"timestamp":"2026-07-18T00:00:00Z",
+		"platform":"python",
+		"runtime":{"name":"cpython","version":"3.12.1"},
+		"error":{"type":"ValueError","message":"No row was found","stack":"Traceback (most recent call last):\n  File \"/app/api/routes/users.py\", line 42, in get_user\n    raise ValueError()\nValueError: No row was found"},
+		"breadcrumbs":[],
+		"context":null,
+		"sdk_version":"0.1.0a2"
+	}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var eventPlatform, groupPlatform, runtimeName, runtimeVersion string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT e.platform, g.platform,
+		       e.context->'runtime'->>'name', e.context->'runtime'->>'version'
+		FROM error_events e
+		JOIN error_groups g ON g.id = e.error_group_id
+		WHERE e.id = $1`, response["event_id"]).
+		Scan(&eventPlatform, &groupPlatform, &runtimeName, &runtimeVersion); err != nil {
+		t.Fatalf("query stored platforms/runtime: %v", err)
+	}
+	if eventPlatform != "python" || groupPlatform != "python" {
+		t.Fatalf("platforms = event:%q group:%q, want python/python", eventPlatform, groupPlatform)
+	}
+	if runtimeName != "cpython" || runtimeVersion != "3.12.1" {
+		t.Fatalf("runtime = %q/%q, want cpython/3.12.1", runtimeName, runtimeVersion)
+	}
+}
+
+func TestIngest_NoPlatformDefaultsToJavascript(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-18T00:00:00Z","error":{"type":"TypeError","message":"boom","stack":"at fn (/src/app.js:1:1)"},"breadcrumbs":[],"context":{},"sdk_version":"1.0.0"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var eventPlatform, groupPlatform string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT e.platform, g.platform
+		FROM error_events e JOIN error_groups g ON g.id = e.error_group_id
+		WHERE e.id = $1`, response["event_id"]).Scan(&eventPlatform, &groupPlatform); err != nil {
+		t.Fatalf("query stored platforms: %v", err)
+	}
+	if eventPlatform != "javascript" || groupPlatform != "javascript" {
+		t.Fatalf("platforms = event:%q group:%q, want javascript/javascript", eventPlatform, groupPlatform)
+	}
+}
+
+func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	stack := "Traceback (most recent call last):\n  File \"%s/api/routes/users.py\", line 42, in get_user\n    raise ValueError()\nValueError: No row was found"
+	body := func(root string) string {
+		return `{"timestamp":"2026-07-18T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"No row was found","stack":` +
+			strconv.Quote(fmt.Sprintf(stack, root)) + `},"breadcrumbs":[],"context":{},"sdk_version":"0.1.0a2"}`
+	}
+	first := postErrorPayload(t, deps, rawKey, body("/app"))
+	second := postErrorPayload(t, deps, rawKey, body("/srv"))
+	if first["group_id"] != second["group_id"] {
+		t.Fatalf("deployment roots fragmented group: %q vs %q", first["group_id"], second["group_id"])
+	}
+
+	var groups, events, occurrences int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*), COALESCE(sum(occurrence_count), 0)
+		FROM error_groups WHERE project_id = $1 AND platform = 'python'`, projectID).Scan(&groups, &occurrences); err != nil {
+		t.Fatalf("query python groups: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM error_events WHERE project_id = $1 AND platform = 'python'`, projectID).Scan(&events); err != nil {
+		t.Fatalf("query python events: %v", err)
+	}
+	if groups != 1 || events != 2 || occurrences != 2 {
+		t.Fatalf("groups/events/occurrences = %d/%d/%d, want 1/2/2", groups, events, occurrences)
+	}
+}
+
+func TestIngest_InvalidPlatformTokensFallBackToJavascript(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	for _, invalid := range []string{
+		"Python",
+		strings.Repeat("a", 33),
+		"bad token!",
+	} {
+		body := `{"timestamp":"2026-07-18T00:00:00Z","platform":` + strconv.Quote(invalid) +
+			`,"error":{"type":"TypeError","message":"boom","stack":"at fn (/src/app.js:1:1)"},"breadcrumbs":[],"context":{},"sdk_version":"1.0.0"}`
+		response := postErrorPayload(t, deps, rawKey, body)
+
+		var eventPlatform, groupPlatform string
+		if err := pool.QueryRow(context.Background(), `
+			SELECT e.platform, g.platform
+			FROM error_events e JOIN error_groups g ON g.id = e.error_group_id
+			WHERE e.id = $1`, response["event_id"]).Scan(&eventPlatform, &groupPlatform); err != nil {
+			t.Fatalf("query stored platforms for %q: %v", invalid, err)
+		}
+		if eventPlatform != "javascript" || groupPlatform != "javascript" {
+			t.Fatalf("platform %q stored as event:%q group:%q, want javascript fallback", invalid, eventPlatform, groupPlatform)
+		}
+	}
+}
+
+func TestIngest_InvalidRuntimeShapeIsNotPersisted(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-18T00:00:00Z","platform":"python","runtime":{"name":"cpython","version":""},"error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var hasRuntime bool
+	if err := pool.QueryRow(context.Background(), `SELECT context ? 'runtime' FROM error_events WHERE id = $1`, response["event_id"]).Scan(&hasRuntime); err != nil {
+		t.Fatalf("query runtime presence: %v", err)
+	}
+	if hasRuntime {
+		t.Fatal("invalid runtime shape was persisted")
+	}
+}
+
+func TestIngest_ContextRuntimeCannotBypassValidation(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-18T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":{"runtime":{"arbitrary":["client","json"]}},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var hasRuntime bool
+	if err := pool.QueryRow(context.Background(), `SELECT context ? 'runtime' FROM error_events WHERE id = $1`, response["event_id"]).Scan(&hasRuntime); err != nil {
+		t.Fatalf("query runtime presence: %v", err)
+	}
+	if hasRuntime {
+		t.Fatal("context.runtime bypassed top-level runtime validation")
+	}
+}
+
+func TestIngest_ValidRuntimeSurvivesNonObjectContext(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-18T00:00:00Z","platform":"python","runtime":{"name":"cpython","version":"3.12.1"},"error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":["not","an","object"],"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var runtimeName, runtimeVersion string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT context->'runtime'->>'name', context->'runtime'->>'version'
+		FROM error_events WHERE id = $1`, response["event_id"]).Scan(&runtimeName, &runtimeVersion); err != nil {
+		t.Fatalf("query stored runtime: %v", err)
+	}
+	if runtimeName != "cpython" || runtimeVersion != "3.12.1" {
+		t.Fatalf("runtime = %q/%q, want cpython/3.12.1", runtimeName, runtimeVersion)
+	}
+}
+
+func TestInsertErrorEventAndGroup_EmptyPlatformDefaultsToJavascript(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, envID, _ := seedTenant(t, deps.Queries)
+	result, err := deps.Queries.InsertErrorEventAndGroup(context.Background(), db.IngestParams{
+		ProjectID:     projectID,
+		EnvironmentID: envID,
+		ErrorType:     "TypeError",
+		ErrorMessage:  "direct insert",
+		StackTraceRaw: "at fn (/src/app.js:1:1)",
+		Fingerprint:   "direct-default-platform-" + uuid.NewString(),
+		Title:         "TypeError: direct insert",
+	})
+	if err != nil {
+		t.Fatalf("insert event and group: %v", err)
+	}
+	var eventPlatform, groupPlatform string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT e.platform, g.platform
+		FROM error_events e JOIN error_groups g ON g.id = e.error_group_id
+		WHERE e.id = $1`, result.EventID).Scan(&eventPlatform, &groupPlatform); err != nil {
+		t.Fatalf("query stored platforms: %v", err)
+	}
+	if eventPlatform != "javascript" || groupPlatform != "javascript" {
+		t.Fatalf("platforms = event:%q group:%q, want javascript/javascript", eventPlatform, groupPlatform)
+	}
+}
+
+func TestIngest_RuntimeMergedBeforeContextRedaction(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, _, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-18T00:00:00Z","platform":"python","runtime":{"name":"sk_live_secretvalue","version":"3.12.1"},"error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	var runtimeName string
+	if err := pool.QueryRow(context.Background(), `SELECT context->'runtime'->>'name' FROM error_events WHERE id = $1`, response["event_id"]).Scan(&runtimeName); err != nil {
+		t.Fatalf("query runtime name: %v", err)
+	}
+	if runtimeName != "[REDACTED]" {
+		t.Fatalf("runtime name = %q, want redacted", runtimeName)
 	}
 }
 

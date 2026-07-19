@@ -325,6 +325,7 @@ type IngestParams struct {
 	Context       string // JSON, defaults to "{}"
 	Release       string // source map lookup
 	SessionID     string // links error event to replay
+	Platform      string // javascript | python | future wire token; empty defaults to javascript
 	// EventTime is the validated client-side event time (issue #27). Zero
 	// means "unknown" and falls back to server arrival time. It feeds
 	// error_events.timestamp and group/junction impact times; created_at
@@ -359,6 +360,9 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 	if p.Context == "" {
 		p.Context = "{}"
 	}
+	if p.Platform == "" {
+		p.Platform = "javascript"
+	}
 
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -391,10 +395,10 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 	// 1. Insert error event
 	var eventID string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO error_events (project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, breadcrumbs, context, release, session_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10)
+		`INSERT INTO error_events (project_id, environment_id, timestamp, error_type, error_message, stack_trace_raw, breadcrumbs, context, release, session_id, platform)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11)
 		 RETURNING id`,
-		p.ProjectID, p.EnvironmentID, eventTime, p.ErrorType, p.ErrorMessage, p.StackTraceRaw, p.Breadcrumbs, p.Context, nilIfEmpty(p.Release), nilIfEmpty(p.SessionID),
+		p.ProjectID, p.EnvironmentID, eventTime, p.ErrorType, p.ErrorMessage, p.StackTraceRaw, p.Breadcrumbs, p.Context, nilIfEmpty(p.Release), nilIfEmpty(p.SessionID), p.Platform,
 	).Scan(&eventID)
 	if err != nil {
 		return nil, fmt.Errorf("insert error event: %w", err)
@@ -420,16 +424,17 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 	var groupID string
 	var isNew bool
 	err = tx.QueryRow(ctx,
-		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id)
-		 VALUES ($1, $2, $3, $4, $4, 1, $5)
+		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, occurrence_count, sample_event_id, platform)
+		 VALUES ($1, $2, $3, $4, $4, 1, $5, $6)
 		 ON CONFLICT (project_id, fingerprint) DO UPDATE
 		   SET first_seen = LEAST(error_groups.first_seen, $4),
 		       last_seen = GREATEST(error_groups.last_seen, $4),
 		       occurrence_count = error_groups.occurrence_count + 1,
 		       sample_event_id = $5,
+		       platform = COALESCE(error_groups.platform, EXCLUDED.platform),
 		       updated_at = now()
 		 RETURNING id, (xmax = 0) AS is_new`,
-		p.ProjectID, p.Fingerprint, p.Title, eventTime, eventID,
+		p.ProjectID, p.Fingerprint, p.Title, eventTime, eventID, p.Platform,
 	).Scan(&groupID, &isNew)
 	if err != nil {
 		return nil, fmt.Errorf("upsert error group: %w", err)

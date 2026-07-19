@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-07-18T00:00:00.000Z",
+  "platform": "python",
+  "runtime": {
+    "name": "cpython",
+    "version": "3.12.1"
+  },
+  "error": {
+    "type": "ValueError",
+    "message": "No row was found",
+    "stack": "Traceback (most recent call last):\n  File \"/app/api/routes/users.py\", line 42, in get_user\n    user = db.query(User).filter_by(id=user_id).one()\nValueError: No row was found\n"
+  },
+  "breadcrumbs": [],
+  "context": {
+    "user_agent": "Python/3.12.1 opslane/0.1.0a2"
+  },
+  "sdk_version": "0.1.0a2"
+}

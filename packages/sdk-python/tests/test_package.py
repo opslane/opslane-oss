@@ -1,10 +1,6 @@
-"""Batch 0 smoke tests: the package exists, imports, exposes the public API,
-and refuses to pretend it works. Behavior tests arrive in Batch 1."""
+"""Package metadata and public-surface smoke tests."""
 import importlib
 import importlib.metadata
-
-import pytest
-
 
 def test_package_imports():
     mod = importlib.import_module("opslane")
@@ -22,24 +18,6 @@ def test_public_api_surface():
 
     for name in ("init", "set_user", "clear_user", "capture_exception", "flush"):
         assert callable(getattr(opslane, name)), f"opslane.{name} missing"
-
-
-def test_api_fails_loudly_until_implemented():
-    # Batch 0 publishes a scaffold. A silent no-op init() would give users a
-    # false sense that monitoring is active; every entry point must raise.
-    import opslane
-
-    with pytest.raises(NotImplementedError):
-        opslane.init(api_key="x")
-    with pytest.raises(NotImplementedError):
-        opslane.capture_exception(ValueError("x"))
-
-
-def test_flask_integration_fails_loudly():
-    from opslane.integrations.flask import OpslaneFlask
-
-    with pytest.raises(NotImplementedError):
-        OpslaneFlask(object())
 
 
 def test_zero_runtime_dependencies():
