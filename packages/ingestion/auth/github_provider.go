@@ -78,6 +78,7 @@ func (p GitHubProvider) ExchangeCode(_ context.Context, code string) (Identity, 
 		Name:            name,
 		AvatarURL:       user.AvatarURL,
 		Username:        user.Login,
+		AccessToken:     token.AccessToken,
 	}, nil
 }
 

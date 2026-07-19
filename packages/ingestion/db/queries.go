@@ -1654,12 +1654,12 @@ func (q *Queries) ProvisionFromIdentityTx(ctx context.Context, tx pgx.Tx, identi
 		return "", "", fmt.Errorf("provision identity: provider, subject, and email are required")
 	}
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, provider+":"+subject); err != nil {
-		return "", "", fmt.Errorf("lock identity provisioning: %w", err)
+	if err := lockIdentityTx(ctx, tx, provider, subject); err != nil {
+		return "", "", err
 	}
 	if identity.EmailVerified {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "email:"+email); err != nil {
-			return "", "", fmt.Errorf("lock identity email: %w", err)
+		if err := lockEmailTx(ctx, tx, email); err != nil {
+			return "", "", err
 		}
 	}
 
@@ -1751,6 +1751,23 @@ func (q *Queries) ProvisionFromIdentityTx(ctx context.Context, tx pgx.Tx, identi
 		return "", "", fmt.Errorf("%w: %s:%s", ErrIdentityConflict, provider, subject)
 	}
 	return userID, orgID, nil
+}
+
+// lockIdentityTx and lockEmailTx are shared by every identity provisioning
+// path. A single key scheme ensures browser and agent onboarding serialize
+// when they resolve the same human concurrently.
+func lockIdentityTx(ctx context.Context, tx pgx.Tx, provider, subject string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, provider+":"+subject); err != nil {
+		return fmt.Errorf("lock identity provisioning: %w", err)
+	}
+	return nil
+}
+
+func lockEmailTx(ctx context.Context, tx pgx.Tx, email string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "email:"+email); err != nil {
+		return fmt.Errorf("lock identity email: %w", err)
+	}
+	return nil
 }
 
 // GetUserByEmail looks up a user by email. Returns nil if not found.
@@ -2096,8 +2113,15 @@ type CLIPKCERequest struct {
 }
 
 func (q *Queries) StoreOAuthLoginState(ctx context.Context, stateHash string, expiresAt time.Time) error {
+	return q.StoreOAuthLoginStateForOrg(ctx, stateHash, "", expiresAt)
+}
+
+// StoreOAuthLoginStateForOrg binds an optional active organization to the
+// single-use state. The callback revalidates membership before using it.
+func (q *Queries) StoreOAuthLoginStateForOrg(ctx context.Context, stateHash, targetOrgID string, expiresAt time.Time) error {
 	_, err := q.pool.Exec(ctx,
-		`INSERT INTO oauth_login_states (state_hash, expires_at) VALUES ($1, $2)`, stateHash, expiresAt)
+		`INSERT INTO oauth_login_states (state_hash, target_org_id, expires_at)
+		 VALUES ($1, NULLIF($2, '')::uuid, $3)`, stateHash, targetOrgID, expiresAt)
 	if err != nil {
 		return fmt.Errorf("store OAuth login state: %w", err)
 	}
@@ -2105,18 +2129,29 @@ func (q *Queries) StoreOAuthLoginState(ctx context.Context, stateHash string, ex
 }
 
 func (q *Queries) ConsumeOAuthLoginState(ctx context.Context, stateHash string) (bool, error) {
-	var consumed string
+	state, err := q.ConsumeOAuthLoginStateDetails(ctx, stateHash)
+	return state != nil, err
+}
+
+type OAuthLoginState struct {
+	TargetOrgID *string
+}
+
+// ConsumeOAuthLoginStateDetails atomically consumes a state and returns its
+// server-bound callback context. Nil means missing, expired, or already used.
+func (q *Queries) ConsumeOAuthLoginStateDetails(ctx context.Context, stateHash string) (*OAuthLoginState, error) {
+	var state OAuthLoginState
 	err := q.pool.QueryRow(ctx,
 		`UPDATE oauth_login_states SET consumed_at = now()
 		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-		 RETURNING state_hash`, stateHash).Scan(&consumed)
+		 RETURNING target_org_id`, stateHash).Scan(&state.TargetOrgID)
 	if err == pgx.ErrNoRows {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("consume OAuth login state: %w", err)
+		return nil, fmt.Errorf("consume OAuth login state: %w", err)
 	}
-	return true, nil
+	return &state, nil
 }
 
 func (q *Queries) StoreCLIPKCERequest(ctx context.Context, stateHash string, request CLIPKCERequest, expiresAt time.Time) error {
@@ -2660,30 +2695,47 @@ func (q *Queries) CreateAPIKeyTx(ctx context.Context, tx pgx.Tx, environmentID s
 
 // AgentSession represents a CLI-initiated auth session for agent-first onboarding.
 type AgentSession struct {
-	ID              string
-	RepoURL         string
-	AgentName       *string
-	Status          string // pending | completed | expired
-	OrgID           *string
-	ProjectID       *string
-	APIKeyPlaintext *string
-	InstallationID  *int64
-	CreatedAt       time.Time
-	CompletedAt     *time.Time
-	ExpiresAt       time.Time
+	ID             string
+	RepoURL        string
+	AgentName      *string
+	Status         string // pending | completed | expired | failed
+	OrgID          *string
+	ProjectID      *string
+	InstallationID *int64
+	PollTokenHash  *string
+	AgentKeyPub    *string
+	APIKeySealed   *string
+	FailureReason  *string
+	AuthClickedAt  *time.Time
+	KeyClaimedAt   *time.Time
+	CreatedAt      time.Time
+	CompletedAt    *time.Time
+	ExpiresAt      time.Time
 }
 
-// CreateAgentSession creates a new pending agent session for the given repo URL.
-func (q *Queries) CreateAgentSession(ctx context.Context, repoURL string, agentName *string) (*AgentSession, error) {
+type CreateAgentSessionParams struct {
+	RepoURL       string
+	AgentName     *string
+	PollTokenHash string
+	AgentKeyPub   string
+}
+
+// CreateAgentSession creates a pending agent session. Multiple pending
+// sessions per repo are allowed; provisioning serializes canonical repo writes.
+func (q *Queries) CreateAgentSession(ctx context.Context, p CreateAgentSessionParams) (*AgentSession, error) {
 	var s AgentSession
 	err := q.pool.QueryRow(ctx,
-		`INSERT INTO agent_sessions (repo_url, agent_name)
-		 VALUES ($1, $2)
+		`INSERT INTO agent_sessions (repo_url, agent_name, poll_token_hash, agent_key_pub)
+		 VALUES ($1, $2, $3, $4)
 		 RETURNING id, repo_url, agent_name, status, org_id, project_id,
-		           api_key_plaintext, installation_id, created_at, completed_at, expires_at`,
-		repoURL, agentName,
+		           installation_id, created_at, completed_at, expires_at,
+		           poll_token_hash, agent_key_pub, api_key_sealed, failure_reason,
+		           auth_clicked_at, key_claimed_at`,
+		p.RepoURL, p.AgentName, p.PollTokenHash, p.AgentKeyPub,
 	).Scan(&s.ID, &s.RepoURL, &s.AgentName, &s.Status, &s.OrgID, &s.ProjectID,
-		&s.APIKeyPlaintext, &s.InstallationID, &s.CreatedAt, &s.CompletedAt, &s.ExpiresAt)
+		&s.InstallationID, &s.CreatedAt, &s.CompletedAt, &s.ExpiresAt,
+		&s.PollTokenHash, &s.AgentKeyPub, &s.APIKeySealed, &s.FailureReason,
+		&s.AuthClickedAt, &s.KeyClaimedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create agent session: %w", err)
 	}
@@ -2695,11 +2747,15 @@ func (q *Queries) GetAgentSession(ctx context.Context, sessionID string) (*Agent
 	var s AgentSession
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, repo_url, agent_name, status, org_id, project_id,
-		        api_key_plaintext, installation_id, created_at, completed_at, expires_at
+		        installation_id, created_at, completed_at, expires_at,
+		        poll_token_hash, agent_key_pub, api_key_sealed, failure_reason,
+		        auth_clicked_at, key_claimed_at
 		 FROM agent_sessions WHERE id = $1`,
 		sessionID,
 	).Scan(&s.ID, &s.RepoURL, &s.AgentName, &s.Status, &s.OrgID, &s.ProjectID,
-		&s.APIKeyPlaintext, &s.InstallationID, &s.CreatedAt, &s.CompletedAt, &s.ExpiresAt)
+		&s.InstallationID, &s.CreatedAt, &s.CompletedAt, &s.ExpiresAt,
+		&s.PollTokenHash, &s.AgentKeyPub, &s.APIKeySealed, &s.FailureReason,
+		&s.AuthClickedAt, &s.KeyClaimedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -2707,54 +2763,6 @@ func (q *Queries) GetAgentSession(ctx context.Context, sessionID string) (*Agent
 		return nil, fmt.Errorf("get agent session: %w", err)
 	}
 	return &s, nil
-}
-
-// CompleteAgentSession marks a pending session as completed with the provisioned resources.
-// Returns false if session was not in pending state or is expired.
-func (q *Queries) CompleteAgentSession(ctx context.Context, sessionID string, orgID, projectID, apiKeyPlaintext string, installationID int64) (bool, error) {
-	tag, err := q.pool.Exec(ctx,
-		`UPDATE agent_sessions
-		 SET status = 'completed', org_id = $2, project_id = $3,
-		     api_key_plaintext = $4, installation_id = $5, completed_at = now()
-		 WHERE id = $1 AND status = 'pending' AND expires_at > now()`,
-		sessionID, orgID, projectID, apiKeyPlaintext, installationID,
-	)
-	if err != nil {
-		return false, fmt.Errorf("complete agent session: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
-// ClaimAgentSessionKey atomically retrieves and nullifies the plaintext API key.
-// Only the first caller gets the key; subsequent calls return nil.
-//
-// Uses a two-CTE pattern: SELECT FOR UPDATE to lock and read the old value,
-// then UPDATE to nullify. PostgreSQL RETURNING yields post-update values,
-// so a single UPDATE ... RETURNING api_key_plaintext would return NULL.
-func (q *Queries) ClaimAgentSessionKey(ctx context.Context, sessionID string) (*string, error) {
-	var key string
-	err := q.pool.QueryRow(ctx,
-		`WITH to_claim AS (
-		   SELECT id, api_key_plaintext
-		   FROM agent_sessions
-		   WHERE id = $1 AND api_key_plaintext IS NOT NULL
-		   FOR UPDATE
-		 ), do_nullify AS (
-		   UPDATE agent_sessions
-		   SET api_key_plaintext = NULL
-		   FROM to_claim
-		   WHERE agent_sessions.id = to_claim.id
-		 )
-		 SELECT api_key_plaintext FROM to_claim`,
-		sessionID,
-	).Scan(&key)
-	if err == pgx.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("claim agent session key: %w", err)
-	}
-	return &key, nil
 }
 
 // ExpireAgentSessions marks all pending sessions past their expiry as expired.
@@ -2767,7 +2775,48 @@ func (q *Queries) ExpireAgentSessions(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("expire agent sessions: %w", err)
 	}
+	if _, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions SET api_key_sealed = NULL
+		 WHERE status = 'completed' AND expires_at <= now() AND api_key_sealed IS NOT NULL`,
+	); err != nil {
+		return 0, fmt.Errorf("purge sealed agent keys: %w", err)
+	}
 	return tag.RowsAffected(), nil
+}
+
+// MarkAgentKeyDelivered stamps first key delivery. COALESCE makes retries
+// idempotent while retaining the first-delivery funnel timestamp.
+func (q *Queries) MarkAgentKeyDelivered(ctx context.Context, sessionID string) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions SET key_claimed_at = COALESCE(key_claimed_at, now())
+		 WHERE id = $1 AND status = 'completed'`, sessionID)
+	if err != nil {
+		return fmt.Errorf("mark agent key delivered: %w", err)
+	}
+	return nil
+}
+
+// MarkAgentSessionFailed records a definitive business failure. Transient
+// failures leave sessions pending so the human can retry the authorization URL.
+func (q *Queries) MarkAgentSessionFailed(ctx context.Context, sessionID, reason string) (bool, error) {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions SET status = 'failed', failure_reason = $2
+		 WHERE id = $1 AND status = 'pending'`, sessionID, reason)
+	if err != nil {
+		return false, fmt.Errorf("mark agent session failed: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// MarkAgentSessionAuthClicked stamps the first human click on the auth URL.
+func (q *Queries) MarkAgentSessionAuthClicked(ctx context.Context, sessionID string) error {
+	_, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions SET auth_clicked_at = COALESCE(auth_clicked_at, now())
+		 WHERE id = $1`, sessionID)
+	if err != nil {
+		return fmt.Errorf("mark agent session auth clicked: %w", err)
+	}
+	return nil
 }
 
 // FindProjectByRepoURL returns the project for a given repo URL (owner/repo format).

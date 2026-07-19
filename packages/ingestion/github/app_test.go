@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -261,6 +262,46 @@ func TestGetUserEmails(t *testing.T) {
 	}
 	if !emails[1].Primary {
 		t.Error("second email should be primary")
+	}
+}
+
+func TestListUserInstallations(t *testing.T) {
+	callCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if r.URL.Path != "/user/installations" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer ghu_tok" {
+			t.Errorf("auth header = %s", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "2" {
+			fmt.Fprint(w, `{"installations":[{"id":222}]}`)
+			return
+		}
+		w.Header().Set("Link", `<https://api.github.com/user/installations?page=2>; rel="next"`)
+		fmt.Fprint(w, `{"installations":[{"id":111}]}`)
+	}))
+	defer ts.Close()
+
+	origClient := httpClient
+	httpClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		req.URL.Scheme = "http"
+		req.URL.Host = ts.Listener.Addr().String()
+		return http.DefaultTransport.RoundTrip(req)
+	})}
+	defer func() { httpClient = origClient }()
+
+	ids, err := ListUserInstallations("ghu_tok")
+	if err != nil {
+		t.Fatalf("ListUserInstallations: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 111 || ids[1] != 222 {
+		t.Errorf("ids = %v, want [111 222]", ids)
+	}
+	if callCount != 2 {
+		t.Errorf("expected pagination (2 calls), got %d", callCount)
 	}
 }
 

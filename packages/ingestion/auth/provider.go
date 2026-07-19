@@ -18,6 +18,9 @@ type Identity struct {
 	Name            string
 	AvatarURL       string
 	Username        string
+	// AccessToken is a provider user token used only during the current request
+	// to bind GitHub App installations to the authenticated human. Never persist.
+	AccessToken string
 }
 
 // AuthProvider proves identity. Local Postgres remains the source of truth for

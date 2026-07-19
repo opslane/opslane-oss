@@ -165,6 +165,55 @@ func ListInstallationRepos(installationToken string) ([]Repo, error) {
 	return allRepos, nil
 }
 
+// ListUserInstallations returns the installation IDs visible to a user access
+// token. This binds an attacker-controlled installation_id to the authenticated
+// human who completed the OAuth exchange.
+func ListUserInstallations(userToken string) ([]int64, error) {
+	var ids []int64
+	for page := 1; ; page++ {
+		reqURL := fmt.Sprintf("%s/user/installations?per_page=100&page=%d", githubAPIBase, page)
+		req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list user installations: %w", err)
+		}
+		var body struct {
+			Installations []struct {
+				ID int64 `json:"id"`
+			} `json:"installations"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&body)
+		link := resp.Header.Get("Link")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("list user installations: status %d", resp.StatusCode)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("list user installations decode: %w", decodeErr)
+		}
+		for _, installation := range body.Installations {
+			ids = append(ids, installation.ID)
+		}
+		if !hasNextPage(link) {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// OverrideHTTPClientForTests swaps the package HTTP client and returns a
+// restore func. Test-only; never call from production code.
+func OverrideHTTPClientForTests(c *http.Client) (restore func()) {
+	orig := httpClient
+	httpClient = c
+	return func() { httpClient = orig }
+}
+
 // fetchRepoPage fetches a single page of repos and closes the response body.
 func fetchRepoPage(installationToken string, page int) ([]Repo, string, error) {
 	reqURL := fmt.Sprintf("%s/installation/repositories?per_page=100&page=%d", githubAPIBase, page)
