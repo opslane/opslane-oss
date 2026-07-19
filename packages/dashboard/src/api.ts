@@ -4,6 +4,7 @@ import type {
   SessionDetail, SessionFilters, SessionListResponse,
   AdminOverview, AdminJobsResponse, HealthResponse,
   AuthConfig, AuthUser, ForgotPasswordResult, OrgInvitation,
+  NotificationDestination, NotificationDestinationList, NotificationTestResult,
   PasswordAuthResult, ResetPasswordResult,
 } from './types/api';
 export type {
@@ -419,6 +420,54 @@ export function createAPIKey(envId: string): Promise<APIKeyCreated> {
 
 export function listAPIKeys(projectId: string): Promise<APIKey[]> {
   return fetchJSON<APIKey[]>(`/projects/${projectId}/api-keys`);
+}
+
+export function listNotificationDestinations(
+  projectId: string,
+): Promise<NotificationDestinationList> {
+  return fetchJSON<NotificationDestinationList>(
+    `/projects/${projectId}/notification-destinations`,
+  );
+}
+
+export function createNotificationDestination(
+  projectId: string,
+  data: { name: string; webhook_url: string },
+): Promise<NotificationDestination> {
+  return postJSON<NotificationDestination>(
+    `/projects/${projectId}/notification-destinations`,
+    data,
+  );
+}
+
+export function updateNotificationDestination(
+  projectId: string,
+  destinationId: string,
+  patch: { name?: string; webhook_url?: string; enabled?: boolean },
+): Promise<NotificationDestination> {
+  return patchJSON<NotificationDestination>(
+    `/projects/${projectId}/notification-destinations/${destinationId}`,
+    patch,
+  );
+}
+
+export function deleteNotificationDestination(
+  projectId: string,
+  destinationId: string,
+): Promise<{ ok: boolean }> {
+  return deleteJSON<{ ok: boolean }>(
+    `/projects/${projectId}/notification-destinations/${destinationId}`,
+  );
+}
+
+export function testNotificationDestination(
+  projectId: string,
+  destinationId: string,
+): Promise<NotificationTestResult> {
+  return postJSON<NotificationTestResult>(
+    `/projects/${projectId}/notification-destinations/${destinationId}/test`,
+    {},
+  );
 }
 
 export function onboardingSetup(
