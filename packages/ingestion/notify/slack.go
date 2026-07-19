@@ -1,0 +1,74 @@
+package notify
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+
+	"github.com/opslane/opslane/packages/ingestion/masking"
+)
+
+const (
+	headerMax  = 150
+	sectionMax = 2900
+)
+
+func slackEscape(value string) string {
+	value = strings.ReplaceAll(value, "&", "&amp;")
+	value = strings.ReplaceAll(value, "<", "&lt;")
+	return strings.ReplaceAll(value, ">", "&gt;")
+}
+
+func truncate(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max-1]) + "…"
+}
+
+// FormatSlack renders an issue.created payload as Slack Block Kit JSON.
+func FormatSlack(payload EventPayload) ([]byte, string, error) {
+	title := masking.RedactURL(masking.RedactBody(payload.Issue.Title))
+	title = strings.ReplaceAll(title, "`", "'")
+	title = truncate(slackEscape(title), sectionMax)
+
+	blocks := []map[string]any{
+		{
+			"type": "header",
+			"text": map[string]any{
+				"type":  "plain_text",
+				"text":  truncate("New issue in "+payload.Project.Name, headerMax),
+				"emoji": true,
+			},
+		},
+		{
+			"type": "section",
+			"text": map[string]any{"type": "mrkdwn", "text": "`" + title + "`"},
+			"fields": []map[string]any{
+				{"type": "mrkdwn", "text": "*Environment:*\n" + slackEscape(payload.Environment)},
+				{"type": "mrkdwn", "text": "*First seen:*\n" + slackEscape(payload.Issue.FirstSeen)},
+			},
+		},
+	}
+	if payload.DashboardURL != "" {
+		blocks = append(blocks, map[string]any{
+			"type": "actions",
+			"elements": []map[string]any{{
+				"type": "button",
+				"text": map[string]any{"type": "plain_text", "text": "View in Opslane"},
+				"url":  payload.DashboardURL,
+			}},
+		})
+	}
+
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	// Slack requires literal &lt;/&gt;/&amp; sequences in mrkdwn. The default
+	// encoder's HTML escaping would obscure those as JSON unicode escapes.
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(map[string]any{"blocks": blocks}); err != nil {
+		return nil, "application/json", err
+	}
+	return body.Bytes(), "application/json", nil
+}
