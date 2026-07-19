@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
+	"github.com/opslane/opslane/packages/ingestion/notify"
 	"github.com/opslane/opslane/packages/ingestion/retention"
 	"github.com/opslane/opslane/packages/ingestion/scrubber"
 )
@@ -66,6 +68,21 @@ func main() {
 		slog.Error("JWT_SECRET must be set and at least 32 bytes", "length", len(jwtSecret))
 		os.Exit(1)
 	}
+	configCipher, err := notify.NewConfigCipher([]byte(jwtSecret))
+	if err != nil {
+		slog.Error("Failed to initialize notification config encryption", "error", err)
+		os.Exit(1)
+	}
+
+	var notifyExtraHosts []string
+	for _, host := range strings.Split(os.Getenv("NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS"), ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			notifyExtraHosts = append(notifyExtraHosts, host)
+		}
+	}
+	if len(notifyExtraHosts) > 0 {
+		slog.Warn("NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS set — webhook host allowlist extended (dev/test only)", "hosts", notifyExtraHosts)
+	}
 
 	// GitHub App OAuth — optional for dev environments without GitHub App.
 	githubAppID := os.Getenv("GITHUB_APP_ID")
@@ -109,6 +126,8 @@ func main() {
 	slog.Info("auth provider selected", "provider", authProvider.Name())
 
 	queries := db.New(pool)
+	queries.DashboardURL = os.Getenv("DASHBOARD_URL")
+	notifySender := notify.NewSender(0, notifyExtraHosts)
 	deps := &handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,
@@ -122,8 +141,13 @@ func main() {
 		GitHubAppSlug:         githubAppSlug,
 		DashboardOrigin:       dashboardOrigin,
 		AdminEmails:           handler.ParseAdminEmails(os.Getenv("ADMIN_EMAILS")),
+		ConfigCipher:          configCipher,
+		NotifyExtraHosts:      notifyExtraHosts,
+		NotifySender:          notifySender,
 	}
 	r := handler.NewRouterWithPool(deps, pool)
+	dispatcher := notify.New(pool, configCipher, notify.Options{ExtraHosts: notifyExtraHosts})
+	go dispatcher.Run(ctx)
 
 	// Periodic cleanup of expired/revoked refresh tokens and auth codes
 	go func() {
