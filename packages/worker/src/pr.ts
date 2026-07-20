@@ -203,6 +203,20 @@ function buildFileLine(files: string[]): string | null {
   return `Changed files: ${files.map((file) => inlineCode(file)).join(', ')}`;
 }
 
+// Removes <...> tag structures completely, repeating until the string is
+// stable so nested or unterminated input (e.g. "<scr<script>ipt>") cannot
+// leave a live tag behind. The pattern has no nested quantifier, so the loop
+// is linear, not a ReDoS.
+function stripAngleTags(value: string): string {
+  let current = value;
+  let previous: string;
+  do {
+    previous = current;
+    current = current.replace(/<[^>]*>/g, '');
+  } while (current !== previous);
+  return current;
+}
+
 function buildEnvironmentLine(
   environmentNames?: string[],
   environmentTotal?: number,
@@ -211,7 +225,7 @@ function buildEnvironmentLine(
   const names = availableNames
     .slice(0, 20)
     .map((name) => sanitizeInline(
-      name.replace(/<[^>]*>/g, '').replace(/[`*_~|\\]/g, ''),
+      stripAngleTags(name).replace(/[`*_~|\\]/g, ''),
       80,
     ))
     .filter(Boolean);

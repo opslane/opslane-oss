@@ -10,6 +10,7 @@ import {
   getPool,
   initSession,
   postEvent,
+  seedEnvironment,
   seedTenant,
   seedUserWithJWT,
   type TestTenant,
@@ -52,21 +53,9 @@ describe.skipIf(!configured || !playwrightAvailable)('dashboard environment filt
   beforeAll(async () => {
     tenant = await seedTenant();
     const db = getPool();
-    const staging = await db.query<{ id: string }>(
-      `INSERT INTO environments (project_id, name) VALUES ($1, 'staging') RETURNING id`,
-      [tenant.projectId],
-    );
-    stagingEnvironmentId = staging.rows[0]!.id;
-    stagingAPIKey = `def_${crypto.randomUUID()}`;
-    await db.query(
-      `INSERT INTO environment_api_keys (environment_id, key_hash, key_prefix)
-       VALUES ($1, $2, $3)`,
-      [
-        stagingEnvironmentId,
-        crypto.createHash('sha256').update(stagingAPIKey).digest('hex'),
-        stagingAPIKey.slice(0, 12),
-      ],
-    );
+    const staging = await seedEnvironment(tenant.projectId, 'staging');
+    stagingEnvironmentId = staging.environmentId;
+    stagingAPIKey = staging.apiKey;
     ({ jwt } = await seedUserWithJWT(tenant.orgId));
     const state = await db.query<{ status: string }>(
       `SELECT status FROM rollup_backfill_state WHERE id`,
