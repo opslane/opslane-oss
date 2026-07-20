@@ -24,14 +24,20 @@ const selectedPlatform = ref<'' | 'javascript' | 'python'>(
 const rawEndUserId = route.query['end_user_id'];
 const selectedEndUserId = ref(typeof rawEndUserId === 'string' ? rawEndUserId : '');
 
-onMounted(async () => {
+onMounted(() => {
+  // Apply URL-derived filters immediately. Account options are auxiliary and
+  // must not delay (or race) the activity feed's initial scoped request.
+  emitFilters();
+  void loadAccounts();
+});
+
+async function loadAccounts() {
   try {
     accounts.value = await listAccounts(props.projectId);
   } catch {
     // Non-fatal: filter bar still works without account list
   }
-  emitFilters();
-});
+}
 
 function emitFilters() {
   const filters: IncidentFilters = {};

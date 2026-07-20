@@ -48,18 +48,27 @@ const { sorted: sortedIncidents, toggleSort, sortIndicator } = useTableSort<Sort
 
 const newIncidentCount = ref(0);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let fetchGeneration = 0;
 
 async function fetchIncidents(filters?: IncidentFilters) {
+  const generation = ++fetchGeneration;
   loading.value = true;
   error.value = null;
   newIncidentCount.value = 0;
   try {
-    incidents.value = await listIncidents(projectId.value, filters);
+    const result = await listIncidents(projectId.value, filters);
+    if (generation === fetchGeneration) {
+      incidents.value = result;
+    }
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    error.value = `Failed to load incidents: ${msg}`;
+    if (generation === fetchGeneration) {
+      const msg = e instanceof Error ? e.message : String(e);
+      error.value = `Failed to load incidents: ${msg}`;
+    }
   } finally {
-    loading.value = false;
+    if (generation === fetchGeneration) {
+      loading.value = false;
+    }
   }
 }
 
@@ -103,7 +112,6 @@ onMounted(async () => {
     return;
   }
 
-  await fetchIncidents();
   startPolling();
 });
 
