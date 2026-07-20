@@ -34,6 +34,12 @@ const breadcrumbs = computed(() => (
   }) ?? []
 ));
 
+// Breadcrumb timestamps are client-supplied and only narrowed to string:
+// format parseable ones like the rest of the view, show the raw value otherwise.
+function formatBreadcrumbTime(timestamp: string): string {
+  return Number.isNaN(Date.parse(timestamp)) ? timestamp : formatAbsolute(timestamp);
+}
+
 async function loadSampleEvent() {
   sampleEvent.value = null;
   sampleEventError.value = null;
@@ -453,7 +459,11 @@ onMounted(async () => {
                   class="rounded border border-border p-3 text-sm"
                 >
                   <div class="flex flex-wrap items-center gap-2 text-xs text-text-muted">
-                    <time v-if="breadcrumb.timestamp" v-text="breadcrumb.timestamp"></time>
+                    <time
+                      v-if="breadcrumb.timestamp"
+                      :datetime="breadcrumb.timestamp"
+                      v-text="formatBreadcrumbTime(breadcrumb.timestamp)"
+                    ></time>
                     <span
                       v-if="breadcrumb.label"
                       class="rounded-full bg-surface-2 px-2 py-0.5 text-text"
