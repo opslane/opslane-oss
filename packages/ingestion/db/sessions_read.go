@@ -28,10 +28,11 @@ type SessionSummary struct {
 }
 
 type SessionFilters struct {
-	EndUserID string
-	AccountID string
-	From      *time.Time
-	To        *time.Time
+	EndUserID     string
+	AccountID     string
+	EnvironmentID string
+	From          *time.Time
+	To            *time.Time
 }
 
 type SessionCursor struct {
@@ -87,10 +88,11 @@ func (q *Queries) ListSessions(ctx context.Context, projectID string, filters Se
    AND ($3 = '' OR eu.external_account_id = $3)
    AND ($4::timestamptz IS NULL OR s.started_at >= $4)
    AND ($5::timestamptz IS NULL OR s.started_at <= $5)
-   AND ($6::timestamptz IS NULL OR (s.started_at, s.id) < ($6, $7))
+   AND ($6 = '' OR s.environment_id = NULLIF($6, '')::uuid)
+   AND ($7::timestamptz IS NULL OR (s.started_at, s.id) < ($7, $8))
  ORDER BY s.started_at DESC, s.id DESC
- LIMIT $8`, projectID, filters.EndUserID, filters.AccountID, filters.From, filters.To,
-		cursorStartedAt, cursorID, limit+1)
+ LIMIT $9`, projectID, filters.EndUserID, filters.AccountID, filters.From, filters.To,
+		filters.EnvironmentID, cursorStartedAt, cursorID, limit+1)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list sessions: %w", err)
 	}

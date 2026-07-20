@@ -48,6 +48,150 @@ func seedGroup(t *testing.T, pool *pgxpool.Pool, q *db.Queries, name string) (or
 	return org.ID, proj.ID, env.ID, result.GroupID
 }
 
+func TestRollupUpsertTracksErrorOccurrencesPerEnvironment(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+
+	org, err := q.CreateOrg(ctx, "rollup-upsert")
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, pool, org.ID) })
+	project, err := q.CreateProject(ctx, org.ID, "rollup-upsert", ptrStr("org/rollup-upsert"))
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	envA, err := q.CreateEnvironment(ctx, project.ID, "production")
+	if err != nil {
+		t.Fatalf("CreateEnvironment production: %v", err)
+	}
+	envB, err := q.CreateEnvironment(ctx, project.ID, "staging")
+	if err != nil {
+		t.Fatalf("CreateEnvironment staging: %v", err)
+	}
+
+	late := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	early := late.Add(-2 * time.Hour)
+	for i, event := range []struct {
+		environmentID string
+		at            time.Time
+	}{
+		{environmentID: envA.ID, at: late},
+		{environmentID: envA.ID, at: early},
+		{environmentID: envB.ID, at: late.Add(time.Hour)},
+	} {
+		if _, err := q.InsertErrorEventAndGroup(ctx, db.IngestParams{
+			ProjectID:     project.ID,
+			EnvironmentID: event.environmentID,
+			ErrorType:     "TypeError",
+			ErrorMessage:  "rollup",
+			StackTraceRaw: "at app.js:1:1",
+			Fingerprint:   "fp-rollup-upsert",
+			Title:         "TypeError: rollup",
+			EventTime:     event.at,
+		}); err != nil {
+			t.Fatalf("InsertErrorEventAndGroup %d: %v", i, err)
+		}
+	}
+
+	type rollup struct {
+		first time.Time
+		last  time.Time
+		count int64
+	}
+	got := map[string]rollup{}
+	rows, err := pool.Query(ctx, `
+		SELECT ege.environment_id, ege.first_seen, ege.last_seen, ege.occurrence_count
+		FROM error_group_environments ege
+		JOIN error_groups eg ON eg.id = ege.error_group_id
+		WHERE eg.project_id = $1 AND eg.fingerprint = 'fp-rollup-upsert'`, project.ID)
+	if err != nil {
+		t.Fatalf("query rollup: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var envID string
+		var value rollup
+		if err := rows.Scan(&envID, &value.first, &value.last, &value.count); err != nil {
+			t.Fatalf("scan rollup: %v", err)
+		}
+		got[envID] = value
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rollup rows: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("rollup rows = %d, want 2: %#v", len(got), got)
+	}
+	if row := got[envA.ID]; row.count != 2 || !row.first.Equal(early) || !row.last.Equal(late) {
+		t.Fatalf("production rollup = %+v, want count=2 first=%s last=%s", row, early, late)
+	}
+	if row := got[envB.ID]; row.count != 1 || !row.first.Equal(late.Add(time.Hour)) || !row.last.Equal(late.Add(time.Hour)) {
+		t.Fatalf("staging rollup = %+v, want one occurrence at %s", row, late.Add(time.Hour))
+	}
+
+	frictionGroupID := insertIncident(t, q, project.ID, "fp-rollup-friction", "friction", "insight")
+	var frictionRows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM error_group_environments WHERE error_group_id = $1`, frictionGroupID,
+	).Scan(&frictionRows); err != nil {
+		t.Fatalf("count friction rollups: %v", err)
+	}
+	if frictionRows != 0 {
+		t.Fatalf("friction rollup rows = %d, want 0", frictionRows)
+	}
+}
+
+func TestRollupUpsertRejectsFrictionFingerprintCollision(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+
+	org, err := q.CreateOrg(ctx, "rollup-kind-collision")
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, pool, org.ID) })
+	project, err := q.CreateProject(ctx, org.ID, "rollup-kind-collision", nil)
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	environment, err := q.CreateEnvironment(ctx, project.ID, "production")
+	if err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+
+	const fingerprint = "fp-error-friction-collision"
+	frictionGroupID := insertIncident(t, q, project.ID, fingerprint, "friction", "insight")
+	_, err = q.InsertErrorEventAndGroup(ctx, db.IngestParams{
+		ProjectID:     project.ID,
+		EnvironmentID: environment.ID,
+		ErrorType:     "TypeError",
+		ErrorMessage:  "kind collision",
+		StackTraceRaw: "at app.js:1:1",
+		Fingerprint:   fingerprint,
+		Title:         "TypeError: kind collision",
+	})
+	if err == nil {
+		t.Fatal("InsertErrorEventAndGroup accepted a friction-kind fingerprint collision")
+	}
+
+	var eventCount, rollupCount, occurrences int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM error_events WHERE project_id = $1`, project.ID).Scan(&eventCount); err != nil {
+		t.Fatalf("count error events: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM error_group_environments WHERE error_group_id = $1`, frictionGroupID).Scan(&rollupCount); err != nil {
+		t.Fatalf("count friction rollups: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT occurrence_count FROM error_groups WHERE id = $1`, frictionGroupID).Scan(&occurrences); err != nil {
+		t.Fatalf("query friction occurrences: %v", err)
+	}
+	if eventCount != 0 || rollupCount != 0 || occurrences != 1 {
+		t.Fatalf("collision mutated state: events=%d rollups=%d occurrences=%d", eventCount, rollupCount, occurrences)
+	}
+}
+
 func setGroupStatus(t *testing.T, pool *pgxpool.Pool, groupID, status string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
@@ -139,7 +283,7 @@ func TestUpdateProjectPrPosture_DefaultValidationAndTenantScope(t *testing.T) {
 	}
 
 	draft := "draft_when_unverified"
-	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, &draft)
+	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, &draft, nil)
 	if err != nil || project == nil {
 		t.Fatalf("UpdateProject posture = (%+v, %v)", project, err)
 	}
@@ -147,16 +291,16 @@ func TestUpdateProjectPrPosture_DefaultValidationAndTenantScope(t *testing.T) {
 		t.Fatalf("PrPosture = %q, want %q", project.PrPosture, draft)
 	}
 
-	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, nil)
+	project, err = q.UpdateProject(ctx, orgID, projectID, nil, nil, nil, nil)
 	if err != nil || project == nil || project.PrPosture != draft {
 		t.Fatalf("omitted posture was not preserved: project=%+v err=%v", project, err)
 	}
 
 	invalid := "publish_everything"
-	if _, err := q.UpdateProject(ctx, orgID, projectID, nil, nil, &invalid); err == nil {
+	if _, err := q.UpdateProject(ctx, orgID, projectID, nil, nil, &invalid, nil); err == nil {
 		t.Fatal("expected invalid pr_posture to violate the database constraint")
 	}
-	if project, err := q.UpdateProject(ctx, otherOrgID, projectID, nil, nil, &draft); err != nil || project != nil {
+	if project, err := q.UpdateProject(ctx, otherOrgID, projectID, nil, nil, &draft, nil); err != nil || project != nil {
 		t.Fatalf("cross-org UpdateProject = (%+v, %v), want nil, nil", project, err)
 	}
 }

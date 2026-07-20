@@ -27,6 +27,8 @@ export interface PipelineInput {
   resolvedStackTrace: unknown;
   breadcrumbs: string;
   context: string;
+  environmentNames: string[];
+  environmentTotal: number;
   sourceFiles: Array<{ filePath: string; content: string }>;
   visualAnalysis: VisualAnalysisOutput | null;
   repoPath: string;
@@ -103,6 +105,8 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     resolvedStackTrace: input.resolvedStackTrace,
     breadcrumbs: input.breadcrumbs,
     context: input.context,
+    environmentNames: input.environmentNames,
+    environmentTotal: input.environmentTotal,
     sourceFiles: input.sourceFiles,
     visualAnalysis: input.visualAnalysis,
     repoUrl: input.repoUrl,
@@ -310,6 +314,8 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       visualAnalysis: input.visualAnalysis,
       errorType: input.errorType,
       errorMessage: input.errorMessage,
+      environmentNames: input.environmentNames,
+      environmentTotal: input.environmentTotal,
       kind: input.kind,
       evidence: fixResult.evidence ?? null,
       draft: deliveryPosture === 'draft',

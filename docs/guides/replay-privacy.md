@@ -15,7 +15,7 @@ Default-on does not mean every page load produces a stored recording. The browse
 
 The current SDK records a continuous rrweb session stream rather than creating a separate replay only when an error occurs:
 
-1. The SDK registers the browser session with `/api/v1/sessions/init`. The server returns whether recording is allowed.
+1. The SDK registers the browser session with `/api/v1/sessions/init`. The server returns whether recording is allowed. If the SDK supplies an `environment`, ingestion resolves it within the API key's project only when that project's payload override is enabled; otherwise the key environment is used. A session keeps its first accepted environment for its lifetime.
 2. The SDK cuts the stream into independently playable chunks roughly every 30 seconds. When an error is accepted, it also flushes the current chunk so the incident can point into that same session.
 3. The browser gzips each chunk and uploads it directly to private object storage through a size-capped presigned POST policy, then commits the chunk to ingestion.
 4. A server-side scrubber inflates the chunk under a hard size ceiling, redacts it, rewrites the stored object, and sets `scrubbed_at`.

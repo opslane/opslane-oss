@@ -73,14 +73,15 @@ type Org struct {
 }
 
 type Project struct {
-	ID               string
-	OrgID            string
-	Name             string
-	GithubRepo       *string
-	DefaultBranch    string
-	FrictionAutonomy string
-	PrPosture        string
-	CreatedAt        time.Time
+	ID                      string
+	OrgID                   string
+	Name                    string
+	GithubRepo              *string
+	DefaultBranch           string
+	FrictionAutonomy        string
+	PrPosture               string
+	AllowPayloadEnvironment bool
+	CreatedAt               time.Time
 }
 
 type Environment struct {
@@ -96,11 +97,18 @@ type APIKeyResult struct {
 	KeyPrefix string
 }
 
+type ProjectProvisioning struct {
+	Project     Project
+	Environment Environment
+	APIKey      APIKeyResult
+}
+
 type APIKeyLookup struct {
-	EnvironmentID  string
-	ProjectID      string
-	OrgID          string
-	AllowedOrigins []string
+	EnvironmentID           string
+	ProjectID               string
+	OrgID                   string
+	AllowedOrigins          []string
+	AllowPayloadEnvironment bool
 }
 
 // OrgExists checks whether an org with the given ID exists.
@@ -132,13 +140,114 @@ func (q *Queries) CreateProject(ctx context.Context, orgID, name string, githubR
 	err := q.pool.QueryRow(ctx,
 		`INSERT INTO projects (org_id, name, github_repo)
 		 VALUES ($1, $2, $3)
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at`,
 		orgID, name, githubRepo,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create project: %w", err)
 	}
 	return &p, nil
+}
+
+// ProvisionProject atomically creates the first-class project bundle. Reusing
+// an idempotency token preserves the original project/environment, revokes the
+// prior one-time provisioning key, and returns a freshly minted replacement.
+func (q *Queries) ProvisionProject(
+	ctx context.Context,
+	orgID, name string,
+	githubRepo *string,
+	idempotencyToken string,
+) (*ProjectProvisioning, error) {
+	if strings.TrimSpace(idempotencyToken) == "" {
+		return nil, fmt.Errorf("provision project: idempotency token is required")
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("provision project: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var result ProjectProvisioning
+	err = tx.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo, idempotency_token)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (org_id, idempotency_token) WHERE idempotency_token IS NOT NULL
+		DO UPDATE SET idempotency_token = EXCLUDED.idempotency_token
+		RETURNING id, org_id, name, github_repo, default_branch,
+		          friction_autonomy, pr_posture, allow_payload_environment, created_at`,
+		orgID, name, githubRepo, idempotencyToken,
+	).Scan(
+		&result.Project.ID,
+		&result.Project.OrgID,
+		&result.Project.Name,
+		&result.Project.GithubRepo,
+		&result.Project.DefaultBranch,
+		&result.Project.FrictionAutonomy,
+		&result.Project.PrPosture,
+		&result.Project.AllowPayloadEnvironment,
+		&result.Project.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("provision project: upsert project: %w", err)
+	}
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO environments (project_id, name)
+		VALUES ($1, 'production')
+		ON CONFLICT (project_id, name) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id, project_id, name, created_at`,
+		result.Project.ID,
+	).Scan(
+		&result.Environment.ID,
+		&result.Environment.ProjectID,
+		&result.Environment.Name,
+		&result.Environment.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("provision project: upsert production environment: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE environment_api_keys ak
+		SET revoked_at = now()
+		FROM environments e
+		WHERE ak.id = (
+		  SELECT provisioning_key_id
+		  FROM projects
+		  WHERE id = $1 AND org_id = $2 AND idempotency_token = $3
+		)
+		  AND ak.environment_id = e.id
+		  AND e.project_id = $1
+		  AND ak.revoked_at IS NULL`,
+		result.Project.ID, orgID, idempotencyToken,
+	); err != nil {
+		return nil, fmt.Errorf("provision project: revoke prior key: %w", err)
+	}
+
+	apiKey, err := q.CreateAPIKeyTx(ctx, tx, result.Environment.ID)
+	if err != nil {
+		return nil, fmt.Errorf("provision project: %w", err)
+	}
+	result.APIKey = *apiKey
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE projects
+		SET provisioning_key_id = $4
+		WHERE id = $1 AND org_id = $2 AND idempotency_token = $3`,
+		result.Project.ID, orgID, idempotencyToken, result.APIKey.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("provision project: store provisioning key: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("provision project: project scope changed before commit")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("provision project: commit: %w", err)
+	}
+	return &result, nil
 }
 
 func (q *Queries) CreateEnvironment(ctx context.Context, projectID, name string) (*Environment, error) {
@@ -153,6 +262,23 @@ func (q *Queries) CreateEnvironment(ctx context.Context, projectID, name string)
 		return nil, fmt.Errorf("create environment: %w", err)
 	}
 	return &env, nil
+}
+
+// FindEnvironmentIDByName resolves an environment name inside one project.
+// An empty id means no match; environment ids are never accepted from clients.
+func (q *Queries) FindEnvironmentIDByName(ctx context.Context, projectID, name string) (string, error) {
+	var id string
+	err := q.pool.QueryRow(ctx,
+		`SELECT id FROM environments WHERE project_id = $1 AND name = $2`,
+		projectID, name,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve environment name: %w", err)
+	}
+	return id, nil
 }
 
 // CreateAPIKey generates a new API key for an environment.
@@ -185,14 +311,14 @@ func (q *Queries) LookupAPIKey(ctx context.Context, rawKey string) (*APIKeyLooku
 
 	var lookup APIKeyLookup
 	err := q.pool.QueryRow(ctx,
-		`SELECT e.id, p.id, o.id, p.allowed_origins
+		`SELECT e.id, p.id, o.id, p.allowed_origins, p.allow_payload_environment
 		 FROM environment_api_keys ak
 		 JOIN environments e ON ak.environment_id = e.id
 		 JOIN projects p ON e.project_id = p.id
 		 JOIN orgs o ON p.org_id = o.id
 		 WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL`,
 		keyHash,
-	).Scan(&lookup.EnvironmentID, &lookup.ProjectID, &lookup.OrgID, &lookup.AllowedOrigins)
+	).Scan(&lookup.EnvironmentID, &lookup.ProjectID, &lookup.OrgID, &lookup.AllowedOrigins, &lookup.AllowPayloadEnvironment)
 	if err != nil {
 		return nil, fmt.Errorf("lookup api key: %w", err)
 	}
@@ -436,6 +562,7 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 		       sample_event_id = $5,
 		       platform = COALESCE(error_groups.platform, EXCLUDED.platform),
 		       updated_at = now()
+		   WHERE error_groups.kind = 'error'
 		 RETURNING id, (xmax = 0) AS is_new`,
 		p.ProjectID, p.Fingerprint, p.Title, eventTime, eventID, p.Platform,
 	).Scan(&groupID, &isNew)
@@ -443,13 +570,27 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 		return nil, fmt.Errorf("upsert error group: %w", err)
 	}
 
-	// 3. Link event to group
+	// 3. Link the event and maintain its environment rollup in one database
+	// round trip while the error_groups row is still locked. Client event times
+	// can arrive out of order, so both bounds are monotonic.
 	_, err = tx.Exec(ctx,
-		`UPDATE error_events SET error_group_id = $1 WHERE id = $2`,
-		groupID, eventID,
+		`WITH linked_event AS (
+		   UPDATE error_events SET error_group_id = $1 WHERE id = $2
+		   RETURNING id
+		 )
+		 INSERT INTO error_group_environments
+		   (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+		 SELECT eg.id, $3, $4, $4, 1
+		 FROM linked_event
+		 JOIN error_groups eg ON eg.id = $1 AND eg.kind = 'error'
+		 ON CONFLICT (error_group_id, environment_id) DO UPDATE
+		   SET first_seen = LEAST(error_group_environments.first_seen, EXCLUDED.first_seen),
+		       last_seen = GREATEST(error_group_environments.last_seen, EXCLUDED.last_seen),
+		       occurrence_count = error_group_environments.occurrence_count + 1`,
+		groupID, eventID, p.EnvironmentID, eventTime,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("link event to group: %w", err)
+		return nil, fmt.Errorf("link event and upsert environment rollup: %w", err)
 	}
 
 	// 3b. Upsert end-user identity if provided (B2B tracking)
@@ -604,55 +745,157 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 
 // ErrorGroupFilters provides optional filtering for ListErrorGroups.
 type ErrorGroupFilters struct {
-	AccountID string // filter by external_account_id via end_users junction
-	EndUserID string // filter by external_user_id via end_users junction
-	Status    string // filter by error group status
+	AccountID     string  // filter by external_account_id via affected occurrences
+	EndUserID     string  // filter by external_user_id via affected occurrences
+	Status        string  // filter by error group status
+	EnvironmentID *string // filter by environment UUID; nil means all environments
 }
 
 // ListErrorGroups returns error groups for a project with optional filters. Tenant-scoped.
 func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters *ErrorGroupFilters) ([]ErrorGroup, error) {
-	query := `SELECT DISTINCT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
-		        eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
-		        eg.environment_id, eg.adjudication_status,
-		        eg.reason_code, eg.reason_message, eg.remediation,
-		        eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
-		        eg.signal_type, eg.element_selector, eg.page_url_normalized,
-		        eg.created_at, eg.updated_at,
-		        eg.merged_at, eg.resolved_at, eg.archived_at
-		 FROM error_groups eg`
-
 	args := []interface{}{projectID}
 	argIdx := 2
-	// Ordinary candidates are hidden workflow records (issue #56); the only
-	// visible candidate is an exhausted 'unchecked' adjudication diagnostic.
-	wheres := []string{"eg.project_id = $1", "(eg.status <> 'candidate' OR eg.adjudication_status = 'unchecked')"}
 
-	needsJoin := filters != nil && (filters.AccountID != "" || filters.EndUserID != "")
-	if needsJoin {
-		query += ` JOIN error_group_affected_users eau ON eau.error_group_id = eg.id
-		           JOIN end_users eu ON eu.id = eau.end_user_id`
+	var environmentArg, statusArg, accountArg, endUserArg int
+	if filters != nil && filters.EnvironmentID != nil && *filters.EnvironmentID != "" {
+		environmentArg = argIdx
+		args = append(args, *filters.EnvironmentID)
+		argIdx++
 	}
-
 	if filters != nil {
 		if filters.Status != "" {
-			wheres = append(wheres, fmt.Sprintf("eg.status = $%d", argIdx))
+			statusArg = argIdx
 			args = append(args, filters.Status)
 			argIdx++
 		}
 		if filters.AccountID != "" {
-			wheres = append(wheres, fmt.Sprintf("eu.external_account_id = $%d", argIdx))
+			accountArg = argIdx
 			args = append(args, filters.AccountID)
 			argIdx++
 		}
 		if filters.EndUserID != "" {
-			wheres = append(wheres, fmt.Sprintf("eu.external_user_id = $%d", argIdx))
+			endUserArg = argIdx
 			args = append(args, filters.EndUserID)
 			argIdx++
 		}
 	}
 
-	query += " WHERE " + strings.Join(wheres, " AND ")
-	query += " ORDER BY eg.last_seen DESC LIMIT 100"
+	identityPredicate := func(alias string) string {
+		predicates := make([]string, 0, 2)
+		if accountArg != 0 {
+			predicates = append(predicates, fmt.Sprintf("%s.external_account_id = $%d", alias, accountArg))
+		}
+		if endUserArg != 0 {
+			predicates = append(predicates, fmt.Sprintf("%s.external_user_id = $%d", alias, endUserArg))
+		}
+		return strings.Join(predicates, " AND ")
+	}
+
+	// Ordinary candidates are hidden workflow records (issue #56); the only
+	// visible candidate is an exhausted 'unchecked' adjudication diagnostic.
+	visibleCandidate := "(eg.status <> 'candidate' OR eg.adjudication_status = 'unchecked')"
+	var query string
+	if environmentArg == 0 {
+		wheres := []string{"eg.project_id = $1", visibleCandidate}
+		if statusArg != 0 {
+			wheres = append(wheres, fmt.Sprintf("eg.status = $%d", statusArg))
+		}
+		if accountArg != 0 || endUserArg != 0 {
+			wheres = append(wheres, fmt.Sprintf(`EXISTS (
+				SELECT 1
+				FROM error_group_affected_users eau
+				JOIN end_users identity_user ON identity_user.id = eau.end_user_id
+				WHERE eau.error_group_id = eg.id AND %s
+			)`, identityPredicate("identity_user")))
+		}
+		query = `SELECT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
+		               eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		               eg.environment_id, eg.adjudication_status,
+		               eg.reason_code, eg.reason_message, eg.remediation,
+		               eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
+		               eg.signal_type, eg.element_selector, eg.page_url_normalized,
+		               eg.created_at, eg.updated_at,
+		               eg.merged_at, eg.resolved_at, eg.archived_at
+		        FROM error_groups eg
+		        WHERE ` + strings.Join(wheres, " AND ") + `
+		        ORDER BY eg.last_seen DESC, eg.id DESC
+		        LIMIT 100`
+	} else {
+		errorWheres := []string{
+			fmt.Sprintf("ege.environment_id = $%d", environmentArg),
+			"eg.project_id = $1",
+			"eg.kind = 'error'",
+			visibleCandidate,
+		}
+		frictionWheres := []string{
+			"eg.project_id = $1",
+			"eg.kind = 'friction'",
+			fmt.Sprintf("eg.environment_id = $%d", environmentArg),
+			visibleCandidate,
+		}
+		if statusArg != 0 {
+			statusClause := fmt.Sprintf("eg.status = $%d", statusArg)
+			errorWheres = append(errorWheres, statusClause)
+			frictionWheres = append(frictionWheres, statusClause)
+		}
+		if accountArg != 0 || endUserArg != 0 {
+			errorWheres = append(errorWheres, fmt.Sprintf(`(
+				EXISTS (
+					SELECT 1
+					FROM error_events identity_event
+					JOIN end_users identity_user ON identity_user.id = identity_event.end_user_id
+					WHERE identity_event.error_group_id = eg.id
+					  AND identity_event.project_id = eg.project_id
+					  AND identity_event.environment_id = $%d
+					  AND %s
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM friction_signals identity_signal
+					JOIN end_users identity_signal_user ON identity_signal_user.id = identity_signal.end_user_id
+					WHERE identity_signal.incident_id = eg.id
+					  AND identity_signal.project_id = eg.project_id
+					  AND identity_signal.environment_id = $%d
+					  AND identity_signal.retracted_at IS NULL
+					  AND identity_signal.superseded_by IS NULL
+					  AND %s
+				)
+			)`, environmentArg, identityPredicate("identity_user"), environmentArg,
+				identityPredicate("identity_signal_user")))
+			frictionWheres = append(frictionWheres, fmt.Sprintf(`EXISTS (
+				SELECT 1
+				FROM error_group_affected_users eau
+				JOIN end_users identity_user ON identity_user.id = eau.end_user_id
+				WHERE eau.error_group_id = eg.id AND %s
+			)`, identityPredicate("identity_user")))
+		}
+		query = fmt.Sprintf(`WITH candidates AS (
+			(SELECT ege.error_group_id AS id, ege.first_seen, ege.last_seen, ege.occurrence_count
+			 FROM error_group_environments ege
+			 JOIN error_groups eg ON eg.id = ege.error_group_id
+			 WHERE %s
+			 ORDER BY ege.last_seen DESC, ege.error_group_id
+			 LIMIT 100)
+			UNION ALL
+			(SELECT eg.id, eg.first_seen, eg.last_seen, eg.occurrence_count::bigint
+			 FROM error_groups eg
+			 WHERE %s
+			 ORDER BY eg.last_seen DESC, eg.id
+			 LIMIT 100)
+		)
+		SELECT eg.id, eg.project_id, eg.fingerprint, eg.title, candidates.first_seen, candidates.last_seen,
+		       candidates.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		       eg.environment_id, eg.adjudication_status,
+		       eg.reason_code, eg.reason_message, eg.remediation,
+		       eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
+		       eg.signal_type, eg.element_selector, eg.page_url_normalized,
+		       eg.created_at, eg.updated_at,
+		       eg.merged_at, eg.resolved_at, eg.archived_at
+		FROM candidates
+		JOIN error_groups eg ON eg.id = candidates.id
+		ORDER BY candidates.last_seen DESC, candidates.id
+		LIMIT 100`, strings.Join(errorWheres, " AND "), strings.Join(frictionWheres, " AND "))
+	}
 
 	rows, err := q.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -837,6 +1080,56 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		return nil, fmt.Errorf("get error group: %w", err)
 	}
 	return &g, nil
+}
+
+// GroupEnvironment is one environment-specific occurrence summary for an
+// incident. Error-kind rows come from the rollup; friction-kind rows come from
+// the group's environment-scoped identity.
+type GroupEnvironment struct {
+	ID              string
+	Name            string
+	OccurrenceCount int64
+	LastSeen        time.Time
+}
+
+// ListGroupEnvironments returns an incident's environment breakdown, scoped to
+// its owning project and explicitly kind-gated.
+func (q *Queries) ListGroupEnvironments(ctx context.Context, projectID, groupID string) ([]GroupEnvironment, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT environment_id, environment_name, occurrence_count, last_seen
+		FROM (
+		  SELECT env.id AS environment_id, env.name AS environment_name,
+		         ege.occurrence_count, ege.last_seen
+		  FROM error_groups eg
+		  JOIN error_group_environments ege ON ege.error_group_id = eg.id
+		  JOIN environments env ON env.id = ege.environment_id
+		  WHERE eg.id = $1 AND eg.project_id = $2 AND eg.kind = 'error'
+		  UNION ALL
+		  SELECT env.id, env.name, eg.occurrence_count::bigint, eg.last_seen
+		  FROM error_groups eg
+		  JOIN environments env ON env.id = eg.environment_id
+		  WHERE eg.id = $1 AND eg.project_id = $2 AND eg.kind = 'friction'
+		) group_environments
+		ORDER BY last_seen DESC, environment_id`, groupID, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list group environments: %w", err)
+	}
+	defer rows.Close()
+
+	var environments []GroupEnvironment
+	for rows.Next() {
+		var environment GroupEnvironment
+		if err := rows.Scan(
+			&environment.ID,
+			&environment.Name,
+			&environment.OccurrenceCount,
+			&environment.LastSeen,
+		); err != nil {
+			return nil, fmt.Errorf("scan group environment: %w", err)
+		}
+		environments = append(environments, environment)
+	}
+	return environments, rows.Err()
 }
 
 // GetLatestJobTraceURL returns the trace_url from the most recent job for an error group.
@@ -2345,7 +2638,7 @@ func (q *Queries) ConsumeAuthorizationCode(ctx context.Context, codeHash string)
 // ListProjectsByOrg returns all projects for a given org. Tenant-scoped.
 func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Project, error) {
 	rows, err := q.pool.Query(ctx,
-		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at
+		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at
 		 FROM projects
 		 WHERE org_id = $1
 		 ORDER BY created_at ASC`,
@@ -2359,7 +2652,7 @@ func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Projec
 	var projects []Project
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		projects = append(projects, p)
@@ -2372,10 +2665,10 @@ func (q *Queries) ListProjectsByOrg(ctx context.Context, orgID string) ([]Projec
 func (q *Queries) GetProjectByOrgID(ctx context.Context, orgID, projectID string) (*Project, error) {
 	var p Project
 	err := q.pool.QueryRow(ctx,
-		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at
+		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at
 		 FROM projects WHERE id = $1 AND org_id = $2`,
 		projectID, orgID,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -2387,17 +2680,18 @@ func (q *Queries) GetProjectByOrgID(ctx context.Context, orgID, projectID string
 
 // UpdateProject updates a project's settings. Only non-nil fields are changed.
 // Tenant-scoped by orgID.
-func (q *Queries) UpdateProject(ctx context.Context, orgID, projectID string, githubRepo, frictionAutonomy, prPosture *string) (*Project, error) {
+func (q *Queries) UpdateProject(ctx context.Context, orgID, projectID string, githubRepo, frictionAutonomy, prPosture *string, allowPayloadEnvironment *bool) (*Project, error) {
 	var p Project
 	err := q.pool.QueryRow(ctx,
 		`UPDATE projects
 		 SET github_repo = COALESCE($3, github_repo),
 		     friction_autonomy = COALESCE($4, friction_autonomy),
-		     pr_posture = COALESCE($5, pr_posture)
+		     pr_posture = COALESCE($5, pr_posture),
+		     allow_payload_environment = COALESCE($6, allow_payload_environment)
 		 WHERE id = $2 AND org_id = $1
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
-		orgID, projectID, githubRepo, frictionAutonomy, prPosture,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at`,
+		orgID, projectID, githubRepo, frictionAutonomy, prPosture, allowPayloadEnvironment,
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -2603,9 +2897,9 @@ func (q *Queries) CreateProjectTx(ctx context.Context, tx pgx.Tx, orgID, name st
 	err := tx.QueryRow(ctx,
 		`INSERT INTO projects (org_id, name, github_repo)
 		 VALUES ($1, $2, $3)
-		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, created_at`,
+		 RETURNING id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at`,
 		orgID, name, githubRepo,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create project tx: %w", err)
 	}
@@ -2832,13 +3126,13 @@ func (q *Queries) MarkAgentSessionAuthClicked(ctx context.Context, sessionID str
 func (q *Queries) FindProjectByRepoURL(ctx context.Context, repoURL string) (*Project, error) {
 	var p Project
 	err := q.pool.QueryRow(ctx,
-		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, created_at
+		`SELECT id, org_id, name, github_repo, default_branch, friction_autonomy, pr_posture, allow_payload_environment, created_at
 		 FROM projects
 		 WHERE github_repo = $1
 		 ORDER BY created_at ASC
 		 LIMIT 1`,
 		repoURL,
-	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.CreatedAt)
+	).Scan(&p.ID, &p.OrgID, &p.Name, &p.GithubRepo, &p.DefaultBranch, &p.FrictionAutonomy, &p.PrPosture, &p.AllowPayloadEnvironment, &p.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}

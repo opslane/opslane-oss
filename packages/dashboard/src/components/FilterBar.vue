@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, toRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import type { Account, IncidentFilters } from '../types/api';
 import { listAccounts } from '../api';
+import { environmentFilterQuery, useEnvironmentFilter } from '../composables/useEnvironmentFilter';
 
 const props = defineProps<{
   projectId: string;
@@ -17,6 +18,11 @@ const router = useRouter();
 const accounts = ref<Account[]>([]);
 const selectedAccountId = ref((route.query['account_id'] as string) || '');
 const selectedStatus = ref((route.query['status'] as string) || '');
+const {
+  environments,
+  rollupReady,
+  selectedEnvironmentId,
+} = useEnvironmentFilter(toRef(props, 'projectId'));
 
 onMounted(async () => {
   try {
@@ -31,12 +37,15 @@ function emitFilters() {
   const filters: IncidentFilters = {};
   if (selectedAccountId.value) filters.account_id = selectedAccountId.value;
   if (selectedStatus.value) filters.status = selectedStatus.value;
+  if (rollupReady.value && selectedEnvironmentId.value) {
+    filters.environment_id = selectedEnvironmentId.value;
+  }
   emit('filter-change', filters);
 }
 
 function onFilterChange() {
   // Sync to URL query params
-  const query: Record<string, string> = { ...route.query as Record<string, string> };
+  const query = environmentFilterQuery(route.query, selectedEnvironmentId.value);
   if (selectedAccountId.value) {
     query['account_id'] = selectedAccountId.value;
   } else {
@@ -51,7 +60,7 @@ function onFilterChange() {
   emitFilters();
 }
 
-watch([selectedAccountId, selectedStatus], onFilterChange);
+watch([selectedAccountId, selectedStatus, selectedEnvironmentId, rollupReady], onFilterChange);
 </script>
 
 <template>
@@ -88,6 +97,23 @@ watch([selectedAccountId, selectedStatus], onFilterChange);
         <option value="needs_human">Needs Human</option>
         <option value="resolved">Resolved</option>
         <option value="archived">Archived</option>
+      </select>
+    </div>
+
+    <div v-if="rollupReady" class="flex items-center gap-2">
+      <label class="text-sm text-text-muted whitespace-nowrap">Environment:</label>
+      <select
+        v-model="selectedEnvironmentId"
+        aria-label="Environment"
+        class="text-sm rounded-md px-2 py-1.5"
+      >
+        <option value="">All environments</option>
+        <option
+          v-for="environment in environments"
+          :key="environment.id"
+          :value="environment.id"
+          v-text="environment.name"
+        ></option>
       </select>
     </div>
   </div>

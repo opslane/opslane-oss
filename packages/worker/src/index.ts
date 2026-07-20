@@ -694,10 +694,11 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   const investigation = await getGroupInvestigation(job.errorGroupId, job.projectId);
 
   // Parallel fetch for independent data
-  const [replay, sourceMaps, sessionPointer] = await Promise.all([
+  const [replay, sourceMaps, sessionPointer, environmentContext] = await Promise.all([
     db.getReplayForGroup(job.errorGroupId, job.projectId),
     event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
     db.getSessionPointerForGroup(job.errorGroupId, job.projectId),
+    db.getEnvironmentNamesForGroup(job.errorGroupId, job.projectId, group.kind),
   ]);
   const artifacts = replay ? await db.getReplayArtifacts(replay.id, job.projectId) : [];
 
@@ -859,6 +860,8 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       resolvedStackTrace: resolvedStack ?? event?.stack_trace_resolved ?? null,
       breadcrumbs: event?.breadcrumbs ?? '[]',
       context: event?.context ?? '{}',
+      environmentNames: environmentContext.names,
+      environmentTotal: environmentContext.totalCount,
       sourceFiles: [],
       visualAnalysis: visualOutput,
       repoPath: repoDir,

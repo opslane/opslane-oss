@@ -398,6 +398,22 @@ async function attachSignalIncrementally(
      WHERE id = $1`,
     [incidentId, signal.occurred_at, signal.id],
   );
+  // Error-kind groups span environments, so folded signals participate in
+  // the same per-environment rollup maintained by error ingestion. The kind
+  // predicate deliberately keeps friction-kind groups out of this table.
+  await client.query(
+    `INSERT INTO error_group_environments
+       (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+     SELECT eg.id, $2, $3::timestamptz, $3::timestamptz, fs.occurrence_count::bigint
+     FROM error_groups eg
+     JOIN friction_signals fs ON fs.id = $5
+     WHERE eg.id = $1 AND eg.project_id = $4 AND eg.kind = 'error'
+     ON CONFLICT (error_group_id, environment_id) DO UPDATE
+       SET first_seen = LEAST(error_group_environments.first_seen, EXCLUDED.first_seen),
+           last_seen = GREATEST(error_group_environments.last_seen, EXCLUDED.last_seen),
+           occurrence_count = error_group_environments.occurrence_count + EXCLUDED.occurrence_count`,
+    [incidentId, signal.environment_id, signal.occurred_at, signal.project_id, signal.id],
+  );
   if (signal.end_user_id) {
     await client.query(
       `INSERT INTO error_group_affected_users
@@ -657,6 +673,60 @@ export async function recomputeIncidentImpact(
   incidentId: string,
   projectId: string,
 ): Promise<void> {
+  // Serialize the source snapshot and absolute replacements with error ingest
+  // and incremental friction folds, both of which hold this group-row lock.
+  const locked = await client.query(
+    `SELECT id FROM error_groups
+     WHERE id = $1 AND project_id = $2
+     FOR UPDATE`,
+    [incidentId, projectId],
+  );
+  if ((locked.rowCount ?? 0) !== 1) {
+    throw new Error(`incident ${incidentId} does not belong to project ${projectId}`);
+  }
+  // Keep this aggregate aligned with the ingestion backfill recompute in
+  // packages/ingestion/db/rollup_backfill.go. Retraction and supersession
+  // rebuild absolute values from source instead of decrementing stale rows.
+  // The delete and rebuild run as two sequential statements (not one CTE that
+  // both deletes and inserts the same rows) because Postgres leaves the outcome
+  // of modifying the same row twice in a single command unspecified; the
+  // enclosing transaction and the group-row lock above keep them atomic.
+  await client.query(
+    `DELETE FROM error_group_environments ege
+     USING error_groups scoped_group
+     WHERE ege.error_group_id = $1
+       AND scoped_group.id = ege.error_group_id
+       AND scoped_group.project_id = $2`,
+    [incidentId, projectId],
+  );
+  await client.query(
+    `WITH source_rows AS (
+       SELECT environment_id, "timestamp" AS at, 1::bigint AS occurrences
+       FROM error_events
+       WHERE error_group_id = $1 AND project_id = $2
+       UNION ALL
+       SELECT environment_id, occurred_at AS at, occurrence_count::bigint AS occurrences
+       FROM friction_signals
+       WHERE incident_id = $1 AND project_id = $2
+         AND retracted_at IS NULL AND superseded_by IS NULL
+     ), aggregate_rows AS (
+       SELECT environment_id, MIN(at) AS first_seen, MAX(at) AS last_seen,
+              SUM(occurrences)::bigint AS occurrence_count
+       FROM source_rows
+       GROUP BY environment_id
+     )
+     INSERT INTO error_group_environments
+       (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+     SELECT eg.id, aggregate_rows.environment_id, aggregate_rows.first_seen,
+            aggregate_rows.last_seen, aggregate_rows.occurrence_count
+     FROM aggregate_rows
+     JOIN error_groups eg ON eg.id = $1 AND eg.project_id = $2 AND eg.kind = 'error'
+     ON CONFLICT (error_group_id, environment_id) DO UPDATE
+       SET first_seen = EXCLUDED.first_seen,
+           last_seen = EXCLUDED.last_seen,
+           occurrence_count = EXCLUDED.occurrence_count`,
+    [incidentId, projectId],
+  );
   // Signals carry occurrence_count (repeats within one session), so impact
   // sums those; each error event counts once.
   await client.query(
@@ -680,8 +750,12 @@ export async function recomputeIncidentImpact(
     [incidentId, projectId],
   );
   await client.query(
-    `DELETE FROM error_group_affected_users WHERE error_group_id = $1`,
-    [incidentId],
+    `DELETE FROM error_group_affected_users eau
+     USING error_groups scoped_group
+     WHERE eau.error_group_id = $1
+       AND scoped_group.id = eau.error_group_id
+       AND scoped_group.project_id = $2`,
+    [incidentId, projectId],
   );
   await client.query(
     `INSERT INTO error_group_affected_users

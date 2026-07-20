@@ -19,6 +19,7 @@ vi.mock('../db.js', () => ({
   getGroupInvestigation: vi.fn(),
   getReplayForGroup: vi.fn(),
   getSessionPointerForGroup: vi.fn(),
+  getEnvironmentNamesForGroup: vi.fn(async () => ({ names: [], totalCount: 0 })),
   getPlayableChunkMetas: vi.fn(),
   getReplayArtifacts: vi.fn(),
   getSourceMaps: vi.fn(),

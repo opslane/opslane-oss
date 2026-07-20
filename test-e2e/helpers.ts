@@ -223,17 +223,49 @@ export async function postEvent(
  */
 export async function listIncidents(
   apiKey: string,
-  projectId: string
+  projectId: string,
+  environmentId?: string,
 ): Promise<Incident[]> {
   const { ingestionUrl } = getConfig();
+  const query = environmentId
+    ? `?environment_id=${encodeURIComponent(environmentId)}`
+    : '';
   const res = await fetch(
-    `${ingestionUrl}/api/v1/projects/${projectId}/incidents`,
+    `${ingestionUrl}/api/v1/projects/${projectId}/incidents${query}`,
     { headers: { 'X-API-Key': apiKey } }
   );
   if (!res.ok) {
     throw new Error(`listIncidents failed: ${res.status} ${await res.text()}`);
   }
   return res.json() as Promise<Incident[]>;
+}
+
+export interface SessionSummary {
+  id: string;
+  started_at: string;
+  status: string;
+  page_url?: string;
+}
+
+/** GET sessions for a project, optionally filtered by environment. */
+export async function listSessions(
+  sessionToken: string,
+  projectId: string,
+  environmentId?: string,
+): Promise<SessionSummary[]> {
+  const { ingestionUrl } = getConfig();
+  const query = environmentId
+    ? `?environment_id=${encodeURIComponent(environmentId)}`
+    : '';
+  const res = await fetch(
+    `${ingestionUrl}/api/v1/projects/${projectId}/sessions${query}`,
+    { headers: { Authorization: `Bearer ${sessionToken}` } },
+  );
+  if (!res.ok) {
+    throw new Error(`listSessions failed: ${res.status} ${await res.text()}`);
+  }
+  const body = await res.json() as { sessions: SessionSummary[] };
+  return body.sessions;
 }
 
 /**
@@ -524,7 +556,8 @@ export async function initSession(
   apiKey: string,
   sessionId: string,
   user?: SessionUser,
-  pageUrl = 'https://app.example.com/checkout'
+  pageUrl = 'https://app.example.com/checkout',
+  environment?: string,
 ): Promise<void> {
   const { ingestionUrl } = getConfig();
   const res = await fetch(`${ingestionUrl}/api/v1/sessions/init`, {
@@ -534,6 +567,7 @@ export async function initSession(
       session_id: sessionId,
       started_at: new Date().toISOString(),
       page_url: pageUrl,
+      ...(environment ? { environment } : {}),
       ...(user ? { user } : {}),
     }),
   });

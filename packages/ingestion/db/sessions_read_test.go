@@ -112,6 +112,33 @@ func TestListSessions_FiltersPaginationAndTenantScope(t *testing.T) {
 	}
 }
 
+func TestListSessions_EnvironmentFilterPreservesKeysetPagination(t *testing.T) {
+	q, pool := sessionTestQueries(t)
+	ctx := context.Background()
+	projectID, productionID := seedSessionProject(t, pool)
+	staging, err := q.CreateEnvironment(ctx, projectID, "staging")
+	if err != nil {
+		t.Fatalf("create staging environment: %v", err)
+	}
+
+	base := time.Now().UTC().Truncate(time.Microsecond).Add(-time.Hour)
+	insertReadSession(t, q, pool, projectID, productionID, nil, "sess_env_prod_old", base.Add(time.Minute))
+	insertReadSession(t, q, pool, projectID, staging.ID, nil, "sess_env_stage_old", base.Add(2*time.Minute))
+	insertReadSession(t, q, pool, projectID, productionID, nil, "sess_env_prod_new", base.Add(3*time.Minute))
+	insertReadSession(t, q, pool, projectID, staging.ID, nil, "sess_env_stage_new", base.Add(4*time.Minute))
+
+	filters := db.SessionFilters{EnvironmentID: productionID}
+	firstPage, cursor, err := q.ListSessions(ctx, projectID, filters, nil, 1)
+	if err != nil || len(firstPage) != 1 || firstPage[0].ID != "sess_env_prod_new" || cursor == nil {
+		t.Fatalf("first environment page = %+v cursor=%v err=%v", firstPage, cursor, err)
+	}
+
+	lastPage, next, err := q.ListSessions(ctx, projectID, filters, cursor, 1)
+	if err != nil || len(lastPage) != 1 || lastPage[0].ID != "sess_env_prod_old" || next != nil {
+		t.Fatalf("last environment page = %+v cursor=%v err=%v", lastPage, next, err)
+	}
+}
+
 func TestSessionSummaryAndPlayableChunks_AreFailClosedAndScoped(t *testing.T) {
 	q, pool := sessionTestQueries(t)
 	ctx := context.Background()

@@ -6,6 +6,7 @@ export interface SdkConfig {
   endpoint: string;
   apiKey: string;
   release: string;
+  environment: string;
   maxBreadcrumbs: number;
   breadcrumbMaxAge: number;
   flushInterval: number;
@@ -25,6 +26,7 @@ export interface SdkInitOptions {
   apiKey: string;
   endpoint?: string;
   release?: string;
+  environment?: string;
   maxBreadcrumbs?: number;
   breadcrumbMaxAge?: number;
   flushInterval?: number;
@@ -39,6 +41,7 @@ export interface SdkInitOptions {
 const DEFAULT_ENDPOINT = 'https://api.opslane.com';
 
 const DEFAULTS: Omit<SdkConfig, 'endpoint' | 'apiKey' | 'release'> = {
+  environment: '',
   maxBreadcrumbs: 50,
   breadcrumbMaxAge: 30_000,
   flushInterval: 5_000,
@@ -76,6 +79,7 @@ export function loadConfig(options: SdkInitOptions): void {
     endpoint,
     apiKey: options.apiKey,
     release: options.release ?? '',
+    environment: options.environment ?? DEFAULTS.environment,
     maxBreadcrumbs: options.maxBreadcrumbs ?? DEFAULTS.maxBreadcrumbs,
     breadcrumbMaxAge: options.breadcrumbMaxAge ?? DEFAULTS.breadcrumbMaxAge,
     flushInterval: options.flushInterval ?? DEFAULTS.flushInterval,

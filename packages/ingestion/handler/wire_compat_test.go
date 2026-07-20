@@ -33,6 +33,7 @@ type wireFixture struct {
 	SDKVersion  string          `json:"sdk_version"`
 	Release     string          `json:"release"`
 	SessionID   string          `json:"session_id"`
+	Environment string          `json:"environment"`
 	ContextUser *struct {
 		ID          string `json:"id"`
 		Email       string `json:"email"`
@@ -258,6 +259,43 @@ func TestWireFixtures_AcceptedAndStored(t *testing.T) {
 			}
 			if accountName != fixture.ContextUser.AccountName {
 				t.Errorf("account_name = %q, want %q", accountName, fixture.ContextUser.AccountName)
+			}
+		})
+	}
+}
+
+func TestWireV110EnvironmentResolution(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, keyEnvironmentID, rawKey := seedTenant(t, deps.Queries)
+	staging, err := deps.Queries.CreateEnvironment(context.Background(), projectID, "staging")
+	if err != nil {
+		t.Fatalf("create staging environment: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE projects SET allow_payload_environment = true WHERE id = $1`, projectID); err != nil {
+		t.Fatalf("enable payload environment: %v", err)
+	}
+
+	tests := []struct {
+		name              string
+		fixture           string
+		wantEnvironmentID string
+	}{
+		{name: "minimal keeps key environment", fixture: "v1.1.0-minimal.json", wantEnvironmentID: keyEnvironmentID},
+		{name: "full resolves staging", fixture: "v1.1.0-full.json", wantEnvironmentID: staging.ID},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw, _ := readFixture(t, filepath.Join(wireFixtureDir, test.fixture))
+			response := postFixture(t, deps, rawKey, raw)
+			var environmentID string
+			if err := pool.QueryRow(context.Background(),
+				`SELECT environment_id FROM error_events WHERE id = $1`, response["event_id"]).
+				Scan(&environmentID); err != nil {
+				t.Fatalf("query stored environment: %v", err)
+			}
+			if environmentID != test.wantEnvironmentID {
+				t.Errorf("environment_id = %q, want %q", environmentID, test.wantEnvironmentID)
 			}
 		})
 	}

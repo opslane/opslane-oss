@@ -45,3 +45,17 @@ outage we cannot hotfix.
 Adding a field: add a new fixture pair, keep the field optional server-side, and
 the old fixtures still pass. Editing or removing an existing fixture: apply the
 `contract-change` label, a conscious acknowledgement that live clients may break.
+
+## Environment field
+
+SDK 1.1.0 adds the optional top-level `environment` string. The corresponding
+frozen fixtures are `v1.1.0-minimal.json` (field omitted) and
+`v1.1.0-full.json` (`"environment": "staging"`). Older payloads remain valid.
+
+An environment name is only an override request. The server accepts names made
+from 1–64 letters, digits, dots, underscores, or hyphens and resolves them
+inside the API key's project. Projects must explicitly enable payload overrides;
+otherwise the API key's environment remains authoritative. Unknown or invalid
+names fall back to the key environment without rejecting the event. Once a
+same-project session exists, that session's environment is authoritative for
+subsequent events carrying its `session_id`.

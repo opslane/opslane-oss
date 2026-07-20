@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { onMounted, ref, watch } from 'vue';
 import { listSessions } from '../api';
 import type { SessionFilters, SessionSummary } from '../types/api';
 import { formatDate, getProjectId, safeUrl } from '../utils';
-import { sessionPageRequest, snapshotSessionFilters } from '../components/session-list-query';
+import { applySessionFilters, sessionPageRequest } from '../components/session-list-query';
+import { useEnvironmentFilter } from '../composables/useEnvironmentFilter';
 
 const sessions = ref<SessionSummary[]>([]);
 const projectId = ref('');
@@ -16,6 +17,16 @@ const accountId = ref('');
 const from = ref('');
 const to = ref('');
 const appliedFilters = ref<SessionFilters>({});
+let fetchGeneration = 0;
+const {
+  environments,
+  rollupReady,
+  selectedEnvironmentId,
+} = useEnvironmentFilter(projectId);
+
+watch(rollupReady, (ready) => {
+  if (ready) applyFilters();
+});
 
 function isoDate(value: string): string | undefined {
   if (!value) return undefined;
@@ -27,32 +38,45 @@ function filters(): SessionFilters {
   return {
     end_user_id: endUserId.value.trim() || undefined,
     account_id: accountId.value.trim() || undefined,
+    environment_id: rollupReady.value ? selectedEnvironmentId.value || undefined : undefined,
     from: isoDate(from.value),
     to: isoDate(to.value),
   };
 }
 
 async function fetchSessions(cursor?: string): Promise<void> {
+  const generation = ++fetchGeneration;
   if (cursor) loadingMore.value = true;
-  else loading.value = true;
+  else {
+    loading.value = true;
+    loadingMore.value = false;
+  }
   error.value = null;
   try {
     const request = sessionPageRequest(appliedFilters.value, cursor);
     const response = await listSessions(projectId.value, request.filters, request.cursor);
+    if (generation !== fetchGeneration) return;
     sessions.value = cursor ? [...sessions.value, ...response.sessions] : response.sessions;
     nextCursor.value = response.next_cursor ?? null;
   } catch (caught: unknown) {
+    if (generation !== fetchGeneration) return;
     const message = caught instanceof Error ? caught.message : String(caught);
     error.value = `Failed to load sessions: ${message}`;
   } finally {
-    loading.value = false;
-    loadingMore.value = false;
+    if (generation === fetchGeneration) {
+      loading.value = false;
+      loadingMore.value = false;
+    }
   }
 }
 
 function applyFilters(): void {
-  appliedFilters.value = snapshotSessionFilters(filters());
-  nextCursor.value = null;
+  // Invalidate any in-flight page before it can append rows produced by the
+  // previous filter snapshot.
+  fetchGeneration++;
+  const applied = applySessionFilters(filters());
+  appliedFilters.value = applied.filters;
+  nextCursor.value = applied.cursor;
   void fetchSessions();
 }
 
@@ -104,9 +128,25 @@ onMounted(() => {
       </div>
     </div>
 
-    <form class="grid gap-3 mb-5 md:grid-cols-2 xl:grid-cols-5" @submit.prevent="applyFilters">
+    <form class="grid gap-3 mb-5 md:grid-cols-2 xl:grid-cols-6" @submit.prevent="applyFilters">
       <input v-model="endUserId" type="text" placeholder="End-user ID" class="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm" />
       <input v-model="accountId" type="text" placeholder="Account ID" class="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm" />
+      <label v-if="rollupReady" class="text-xs text-text-muted">
+        Environment
+        <select
+          v-model="selectedEnvironmentId"
+          class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
+          @change="applyFilters"
+        >
+          <option value="">All environments</option>
+          <option
+            v-for="environment in environments"
+            :key="environment.id"
+            :value="environment.id"
+            v-text="environment.name"
+          ></option>
+        </select>
+      </label>
       <label class="text-xs text-text-muted">
         From
         <input v-model="from" type="datetime-local" class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text" />

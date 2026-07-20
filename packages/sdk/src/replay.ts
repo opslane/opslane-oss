@@ -148,6 +148,7 @@ async function registerSession(sessionID = ensureSessionID()): Promise<boolean> 
         session_id: sessionID,
         started_at: new Date().toISOString(),
         page_url: currentPageUrl(),
+        environment: config.environment || undefined,
         user: user ? {
           id: user.id,
           email: user.email,

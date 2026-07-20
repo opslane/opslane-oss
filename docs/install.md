@@ -69,3 +69,19 @@ createApp(App).use(opslaneVuePlugin).mount('#app');
 ```
 
 Do not commit your ingest key to the repository. Keep it in your deploy platform or CI secret store.
+
+## Upgrading large installations
+
+The environments-first-class migration creates and backfills the
+`error_group_environments` rollup used by filtered incident reads. The checked-in
+migration uses ordinary `CREATE INDEX` statements so it remains transaction-safe
+in the automatic migrator. On a large production database, operators should
+schedule a maintenance window or create the equivalent indexes with
+`CREATE INDEX CONCURRENTLY` before deploying, then let the guarded migration
+confirm them.
+
+The backfill is a locked, restartable recomputation from source events and active
+friction signals. Do not bypass it: dashboard environment filters remain hidden
+until `rollup_backfill_state` reports `complete`. Monitor ingest latency during
+the rollout and use the supplied hot-path benchmark and `EXPLAIN (ANALYZE,
+BUFFERS)` gate before enabling the feature for high-volume projects.

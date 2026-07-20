@@ -22,6 +22,7 @@ describe('SDK Config', () => {
       endpoint: 'https://ingest.example.com',
       apiKey: 'key-abc',
       release: '',
+      environment: '',
       maxBreadcrumbs: 50,
       breadcrumbMaxAge: 30_000,
       flushInterval: 5_000,
@@ -51,6 +52,15 @@ describe('SDK Config', () => {
     });
 
     expect(getConfig().release).toBe('v1.2.3');
+  });
+
+  it('defaults environment to empty and accepts an explicit environment', () => {
+    loadConfig({ apiKey: 'key-abc' });
+    expect(getConfig().environment).toBe('');
+
+    resetConfig();
+    loadConfig({ apiKey: 'key-abc', environment: 'staging' });
+    expect(getConfig().environment).toBe('staging');
   });
 
   it('should allow partial overrides with defaults', () => {
