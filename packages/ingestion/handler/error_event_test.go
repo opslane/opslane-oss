@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
@@ -314,6 +316,35 @@ func TestListIncidents_PlatformQueryParam(t *testing.T) {
 	handler.NewRouter(deps).ServeHTTP(badResponse, badReq)
 	if badResponse.Code != http.StatusBadRequest {
 		t.Fatalf("invalid platform = %d (%s), want 400", badResponse.Code, badResponse.Body.String())
+	}
+}
+
+func TestGetSampleEvent_TenantScopedRoundTrip(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","runtime":{"name":"cpython","version":"3.12.1"},"error":{"type":"ValueError","message":"No row was found","stack":"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\n    raise ValueError()\nValueError: No row was found"},"breadcrumbs":[{"type":"log","timestamp":"t","category":"app","level":"warning","message":"near expiry"}],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	ev, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"])
+	if err != nil {
+		t.Fatalf("get sample event: %v", err)
+	}
+	if ev.ErrorType != "ValueError" || ev.Platform != "python" ||
+		!strings.HasPrefix(ev.StackTraceRaw, "Traceback") {
+		t.Fatalf("unexpected sample event: %+v", ev)
+	}
+	_, otherProject, _, _ := seedTenant(t, deps.Queries)
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), otherProject, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-project sample event read must be pgx.ErrNoRows, got %v", err)
+	}
+
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET status = 'candidate', adjudication_status = NULL WHERE id = $1`,
+		response["group_id"]); err != nil {
+		t.Fatalf("hide group as ordinary candidate: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("hidden candidate's sample event must be pgx.ErrNoRows, got %v", err)
 	}
 }
 

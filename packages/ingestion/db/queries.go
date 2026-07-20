@@ -846,6 +846,39 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 	return &g, nil
 }
 
+// SampleEvent is the representative event for an error group, used by the
+// dashboard detail view. Tenant-scoped through the owning group's project_id.
+type SampleEvent struct {
+	Timestamp     time.Time
+	Platform      string
+	ErrorType     string
+	ErrorMessage  string
+	StackTraceRaw string
+	Breadcrumbs   []byte // JSONB passthrough
+	Context       []byte // JSONB passthrough
+}
+
+// GetSampleEvent returns the sample event for a group, scoped to the project.
+// Ordinary candidate rows are hidden workflow records and stay invisible here.
+// The event-project join protects against a corrupt cross-project sample pointer.
+func (q *Queries) GetSampleEvent(ctx context.Context, projectID, groupID string) (*SampleEvent, error) {
+	var ev SampleEvent
+	err := q.pool.QueryRow(ctx,
+		`SELECT e."timestamp", e.platform, e.error_type, e.error_message,
+		        e.stack_trace_raw, e.breadcrumbs, e.context
+		 FROM error_groups g
+		 JOIN error_events e ON e.id = g.sample_event_id AND e.project_id = g.project_id
+		 WHERE g.id = $1 AND g.project_id = $2
+		   AND (g.status <> 'candidate' OR g.adjudication_status = 'unchecked')`,
+		groupID, projectID,
+	).Scan(&ev.Timestamp, &ev.Platform, &ev.ErrorType, &ev.ErrorMessage,
+		&ev.StackTraceRaw, &ev.Breadcrumbs, &ev.Context)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
 // GetLatestJobTraceURL returns the trace_url from the most recent job for an error group.
 // Tenant-scoped via error_groups join.
 func (q *Queries) GetLatestJobTraceURL(ctx context.Context, projectID, errorGroupID string) (*string, error) {
