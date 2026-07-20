@@ -4,6 +4,10 @@ covers:
   - packages/worker/src/pr.ts
   - packages/worker/src/repo-clone.ts
   - packages/worker/src/setup-pr.ts
+  - packages/ingestion/auth/github_provider.go
+  - packages/ingestion/handler/agent_setup.go
+  - packages/ingestion/handler/routes.go
+  - packages/ingestion/main.go
 ---
 # Connecting GitHub
 
@@ -33,6 +37,14 @@ A GitHub App gives you short-lived installation tokens scoped to explicitly sele
 - Callback URL: `https://your-instance/auth/github/callback`
 - Setup URL: `https://your-instance/api/v1/github/setup`
 - Webhook URL: `https://your-instance/api/v1/github/webhook` + a webhook secret
+
+### Extra requirements for agent onboarding
+
+If agents will set up projects via `opslane setup` (see the agent quickstart), the App additionally needs:
+
+- **"Request user authorization (OAuth) during installation" enabled** — the agent flow verifies the authorizing human's identity in the same interaction as the install.
+- **Account permission "Email addresses: Read-only"** — the identity check reads the authorizer's verified email; without this permission every agent authorization fails with "GitHub check failed".
+- The **Callback URL** must be your server's `/auth/github/callback` (one shared callback dispatches both the web login flow and agent sessions).
 
 Existing installations must approve the **Checks: read** permission upgrade in
 GitHub before Opslane can observe CI. Until it is approved, draft PRs remain drafts
