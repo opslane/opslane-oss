@@ -223,6 +223,15 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 		})
 
 	default: // pending
+		// ExpireAgentSessions only flips the status column hourly. Read the
+		// window directly so a lapsed session reports expired immediately,
+		// matching what AgentAuthRedirect already tells the human.
+		if time.Now().After(session.ExpiresAt) {
+			agentJSON(w, http.StatusGone, map[string]any{
+				"status": "expired", "message": "session expired; re-run setup",
+			})
+			return
+		}
 		agentJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 	}
 }
