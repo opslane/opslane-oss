@@ -23,6 +23,7 @@ type incidentJSON struct {
 	Title                string              `json:"title"`
 	Status               string              `json:"status"`
 	Kind                 string              `json:"kind"`
+	Platform             *string             `json:"platform,omitempty"`
 	EnvironmentID        *string             `json:"environment_id,omitempty"`
 	AdjudicationStatus   *string             `json:"adjudication_status,omitempty"`
 	FirstSeen            string              `json:"first_seen"`
@@ -72,6 +73,7 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 		Title:               g.Title,
 		Status:              g.Status,
 		Kind:                g.Kind,
+		Platform:            g.Platform,
 		EnvironmentID:       g.EnvironmentID,
 		AdjudicationStatus:  g.AdjudicationStatus,
 		FirstSeen:           g.FirstSeen.Format(time.RFC3339),

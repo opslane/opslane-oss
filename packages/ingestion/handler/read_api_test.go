@@ -37,6 +37,17 @@ func TestIncidentJSONIncludesKind(t *testing.T) {
 	}
 }
 
+func TestToIncidentJSON_Platform(t *testing.T) {
+	platform := "python"
+	inc := toIncidentJSON(db.ErrorGroup{Platform: &platform})
+	if inc.Platform == nil || *inc.Platform != "python" {
+		t.Fatalf("platform = %v, want python", inc.Platform)
+	}
+	if got := toIncidentJSON(db.ErrorGroup{}); got.Platform != nil {
+		t.Fatalf("friction incident platform should marshal as absent, got %v", got.Platform)
+	}
+}
+
 func TestIncidentJSON_IncludesVerificationEvidenceAndCandidateDiff(t *testing.T) {
 	diff := "diff --git a/src/a.ts b/src/a.ts"
 	inc := toIncidentJSON(db.ErrorGroup{
