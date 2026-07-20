@@ -24,6 +24,13 @@ func TestRedactHeaders_SensitiveHeadersRedacted(t *testing.T) {
 		"X-Auth-Token":         "auth-value",
 		"X-Access-Token":       "access-value",
 		"X-Amz-Security-Token": "aws-value",
+		"Private-Token":        "gitlab-value",
+		"X-Gitlab-Token":       "gitlab-hook-value",
+		"X-Vault-Token":        "vault-value",
+		"X-Goog-Api-Key":       "goog-value",
+		"X-Refresh-Token":      "refresh-value",
+		"X-Session-Token":      "session-token-value",
+		"X-Session-Id":         "session-id-value",
 		"Content-Type":         "application/json",
 	}
 
@@ -32,7 +39,9 @@ func TestRedactHeaders_SensitiveHeadersRedacted(t *testing.T) {
 	sensitive := []string{
 		"Authorization", "Proxy-Authorization", "Authentication", "Cookie",
 		"Set-Cookie", "X-Api-Key", "X-CSRF-Token", "X-Auth-Token",
-		"X-Access-Token", "X-Amz-Security-Token",
+		"X-Access-Token", "X-Amz-Security-Token", "Private-Token",
+		"X-Gitlab-Token", "X-Vault-Token", "X-Goog-Api-Key",
+		"X-Refresh-Token", "X-Session-Token", "X-Session-Id",
 	}
 	for _, key := range sensitive {
 		if got[key] != "[REDACTED]" {
@@ -431,5 +440,42 @@ func TestRedactRecording(t *testing.T) {
 	// Non-JSON input falls back to string-level redaction (never returned verbatim).
 	if out := string(masking.RedactRecording([]byte("token ghp_rawleak2 here"))); strings.Contains(out, "ghp_rawleak2") {
 		t.Errorf("non-JSON recording not redacted: %s", out)
+	}
+}
+
+func TestRedactBreadcrumbs_RedactsFieldsOutsideData(t *testing.T) {
+	raw := []byte(`[{"type":"http","message":"token ghp_topLevelSecret123","headers":{"Authorization":"Bearer xoxb-top-secret"}}]`)
+	got := string(masking.RedactBreadcrumbs(raw))
+	for _, leak := range []string{"ghp_topLevelSecret123", "xoxb-top-secret"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("secret %q outside data survived breadcrumb redaction: %s", leak, got)
+		}
+	}
+	if !strings.Contains(got, `"type":"http"`) {
+		t.Errorf("benign field clobbered: %s", got)
+	}
+}
+
+func TestRedactBreadcrumbs_PreservesLargeIntegers(t *testing.T) {
+	raw := []byte(`[{"timestamp_ns":1721430000123456789,"data":{"status_code":200}}]`)
+	got := string(masking.RedactBreadcrumbs(raw))
+	if !strings.Contains(got, "1721430000123456789") {
+		t.Errorf("int64-scale value lost precision through redaction: %s", got)
+	}
+	if !strings.Contains(got, "200") {
+		t.Errorf("numeric data field clobbered: %s", got)
+	}
+}
+
+func TestRedactURL_NonHTTPSchemes(t *testing.T) {
+	for _, tc := range []struct{ in, leak string }{
+		{"connect to postgres://svc:dbpassword1@db.internal/app failed", "dbpassword1"},
+		{"redis://default:cachepw2@cache:6379 timed out", "cachepw2"},
+		{"amqp://guest:queuepw3@mq/vhost unreachable", "queuepw3"},
+	} {
+		got := masking.RedactURL(tc.in)
+		if strings.Contains(got, tc.leak) {
+			t.Errorf("RedactURL leaked DSN credential %q: %s", tc.leak, got)
+		}
 	}
 }

@@ -135,6 +135,8 @@ func TestFilterSensitiveHeaders(t *testing.T) {
 		"Authorization", "PROXY-AUTHORIZATION", "authentication",
 		"Cookie", "set-cookie", "x-api-key", "X-CSRF-Token",
 		"x-auth-token", "X-Access-Token", "x-amz-security-token",
+		"Private-Token", "x-gitlab-token", "X-Vault-Token",
+		"x-goog-api-key", "X-Refresh-Token", "x-session-token", "X-Session-Id",
 	} {
 		in[k] = json.RawMessage(`"secret"`)
 	}
@@ -144,5 +146,19 @@ func TestFilterSensitiveHeaders(t *testing.T) {
 	}
 	if _, ok := out["content-type"]; !ok {
 		t.Fatal("benign header must survive")
+	}
+}
+
+func TestSanitizeSampleContext_NonObjectRequest(t *testing.T) {
+	out := sanitizeSampleContext([]byte(`{"request":"GET /users/42","other":"ok"}`))
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("sanitized context is not an object: %v (%s)", err, out)
+	}
+	if _, exists := decoded["request"]; exists {
+		t.Fatalf("non-object request must be dropped, got %s", out)
+	}
+	if string(decoded["other"]) != `"ok"` {
+		t.Fatalf("benign sibling field clobbered: %s", out)
 	}
 }

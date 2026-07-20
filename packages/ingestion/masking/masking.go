@@ -1,6 +1,7 @@
 package masking
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -21,6 +22,13 @@ var sensitiveHeaders = map[string]struct{}{
 	"x-auth-token":         {},
 	"x-access-token":       {},
 	"x-amz-security-token": {},
+	"private-token":        {},
+	"x-gitlab-token":       {},
+	"x-vault-token":        {},
+	"x-goog-api-key":       {},
+	"x-refresh-token":      {},
+	"x-session-token":      {},
+	"x-session-id":         {},
 }
 
 // IsSensitiveHeader reports whether a header name (any case) must never be
@@ -35,7 +43,10 @@ func IsSensitiveHeader(name string) bool {
 // alphanumeric characters (the key material).
 var apiKeyPrefixRe = regexp.MustCompile(`(?i)(sk_live_|sk_test_|AKIA|ghp_|gho_|def_)[A-Za-z0-9]+`)
 
-var urlCredRe = regexp.MustCompile(`(?i)(https?://)[^/@\s:]+(?::[^/@\s]+)?@`)
+// urlCredRe matches userinfo credentials in any URI scheme, not just HTTP:
+// exception messages routinely embed DSNs (postgres://, redis://, amqp://)
+// with passwords in the authority section.
+var urlCredRe = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s:]+(?::[^/@\s]+)?@`)
 
 var urlSecretQueryRe = regexp.MustCompile(
 	`(?i)([?&](?:access_token|refresh_token|token|api_key|apikey|key|secret|password|sig|signature)=)[^&\s"']+`)
@@ -174,9 +185,13 @@ func RedactBreadcrumbs(breadcrumbs []byte) []byte {
 		return breadcrumbs
 	}
 
+	// UseNumber keeps int64-scale values (epoch-nanos timestamps, IDs) exact:
+	// a plain Unmarshal into interface{} would round-trip them through float64.
+	dec := json.NewDecoder(bytes.NewReader(breadcrumbs))
+	dec.UseNumber()
 	var crumbs []interface{}
-	if err := json.Unmarshal(breadcrumbs, &crumbs); err != nil {
-		// Not valid JSON array -- return unchanged.
+	if err := dec.Decode(&crumbs); err != nil {
+		// Not a valid JSON array -- return unchanged.
 		return breadcrumbs
 	}
 

@@ -347,6 +347,27 @@ func TestGetSampleEvent_TenantScopedRoundTrip(t *testing.T) {
 	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("hidden candidate's sample event must be pgx.ErrNoRows, got %v", err)
 	}
+
+	// Same-project wrong-group pointer must also be invisible: a stale
+	// sample_event_id must not serve another incident's evidence.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET status = 'new', adjudication_status = NULL WHERE id = $1`,
+		response["group_id"]); err != nil {
+		t.Fatalf("restore group visibility: %v", err)
+	}
+	other := postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:03Z","platform":"python","error":{"type":"KeyError","message":"different group","stack":"Traceback (most recent call last):\nKeyError: different group"},"breadcrumbs":[],"context":{}}`)
+	if other["group_id"] == response["group_id"] {
+		t.Fatal("wrong-group case needs a distinct group")
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET sample_event_id = $1 WHERE id = $2`,
+		other["event_id"], response["group_id"]); err != nil {
+		t.Fatalf("corrupt same-project sample pointer: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("same-project wrong-group sample pointer must be pgx.ErrNoRows, got %v", err)
+	}
 }
 
 func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
@@ -361,10 +382,13 @@ func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
 	// protection must redact the whole payload and remove sensitive header keys.
 	if _, err := pool.Exec(context.Background(),
 		`UPDATE error_events
-		 SET breadcrumbs = $2::jsonb, context = $3::jsonb
+		 SET breadcrumbs = $2::jsonb, context = $3::jsonb,
+		     error_message = $4, stack_trace_raw = $5
 		 WHERE id = $1`, posted["event_id"],
 		`[{"type":"http","message":"token ghp_historicalmessage","data":{"Proxy-Authorization":"historical-breadcrumb-secret","content-type":"application/json"}}]`,
-		`{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer historical-header-secret","content-type":"application/json"}},"nested":{"x-auth-token":"historical-context-secret"}}`); err != nil {
+		`{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer historical-header-secret","content-type":"application/json","Private-Token":"historical-gitlab-secret"}},"nested":{"x-auth-token":"historical-context-secret"}}`,
+		`connect to postgres://svc:histdbpassword@db.internal/app failed`,
+		"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\n    token ghp_stacksecret123\nValueError: endpoint sample"); err != nil {
 		t.Fatalf("seed historical secrets: %v", err)
 	}
 
@@ -390,7 +414,11 @@ func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
 	}
-	for _, leak := range []string{"historical-header-secret", "historical-breadcrumb-secret", "historical-context-secret", "ghp_historicalmessage"} {
+	for _, leak := range []string{
+		"historical-header-secret", "historical-breadcrumb-secret",
+		"historical-context-secret", "ghp_historicalmessage",
+		"historical-gitlab-secret", "histdbpassword", "ghp_stacksecret123",
+	} {
 		if strings.Contains(response.Body.String(), leak) {
 			t.Errorf("sample-event leaked %q: %s", leak, response.Body.String())
 		}

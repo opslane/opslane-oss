@@ -362,10 +362,13 @@ func (d *Dependencies) GetSampleEvent(w http.ResponseWriter, r *http.Request) {
 	response := sampleEventJSON{
 		Timestamp: event.Timestamp.Format(time.RFC3339),
 		Platform:  event.Platform,
+		// Error text is persisted verbatim (grouping fingerprints the raw
+		// values), so redact on the way out: exception messages and stack
+		// frames are common carriers of leaked tokens, DSNs, and JWTs.
 		Error: sampleErrorJSON{
-			Type:    event.ErrorType,
-			Message: event.ErrorMessage,
-			Stack:   event.StackTraceRaw,
+			Type:    masking.RedactBody(event.ErrorType),
+			Message: masking.RedactURL(masking.RedactBody(event.ErrorMessage)),
+			Stack:   masking.RedactURL(masking.RedactBody(event.StackTraceRaw)),
 		},
 		Breadcrumbs: normalizeSampleBreadcrumbs(event.Breadcrumbs),
 		Context:     sanitizeSampleContext(event.Context),

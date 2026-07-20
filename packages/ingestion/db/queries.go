@@ -860,14 +860,17 @@ type SampleEvent struct {
 
 // GetSampleEvent returns the sample event for a group, scoped to the project.
 // Ordinary candidate rows are hidden workflow records and stay invisible here.
-// The event-project join protects against a corrupt cross-project sample pointer.
+// The join requires the event to belong to the same project AND the same group:
+// sample_event_id has no FK, so a corrupt pointer must not serve another
+// tenant's event (cross-project) or another incident's evidence (same-project).
 func (q *Queries) GetSampleEvent(ctx context.Context, projectID, groupID string) (*SampleEvent, error) {
 	var ev SampleEvent
 	err := q.pool.QueryRow(ctx,
 		`SELECT e."timestamp", e.platform, e.error_type, e.error_message,
 		        e.stack_trace_raw, e.breadcrumbs, e.context
 		 FROM error_groups g
-		 JOIN error_events e ON e.id = g.sample_event_id AND e.project_id = g.project_id
+		 JOIN error_events e ON e.id = g.sample_event_id
+		   AND e.project_id = g.project_id AND e.error_group_id = g.id
 		 WHERE g.id = $1 AND g.project_id = $2
 		   AND (g.status <> 'candidate' OR g.adjudication_status = 'unchecked')`,
 		groupID, projectID,
