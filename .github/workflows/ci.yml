@@ -23,6 +23,13 @@ jobs:
   #   gh api repos/opslane/opslane-oss/branches/main/protection \
   #     --jq '.required_status_checks.contexts'
   #
+  # This workflow runs on `pull_request`, so the classifier, the ci-ok checker,
+  # and their tests all come from the PR head -- weakening the gate takes a
+  # coordinated edit across scripts/ci-changed-areas.mjs, scripts/check-ci-ok.mjs,
+  # and scripts/__tests__/, but it is a code-review control, not a CI one. The
+  # wire-fixtures gate uses pull_request_target precisely to avoid that; this
+  # one cannot, because it must diff the PR's own tree.
+  #
   # Push to main deliberately classifies nothing and turns every area on:
   # candidate-images is published off a green ci-ok, so it must be backed by a
   # full run, and a classifier mistake then shows up as a red main rather than

@@ -171,7 +171,12 @@ function workflowJobs(yml) {
   const jobsStart = yml.indexOf('\njobs:\n');
   assert.notEqual(jobsStart, -1, 'ci.yml must contain a jobs block');
   const jobsSection = yml.slice(jobsStart + '\njobs:\n'.length);
-  const matches = [...jobsSection.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)];
+  // Deliberately as permissive as GitHub's own job-id rules (underscores and
+  // uppercase are legal). A narrower pattern would make an unmatched job id
+  // invisible here, and the "every workflow job is covered" assertion below
+  // would pass while that job silently gated nothing.
+  const matches = [...jobsSection.matchAll(/^ {2}([A-Za-z_][A-Za-z0-9_-]*):$/gm)];
+  assert.ok(matches.length > 0, 'ci.yml must define at least one job');
   return new Map(matches.map((match, index) => {
     const end = matches[index + 1]?.index ?? jobsSection.length;
     return [match[1], jobsSection.slice(match.index, end)];
