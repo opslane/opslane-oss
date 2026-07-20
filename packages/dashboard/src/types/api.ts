@@ -129,6 +129,7 @@ export interface Incident {
   id: string;
   project_id: string;
   kind: 'error' | 'friction';
+  platform?: string | null;
   /** Present only on kind='friction': friction identity is environment-scoped. */
   environment_id?: string;
   /** Present only on kind='friction'; 'unchecked' flags an exhausted,
@@ -157,6 +158,18 @@ export interface Incident {
     session_id: string;
     error_at: string;
   };
+}
+
+export interface SampleEvent {
+  timestamp: string;
+  platform: string;
+  error: {
+    type: string;
+    message: string;
+    stack: string;
+  };
+  breadcrumbs: unknown[];
+  context: Record<string, unknown>;
 }
 
 // === Session replay browsing ===
@@ -239,6 +252,7 @@ export interface IncidentFilters {
   account_id?: string;
   end_user_id?: string;
   status?: string;
+  platform?: 'javascript' | 'python';
 }
 
 // === GitHub integration ===
