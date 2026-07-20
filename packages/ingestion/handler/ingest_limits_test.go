@@ -239,6 +239,19 @@ func TestRouter_OriginExemptionIsScopedToEvents(t *testing.T) {
 		t.Fatalf("/events must accept a header-less server SDK with 202, got %d", code)
 	}
 
+	// ...and the exemption is an exemption, not a removal: a browser-shaped
+	// request to the same route still meets the allowlist. Without this, a
+	// route wired with no origin middleware at all would pass this test.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", rawKey)
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("/events must still 403 a foreign browser origin, got %d", rec.Code)
+	}
+
 	// Every browser-only route must still reject the same header-less caller.
 	// These 403 from the middleware before the handler runs, so `{}` is a fine
 	// body for all of them.
