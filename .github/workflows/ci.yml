@@ -257,7 +257,13 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "53"
+          # The exact collected total, not a slack floor, so any silently
+          # dropped test trips it. Re-derive from an actual run's
+          # numTotalTests — NOT from `vitest list`, which does not expand
+          # it.each and undercounts (60 vs 75, the 24 REASON_CODES cases):
+          #   vitest run --reporter=json --outputFile=/tmp/e2e.json
+          #   node -e 'console.log(require("/tmp/e2e.json").numTotalTests)'
+          E2E_MIN_TESTS: "75"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
           # The environments/projects suites below are pinned for the same
