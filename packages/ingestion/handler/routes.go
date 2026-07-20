@@ -132,6 +132,7 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		// Incidents (session or SDK auth — CLI uses API key, dashboard uses JWT)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents", deps.ListIncidents)
 		r.With(deps.AuthenticateSessionOrSDK).Get("/projects/{projectID}/incidents/{incidentID}", deps.GetIncident)
+		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/incidents/{incidentID}/sample-event", deps.GetSampleEvent)
 		// === Project D: replay retrieval (project-scoped, dashboard JWT auth) ===
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/replays/{replayID}", deps.GetReplay)
 		// Always-on session browsing and bounded chunk playback.

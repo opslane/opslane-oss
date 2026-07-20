@@ -224,6 +224,9 @@ export interface Incident {
   id: string;
   project_id: string;
   kind: IncidentKind;
+  /** Platform wire token ('javascript', 'python', future tokens) for error
+   * incidents; null/absent for friction. */
+  platform?: string | null;
   /** Present only on kind='friction': friction identity is environment-scoped. */
   environment_id?: string;
   /** Present only on kind='friction'; 'unchecked' flags an exhausted
@@ -257,6 +260,21 @@ export interface Incident {
   merged_at?: string;
   resolved_at?: string;
   archived_at?: string;
+}
+
+/** Sample event for an error group, served by
+ * GET /projects/{projectId}/incidents/{incidentId}/sample-event. */
+export interface SampleEvent {
+  timestamp: string;
+  platform: string;
+  error: {
+    type: string;
+    message: string;
+    stack: string;
+  };
+  /** The read API normalizes non-array stored values to an empty array. */
+  breadcrumbs: unknown[];
+  context: Record<string, unknown>;
 }
 
 // === Source map upload ===

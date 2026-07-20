@@ -209,6 +209,15 @@ jobs:
       - run: pnpm --filter @opslane/shared --filter @opslane/worker --filter @opslane/dashboard build
       - name: Install Playwright chromium (browser smoke)
         run: pnpm --filter @opslane/test-e2e exec playwright install --with-deps chromium
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      # The python smoke serves test-fixtures/flask-app with the real SDK.
+      # Without flask its live leg skips, and the skip gate below fails the
+      # job rather than letting Python coverage silently disappear. Flask is
+      # pinned to the fixture's requirements.txt.
+      - name: Install Flask for the python SDK smoke
+        run: python -m pip install 'flask==3.0.3'
       - name: Assert the LLM key is absent
         run: |
           if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -237,6 +246,9 @@ jobs:
           MINIO_ACCESS_KEY: minio
           MINIO_SECRET_KEY: minio12345
           MINIO_BUCKET: opslane-replays
+          # Interpreter the python smoke serves the Flask fixture with; the
+          # setup-python step above put flask in it.
+          OPSLANE_PYTHON: python
         run: >
           pnpm --filter @opslane/test-e2e exec vitest run
           --reporter=default --reporter=json
@@ -245,7 +257,7 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "37"
+          E2E_MIN_TESTS: "46"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
           # The environments/projects suites below are pinned for the same
@@ -255,11 +267,15 @@ jobs:
           # switch, and SDK environment payload work in a real browser. Without
           # pinning, a skipIf regression (missing INGESTION_URL or Chromium)
           # would silently drop them while the total count still passed.
+          # The python smoke's live leg is pinned for the same reason: it
+          # self-skips without flask, and a skip here is a coverage hole.
           E2E_REQUIRED_PATTERNS: |
             ^browser smoke: Vue error to needs_human >
             ^browser smoke: React error to needs_human >
             ^browser smoke: rage click to friction signal >
             ^notifications contract
+            ^python SDK live smoke \(Flask fixture → ingestion\) >
+            ^python wire adversarial \(hostile non-SDK client\) >
             ^first-class environment ingestion > keeps one group across key environments
             ^first-class environment ingestion > resolves opted-in names and accepts disabled, unknown, and invalid
             ^first-class environment ingestion > supports out-of-order events, makes the existing same-project session

@@ -1,6 +1,7 @@
 package masking
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -11,18 +12,41 @@ const redacted = "[REDACTED]"
 // sensitiveHeaders is the set of HTTP header names whose values must be
 // redacted before persistence. Comparison is case-insensitive.
 var sensitiveHeaders = map[string]struct{}{
-	"authorization": {},
-	"cookie":        {},
-	"set-cookie":    {},
-	"x-api-key":     {},
-	"x-csrf-token":  {},
+	"authorization":        {},
+	"proxy-authorization":  {},
+	"authentication":       {},
+	"cookie":               {},
+	"set-cookie":           {},
+	"x-api-key":            {},
+	"x-csrf-token":         {},
+	"x-auth-token":         {},
+	"x-access-token":       {},
+	"x-amz-security-token": {},
+	"private-token":        {},
+	"x-gitlab-token":       {},
+	"x-vault-token":        {},
+	"x-goog-api-key":       {},
+	"x-refresh-token":      {},
+	"x-session-token":      {},
+	"x-session-id":         {},
+}
+
+// IsSensitiveHeader reports whether a header name (any case) must never be
+// exposed or persisted in cleartext. It is the single source of truth for
+// write-side redaction and read-side filtering.
+func IsSensitiveHeader(name string) bool {
+	_, ok := sensitiveHeaders[strings.ToLower(name)]
+	return ok
 }
 
 // apiKeyPrefixRe matches well-known API key prefixes followed by
 // alphanumeric characters (the key material).
 var apiKeyPrefixRe = regexp.MustCompile(`(?i)(sk_live_|sk_test_|AKIA|ghp_|gho_|def_)[A-Za-z0-9]+`)
 
-var urlCredRe = regexp.MustCompile(`(?i)(https?://)[^/@\s:]+(?::[^/@\s]+)?@`)
+// urlCredRe matches userinfo credentials in any URI scheme, not just HTTP:
+// exception messages routinely embed DSNs (postgres://, redis://, amqp://)
+// with passwords in the authority section.
+var urlCredRe = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s:]+(?::[^/@\s]+)?@`)
 
 var urlSecretQueryRe = regexp.MustCompile(
 	`(?i)([?&](?:access_token|refresh_token|token|api_key|apikey|key|secret|password|sig|signature)=)[^&\s"']+`)
@@ -44,7 +68,7 @@ var passwordFieldRe = regexp.MustCompile(
 func RedactHeaders(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for k, v := range headers {
-		if _, ok := sensitiveHeaders[strings.ToLower(k)]; ok {
+		if IsSensitiveHeader(k) {
 			out[k] = redacted
 		} else {
 			out[k] = v
@@ -128,7 +152,7 @@ func redactValue(v interface{}) interface{} {
 	case map[string]interface{}:
 		for k, child := range val {
 			lk := strings.ToLower(k)
-			if _, ok := sensitiveHeaders[lk]; ok {
+			if IsSensitiveHeader(lk) {
 				val[k] = redacted
 				continue
 			}
@@ -151,9 +175,9 @@ func redactValue(v interface{}) interface{} {
 	}
 }
 
-// RedactBreadcrumbs parses a JSON-encoded breadcrumbs array, redacts
-// any sensitive header-like data inside each breadcrumb's "data" field,
-// and returns the re-serialised JSON.
+// RedactBreadcrumbs parses a JSON-encoded breadcrumbs array, recursively
+// redacts sensitive keys and string values throughout every breadcrumb, and
+// returns the re-serialised JSON.
 //
 // If the input is nil, empty, or not valid JSON, it is returned as-is.
 func RedactBreadcrumbs(breadcrumbs []byte) []byte {
@@ -161,42 +185,17 @@ func RedactBreadcrumbs(breadcrumbs []byte) []byte {
 		return breadcrumbs
 	}
 
-	var crumbs []map[string]json.RawMessage
-	if err := json.Unmarshal(breadcrumbs, &crumbs); err != nil {
-		// Not valid JSON array -- return unchanged.
+	// UseNumber keeps int64-scale values (epoch-nanos timestamps, IDs) exact:
+	// a plain Unmarshal into interface{} would round-trip them through float64.
+	dec := json.NewDecoder(bytes.NewReader(breadcrumbs))
+	dec.UseNumber()
+	var crumbs []interface{}
+	if err := dec.Decode(&crumbs); err != nil {
+		// Not a valid JSON array -- return unchanged.
 		return breadcrumbs
 	}
 
-	for i, crumb := range crumbs {
-		dataRaw, ok := crumb["data"]
-		if !ok {
-			continue
-		}
-
-		// Parse data as map[string]interface{} to handle mixed-type values
-		// (e.g., {"Authorization": "Bearer x", "status_code": 200}).
-		var dataMap map[string]interface{}
-		if err := json.Unmarshal(dataRaw, &dataMap); err != nil {
-			// Data is not an object. Apply body-level redaction on raw JSON.
-			redactedRaw := RedactURL(RedactBody(string(dataRaw)))
-			crumbs[i]["data"] = json.RawMessage(redactedRaw)
-			continue
-		}
-
-		// Recurse so nested header/token values (e.g.
-		// data.request.headers.Authorization) are redacted too, not just
-		// top-level keys. redactValue walks maps/arrays, redacts sensitive
-		// keys at any depth, and scrubs every string value.
-		redactedData := redactValue(dataMap)
-
-		encoded, err := json.Marshal(redactedData)
-		if err != nil {
-			continue
-		}
-		crumbs[i]["data"] = json.RawMessage(encoded)
-	}
-
-	out, err := json.Marshal(crumbs)
+	out, err := json.Marshal(redactValue(crumbs))
 	if err != nil {
 		return breadcrumbs
 	}

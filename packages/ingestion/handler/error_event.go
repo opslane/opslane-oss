@@ -202,10 +202,9 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 	environmentID = resolvedEnvironmentID
 
 	// Redact secrets before persistence. End-user identity was already extracted
-	// from raw context above, so B2B tracking remains intact. RedactBreadcrumbs only
-	// scrubs each crumb's "data" field, so layer RedactBody over the whole serialized
-	// array to also catch bare tokens/JWTs in free-text fields (e.g. "message"),
-	// matching the per-value coverage RedactContext already gives the context object.
+	// from raw context above, so B2B tracking remains intact. RedactBreadcrumbs walks
+	// the whole array; retain the serialized body/URL pass as defense in depth for
+	// malformed or future breadcrumb shapes.
 	breadcrumbs = masking.RedactURL(masking.RedactBody(string(masking.RedactBreadcrumbs([]byte(breadcrumbs)))))
 	ctx = string(masking.RedactContext([]byte(ctx)))
 

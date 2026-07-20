@@ -4,6 +4,7 @@ import type { Incident, IncidentFilters, ErrorGroupStatus } from '../types/api';
 import { listIncidents } from '../api';
 import { getProjectId, statusBadgeClass, statusLabel, formatDate } from '../utils';
 import { kindBadge } from '../components/incident-kind';
+import { platformBadge } from '../components/platform-badge';
 import { useTableSort } from '../composables/useTableSort';
 import FilterBar from '../components/FilterBar.vue';
 
@@ -107,7 +108,6 @@ onMounted(async () => {
     return;
   }
 
-  await fetchIncidents();
   startPolling();
 });
 
@@ -210,12 +210,21 @@ onUnmounted(() => stopPolling());
               </router-link>
             </td>
             <td class="py-2.5 px-4">
-              <span
-                class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
-                :class="kindBadge(incident.kind, incident.adjudication_status).class"
-                v-text="kindBadge(incident.kind, incident.adjudication_status).label"
-              >
-              </span>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span
+                  class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
+                  :class="kindBadge(incident.kind, incident.adjudication_status).class"
+                  v-text="kindBadge(incident.kind, incident.adjudication_status).label"
+                >
+                </span>
+                <span
+                  v-if="platformBadge(incident.platform)"
+                  class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
+                  :class="platformBadge(incident.platform)?.class"
+                  v-text="platformBadge(incident.platform)?.label"
+                >
+                </span>
+              </div>
             </td>
             <td class="py-2.5 px-4">
               <span

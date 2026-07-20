@@ -14,3 +14,14 @@ def health():
 @app.get("/boom")
 def boom():
     raise ValueError("seeded failure for SDK testing")
+
+
+@app.get("/boom-secret")
+def boom_secret():
+    """Raises with planted FAKE credentials (a DSN and a ghp_ token). The
+    python-smoke e2e asserts the read API serves this incident with both
+    values redacted; they must never appear in an API response."""
+    raise ValueError(
+        "connect to postgres://svc:plantedfakepassword@db.internal/app failed"
+        " (token ghp_plantedfakee2esecret123)"
+    )

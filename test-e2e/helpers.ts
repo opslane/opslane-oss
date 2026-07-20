@@ -508,6 +508,14 @@ export async function cleanupTenant(orgId: string): Promise<void> {
     `DELETE FROM error_events WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]
   );
+  // Events with context.user create affected-user junction rows that block
+  // the error_groups delete (no cascade).
+  await db.query(
+    `DELETE FROM error_group_affected_users WHERE error_group_id IN (
+       SELECT eg.id FROM error_groups eg JOIN projects p ON eg.project_id = p.id WHERE p.org_id = $1
+     )`,
+    [orgId]
+  );
   await db.query(
     `DELETE FROM error_groups WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]

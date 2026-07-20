@@ -37,6 +37,17 @@ func TestIncidentJSONIncludesKind(t *testing.T) {
 	}
 }
 
+func TestToIncidentJSON_Platform(t *testing.T) {
+	platform := "python"
+	inc := toIncidentJSON(db.ErrorGroup{Platform: &platform})
+	if inc.Platform == nil || *inc.Platform != "python" {
+		t.Fatalf("platform = %v, want python", inc.Platform)
+	}
+	if got := toIncidentJSON(db.ErrorGroup{}); got.Platform != nil {
+		t.Fatalf("friction incident platform should marshal as absent, got %v", got.Platform)
+	}
+}
+
 func TestIncidentJSON_IncludesVerificationEvidenceAndCandidateDiff(t *testing.T) {
 	diff := "diff --git a/src/a.ts b/src/a.ts"
 	inc := toIncidentJSON(db.ErrorGroup{
@@ -115,5 +126,39 @@ func TestIncidentJSON_AdjudicationFieldsOmittedForErrors(t *testing.T) {
 	if strings.Contains(string(data), "environment_id") ||
 		strings.Contains(string(data), "adjudication_status") {
 		t.Errorf("error incidents must omit adjudication fields, got %s", data)
+	}
+}
+
+func TestFilterSensitiveHeaders(t *testing.T) {
+	in := map[string]json.RawMessage{"content-type": json.RawMessage(`"application/json"`)}
+	for _, k := range []string{
+		"Authorization", "PROXY-AUTHORIZATION", "authentication",
+		"Cookie", "set-cookie", "x-api-key", "X-CSRF-Token",
+		"x-auth-token", "X-Access-Token", "x-amz-security-token",
+		"Private-Token", "x-gitlab-token", "X-Vault-Token",
+		"x-goog-api-key", "X-Refresh-Token", "x-session-token", "X-Session-Id",
+	} {
+		in[k] = json.RawMessage(`"secret"`)
+	}
+	out := filterSensitiveHeaders(in)
+	if len(out) != 1 {
+		t.Fatalf("expected only content-type to survive, got %v", out)
+	}
+	if _, ok := out["content-type"]; !ok {
+		t.Fatal("benign header must survive")
+	}
+}
+
+func TestSanitizeSampleContext_NonObjectRequest(t *testing.T) {
+	out := sanitizeSampleContext([]byte(`{"request":"GET /users/42","other":"ok"}`))
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("sanitized context is not an object: %v (%s)", err, out)
+	}
+	if _, exists := decoded["request"]; exists {
+		t.Fatalf("non-object request must be dropped, got %s", out)
+	}
+	if string(decoded["other"]) != `"ok"` {
+		t.Fatalf("benign sibling field clobbered: %s", out)
 	}
 }

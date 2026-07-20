@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
@@ -228,6 +231,380 @@ func TestIngest_NoPlatformDefaultsToJavascript(t *testing.T) {
 	}
 	if eventPlatform != "javascript" || groupPlatform != "javascript" {
 		t.Fatalf("platforms = event:%q group:%q, want javascript/javascript", eventPlatform, groupPlatform)
+	}
+}
+
+func TestIngest_PlatformReadBackThroughGroupQueries(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	groups, err := deps.Queries.ListErrorGroups(context.Background(), projectID, nil)
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Platform == nil || *groups[0].Platform != "python" {
+		t.Fatalf("ListErrorGroups platform = %+v, want python", groups)
+	}
+	group, err := deps.Queries.GetErrorGroup(context.Background(), projectID, response["group_id"])
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if group.Platform == nil || *group.Platform != "python" {
+		t.Fatalf("GetErrorGroup platform = %v, want python", group.Platform)
+	}
+}
+
+func TestListErrorGroups_PlatformFilter(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, envID, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"python-only","stack":"Traceback (most recent call last):\nValueError: python-only"},"breadcrumbs":[],"context":{}}`)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:01Z","platform":"javascript","error":{"type":"TypeError","message":"javascript-only","stack":"at fn (/src/app.js:1:1)"},"breadcrumbs":[],"context":{}}`)
+	// Environment-scoped, matching real friction identity: this makes the
+	// friction arm of the environment-scoped query actually participate, so a
+	// platform filter has something to suppress.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO error_groups (project_id, environment_id, fingerprint, title, first_seen, last_seen, kind, status)
+		 VALUES ($1, $2, $3, 'friction-only', now(), now(), 'friction', 'insight')`,
+		projectID, envID, "friction-"+t.Name()); err != nil {
+		t.Fatalf("insert friction incident: %v", err)
+	}
+
+	python := "python"
+	got, err := deps.Queries.ListErrorGroups(context.Background(), projectID, &db.ErrorGroupFilters{Platform: python})
+	if err != nil {
+		t.Fatalf("list python groups: %v", err)
+	}
+	if len(got) != 1 || got[0].Platform == nil || *got[0].Platform != python || got[0].Kind != "error" {
+		t.Fatalf("platform-filtered groups = %+v, want one python error", got)
+	}
+
+	all, err := deps.Queries.ListErrorGroups(context.Background(), projectID, nil)
+	if err != nil {
+		t.Fatalf("list all groups: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("unfiltered groups = %+v, want python, javascript, and friction", all)
+	}
+
+	// Environment-scoped listing takes a different query (a rollup CTE with a
+	// separate friction arm), so the platform filter must be asserted there too.
+	scoped, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{Platform: python, EnvironmentID: &envID})
+	if err != nil {
+		t.Fatalf("list python groups in environment: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].Platform == nil || *scoped[0].Platform != python || scoped[0].Kind != "error" {
+		t.Fatalf("environment+platform groups = %+v, want one python error", scoped)
+	}
+
+	// Unfiltered, the same environment must still surface the friction row —
+	// otherwise the assertion above would pass even if the friction arm were
+	// broken for every query rather than suppressed only by the platform filter.
+	scopedAll, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{EnvironmentID: &envID})
+	if err != nil {
+		t.Fatalf("list all groups in environment: %v", err)
+	}
+	var scopedFriction int
+	for _, group := range scopedAll {
+		if group.Kind == "friction" {
+			scopedFriction++
+		}
+	}
+	if len(scopedAll) != 3 || scopedFriction != 1 {
+		t.Fatalf("environment-scoped groups = %+v, want both errors and the friction row", scopedAll)
+	}
+}
+
+func TestListIncidents_PlatformQueryParam(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"python-http","stack":"Traceback (most recent call last):\nValueError: python-http"},"breadcrumbs":[],"context":{}}`)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:01Z","platform":"javascript","error":{"type":"TypeError","message":"javascript-http","stack":"at fn (/src/http.js:1:1)"},"breadcrumbs":[],"context":{}}`)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?platform=python", nil)
+	req.Header.Set("X-API-Key", rawKey)
+	response := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("platform-only request = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	var incidents []struct {
+		Platform *string `json:"platform"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&incidents); err != nil {
+		t.Fatalf("decode incidents: %v", err)
+	}
+	if len(incidents) != 1 || incidents[0].Platform == nil || *incidents[0].Platform != "python" {
+		t.Fatalf("platform-filtered response = %+v, want one python incident", incidents)
+	}
+
+	badReq := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?platform=Not%20A%20Token", nil)
+	badReq.Header.Set("X-API-Key", rawKey)
+	badResponse := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(badResponse, badReq)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid platform = %d (%s), want 400", badResponse.Code, badResponse.Body.String())
+	}
+}
+
+func TestGetSampleEvent_TenantScopedRoundTrip(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","runtime":{"name":"cpython","version":"3.12.1"},"error":{"type":"ValueError","message":"No row was found","stack":"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\n    raise ValueError()\nValueError: No row was found"},"breadcrumbs":[{"type":"log","timestamp":"t","category":"app","level":"warning","message":"near expiry"}],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	ev, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"])
+	if err != nil {
+		t.Fatalf("get sample event: %v", err)
+	}
+	if ev.ErrorType != "ValueError" || ev.Platform != "python" ||
+		!strings.HasPrefix(ev.StackTraceRaw, "Traceback") {
+		t.Fatalf("unexpected sample event: %+v", ev)
+	}
+	_, otherProject, _, _ := seedTenant(t, deps.Queries)
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), otherProject, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("cross-project sample event read must be pgx.ErrNoRows, got %v", err)
+	}
+
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET status = 'candidate', adjudication_status = NULL WHERE id = $1`,
+		response["group_id"]); err != nil {
+		t.Fatalf("hide group as ordinary candidate: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("hidden candidate's sample event must be pgx.ErrNoRows, got %v", err)
+	}
+
+	// Same-project wrong-group pointer must also be invisible: a stale
+	// sample_event_id must not serve another incident's evidence.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET status = 'new', adjudication_status = NULL WHERE id = $1`,
+		response["group_id"]); err != nil {
+		t.Fatalf("restore group visibility: %v", err)
+	}
+	other := postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:03Z","platform":"python","error":{"type":"KeyError","message":"different group","stack":"Traceback (most recent call last):\nKeyError: different group"},"breadcrumbs":[],"context":{}}`)
+	if other["group_id"] == response["group_id"] {
+		t.Fatal("wrong-group case needs a distinct group")
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET sample_event_id = $1 WHERE id = $2`,
+		other["event_id"], response["group_id"]); err != nil {
+		t.Fatalf("corrupt same-project sample pointer: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("same-project wrong-group sample pointer must be pgx.ErrNoRows, got %v", err)
+	}
+}
+
+func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
+	deps, pool := testDeps(t)
+	orgID, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	deps.JWTSecret = []byte(authTestJWTSecret)
+	router := handler.NewRouter(deps)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"endpoint sample","stack":"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\nValueError: endpoint sample"},"breadcrumbs":[{"type":"log","message":"near expiry"}],"context":{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer client-secret","content-type":"application/json"}}}}`
+	posted := postErrorPayload(t, deps, rawKey, body)
+
+	// Simulate a historical row written before the expanded deny-list. Read-side
+	// protection must redact the whole payload and remove sensitive header keys.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_events
+		 SET breadcrumbs = $2::jsonb, context = $3::jsonb,
+		     error_message = $4, stack_trace_raw = $5
+		 WHERE id = $1`, posted["event_id"],
+		`[{"type":"http","message":"token ghp_historicalmessage","data":{"Proxy-Authorization":"historical-breadcrumb-secret","content-type":"application/json"}}]`,
+		`{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer historical-header-secret","content-type":"application/json","Private-Token":"historical-gitlab-secret"}},"nested":{"x-auth-token":"historical-context-secret"}}`,
+		`connect to postgres://svc:histdbpassword@db.internal/app failed`,
+		"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\n    token ghp_stacksecret123\nValueError: endpoint sample"); err != nil {
+		t.Fatalf("seed historical secrets: %v", err)
+	}
+
+	token, err := auth.SignAccessToken([]byte(authTestJWTSecret), "sample-user", orgID, "sample@example.com")
+	if err != nil {
+		t.Fatalf("sign session token: %v", err)
+	}
+	get := func(path string, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+	path := "/api/v1/projects/" + projectID + "/incidents/" + posted["group_id"] + "/sample-event"
+	response := get(path, map[string]string{"Authorization": "Bearer " + token})
+	if response.Code != http.StatusOK {
+		t.Fatalf("sample-event response = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
+	for _, leak := range []string{
+		"historical-header-secret", "historical-breadcrumb-secret",
+		"historical-context-secret", "ghp_historicalmessage",
+		"historical-gitlab-secret", "histdbpassword", "ghp_stacksecret123",
+	} {
+		if strings.Contains(response.Body.String(), leak) {
+			t.Errorf("sample-event leaked %q: %s", leak, response.Body.String())
+		}
+	}
+	var sample struct {
+		Error struct {
+			Type  string `json:"type"`
+			Stack string `json:"stack"`
+		} `json:"error"`
+		Breadcrumbs []map[string]any `json:"breadcrumbs"`
+		Context     map[string]any   `json:"context"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&sample); err != nil {
+		t.Fatalf("decode sample event: %v", err)
+	}
+	if sample.Error.Type != "ValueError" || !strings.HasPrefix(sample.Error.Stack, "Traceback") || len(sample.Breadcrumbs) != 1 {
+		t.Fatalf("unexpected sample event: %+v", sample)
+	}
+	requestContext, ok := sample.Context["request"].(map[string]any)
+	if !ok || requestContext["remote_addr"] != "203.0.113.9" {
+		t.Fatalf("request context = %#v", sample.Context["request"])
+	}
+	headers, ok := requestContext["headers"].(map[string]any)
+	if !ok || headers["content-type"] != "application/json" {
+		t.Fatalf("filtered headers = %#v", requestContext["headers"])
+	}
+	if _, exists := headers["Authorization"]; exists {
+		t.Fatalf("Authorization header survived: %#v", headers)
+	}
+
+	unknown := get("/api/v1/projects/"+projectID+"/incidents/"+uuid.NewString()+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown incident = %d (%s), want 404", unknown.Code, unknown.Body.String())
+	}
+	sibling, err := deps.Queries.CreateProject(context.Background(), orgID, "sample-event-sibling", nil)
+	if err != nil {
+		t.Fatalf("create sibling project: %v", err)
+	}
+	crossProject := get("/api/v1/projects/"+sibling.ID+"/incidents/"+posted["group_id"]+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if crossProject.Code != http.StatusNotFound {
+		t.Fatalf("cross-project incident = %d (%s), want 404", crossProject.Code, crossProject.Body.String())
+	}
+	sdkResponse := get(path, map[string]string{"X-API-Key": rawKey})
+	if sdkResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("SDK-key sample event = %d (%s), want 401", sdkResponse.Code, sdkResponse.Body.String())
+	}
+
+	// Lock the event-project join itself: sample_event_id has no same-project
+	// constraint, so a corrupt pointer must not expose another tenant's event.
+	_, _, _, otherRawKey := seedTenant(t, deps.Queries)
+	otherEvent := postErrorPayload(t, deps, otherRawKey,
+		`{"timestamp":"2026-07-19T00:00:02Z","platform":"python","error":{"type":"SecretError","message":"other tenant","stack":"Traceback\nSecretError: other tenant"},"breadcrumbs":[],"context":{"secret":"other-tenant-secret"}}`)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET sample_event_id = $1 WHERE id = $2`,
+		otherEvent["event_id"], posted["group_id"]); err != nil {
+		t.Fatalf("corrupt cross-project sample pointer: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, posted["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("corrupt cross-project sample pointer must be pgx.ErrNoRows, got %v", err)
+	}
+	corruptPointer := get(path, map[string]string{"Authorization": "Bearer " + token})
+	if corruptPointer.Code != http.StatusNotFound {
+		t.Fatalf("corrupt cross-project pointer = %d (%s), want 404", corruptPointer.Code, corruptPointer.Body.String())
+	}
+	if strings.Contains(corruptPointer.Body.String(), "other-tenant-secret") {
+		t.Fatalf("corrupt cross-project pointer leaked another tenant: %s", corruptPointer.Body.String())
+	}
+
+	malformed := postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:01Z","platform":"python","error":{"type":"RuntimeError","message":"malformed headers","stack":"Traceback\nRuntimeError: malformed headers"},"breadcrumbs":{},"context":{"request":{"headers":[["Authorization","array-secret"]]}}}`)
+	malformedResponse := get("/api/v1/projects/"+projectID+"/incidents/"+malformed["group_id"]+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if malformedResponse.Code != http.StatusOK {
+		t.Fatalf("malformed sample = %d (%s), want 200", malformedResponse.Code, malformedResponse.Body.String())
+	}
+	if strings.Contains(malformedResponse.Body.String(), "array-secret") {
+		t.Fatalf("malformed headers leaked: %s", malformedResponse.Body.String())
+	}
+	var malformedSample struct {
+		Breadcrumbs []any          `json:"breadcrumbs"`
+		Context     map[string]any `json:"context"`
+	}
+	if err := json.NewDecoder(malformedResponse.Body).Decode(&malformedSample); err != nil {
+		t.Fatalf("decode malformed sample: %v", err)
+	}
+	if malformedSample.Breadcrumbs == nil {
+		t.Fatal("non-array breadcrumbs must normalize to []")
+	}
+	if request, ok := malformedSample.Context["request"].(map[string]any); ok {
+		if headers, exists := request["headers"]; exists {
+			if headerMap, isMap := headers.(map[string]any); !isMap || len(headerMap) != 0 {
+				t.Fatalf("malformed headers must be dropped or empty, got %#v", headers)
+			}
+		}
+	}
+}
+
+func TestCrossStackEndUserTimeline(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:00Z","error":{"type":"TypeError","message":"cross-stack javascript","stack":"at jsFrame (/src/app.js:1:1)"},"breadcrumbs":[],"context":{"user":{"id":"cross-stack-user"}}}`)
+	postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:01Z","platform":"python","error":{"type":"ValueError","message":"cross-stack python","stack":"Traceback (most recent call last):\nValueError: cross-stack python"},"breadcrumbs":[],"context":{"user":{"id":"cross-stack-user"}}}`)
+
+	groups, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{EndUserID: "cross-stack-user"})
+	if err != nil {
+		t.Fatalf("list cross-stack groups: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("cross-stack groups = %+v, want two", groups)
+	}
+	wantPlatforms := map[string]bool{"javascript": false, "python": false}
+	for _, group := range groups {
+		if group.Platform == nil {
+			t.Fatalf("group missing platform: %+v", group)
+		}
+		if _, ok := wantPlatforms[*group.Platform]; !ok {
+			t.Fatalf("unexpected platform %q", *group.Platform)
+		}
+		wantPlatforms[*group.Platform] = true
+	}
+	for platform, seen := range wantPlatforms {
+		if !seen {
+			t.Errorf("data-layer timeline missing %s group", platform)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?end_user_id=cross-stack-user", nil)
+	req.Header.Set("X-API-Key", rawKey)
+	response := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("timeline response = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	var incidents []struct {
+		Platform string `json:"platform"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&incidents); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if len(incidents) != 2 {
+		t.Fatalf("HTTP timeline = %+v, want two incidents", incidents)
+	}
+	httpPlatforms := map[string]bool{}
+	for _, incident := range incidents {
+		httpPlatforms[incident.Platform] = true
+	}
+	if !httpPlatforms["javascript"] || !httpPlatforms["python"] {
+		t.Fatalf("HTTP timeline platforms = %+v, want javascript and python", httpPlatforms)
 	}
 }
 

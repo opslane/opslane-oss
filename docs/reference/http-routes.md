@@ -78,6 +78,7 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 | GET | `/api/v1/projects/{projectID}/sessions/{sessionID}` | Session detail and scrubbed chunk manifest |
 | GET | `/api/v1/projects/{projectID}/sessions/{sessionID}/chunks/{seq}` | Fetch one decoded, re-redacted scrubbed chunk |
 | GET | `/api/v1/projects/{projectID}/incidents/{incidentID}/affected-users` | Affected users |
+| GET | `/api/v1/projects/{projectID}/incidents/{incidentID}/sample-event` | Fetch the redacted representative error event for traceback, breadcrumbs, and request context |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/fix` | Trigger an eligible error or approved friction fix |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/resolve` | Resolve incident |
 | POST | `/api/v1/projects/{projectID}/incidents/{incidentID}/archive` | Archive incident |

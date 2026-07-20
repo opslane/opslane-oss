@@ -421,6 +421,7 @@ type ErrorGroup struct {
 	AffectedUsersCount   int
 	Status               string
 	Kind                 string
+	Platform             *string
 	EnvironmentID        *string
 	AdjudicationStatus   *string
 	ReasonCode           *string
@@ -749,6 +750,7 @@ type ErrorGroupFilters struct {
 	EndUserID     string  // filter by external_user_id via affected occurrences
 	Status        string  // filter by error group status
 	EnvironmentID *string // filter by environment UUID; nil means all environments
+	Platform      string  // filter by platform; implies kind='error' (friction incidents have no platform)
 }
 
 // ListErrorGroups returns error groups for a project with optional filters. Tenant-scoped.
@@ -756,7 +758,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 	args := []interface{}{projectID}
 	argIdx := 2
 
-	var environmentArg, statusArg, accountArg, endUserArg int
+	var environmentArg, statusArg, accountArg, endUserArg, platformArg int
 	if filters != nil && filters.EnvironmentID != nil && *filters.EnvironmentID != "" {
 		environmentArg = argIdx
 		args = append(args, *filters.EnvironmentID)
@@ -766,6 +768,11 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		if filters.Status != "" {
 			statusArg = argIdx
 			args = append(args, filters.Status)
+			argIdx++
+		}
+		if filters.Platform != "" {
+			platformArg = argIdx
+			args = append(args, filters.Platform)
 			argIdx++
 		}
 		if filters.AccountID != "" {
@@ -800,6 +807,9 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		if statusArg != 0 {
 			wheres = append(wheres, fmt.Sprintf("eg.status = $%d", statusArg))
 		}
+		if platformArg != 0 {
+			wheres = append(wheres, fmt.Sprintf("eg.platform = $%d AND eg.kind = 'error'", platformArg))
+		}
 		if accountArg != 0 || endUserArg != 0 {
 			wheres = append(wheres, fmt.Sprintf(`EXISTS (
 				SELECT 1
@@ -809,7 +819,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 			)`, identityPredicate("identity_user")))
 		}
 		query = `SELECT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
-		               eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		               eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind, eg.platform,
 		               eg.environment_id, eg.adjudication_status,
 		               eg.reason_code, eg.reason_message, eg.remediation,
 		               eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
@@ -837,6 +847,13 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 			statusClause := fmt.Sprintf("eg.status = $%d", statusArg)
 			errorWheres = append(errorWheres, statusClause)
 			frictionWheres = append(frictionWheres, statusClause)
+		}
+		if platformArg != 0 {
+			// A platform filter implies kind='error'. Friction incidents carry
+			// no platform, so their UNION arm must contribute nothing rather
+			// than relying on NULL comparison semantics to hide them.
+			errorWheres = append(errorWheres, fmt.Sprintf("eg.platform = $%d", platformArg))
+			frictionWheres = append(frictionWheres, "false")
 		}
 		if accountArg != 0 || endUserArg != 0 {
 			errorWheres = append(errorWheres, fmt.Sprintf(`(
@@ -884,7 +901,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 			 LIMIT 100)
 		)
 		SELECT eg.id, eg.project_id, eg.fingerprint, eg.title, candidates.first_seen, candidates.last_seen,
-		       candidates.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		       candidates.occurrence_count, eg.affected_users_count, eg.status, eg.kind, eg.platform,
 		       eg.environment_id, eg.adjudication_status,
 		       eg.reason_code, eg.reason_message, eg.remediation,
 		       eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
@@ -908,7 +925,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		var g ErrorGroup
 		err := rows.Scan(
 			&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind, &g.Platform,
 			&g.EnvironmentID, &g.AdjudicationStatus,
 			&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 			&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
@@ -1050,7 +1067,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 	var g ErrorGroup
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, project_id, fingerprint, title, first_seen, last_seen,
-		        occurrence_count, affected_users_count, status, kind,
+		        occurrence_count, affected_users_count, status, kind, platform,
 		        environment_id, adjudication_status,
 		        reason_code, reason_message, remediation,
 		        confidence, pr_url, root_cause, suggested_mitigation,
@@ -1064,7 +1081,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		groupID, projectID,
 	).Scan(
 		&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind, &g.Platform,
 		&g.EnvironmentID, &g.AdjudicationStatus,
 		&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 		&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
@@ -1080,6 +1097,42 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		return nil, fmt.Errorf("get error group: %w", err)
 	}
 	return &g, nil
+}
+
+// SampleEvent is the representative event for an error group, used by the
+// dashboard detail view. Tenant-scoped through the owning group's project_id.
+type SampleEvent struct {
+	Timestamp     time.Time
+	Platform      string
+	ErrorType     string
+	ErrorMessage  string
+	StackTraceRaw string
+	Breadcrumbs   []byte // JSONB passthrough
+	Context       []byte // JSONB passthrough
+}
+
+// GetSampleEvent returns the sample event for a group, scoped to the project.
+// Ordinary candidate rows are hidden workflow records and stay invisible here.
+// The join requires the event to belong to the same project AND the same group:
+// sample_event_id has no FK, so a corrupt pointer must not serve another
+// tenant's event (cross-project) or another incident's evidence (same-project).
+func (q *Queries) GetSampleEvent(ctx context.Context, projectID, groupID string) (*SampleEvent, error) {
+	var ev SampleEvent
+	err := q.pool.QueryRow(ctx,
+		`SELECT e."timestamp", e.platform, e.error_type, e.error_message,
+		        e.stack_trace_raw, e.breadcrumbs, e.context
+		 FROM error_groups g
+		 JOIN error_events e ON e.id = g.sample_event_id
+		   AND e.project_id = g.project_id AND e.error_group_id = g.id
+		 WHERE g.id = $1 AND g.project_id = $2
+		   AND (g.status <> 'candidate' OR g.adjudication_status = 'unchecked')`,
+		groupID, projectID,
+	).Scan(&ev.Timestamp, &ev.Platform, &ev.ErrorType, &ev.ErrorMessage,
+		&ev.StackTraceRaw, &ev.Breadcrumbs, &ev.Context)
+	if err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
 
 // GroupEnvironment is one environment-specific occurrence summary for an

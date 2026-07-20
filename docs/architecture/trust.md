@@ -63,8 +63,7 @@ object at completion, so an upload interrupted before completion leaves the raw
 recording in storage. That path is retired once error replays resolve to chunk
 pointers.
 
-For error events, ingestion also replaces sensitive headers, well-known API-key
-prefixes, and URL-embedded credentials with `[REDACTED]` before persistence.
+For error events, ingestion redacts breadcrumbs and context (sensitive headers, API-key prefixes, URL-embedded credentials) before persistence. Error messages and stack traces are stored verbatim to preserve grouping fingerprints, then redacted when served.
 
 See [replay privacy and masking](../guides/replay-privacy.md) for what replay data may contain.
 
