@@ -1,9 +1,45 @@
+import type { AdminOverview } from './types/api';
+
+type AdminOnboardingOverview = NonNullable<AdminOverview['onboarding']>;
+type OnboardingStageKey =
+  | 'started'
+  | 'auth_clicked'
+  | 'completed'
+  | 'key_claimed'
+  | 'first_event_received';
+
+export interface OnboardingFunnelStage {
+  key: OnboardingStageKey;
+  label: string;
+  value: number;
+  pctOfFirst: number;
+}
+
 export function formatDuration(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return '\u2014';
   if (seconds < 1) return '<1s';
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
   return `${Math.floor(seconds / 3_600)}h ${Math.round((seconds % 3_600) / 60)}m`;
+}
+
+export function onboardingFunnelStages(onboarding: AdminOnboardingOverview): OnboardingFunnelStage[] {
+  const stages: Array<{ key: OnboardingStageKey; label: string }> = [
+    { key: 'started', label: 'Started' },
+    { key: 'auth_clicked', label: 'Auth clicked' },
+    { key: 'completed', label: 'Completed' },
+    { key: 'key_claimed', label: 'Key claimed' },
+    { key: 'first_event_received', label: 'Project activated' },
+  ];
+
+  return stages.map(({ key, label }) => ({
+    key,
+    label,
+    value: onboarding[key],
+    pctOfFirst: onboarding.started === 0
+      ? 0
+      : Math.round((onboarding[key] / onboarding.started) * 100),
+  }));
 }
 
 // Keep the shared statuses aligned with statusBadgeClass in utils.ts so the

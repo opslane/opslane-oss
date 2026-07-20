@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { adminStatusBadgeClass, formatDuration } from './admin-format';
+import { adminStatusBadgeClass, formatDuration, onboardingFunnelStages } from './admin-format';
 
 describe('admin formatting', () => {
   it('formats nullable job durations without implying pending jobs completed', () => {
@@ -16,5 +16,40 @@ describe('admin formatting', () => {
   it('distinguishes draft PRs from ready PRs', () => {
     expect(adminStatusBadgeClass('pr_draft')).toContain('text-amber');
     expect(adminStatusBadgeClass('pr_created')).toContain('text-green');
+  });
+
+  it('formats the onboarding funnel in order with conversion from started', () => {
+    const stages = onboardingFunnelStages({
+      started: 10,
+      auth_clicked: 8,
+      completed: 6,
+      key_claimed: 4,
+      first_event_received: 3,
+      failed: 2,
+      by_failure_reason: {},
+    });
+
+    expect(stages.map(({ key }) => key)).toEqual([
+      'started',
+      'auth_clicked',
+      'completed',
+      'key_claimed',
+      'first_event_received',
+    ]);
+    expect(stages.map(({ pctOfFirst }) => pctOfFirst)).toEqual([100, 80, 60, 40, 30]);
+  });
+
+  it('reports zero conversion rather than NaN when no onboarding sessions started', () => {
+    const stages = onboardingFunnelStages({
+      started: 0,
+      auth_clicked: 0,
+      completed: 0,
+      key_claimed: 0,
+      first_event_received: 0,
+      failed: 0,
+      by_failure_reason: {},
+    });
+
+    expect(stages.map(({ pctOfFirst }) => pctOfFirst)).toEqual([0, 0, 0, 0, 0]);
   });
 });
