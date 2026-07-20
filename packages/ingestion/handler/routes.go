@@ -81,7 +81,7 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		// Browser endpoints (replays, sessions, chunks) are origin-gated
 		// strictly. /events also accepts server-side SDKs, which send no
 		// Origin or Referer (#104). Sourcemaps are uploaded at build time from
-		// Node (no Origin header), so EnforceOrigin is not applied there.
+		// Node (no Origin header), so no origin middleware is applied there.
 		r.With(deps.AuthenticateSDK, deps.EnforceOriginAllowingServerSDK, rateLimitByProject(eventsLimiter)).Post("/events", deps.IngestEvent)
 		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/init", deps.ReplayInit)
 		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/{replayID}/complete", deps.ReplayComplete)

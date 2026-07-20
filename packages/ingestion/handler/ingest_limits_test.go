@@ -232,13 +232,28 @@ func TestRouter_OriginExemptionIsScopedToEvents(t *testing.T) {
 		return rec.Code
 	}
 
-	// /events: header-less server SDK is admitted (not 403).
-	if code := post("/api/v1/events", `{"timestamp":"2026-07-20T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"scoped","stack":"Traceback (most recent call last):\nValueError: scoped"},"breadcrumbs":[],"context":{}}`); code == http.StatusForbidden {
-		t.Fatalf("/events must not 403 a header-less server SDK, got %d", code)
+	// /events: header-less server SDK is fully accepted, not merely un-403ed.
+	// Asserting the exact 202 keeps an unrelated 400/401/500 from passing as a
+	// working exemption.
+	if code := post("/api/v1/events", `{"timestamp":"2026-07-20T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"scoped","stack":"Traceback (most recent call last):\nValueError: scoped"},"breadcrumbs":[],"context":{}}`); code != http.StatusAccepted {
+		t.Fatalf("/events must accept a header-less server SDK with 202, got %d", code)
 	}
 
-	// A browser-only route must still reject the same header-less caller.
-	if code := post("/api/v1/sessions/init", `{}`); code != http.StatusForbidden {
-		t.Fatalf("/sessions/init must still 403 a header-less caller, got %d", code)
+	// Every browser-only route must still reject the same header-less caller.
+	// These 403 from the middleware before the handler runs, so `{}` is a fine
+	// body for all of them.
+	browserOnly := []string{
+		"/api/v1/replays/init",
+		"/api/v1/replays/r1/complete",
+		"/api/v1/replays/r1/fail",
+		"/api/v1/sessions/init",
+		"/api/v1/sessions/s1/chunks/upload-url",
+		"/api/v1/sessions/s1/chunks/0/commit",
+		"/api/v1/sessions/s1/chunks/0/inline",
+	}
+	for _, path := range browserOnly {
+		if code := post(path, `{}`); code != http.StatusForbidden {
+			t.Errorf("%s must still 403 a header-less caller, got %d", path, code)
+		}
 	}
 }
