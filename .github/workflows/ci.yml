@@ -13,8 +13,88 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Classifies the PR's changed files into the areas the heavy jobs gate on.
+  #
+  # INVARIANT this design depends on: ci-ok and wire-fixtures are the ONLY
+  # required status checks on main. A job-level `if:` that evaluates false
+  # reports SUCCESS to the status API, not pending -- so if an individual job
+  # below is ever marked required directly, a filtered-out PR would pass with
+  # that check green and nothing behind it. Check before changing:
+  #   gh api repos/opslane/opslane-oss/branches/main/protection \
+  #     --jq '.required_status_checks.contexts'
+  #
+  # This workflow runs on `pull_request`, so the classifier, the ci-ok checker,
+  # and their tests all come from the PR head -- weakening the gate takes a
+  # coordinated edit across scripts/ci-changed-areas.mjs, scripts/check-ci-ok.mjs,
+  # and scripts/__tests__/, but it is a code-review control, not a CI one. The
+  # wire-fixtures gate uses pull_request_target precisely to avoid that; this
+  # one cannot, because it must diff the PR's own tree.
+  #
+  # Push to main deliberately classifies nothing and turns every area on:
+  # candidate-images is published off a green ci-ok, so it must be backed by a
+  # full run, and a classifier mistake then shows up as a red main rather than
+  # a silent hole.
+  changes:
+    name: Classify changed files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.classify.outputs.go }}
+      js: ${{ steps.classify.outputs.js }}
+      python: ${{ steps.classify.outputs.python }}
+      e2e: ${{ steps.classify.outputs.e2e }}
+      reliability: ${{ steps.classify.outputs.reliability }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Classify
+        id: classify
+        env:
+          # base.sha is the base ref tip at event time; the three-dot diff
+          # below is what resolves the merge base from it. If main advanced
+          # since, the merge base is the same or older, so the file set is the
+          # same or larger -- wrong in the safe direction.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Not a pull request; running every area."
+            for area in go js python e2e reliability; do
+              echo "$area=true" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            echo "pull_request.base.sha is empty; cannot classify." >&2
+            exit 1
+          fi
+          # --no-renames: a detected rename reports only the destination, so
+          # moving an active file into docs/ could otherwise suppress the jobs
+          # that covered it. Without rename detection it is a delete plus an
+          # add, and both paths get classified.
+          git diff --no-renames --name-only -z "$BASE_SHA...HEAD" \
+            | node scripts/ci-changed-areas.mjs \
+            | tee -a "$GITHUB_OUTPUT"
+      - name: Summarize
+        run: |
+          {
+            echo "### Changed-file classification"
+            echo '```'
+            echo "go=${{ steps.classify.outputs.go }}"
+            echo "js=${{ steps.classify.outputs.js }}"
+            echo "python=${{ steps.classify.outputs.python }}"
+            echo "e2e=${{ steps.classify.outputs.e2e }}"
+            echo "reliability=${{ steps.classify.outputs.reliability }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   go:
     name: Go build and test
+    needs: [changes]
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -87,8 +167,44 @@ jobs:
           go test ./... -v 2>&1 | tee /tmp/go-test.log
           ../../scripts/check-go-skips.mjs /tmp/go-test.log
 
+  # Repo-wide static checks: docs drift/scope, action pinning, wire-fixture
+  # policy tests. Deliberately unconditional, and deliberately NOT inside the
+  # js job -- these are the checks that read docs/, .github/workflows/, and
+  # Go/worker/SDK source, so leaving them in js would make js un-skippable for
+  # almost every change. Keeping them always-on is also what makes it safe to
+  # skip everything else on a docs-only or workflow-only PR.
+  repo-checks:
+    name: Repo-wide checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # docs-sync's runnable-snippet tests reach test:repo through
+      # docs:map:test, and they type-check the docs' examples for real: each
+      # runs `pnpm build` inside test-fixtures/react-app or vue-app, which
+      # resolve @opslane/sdk over the workspace link and therefore need
+      # packages/sdk/dist on disk. This job used to be part of js, which ran
+      # `pnpm -r build` first and supplied that implicitly.
+      #
+      # Only the SDK is needed: it has no workspace dependencies of its own,
+      # and those two fixtures depend on nothing else in the repo. Should a
+      # future runnable snippet import another package, this job fails --
+      # it is always-on, so the gap surfaces immediately rather than rotting.
+      - run: pnpm --filter @opslane/sdk build
+      - run: pnpm test:repo
+
   js:
     name: JS build and test
+    needs: [changes]
+    if: needs.changes.outputs.js == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -122,12 +238,14 @@ jobs:
       - name: Install Playwright chromium (SDK browser tests)
         run: pnpm --filter @opslane/sdk exec playwright install --with-deps chromium
       - run: pnpm -r build
-      - run: pnpm test
+      - run: pnpm test:unit
       - name: License-boundary check (MIT-published packages)
         run: node scripts/check-licenses.mjs
 
   sdk-python:
     name: Python SDK tests (${{ matrix.python-version }})
+    needs: [changes]
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -169,22 +287,10 @@ jobs:
           persist-credentials: false
       - run: docker compose config --quiet
 
-  docker:
-    name: Docker build (${{ matrix.image }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [ingestion, worker]
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - run: docker build -f packages/${{ matrix.image }}/Dockerfile .
-
   e2e-keyless:
     name: Keyless smoke E2E
+    needs: [changes]
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -257,7 +363,13 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "46"
+          # The exact collected total, not a slack floor, so any silently
+          # dropped test trips it. Re-derive from an actual run's
+          # numTotalTests — NOT from `vitest list`, which does not expand
+          # it.each and undercounts (60 vs 75, the 24 REASON_CODES cases):
+          #   vitest run --reporter=json --outputFile=/tmp/e2e.json
+          #   node -e 'console.log(require("/tmp/e2e.json").numTotalTests)'
+          E2E_MIN_TESTS: "75"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
           # The environments/projects suites below are pinned for the same
@@ -269,6 +381,10 @@ jobs:
           # would silently drop them while the total count still passed.
           # The python smoke's live leg is pinned for the same reason: it
           # self-skips without flask, and a skip here is a coverage hole.
+          # The origin-allowlist cases are pinned individually rather than by
+          # suite prefix: they carry the #104 security contract, and a suite
+          # prefix would let the rejection cases be deleted while the accepted
+          # case alone keeps the pattern matching.
           E2E_REQUIRED_PATTERNS: |
             ^browser smoke: Vue error to needs_human >
             ^browser smoke: React error to needs_human >
@@ -282,6 +398,13 @@ jobs:
             ^dashboard environment filtering > gates readiness and filters incidents, detail chips, and sessions in real Chromium
             ^first-class projects dashboard > switches safely from a deep link and provisions a usable project key
             ^SDK environment browser contract > sends the configured name through real Chromium
+            ^origin allowlist with a server-side SDK > accepts a backend event that carries no Origin or Referer$
+            ^origin allowlist with a server-side SDK > accepts a browser event from an allowlisted origin$
+            ^origin allowlist with a server-side SDK > rejects a browser event from an origin not on the list$
+            ^origin allowlist with a server-side SDK > rejects a referer-only event from an origin not on the list$
+            ^origin allowlist with a server-side SDK > keeps browser-only routes strict for header-less callers$
+            ^real Chromium always sends Origin to /events > rejects a page whose origin is not on the allowlist$
+            ^real Chromium always sends Origin to /events > accepts the same page once its origin is allowlisted$
         run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
       - name: Token-leak scan over logs and public HTTP surfaces
         run: |
@@ -306,6 +429,8 @@ jobs:
 
   reliability-system:
     name: Deterministic event-to-PR reliability
+    needs: [changes]
+    if: needs.changes.outputs.reliability == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -328,7 +453,7 @@ jobs:
         run: docker compose down -v
 
   security:
-    name: Secret scan and action pinning
+    name: Secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -340,23 +465,24 @@ jobs:
           docker run --rm -v "$PWD:/repo:ro"
           ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
           dir /repo --config /repo/.gitleaks.toml --no-banner --redact
-      - name: Enforce SHA-pinned actions
-        run: node scripts/check-action-pins.mjs
-
   ci-ok:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security, sdk-python]
+    needs: [changes, repo-checks, go, js, sdk-python, compose, e2e-keyless, reliability-system, security]
     if: always()
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Report job results
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: echo "$RESULTS"
-      - name: Fail on any failed, cancelled, or skipped required job
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
-        run: exit 1
+      - name: Verify every job ran or skipped exactly as classified
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/check-ci-ok.mjs
 
   # Candidate images: only on push to main, only after ci-ok. The unique tag
   # main-<sha>-<run-id>-<attempt> IS the candidate's identity (no stored

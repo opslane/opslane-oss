@@ -1,6 +1,6 @@
 # HTTP routes
 
-All routes registered by the ingestion API (`packages/ingestion/handler/routes.go`). Auth column legend: **none** (public), **poll token** (`X-Opslane-Poll-Token` for one agent session), **SDK** (`X-API-Key` per-environment key; browser endpoints also origin-gated and rate-limited per project), **session** (dashboard JWT cookie or CLI token), **either** (session or SDK).
+All routes registered by the ingestion API (`packages/ingestion/handler/routes.go`). Auth column legend: **none** (public), **poll token** (`X-Opslane-Poll-Token` for one agent session), **SDK** (`X-API-Key` per-environment key; rate-limited per project, and origin-gated — unconditionally on the browser-only endpoints, and on `/api/v1/events` only when the request presents `Origin` or `Referer`), **session** (dashboard JWT cookie or CLI token), **either** (session or SDK).
 
 These are curated tables, not a stability contract — the API is early-stage and may change. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `routes.go` disagree.
 
@@ -35,7 +35,7 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 
 | Method | Path | Origin-gated | Purpose |
 | --- | --- | --- | --- |
-| POST | `/api/v1/events` | yes | Ingest an error event; optional payload `environment` is project-gated and falls back to the key environment |
+| POST | `/api/v1/events` | browser callers only | Ingest an error event; optional payload `environment` is project-gated and falls back to the key environment |
 | POST | `/api/v1/replays/init` | yes | Begin a replay upload |
 | POST | `/api/v1/replays/{replayID}/complete` | yes | Finish a replay upload |
 | POST | `/api/v1/replays/{replayID}/fail` | yes | Record a replay upload failure |
