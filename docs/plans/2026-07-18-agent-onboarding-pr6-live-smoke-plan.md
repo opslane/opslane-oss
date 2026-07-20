@@ -2,7 +2,7 @@
 
 > **Execution:** task-by-task (Claude: `superpowers:executing-plans`; other executors follow the same flow). Tasks marked **HUMAN** need the founder at a browser logged into GitHub as `abhishekray07` — the executor must stop and wait at each one.
 
-> **Status:** Revised after two Codex review rounds (round 1: 6 P0, 9 P1, 6 P2; round 2: 4 carry-overs + 1 P0, 4 P1 new — all folded in).
+> **Status:** EXECUTED GREEN 2026-07-19 (PDT). Revised after two Codex review rounds (round 1: 6 P0, 9 P1, 6 P2; round 2: 4 carry-overs + 1 P0, 4 P1 new — all folded in). Evidence and execution findings below; three runbook corrections from the live run are annotated inline.
 
 **Goal:** Prove the entire agent-first onboarding loop works live, exactly as an agent would drive it: `setup --start` → human GitHub authorization → poll (server redelivery contract proven over raw HTTP, then CLI claim) → apply `snippet` patches + env file → real browser error → event ingested at `/api/v1/events` (202, network-captured) → `verify` reports `has_events: true` → admin funnel reads exactly `started 1 / auth_clicked 1 / completed 1 / key_claimed 1 / first_event_received 1 / failed 0`.
 
@@ -341,7 +341,8 @@ python3 -c "
 import json, os
 d = json.load(open(os.path.expanduser('~/.opslane/smoke/snippet.json')))
 patches = d.get('patches', [])
-assert patches and any('main.tsx' in (p.get('file') or p.get('path') or '') for p in patches), 'EMPTY/WRONG patches — Step 1 skipped or codemod regressed'
+# Field is file_path (verified in execution — file/path are wrong keys)
+assert patches and any('main.tsx' in str(p.get('file_path') or '') for p in patches), 'EMPTY/WRONG patches — Step 1 skipped or codemod regressed'
 assert 'localhost:8082' in json.dumps(d), 'endpoint override missing'
 print('snippet ok:', len(patches), 'patch(es), endpoint present')
 "
@@ -385,15 +386,20 @@ await page.goto('http://localhost:5199');
 await page.click('[data-testid="nav-profile"]');
 await page.click('[data-testid="load-profile-btn"]');
 await page.waitForSelector('[data-testid="boundary-fallback"]');
-await page.waitForTimeout(4000);   // allow SDK batching/flush
+await page.waitForTimeout(12000);  // SDK error flush is ~5-10s — 4s missed it in execution
 await browser.close();
 console.log(JSON.stringify(captured, null, 2));
 const ok = captured.some(c => c.status === 202 && c.body?.event_id && c.body?.group_id);
 if (!ok) { console.error('FAIL: no 202 /api/v1/events with event_id+group_id'); process.exit(1); }
 console.error('CAPTURE OK');
 EOF
+# ESM resolves imports from the SCRIPT's location, not cwd — the script must
+# live inside test-e2e/ for @opslane's @playwright/test to resolve (execution finding).
+cp "$HOME/.opslane/smoke/capture-event.mjs" "$REPO_ROOT/test-e2e/.smoke-capture.mjs"
 cd "$REPO_ROOT/test-e2e"
-node "$HOME/.opslane/smoke/capture-event.mjs"
+node .smoke-capture.mjs; RC=$?
+rm -f .smoke-capture.mjs
+exit $RC
 ```
 
 Expected: `CAPTURE OK` with a JSON array showing `POST …/api/v1/events` → status **202**, body with `event_id` + `group_id`. Paste that (sanitized) into evidence — the DB count alone doesn't prove the HTTP contract. (First run may need `cd test-e2e && pnpm exec playwright install chromium`.)
@@ -527,21 +533,27 @@ PR body: link the loop steps to the evidence, state the funnel numbers, list any
 
 ---
 
-## Evidence (filled in during execution)
+## Evidence (execution of 2026-07-19 PDT / 2026-07-20 UTC)
 
-_Empty until the smoke runs._
-
-| Step | Expected | Actual | Timestamp |
+| Step | Expected | Actual | Timestamp (UTC) |
 | --- | --- | --- | --- |
-| `setup --start` | 201 `auth_required`, `auth_url`, `poll_id` | | |
-| Human authorization | combined screen → success page | | |
-| Raw HTTP poll ×2 | both `completed`, identical key (hash prefix) | | |
-| CLI `setup --poll` | `completed`, credentials saved | | |
-| Second CLI poll | local `not_found`, exit 1 | | |
-| Snippet | non-empty `main.tsx` patch + endpoint + `.env.local` | | |
-| Events POST | **202**, `event_id` + `group_id` (Playwright capture) | | |
-| `verify` | `has_events: true` | | |
-| Funnel | 1/1/1/1/1, failed 0 | | |
+| `setup --start` | 201 `auth_required`, `auth_url`, `poll_id` | ✅ `{"status":"auth_required","auth_url":"http://localhost:8082/agent/auth/3c8486d2-…","poll_id":"3c8486d2-138f-441b-9d15-224e2c3f113d","poll_token":"<redacted>"}`; DB: `pending \| clicked=f \| v2=t` | 04:49 |
+| Human authorization | combined screen → success page | ✅ after one real retry (see Finding 1): "Done! Opslane is set up for **abhishekray07/opslane-smoke-fixture**." All four params (`code`, `installation_id=147720013`, `setup_action=install`, `state`) arrived at `/auth/github/callback` — Phase 0 contract held live | 04:57 |
+| Raw HTTP poll ×2 | both `completed`, identical key (hash prefix) | ✅ `redelivery OK — both polls completed, identical key (sha256 prefix 565035a342683f19)` | 04:58 |
+| CLI `setup --poll` | `completed`, credentials saved | ✅ `{"status":"completed","org_id":"32a46237-…","project_id":"92cfbff6-…","api_key":"<redacted sha256:565035a342683f19>"}` — same key hash as raw polls | 04:58 |
+| Second CLI poll | local `not_found`, exit 1 | ✅ `{"status":"not_found","poll_id":"3c8486d2-…"}`, exit code 1 | 04:58 |
+| Snippet | non-empty `main.tsx` patch + endpoint + `.env.local` | ✅ 1 patch, `file_path: "src/main.tsx"`, init uses `import.meta.env.VITE_OPSLANE_API_KEY` + `endpoint: 'http://localhost:8082'`; env → `.env.local` (`VITE_OPSLANE_API_KEY`, `<redacted>`) | 04:59 |
+| Events POST | **202**, `event_id` + `group_id` (Playwright capture) | ✅ `[{"url":"http://localhost:8082/api/v1/events","status":202,"body":{"event_id":"31f1b337-…","group_id":"62532ffd-…","error_group_id":"62532ffd-…"}}]` — `CAPTURE OK` | 05:06 |
+| `verify` | `has_events: true` | ✅ `{"status":"ok","api_reachable":true,"has_events":true,"message":"Connected. Events received."}` | 05:07 |
+| Funnel | 1/1/1/1/1, failed 0 | ✅ `{"started":1,"auth_clicked":1,"completed":1,"key_claimed":1,"first_event_received":1,"failed":0,"by_failure_reason":{}}` — exact | 05:07 |
+
+### Execution findings
+
+1. **[Real catch] App A lacked the "Email addresses: Read-only" account permission.** First authorization attempt: code exchange succeeded, then the mandatory-identity email check failed → 502 and the human saw "GitHub check failed — could not load your GitHub email addresses. Reopen the authorization link to retry." The session correctly stayed `pending` (PR 1's transient-vs-definitive threat rule, observed working live). Fix: grant the permission in App settings, approve the permission update on the installation, reopen the same auth link — succeeded within the same session's 15-minute window. **Consequence: the production App's required-permissions list must include Email addresses: read; Appendix A already encodes it (`emails: read`).**
+2. **[Runbook, fixed inline] Playwright capture script must live inside `test-e2e/`** — Node ESM resolves `@playwright/test` from the script's own directory, not cwd. And the SDK's error flush is ~5-10s, so the capture wait is 12s (4s missed the POST while `sessions/init` proved the SDK was alive).
+3. **[Runbook, fixed inline] Snippet patch objects use `file_path`**, not `file`/`path`.
+4. **[Environment quirk, out of scope] Replay chunk blob upload failed** (`POST http://localhost:9012/opslane-replays/ → ERR_ABORTED`): the MinIO presigned URL says port 9012 but this worktree's MinIO container was mapped to 19012 by an older session's override. Error-event ingestion and chunk `commit` (200) were unaffected. Worth a separate look at how the presign origin is derived for non-default MinIO ports.
+5. **Fresh-install proof:** the smoke ran against installation `147720013`, newly created during the run (the stale spike installation `147489201` was deleted via the App API beforehand).
 
 ## Appendix A — Regenerating a dev App (only if App A's credentials are lost)
 

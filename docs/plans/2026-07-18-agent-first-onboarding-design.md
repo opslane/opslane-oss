@@ -1,7 +1,7 @@
 # Agent-First Onboarding ("Let your agent do it")
 
 **Date:** 2026-07-18
-**Status:** Draft — v5 after four adversarial review rounds (Codex: 25 findings; round 2: 9; round 3: 7; round 4 on the PR 1 implementation plan: 8 — all 49 dispositioned below). Phase 0 spike completed 2026-07-18 (D-B: OAuth-during-install + shared callback dispatcher). D-A ratified. PR 1 server implementation landed; later onboarding PRs remain planned.
+**Status:** Draft — v5 after four adversarial review rounds (Codex: 25 findings; round 2: 9; round 3: 7; round 4 on the PR 1 implementation plan: 8 — all 49 dispositioned below). Phase 0 spike completed 2026-07-18 (D-B: OAuth-during-install + shared callback dispatcher). D-A ratified. PRs 1 (#99), 2 (#112), 4 (#115), and 5 (#117) are merged; PR 6 live smoke executed green 2026-07-19; PRs 3 and 7 remain planned.
 **Author:** Abhishek + Claude; reviews by Codex + external rounds 2–3
 
 ## Problem
@@ -71,7 +71,7 @@ Method: two throwaway GitHub Apps created via the manifest flow against a localh
 
 **D-B resolution: Experiment A wins** — one human interaction, exact parameter contract our design needs. Implementation consequence for PR 1: enabling OAuth-during-install applies to **every** install of the production App and disables its Setup URL, so the App's callback URL becomes a **shared dispatcher**: `state` matches a pending agent session → agent flow; otherwise → the existing web-install path (SetupWizard's install handling must be migrated off the Setup URL as part of PR 1). Two-stage (Experiment B) is the proven fallback.
 
-**Assets:** spike App A (`opslane-spike-a-e196`, id 4334696) can be repurposed as the PR 6 development App (repoint its callback to the local ingestion URL); App B (`opslane-spike-b-2075`, id 4334699) can be deleted. Spike credentials live only in the session scratchpad (mode 0600) — delete after PR 6 or regenerate.
+**Assets:** spike App A (`opslane-spike-a-e196`, id 4334696) can be repurposed as the PR 6 development App (repoint its callback to the local ingestion URL); App B (`opslane-spike-b-2075`, id 4334699) can be deleted. App A is the standing dev App for local smokes (decision recorded in the PR 6 runbook); its credentials live at `~/.opslane/dev-apps/opslane-spike-a.json` (0600, outside any repo — rotate via App settings if exposed). App B deleted after PR 6.
 
 ### PR 1 — Server: harden the agent flow (AGPL)
 
@@ -93,6 +93,8 @@ Method: two throwaway GitHub Apps created via the manifest flow against a localh
 Verification: `go build ./... && go test ./...`; new tests: identity-required, installation-not-yours, repo-not-granted, concurrent callbacks (one project, one completion), concurrent same-repo sessions (one project row), poll with wrong/missing token (404, no oracle), double-poll same key, decrypt-after-restart (ciphertext + fresh token presentation still delivers), post-expiry nothing + ciphertext purged, migration fresh+reapply on a disposable DB.
 
 ### PR 2 — CLI: agent-safe protocol + first npm publish (MIT)
+
+**Status: merged** — #112.
 
 - **Formal CLI contract (R9, R3-7):** a `docs/reference/cli-agent-contract.md` table — for each command: every `status` value, HTTP cause, JSON schema, exit code, retry rule. Invariants: exactly one JSON document per invocation on stdout, diagnostics to stderr; `pending`/`auth_required` are exit 0 (not errors); conflicts (`--start` + `--poll`) are usage errors with JSON output. **The one-JSON invariant covers `setup`, `snippet`, `verify`, `status` only; `login` is documented as an interactive human command and exempt.** The contract also pins: poll-token header name `X-Opslane-Poll-Token`; the canonical-origin algorithm (lowercase scheme+host, strip default ports 80/443, no trailing slash or path); and atomic local-file writes (temp file + rename, mode 0600). Tested by running the **compiled CLI as a subprocess**.
 - **Hosted default:** `cli/src/config.ts` (`https://api.opslane.com` fallback) used by `setup`/`login`/`doctor`.
@@ -120,15 +122,21 @@ Verification: `go build ./... && go test ./...`; new tests: identity-required, i
 
 ### PR 4 — Dashboard cards (flag-off) (AGPL)
 
+**Status: merged** — #115; plan `2026-07-18-agent-onboarding-pr4-dashboard-cards-plan.md`.
+
 - `agent-onboarding.ts` with `buildAgentPrompt(origin)`; cards in `Login.vue` + `SetupWizard.vue` behind a config flag **default off** (R8).
 
 ### PR 5 — Funnel telemetry (AGPL)
+
+**Status: merged** — #117; plan `2026-07-18-agent-onboarding-pr5-telemetry-plan.md`.
 
 - Columns from PR 1's migration (`auth_clicked_at`, `key_claimed_at`, `failure_reason`). Steps: `setup_started` (`created_at`), `auth_clicked` (COALESCE in `AgentAuthRedirect`), `completed`, `key_claimed` (first delivery, exactly-once by COALESCE), `first_event_received` (read-time `EXISTS` to `error_events` — point-in-time metric, not an event log) (F18).
 - `OnboardingFunnel(ctx, since)` (default 30 days, explicit param); post-migration sessions only, no backfill. Exposed via `AdminOverview`.
 - Scoped out (F19): card-impression/copy/doc-fetch analytics — needs a client analytics vendor decision.
 
 ### PR 6 — Live end-to-end smoke
+
+**Status: done (2026-07-19)** — executed green; runbook + evidence in `2026-07-18-agent-onboarding-pr6-live-smoke-plan.md`. Live catch: the dev App needed the **Email addresses: Read-only** account permission for the mandatory-identity check — the production App's permission list must include it.
 
 - Uses the Phase 0 development App. Full loop from `test-fixtures/react-app`: `setup --start` → human authorization → `setup --poll` → patches + env file → error → event at `/api/v1/events` → `verify` `has_events:true` → funnel 1/1/1/1/1.
 
