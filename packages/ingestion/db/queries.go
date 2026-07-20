@@ -608,6 +608,7 @@ type ErrorGroupFilters struct {
 	AccountID string // filter by external_account_id via end_users junction
 	EndUserID string // filter by external_user_id via end_users junction
 	Status    string // filter by error group status
+	Platform  string // filter by platform; implies kind='error' (friction incidents have no platform)
 }
 
 // ListErrorGroups returns error groups for a project with optional filters. Tenant-scoped.
@@ -638,6 +639,11 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		if filters.Status != "" {
 			wheres = append(wheres, fmt.Sprintf("eg.status = $%d", argIdx))
 			args = append(args, filters.Status)
+			argIdx++
+		}
+		if filters.Platform != "" {
+			wheres = append(wheres, fmt.Sprintf("eg.platform = $%d AND eg.kind = 'error'", argIdx))
+			args = append(args, filters.Platform)
 			argIdx++
 		}
 		if filters.AccountID != "" {

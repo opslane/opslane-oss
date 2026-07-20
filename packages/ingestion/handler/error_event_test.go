@@ -253,6 +253,36 @@ func TestIngest_PlatformReadBackThroughGroupQueries(t *testing.T) {
 	}
 }
 
+func TestListErrorGroups_PlatformFilter(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"python-only","stack":"Traceback (most recent call last):\nValueError: python-only"},"breadcrumbs":[],"context":{}}`)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:01Z","platform":"javascript","error":{"type":"TypeError","message":"javascript-only","stack":"at fn (/src/app.js:1:1)"},"breadcrumbs":[],"context":{}}`)
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, kind, status)
+		 VALUES ($1, $2, 'friction-only', now(), now(), 'friction', 'insight')`,
+		projectID, "friction-"+t.Name()); err != nil {
+		t.Fatalf("insert friction incident: %v", err)
+	}
+
+	python := "python"
+	got, err := deps.Queries.ListErrorGroups(context.Background(), projectID, &db.ErrorGroupFilters{Platform: python})
+	if err != nil {
+		t.Fatalf("list python groups: %v", err)
+	}
+	if len(got) != 1 || got[0].Platform == nil || *got[0].Platform != python || got[0].Kind != "error" {
+		t.Fatalf("platform-filtered groups = %+v, want one python error", got)
+	}
+
+	all, err := deps.Queries.ListErrorGroups(context.Background(), projectID, nil)
+	if err != nil {
+		t.Fatalf("list all groups: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("unfiltered groups = %+v, want python, javascript, and friction", all)
+	}
+}
+
 func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
 	deps, pool := testDeps(t)
 	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
