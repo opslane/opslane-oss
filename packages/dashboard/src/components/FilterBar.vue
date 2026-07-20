@@ -17,6 +17,12 @@ const router = useRouter();
 const accounts = ref<Account[]>([]);
 const selectedAccountId = ref((route.query['account_id'] as string) || '');
 const selectedStatus = ref((route.query['status'] as string) || '');
+const rawPlatform = route.query['platform'];
+const selectedPlatform = ref<'' | 'javascript' | 'python'>(
+  rawPlatform === 'javascript' || rawPlatform === 'python' ? rawPlatform : '',
+);
+const rawEndUserId = route.query['end_user_id'];
+const selectedEndUserId = ref(typeof rawEndUserId === 'string' ? rawEndUserId : '');
 
 onMounted(async () => {
   try {
@@ -30,7 +36,9 @@ onMounted(async () => {
 function emitFilters() {
   const filters: IncidentFilters = {};
   if (selectedAccountId.value) filters.account_id = selectedAccountId.value;
+  if (selectedEndUserId.value) filters.end_user_id = selectedEndUserId.value;
   if (selectedStatus.value) filters.status = selectedStatus.value;
+  if (selectedPlatform.value) filters.platform = selectedPlatform.value;
   emit('filter-change', filters);
 }
 
@@ -47,11 +55,21 @@ function onFilterChange() {
   } else {
     delete query['status'];
   }
+  if (selectedPlatform.value) {
+    query['platform'] = selectedPlatform.value;
+  } else {
+    delete query['platform'];
+  }
+  if (selectedEndUserId.value) {
+    query['end_user_id'] = selectedEndUserId.value;
+  } else {
+    delete query['end_user_id'];
+  }
   router.replace({ query });
   emitFilters();
 }
 
-watch([selectedAccountId, selectedStatus], onFilterChange);
+watch([selectedAccountId, selectedStatus, selectedPlatform], onFilterChange);
 </script>
 
 <template>
@@ -88,6 +106,18 @@ watch([selectedAccountId, selectedStatus], onFilterChange);
         <option value="needs_human">Needs Human</option>
         <option value="resolved">Resolved</option>
         <option value="archived">Archived</option>
+      </select>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <label class="text-sm text-text-muted whitespace-nowrap">Platform:</label>
+      <select
+        v-model="selectedPlatform"
+        class="text-sm rounded-md px-2 py-1.5"
+      >
+        <option value="">All platforms</option>
+        <option value="javascript">JavaScript</option>
+        <option value="python">Python</option>
       </select>
     </div>
   </div>
