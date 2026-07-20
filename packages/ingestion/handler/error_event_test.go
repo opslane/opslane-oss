@@ -469,6 +469,64 @@ func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
 	}
 }
 
+func TestCrossStackEndUserTimeline(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:00Z","error":{"type":"TypeError","message":"cross-stack javascript","stack":"at jsFrame (/src/app.js:1:1)"},"breadcrumbs":[],"context":{"user":{"id":"cross-stack-user"}}}`)
+	postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:01Z","platform":"python","error":{"type":"ValueError","message":"cross-stack python","stack":"Traceback (most recent call last):\nValueError: cross-stack python"},"breadcrumbs":[],"context":{"user":{"id":"cross-stack-user"}}}`)
+
+	groups, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{EndUserID: "cross-stack-user"})
+	if err != nil {
+		t.Fatalf("list cross-stack groups: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("cross-stack groups = %+v, want two", groups)
+	}
+	wantPlatforms := map[string]bool{"javascript": false, "python": false}
+	for _, group := range groups {
+		if group.Platform == nil {
+			t.Fatalf("group missing platform: %+v", group)
+		}
+		if _, ok := wantPlatforms[*group.Platform]; !ok {
+			t.Fatalf("unexpected platform %q", *group.Platform)
+		}
+		wantPlatforms[*group.Platform] = true
+	}
+	for platform, seen := range wantPlatforms {
+		if !seen {
+			t.Errorf("data-layer timeline missing %s group", platform)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?end_user_id=cross-stack-user", nil)
+	req.Header.Set("X-API-Key", rawKey)
+	response := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("timeline response = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	var incidents []struct {
+		Platform string `json:"platform"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&incidents); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if len(incidents) != 2 {
+		t.Fatalf("HTTP timeline = %+v, want two incidents", incidents)
+	}
+	httpPlatforms := map[string]bool{}
+	for _, incident := range incidents {
+		httpPlatforms[incident.Platform] = true
+	}
+	if !httpPlatforms["javascript"] || !httpPlatforms["python"] {
+		t.Fatalf("HTTP timeline platforms = %+v, want javascript and python", httpPlatforms)
+	}
+}
+
 func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
 	deps, pool := testDeps(t)
 	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
