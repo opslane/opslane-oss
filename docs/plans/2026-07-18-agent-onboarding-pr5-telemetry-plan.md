@@ -1,85 +1,102 @@
 # Agent Onboarding PR 5 — Funnel Telemetry Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Execution:** task-by-task, a commit per task (Claude: `superpowers:executing-plans`; other executors follow the same flow).
 
-**Goal:** Surface the agent-onboarding funnel (started → auth clicked → completed → key claimed → first event) plus failure breakdown in the existing admin overview, with no new vendor, route, or migration.
+> **Status:** Revised after Codex review (1 P0, 10 P1, 4 P2). The P0 (wrong migration number → cohort filter can't exclude legacy rows) and every P1 are folded into the tasks below.
 
-**Architecture:** Everything already exists except the read side: migration 016 added `auth_clicked_at` / `key_claimed_at` / `failure_reason`, and the write paths are live (`MarkAgentSessionAuthClicked` in the auth redirect, `MarkAgentKeyDelivered` on first key delivery, `MarkAgentSessionFailed` + the provisioning tx). This PR adds one query section to `AdminOverviewData`, one JSON field, one dashboard section, and tests.
+**Goal:** Surface the agent-onboarding funnel (started → auth-clicked → completed → key-claimed → first-event) plus a failure breakdown in the existing admin overview — as an accurate, best-effort operational metric, with no new vendor or route.
 
-**Tech Stack:** Go 1.24 + pgx (db), Vue 3 + Tailwind (AdminView), vitest/go test.
+**Architecture:** One SQL statement (single scan, one snapshot) added to `AdminOverviewData`, one JSON field on `AdminOverview`, one dashboard section, and a small index migration. The funnel cohort is defined by the **v2 writer markers**, not by time alone, because the telemetry columns are nullable and pre-v2 rows have no defaults.
 
-**Context you need:**
-- Design doc v5: PR 5 section + F18/F19 dispositions. Funnel semantics fixed there: `since` = 30 days; **post-migration sessions only, no backfill** (old rows lack the timestamps — do not present pre-016 data as zeros); `first_event_received` is a point-in-time metric (read-time `EXISTS`), not an event log; card-impression/copy analytics are scoped out (F19).
-- `packages/ingestion/db/admin.go` — `AdminOverview` struct (`Events/Jobs/Workers/Outcomes`) and `AdminOverviewData(ctx)`'s sequential-query pattern (pre-initialized maps, `fmt.Errorf("<label>: %w")`, explicit `rows.Close()`). Mirror it exactly.
-- `handler/admin.go:AdminOverview` serves it; route already `RequireAdmin`-gated. **No routes.go change.**
-- Funnel columns and writers (verify, don't re-implement): `db/queries.go` `MarkAgentSessionAuthClicked` (~:2806), `MarkAgentKeyDelivered` (~:2782), `MarkAgentSessionFailed` (~:2794); `agent_provision.go` sets `status='completed'`/`failed`. `error_events(project_id)` is indexed (`idx_error_events_project`).
-- Dashboard: `src/types/api.ts` has the `AdminOverview` type consumed by `AdminView.vue`; the headline metric-card grid at `AdminView.vue:119-148` is the pattern to copy (`rounded-lg border border-border bg-surface p-4`, label `text-xs text-text-muted`, value `text-2xl font-semibold tabular-nums`).
-- Test patterns: `db/admin_test.go` (DB-backed, `testPool`), `handler/admin_integration_test.go` (`authTestRouter` + allowlisted admin JWT), dashboard `// @vitest-environment jsdom` mounts.
-- DB tests need local Postgres (compose, port 5434) with migrations applied.
+**Tech Stack:** Go 1.24 + pgx (db), Vue 3 + Tailwind (AdminView), go test / vitest.
+
+**Context you need (verified against the merged code):**
+- Design doc v5: PR 5 section + F18/F19. **Corrections from review, superseding the design-doc PR 5 wording:**
+  - The funnel columns are in **migration `017_agent_sessions_v2.sql`** (not 016 — 016 is unrelated `016_platform.sql`). They are **nullable, no defaults**.
+  - Cohort = **post-v2 sessions**, identified by `poll_token_hash IS NOT NULL AND agent_key_pub IS NOT NULL` (current `CreateAgentSession` always writes both — `queries.go` ~:2728). A time filter alone cannot exclude a recent pre-017 row; the marker filter can. The 30-day window is layered on top for recency.
+  - `first_event_received` is **project activation**, not a strict "key→event" stage: it counts completed sessions whose project currently has any `error_events` row. It does **not** require `key_claimed_at` and does not prove ordering, so it can exceed `key_claimed`. Label and document it as activation, not as a strictly-ordered funnel step.
+  - `auth_clicked` / `key_claimed` are **best-effort**: both stamps are written after the fact and their write failures are logged-and-swallowed (`agent_setup.go` ~:204, ~:270). Document as best-effort telemetry, not an exact action count.
+- `packages/ingestion/db/admin.go` — `AdminOverview` struct + `AdminOverviewData`. **Match its real style:** each single-row section uses scoped `if err := q.pool.QueryRow(...).Scan(...); err != nil { return nil, fmt.Errorf("admin <label>: %w", err) }`; maps are pre-initialized; multi-row sections close rows, check `rows.Err()`, and use distinct query/scan/iterate error wraps. Error prefix is `admin ...`.
+- `handler/admin.go` `AdminOverview` serves it; route already `RequireAdmin`-gated (`routes.go`). **No routes.go change.**
+- Writers (do not reimplement): `MarkAgentSessionAuthClicked`, `MarkAgentKeyDelivered`, `MarkAgentSessionFailed` in `queries.go`; `agent_provision.go` sets `status='completed'`/`'failed'`. `error_events(project_id)` is indexed (`idx_error_events_project`, `001_baseline.sql:128`) — the correlated `EXISTS` is a short-circuiting indexed probe, **not** quadratic. `error_events.environment_id` is **NOT NULL** (`001_baseline.sql:59`).
+- `agent_sessions` has only a partial pending-status index today and is never purged; the admin page auto-refreshes every 60s (`AdminView.vue:79`). → **add a `created_at` index** (Task 1) so the funnel scan is bounded; note purging as future work.
+- Test patterns: DB tests that need migration-complete isolation use the **disposable-DB** helper (`migrations_test.go` `disposableDB`), NOT `testPool` baseline/delta — Go runs packages concurrently and other suites write agent_sessions to the shared retained DB. `handler/admin_integration_test.go` uses `authTestRouter` + allowlisted admin JWT. Dashboard: `// @vitest-environment jsdom` + `@vue/test-utils mount`.
+- Docs: `scripts/check-docs-drift.mjs` parses only method/path cells (`:94`) — editing a description or adding a response-field table is NOT drift-checked. Do not claim field-level drift detection and do not add `covers:` frontmatter to `docs/reference/**` (deterministic tier — `docs-map.mjs:10`).
+- **Gate commands:** run package tests directly (`go test ./db ./handler`, `pnpm --filter @opslane/dashboard test`) and the drift/scope scripts directly (`node scripts/check-docs-drift.mjs`, `node scripts/check-docs-scope.mjs`). Do NOT rely on root `pnpm test` for this work — its `docs:map:test` script walks `.claude/skills/**` and is not the right gate here.
 
 ---
 
-## Task 1: db — funnel struct + query section
+## Task 1: Migration — `created_at` index + db funnel struct & query
 
-**Files:** Modify `packages/ingestion/db/admin.go`; test in `packages/ingestion/db/admin_test.go` (or a new `admin_onboarding_test.go` alongside, same package).
+**Files:** Create `packages/ingestion/db/migrations/018_agent_sessions_created_at_index.sql`; modify `packages/ingestion/db/admin.go`; test `packages/ingestion/db/admin_onboarding_test.go`.
 
-**Step 1: Failing test**
+**Step 1: Migration (idempotent, expand-only)**
+
+```sql
+-- 018_agent_sessions_created_at_index.sql
+-- The admin onboarding funnel scans agent_sessions by created_at every ~60s
+-- (admin dashboard auto-refresh). The table has only a partial pending index
+-- and is never purged, so give the funnel a usable time index.
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_created_at
+  ON agent_sessions (created_at);
+```
+
+Apply to a disposable DB fresh + re-apply (idempotency): `go test ./db -run TestMigrations`.
+
+**Step 2: Failing test** (`admin_onboarding_test.go`, package `db_test`) — use the **disposable-DB** pattern from `migrations_test.go`, not `testPool` delta:
 
 ```go
 func TestAdminOverviewOnboardingFunnel(t *testing.T) {
-	pool := testPool(t)
+	admin := testPool(t)                 // connection to create the throwaway DB
+	pool, _ := disposableDB(t, admin)    // migrated, isolated — no cross-suite noise
 	q := db.New(pool)
 	ctx := context.Background()
 
-	// Seed four sessions in known funnel states (30-day window).
-	// 1: started only. 2: started+clicked. 3: completed+key claimed, project
-	// WITH an event. 4: failed with a reason. Plus one OLD session (created_at
-	// 40 days ago) that must be excluded from every count.
-	org, _ := q.CreateOrg(ctx, "funnel-test-org")
-	t.Cleanup(func() { cleanupTenant(t, pool, org.ID) })
-	project, _ := q.CreateProject(ctx, org.ID, "funnel-proj", ptrStr("funnel/repo"))
-	// insert an error_event row for project (copy the insert used by other db tests)
+	org, err := q.CreateOrg(ctx, "funnel-org"); mustNil(t, err)
+	project, err := q.CreateProject(ctx, org.ID, "funnel-proj", ptrStr("funnel/repo")); mustNil(t, err)
+	env, err := q.CreateEnvironment(ctx, project.ID, "production"); mustNil(t, err) // error_events.environment_id is NOT NULL
+	// insert one error_event for `project` via env.ID (copy the insert other db tests use)
 
-	mk := func(mut string) string { // helper: create session then apply mutation SQL
-		s, err := q.CreateAgentSession(ctx, db.CreateAgentSessionParams{
-			RepoURL: "funnel/repo-" + mut, PollTokenHash: "h", AgentKeyPub: "p"})
-		if err != nil { t.Fatal(err) }
-		t.Cleanup(func() { pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id=$1`, s.ID) })
-		return s.ID
-	}
-	_ = mk("started")
-	s2 := mk("clicked")
-	pool.Exec(ctx, `UPDATE agent_sessions SET auth_clicked_at=now() WHERE id=$1`, s2)
-	s3 := mk("done")
-	pool.Exec(ctx, `UPDATE agent_sessions SET auth_clicked_at=now(), status='completed',
-		completed_at=now(), key_claimed_at=now(), org_id=$2, project_id=$3 WHERE id=$1`,
-		s3, org.ID, project.ID)
-	s4 := mk("failed")
-	pool.Exec(ctx, `UPDATE agent_sessions SET status='failed', failure_reason='repo_not_granted' WHERE id=$1`, s4)
-	s5 := mk("old")
-	pool.Exec(ctx, `UPDATE agent_sessions SET created_at=now()-interval '40 days' WHERE id=$1`, s5)
+	// Seed DISTINCT populations (not all +1), each a real v2 session:
+	//  A: started only            (markers set, no auth_clicked)
+	//  B: auth_clicked, not completed
+	//  C: completed, key NOT claimed, project has NO event
+	//  D: completed, key claimed,  project HAS an event   -> first_event
+	//  E: failed, reason repo_not_granted
+	//  F: failed, reason identity_unverified
+	//  G: in-window LEGACY row (poll_token_hash NULL)      -> excluded from all counts
+	//  H: post-v2 but created 40 days ago                  -> excluded by window
+	// (create via q.CreateAgentSession for real markers; mutate state via checked UPDATEs)
 
-	overview, err := q.AdminOverviewData(ctx)
-	if err != nil { t.Fatal(err) }
-	f := overview.Onboarding
-	// Counts are >= seeded values (shared dev DB may hold other rows) — assert
-	// deltas instead: run AdminOverviewData BEFORE seeding, diff after.
-	_ = f
+	o, err := q.AdminOverviewData(ctx); mustNil(t, err)
+	f := o.Onboarding
+	// Disposable DB => absolute asserts, no deltas:
+	if f.Started != 6 { t.Fatalf("started=%d want 6", f.Started) }       // A-F, not G/H
+	if f.AuthClicked != 1 { ... }        // B (+ any that set it)
+	if f.Completed != 2 { ... }          // C,D
+	if f.KeyClaimed != 1 { ... }         // D
+	if f.FirstEventReceived != 1 { ... } // D
+	if f.Failed != 2 { ... }             // E,F
+	if f.ByFailureReason["repo_not_granted"] != 1 || f.ByFailureReason["identity_unverified"] != 1 { ... }
 }
 ```
 
-Structure the assertion as before/after delta (take a baseline `AdminOverviewData` before seeding, subtract) so the test is robust on the shared dev DB — same defensive style the other db tests use with cleanup. Assert deltas: `Started +4` (old excluded), `AuthClicked +2`, `Completed +1`, `KeyClaimed +1`, `FirstEvent +1`, `Failed +1`, `ByFailureReason["repo_not_granted"] +1`.
+Assert **every** fixture mutation's error (CreateOrg/CreateProject/CreateEnvironment/each UPDATE). Explicitly cover: the legacy row G (marker filter excludes it) and the out-of-window row H.
 
-**Step 2:** `cd packages/ingestion && go test ./db -run TestAdminOverviewOnboardingFunnel -v` → FAIL (`overview.Onboarding` undefined).
+**Step 3: Run** → FAIL (`o.Onboarding` undefined).
 
-**Step 3: Implement.** Add to `admin.go`:
+**Step 4: Implement.** Add to `admin.go`:
 
 ```go
-// AdminOnboardingOverview is the agent-onboarding funnel (design PR 5 / F18).
-// Window: sessions created in the last 30 days. Pre-migration-016 rows lack
-// click/claim timestamps and are naturally undercounted — no backfill, by design.
-// FirstEventReceived is a point-in-time read (EXISTS against error_events),
-// not an event log.
+// AdminOnboardingOverview is the agent-onboarding funnel over v2 sessions in
+// the last 30 days. Cohort = poll_token_hash/agent_key_pub NOT NULL (the v2
+// writer markers) because the telemetry columns are nullable with no defaults,
+// so a time filter alone cannot exclude pre-017 rows.
+//
+// Caveats (see plan): auth_clicked/key_claimed are best-effort stamps (their
+// write failures are swallowed); FirstEventReceived is PROJECT ACTIVATION
+// (completed session whose project has any event), not a strictly-ordered
+// key->event step, so it may exceed KeyClaimed.
 type AdminOnboardingOverview struct {
 	Started            int64            `json:"started"`
 	AuthClicked        int64            `json:"auth_clicked"`
@@ -91,111 +108,77 @@ type AdminOnboardingOverview struct {
 }
 ```
 
-Add `Onboarding AdminOnboardingOverview \`json:"onboarding"\`` to `AdminOverview`. In `AdminOverviewData`, append a section (initialize `ByFailureReason` map up top with the other maps):
+Add `Onboarding AdminOnboardingOverview \`json:"onboarding"\`` to `AdminOverview`. Pre-init `ByFailureReason` with the other maps. **One statement, one snapshot** (fixes double-scan + cross-snapshot inconsistency between totals and the failure breakdown) via a CTE returning both the counters and the per-reason rows; scan the counters row, then iterate the reason rows — all from the single query. Sketch:
 
 ```go
-	// Agent-onboarding funnel (last 30 days).
-	err = q.pool.QueryRow(ctx, `
-		SELECT count(*),
-		       count(auth_clicked_at),
-		       count(*) FILTER (WHERE status = 'completed'),
-		       count(key_claimed_at),
-		       count(*) FILTER (WHERE status = 'completed' AND project_id IS NOT NULL
-		         AND EXISTS (SELECT 1 FROM error_events e WHERE e.project_id = agent_sessions.project_id)),
-		       count(*) FILTER (WHERE status = 'failed')
-		FROM agent_sessions
-		WHERE created_at >= now() - interval '30 days'`,
-	).Scan(&result.Onboarding.Started, &result.Onboarding.AuthClicked,
-		&result.Onboarding.Completed, &result.Onboarding.KeyClaimed,
-		&result.Onboarding.FirstEventReceived, &result.Onboarding.Failed)
-	if err != nil {
-		return nil, fmt.Errorf("onboarding funnel: %w", err)
-	}
-
-	rows, err = q.pool.Query(ctx, `
-		SELECT failure_reason, count(*) FROM agent_sessions
-		WHERE status = 'failed' AND failure_reason IS NOT NULL
-		  AND created_at >= now() - interval '30 days'
-		GROUP BY failure_reason`)
-	// ... scan into result.Onboarding.ByFailureReason, same rows pattern as the
-	// jobs-by-status section, wrapped "onboarding failure reasons: %w".
+const cohort = `poll_token_hash IS NOT NULL AND agent_key_pub IS NOT NULL
+                AND created_at >= now() - interval '30 days'`
+rows, err := q.pool.Query(ctx, `
+    WITH funnel AS (SELECT * FROM agent_sessions WHERE `+cohort+`)
+    SELECT
+      'totals' AS kind, NULL::text AS reason,
+      count(*), count(auth_clicked_at),
+      count(*) FILTER (WHERE status='completed'),
+      count(key_claimed_at),
+      count(*) FILTER (WHERE status='completed' AND project_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM error_events e WHERE e.project_id = funnel.project_id)),
+      count(*) FILTER (WHERE status='failed')
+    FROM funnel
+    UNION ALL
+    SELECT 'reason', failure_reason, count(*),0,0,0,0,0
+    FROM funnel WHERE status='failed' AND failure_reason IS NOT NULL
+    GROUP BY failure_reason`)
 ```
 
-**Step 4:** Test → PASS. Also `go test ./db ./handler` (the handler integration test for `/api/v1/admin/overview` must still pass — the response simply gains a field).
+Scan the `totals` row into the counters, accumulate `reason` rows into `ByFailureReason`. Follow `admin.go`'s exact idioms: distinct query/scan/iterate error wraps prefixed `admin onboarding funnel:`, `defer rows.Close()`, check `rows.Err()`.
 
-**Step 5:** Commit: `feat(ingestion): agent-onboarding funnel in admin overview`
+**Step 5:** `go test ./db -run 'TestAdminOverviewOnboardingFunnel|TestMigrations' -v` → PASS. **Step 6:** Commit: `feat(ingestion): agent-onboarding funnel in admin overview + created_at index`
 
 ---
 
-## Task 2: Dashboard — type + AdminView funnel section
+## Task 2: Handler contract test
 
-**Files:** Modify `packages/dashboard/src/types/api.ts`, `packages/dashboard/src/views/AdminView.vue`; test `packages/dashboard/src/admin-funnel.test.ts`.
+**Files:** Modify `packages/ingestion/handler/admin_integration_test.go`.
 
-**Step 1:** Add to the `AdminOverview` type in `types/api.ts`:
+The existing admin test only asserts HTTP 200. Add: decode the `/api/v1/admin/overview` body and assert the `onboarding` object is present with the expected numeric fields (seed one completed+key-claimed session with an event beforehand, mirroring Task 1's fixture, via the test's DB pool). This proves the JSON tag + wiring, which the pure formatter test cannot. Run `go test ./handler -run Admin -v` → PASS. Commit: `test(ingestion): assert onboarding funnel in admin overview response`
+
+---
+
+## Task 3: Dashboard — optional type, funnel formatter + section, mount test
+
+**Files:** Modify `packages/dashboard/src/types/api.ts`, `src/admin-format.ts`, `src/views/AdminView.vue`; tests `src/admin-format.test.ts`, and a mount test.
+
+**Step 1: Type — optional for old-server compat (P2).** Add to `AdminOverview` in `types/api.ts`:
 
 ```ts
-  onboarding: {
-    started: number;
-    auth_clicked: number;
-    completed: number;
-    key_claimed: number;
-    first_event_received: number;
-    failed: number;
+  onboarding?: {
+    started: number; auth_clicked: number; completed: number;
+    key_claimed: number; first_event_received: number; failed: number;
     by_failure_reason: Record<string, number>;
   };
 ```
 
-**Step 2: Failing test.** Extract a tiny pure helper so the display logic is testable without mounting the 335-line view — create `src/admin-format.ts` addition (that module already exists):
+Optional (`?`), so a pre-PR5 server payload type-checks and the `v-if` guard is honest rather than an untyped workaround.
 
-```ts
-export interface FunnelStage { label: string; count: number; pctOfFirst: number; }
-export function onboardingFunnelStages(o: AdminOverview['onboarding']): FunnelStage[]
-```
+**Step 2: Failing formatter test** (`admin-format.test.ts`): `onboardingFunnelStages(o)` returns stages in order started → auth_clicked → completed → key_claimed → first_event_received with `pctOfFirst` (100 for started, rounded after, 0 not NaN when started is 0). Add a helper `onboardingFunnelStages` to `admin-format.ts`.
 
-Test (plain node env, next to `admin-format.test.ts`): stages in order started → auth_clicked → completed → key_claimed → first_event_received; `pctOfFirst` is 100 for the first stage and rounded percentages after; all-zero input yields pct 0 (no NaN).
+**Step 3: Implement** helper; test PASS.
 
-**Step 3:** Implement helper; test PASS.
+**Step 4: Render + mount test.** In `AdminView.vue`, after the headline-metrics grid, add a `<section v-if="overview.onboarding">` reusing the metric-card pattern (`rounded-lg border border-border bg-surface p-4`, label `text-xs text-text-muted`, value `text-2xl font-semibold tabular-nums`), a `funnelStages` computed, and a failure-reason line (label "Agent onboarding (30d) · activation & best-effort" so the caveats are visible). Add a jsdom mount test (mock `../api` `getAdminOverview` to return a payload WITH `onboarding`, plus one WITHOUT it to prove the `v-if` guard doesn't crash) asserting the funnel numbers render. This is the Vue-wiring proof the formatter test can't give.
 
-**Step 4: Render.** In `AdminView.vue`, after the headline-metrics section (the grid at ~lines 119-148), add a new section following the same card pattern:
-
-```vue
-      <section v-if="overview.onboarding" aria-label="Agent onboarding funnel" class="space-y-3">
-        <h2 class="text-sm font-medium text-text">Agent onboarding (30d)</h2>
-        <div class="grid grid-cols-2 gap-3 md:grid-cols-5">
-          <div v-for="stage in funnelStages" :key="stage.label"
-               class="rounded-lg border border-border bg-surface p-4">
-            <p class="text-xs text-text-muted">{{ stage.label }}</p>
-            <p class="mt-2 text-2xl font-semibold tabular-nums">{{ stage.count }}</p>
-            <p class="text-xs text-text-faint">{{ stage.pctOfFirst }}%</p>
-          </div>
-        </div>
-        <div v-if="Object.keys(overview.onboarding.by_failure_reason).length"
-             class="text-xs text-text-muted">
-          Failures:
-          <span v-for="(n, reason) in overview.onboarding.by_failure_reason" :key="reason" class="mr-3">
-            {{ reason }}: <span class="tabular-nums">{{ n }}</span>
-          </span>
-        </div>
-      </section>
-```
-
-with `const funnelStages = computed(() => overview.value ? onboardingFunnelStages(overview.value.onboarding) : []);` in the script. Guard with `v-if="overview.onboarding"` so an older server payload doesn't crash the view.
-
-**Step 5:** `pnpm --filter @opslane/dashboard build && pnpm --filter @opslane/dashboard test` → PASS.
-
-**Step 6:** Commit: `feat(dashboard): onboarding funnel section in admin view`
+**Step 5:** `pnpm --filter @opslane/dashboard build && pnpm --filter @opslane/dashboard test` → PASS. Commit: `feat(dashboard): onboarding funnel section in admin view`
 
 ---
 
-## Task 3: Docs + gate
+## Task 4: Docs + gate
 
-**Files:** Modify `docs/reference/http-routes.md` (line ~54).
+**Files:** Modify `docs/reference/http-routes.md`.
 
-1. Extend the `/api/v1/admin/overview` row description: "…observability overview incl. agent-onboarding funnel (404 unless allowlisted)". Run root `pnpm test` — the drift checker must stay green.
-2. Full gate: `cd packages/ingestion && go build ./... && go test ./... -count=1`; `pnpm --filter @opslane/dashboard build && pnpm --filter @opslane/dashboard test`.
-3. Live check: compose up, run one `opslane setup --start` against local (or seed a session by SQL), open `/admin` as an allowlisted user, see the funnel render.
-4. Commit: `docs: admin overview covers onboarding funnel`. STOP — no push (repo hook); hand to the user for `! git push` + `gh pr create`.
+1. Extend the `/api/v1/admin/overview` **description** cell only (the drift checker parses method/path, not descriptions or fields — do not claim field-level drift detection): "…observability overview incl. best-effort agent-onboarding funnel (404 unless allowlisted)". No `covers:` frontmatter (deterministic tier).
+2. Gate (direct commands, not root `pnpm test`): `cd packages/ingestion && go build ./... && go test ./db ./handler`; `pnpm --filter @opslane/dashboard build && pnpm --filter @opslane/dashboard test`; `node scripts/check-docs-drift.mjs && node scripts/check-docs-scope.mjs`.
+3. Migration idempotency on a disposable DB (fresh + reapply) already covered by `TestMigrations`; also apply 018 to the shared dev DB so local admin views work.
+4. Live check: seed a session (or run one `opslane setup`), open `/admin` as an allowlisted user, confirm the funnel renders. Commit: `docs: admin overview covers onboarding funnel`. STOP — no push (repo hook); hand to the user for `! git push` + PR.
 
-## Scoped out (recorded, not forgotten)
+## Scoped out (recorded)
 
-Card impressions / copy clicks / doc fetches / CLI-launch counts (F19 — requires a client analytics vendor decision); `since` as a query parameter (fixed 30-day window matches every other AdminOverview section; parameterize only when someone asks).
+Card-impression / copy / doc-fetch / CLI-launch counts (F19 — needs a client analytics vendor decision). `since` as a query parameter (fixed 30-day window; the other AdminOverview sections use varied windows — 1h/5m/24h/48h/7d/all-time — so there is no single house style to match; parameterize only on request). `agent_sessions` purging/retention (future; the `created_at` index bounds the scan cost for now).

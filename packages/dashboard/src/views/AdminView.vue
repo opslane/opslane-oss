@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { APIError, getAdminOverview, getHealth, listAdminJobs } from '../api';
-import { adminStatusBadgeClass, formatDuration } from '../admin-format';
+import { adminStatusBadgeClass, formatDuration, onboardingFunnelStages } from '../admin-format';
 import AdminHourlyChart from '../components/AdminHourlyChart.vue';
 import type { AdminJob, AdminOverview, HealthResponse } from '../types/api';
 import { formatDate, safeUrl } from '../utils';
@@ -26,6 +26,13 @@ const jobStatuses = computed(() =>
 );
 const outcomeStatuses = computed(() =>
   Object.entries(overview.value?.outcomes.by_status ?? {}).sort((a, b) => b[1] - a[1]),
+);
+const funnelStages = computed(() => overview.value?.onboarding
+  ? onboardingFunnelStages(overview.value.onboarding)
+  : [],
+);
+const onboardingFailureReasons = computed(() =>
+  Object.entries(overview.value?.onboarding?.by_failure_reason ?? {}).sort((a, b) => b[1] - a[1]),
 );
 const healthChecks = computed(() => Object.entries(health.value?.checks ?? {}));
 
@@ -144,6 +151,36 @@ onUnmounted(() => {
         <div class="rounded-lg border border-border bg-surface p-4">
           <p class="text-xs text-text-muted">Workers w/ live claims</p>
           <p class="mt-2 text-2xl font-semibold tabular-nums">{{ overview.workers.live_claims.toLocaleString() }}</p>
+        </div>
+      </section>
+
+      <section
+        v-if="overview.onboarding"
+        aria-label="Agent onboarding funnel"
+        class="rounded-lg border border-border bg-surface p-5"
+      >
+        <div>
+          <h2 class="text-base font-medium">Agent onboarding (30d) · activation &amp; best-effort</h2>
+          <p class="mt-1 text-xs text-text-muted">
+            Auth clicks and key claims are best-effort stamps; activation means the completed session's project has received an event.
+          </p>
+        </div>
+        <div class="mt-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div
+            v-for="stage in funnelStages"
+            :key="stage.key"
+            class="rounded-lg border border-border bg-surface p-4"
+          >
+            <p class="text-xs text-text-muted" v-text="stage.label"></p>
+            <p class="mt-2 text-2xl font-semibold tabular-nums">{{ stage.value.toLocaleString() }}</p>
+            <p class="mt-1 text-xs text-text-faint">{{ stage.pctOfFirst }}% of started</p>
+          </div>
+        </div>
+        <div class="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-muted">
+          <span>Failed: <strong class="tabular-nums text-text">{{ overview.onboarding.failed.toLocaleString() }}</strong></span>
+          <span v-for="([reason, count]) in onboardingFailureReasons" :key="reason">
+            {{ reason.replace(/_/g, ' ') }}: <strong class="tabular-nums text-text">{{ count.toLocaleString() }}</strong>
+          </span>
         </div>
       </section>
 

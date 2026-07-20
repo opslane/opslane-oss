@@ -322,6 +322,15 @@ export interface AdminOverview {
     merged_7d: number;
     closed_7d: number;
   };
+  onboarding?: {
+    started: number;
+    auth_clicked: number;
+    completed: number;
+    key_claimed: number;
+    first_event_received: number;
+    failed: number;
+    by_failure_reason: Record<string, number>;
+  };
 }
 
 export interface AdminJob {
