@@ -196,11 +196,17 @@ func (d *Dependencies) ListIncidents(w http.ResponseWriter, r *http.Request) {
 	accountID := r.URL.Query().Get("account_id")
 	endUserID := r.URL.Query().Get("end_user_id")
 	status := r.URL.Query().Get("status")
-	if accountID != "" || endUserID != "" || status != "" {
+	platform := r.URL.Query().Get("platform")
+	if platform != "" && !rePlatformToken.MatchString(platform) {
+		writeJSONError(w, http.StatusBadRequest, "invalid platform")
+		return
+	}
+	if accountID != "" || endUserID != "" || status != "" || platform != "" {
 		filters = &db.ErrorGroupFilters{
 			AccountID: accountID,
 			EndUserID: endUserID,
 			Status:    status,
+			Platform:  platform,
 		}
 	}
 

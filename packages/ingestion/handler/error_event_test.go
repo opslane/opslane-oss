@@ -283,6 +283,40 @@ func TestListErrorGroups_PlatformFilter(t *testing.T) {
 	}
 }
 
+func TestListIncidents_PlatformQueryParam(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"python-http","stack":"Traceback (most recent call last):\nValueError: python-http"},"breadcrumbs":[],"context":{}}`)
+	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:01Z","platform":"javascript","error":{"type":"TypeError","message":"javascript-http","stack":"at fn (/src/http.js:1:1)"},"breadcrumbs":[],"context":{}}`)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?platform=python", nil)
+	req.Header.Set("X-API-Key", rawKey)
+	response := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("platform-only request = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	var incidents []struct {
+		Platform *string `json:"platform"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&incidents); err != nil {
+		t.Fatalf("decode incidents: %v", err)
+	}
+	if len(incidents) != 1 || incidents[0].Platform == nil || *incidents[0].Platform != "python" {
+		t.Fatalf("platform-filtered response = %+v, want one python incident", incidents)
+	}
+
+	badReq := httptest.NewRequest(http.MethodGet,
+		"/api/v1/projects/"+projectID+"/incidents?platform=Not%20A%20Token", nil)
+	badReq.Header.Set("X-API-Key", rawKey)
+	badResponse := httptest.NewRecorder()
+	handler.NewRouter(deps).ServeHTTP(badResponse, badReq)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid platform = %d (%s), want 400", badResponse.Code, badResponse.Body.String())
+	}
+}
+
 func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
 	deps, pool := testDeps(t)
 	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
