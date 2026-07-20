@@ -275,6 +275,36 @@ func TestAgentPollExpiredSessionContract(t *testing.T) {
 	}
 }
 
+// A pending session whose expires_at has lapsed must poll as expired even
+// though the hourly ExpireAgentSessions sweep has not run yet. Otherwise the
+// agent is told "pending" (exit 0, keep waiting) for up to an hour while the
+// human opening the same auth link already gets 410.
+func TestAgentPollLapsedPendingSessionIsExpiredBeforeSweep(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	q := db.New(pool)
+	session, raw := createCallbackSession(t, q, "lapsed-owner/"+uuid.NewString())
+	t.Cleanup(func() { cleanupCallbackTenant(t, pool, session.ID, 0, "") })
+
+	// Lapse the window without running the sweep — status stays 'pending'.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE agent_sessions SET expires_at = now() - interval '1 minute' WHERE id = $1`, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT status FROM agent_sessions WHERE id = $1`, session.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("precondition: want status pending (unswept), got %q", status)
+	}
+
+	code, body := pollAgentSession(t, &Dependencies{Queries: q}, session.ID, raw)
+	if code != http.StatusGone || body["status"] != "expired" || body["message"] != "session expired; re-run setup" {
+		t.Fatalf("lapsed pending session: code=%d body=%v", code, body)
+	}
+}
+
 func TestAgentSetupV2ContractAndNoTenantLeakage(t *testing.T) {
 	pool := githubOAuthTestPool(t)
 	q := db.New(pool)
