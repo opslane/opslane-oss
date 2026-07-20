@@ -1,4 +1,4 @@
-FROM node:22-slim
+FROM node:25-slim
 LABEL org.opencontainers.image.source="https://github.com/opslane/opslane-oss"
 LABEL org.opencontainers.image.description="Opslane worker service"
 
