@@ -22,10 +22,20 @@ const playwrightAvailable = await isPlaywrightAvailable();
 
 const PAGE_BODY = '<!doctype html><meta charset="utf-8"><title>origin probe</title>';
 
-/** Serves a blank page so Chromium has a real HTTP origin to fetch from. */
+/**
+ * Serves a blank page so Chromium has a real HTTP origin to fetch from.
+ *
+ * `Referrer-Policy: no-referrer` is what makes these tests mean anything. The
+ * middleware treats Referer as browser context too, and an http->http
+ * cross-origin fetch sends BOTH headers by default — so without this, the
+ * assertions below would pass on Referer alone and would keep passing even if
+ * Chromium stopped sending Origin, which is the one assumption the /events
+ * exemption rests on. Suppressing Referer leaves Origin as the only signal.
+ */
 async function startPageServer(): Promise<{ url: string; close(): Promise<void> }> {
   const server: Server = createHttpServer((_request, response) => {
     response.setHeader('Content-Type', 'text/html; charset=utf-8');
+    response.setHeader('Referrer-Policy', 'no-referrer');
     response.end(PAGE_BODY);
   });
   await new Promise<void>((resolve, reject) => {
@@ -47,14 +57,16 @@ describe.skipIf(!playwrightAvailable)('real Chromium always sends Origin to /eve
   let page: { url: string; close(): Promise<void> };
   let browser: import('@playwright/test').Browser;
 
-  beforeAll(async () => {
-    tenant = await seedTenant('e2e/origin-allowlist-browser');
-    // An allowlist that deliberately excludes the page origin. A browser that
-    // sent no Origin would be treated as a server SDK and admitted.
+  /** Each test sets the allowlist it needs, so neither depends on run order. */
+  async function setAllowlist(origins: string[]): Promise<void> {
     await getPool().query(
       `UPDATE projects SET allowed_origins = $2 WHERE id = $1`,
-      [tenant.projectId, ['https://app.allowlisted.example']],
+      [tenant.projectId, origins],
     );
+  }
+
+  beforeAll(async () => {
+    tenant = await seedTenant('e2e/origin-allowlist-browser');
     page = await startPageServer();
     const { chromium } = await import('@playwright/test');
     browser = await chromium.launch();
@@ -99,15 +111,15 @@ describe.skipIf(!playwrightAvailable)('real Chromium always sends Origin to /eve
   }
 
   it('rejects a page whose origin is not on the allowlist', async () => {
-    // A 202 here would mean Chromium omitted Origin and took the exempt path.
+    // An allowlist that deliberately excludes the page origin. A browser that
+    // sent no Origin would be treated as a server SDK and admitted, so a 202
+    // here would mean Chromium omitted Origin and took the exempt path.
+    await setAllowlist(['https://app.allowlisted.example']);
     expect(await postFromPage('browser origin blocked')).toBe(403);
   }, 60_000);
 
   it('accepts the same page once its origin is allowlisted', async () => {
-    await getPool().query(
-      `UPDATE projects SET allowed_origins = $2 WHERE id = $1`,
-      [tenant.projectId, ['https://app.allowlisted.example', page.url]],
-    );
+    await setAllowlist(['https://app.allowlisted.example', page.url]);
     expect(await postFromPage('browser origin allowed')).toBe(202);
   }, 60_000);
 });
