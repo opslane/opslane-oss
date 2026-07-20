@@ -68,6 +68,11 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 | POST | `/api/v1/projects/{projectID}/environments` | Create environment |
 | POST | `/api/v1/environments/{envID}/api-keys` | Create ingest key |
 | GET | `/api/v1/projects/{projectID}/api-keys` | List ingest keys |
+| GET | `/api/v1/projects/{projectID}/notification-destinations` | List project notification destinations and recent delivery state |
+| POST | `/api/v1/projects/{projectID}/notification-destinations` | Create a Slack notification destination |
+| PATCH | `/api/v1/projects/{projectID}/notification-destinations/{destID}` | Update a notification destination |
+| DELETE | `/api/v1/projects/{projectID}/notification-destinations/{destID}` | Delete a notification destination |
+| POST | `/api/v1/projects/{projectID}/notification-destinations/{destID}/test` | Send a test notification |
 | GET | `/api/v1/projects/{projectID}/replays/{replayID}` | Fetch a replay |
 | GET | `/api/v1/projects/{projectID}/sessions` | List sessions with filters and keyset pagination |
 | GET | `/api/v1/projects/{projectID}/sessions/{sessionID}` | Session detail and scrubbed chunk manifest |

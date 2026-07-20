@@ -22,10 +22,11 @@ import {
 import type { AuthMembership, GitHubConfig, GitHubAppStatus } from '../types/api';
 import { formatDate, safeUrl } from '../utils';
 import CopyButton from '../components/CopyButton.vue';
+import IntegrationsSettings from '../components/IntegrationsSettings.vue';
 import RepoSelector from '../components/RepoSelector.vue';
 import InvitationsPanel from '../components/InvitationsPanel.vue';
 
-type SettingsTab = 'project' | 'environments' | 'api-keys' | 'organization';
+type SettingsTab = 'project' | 'environments' | 'api-keys' | 'integrations' | 'organization';
 const activeTab = ref<SettingsTab>('project');
 const activeRole = ref<AuthMembership['role']>();
 
@@ -412,6 +413,13 @@ async function handleCreateKey(): Promise<void> {
           API Keys
         </button>
         <button
+          class="text-sm font-medium transition-colors"
+          :class="activeTab === 'integrations' ? 'tab-active' : 'tab-inactive'"
+          @click="switchTab('integrations')"
+        >
+          Integrations
+        </button>
+        <button
           v-if="activeRole"
           class="text-sm font-medium transition-colors"
           :class="activeTab === 'organization' ? 'tab-active' : 'tab-inactive'"
@@ -744,6 +752,11 @@ async function handleCreateKey(): Promise<void> {
     <div v-if="activeTab === 'organization'">
       <InvitationsPanel :active-role="activeRole" />
     </div>
+
+    <IntegrationsSettings
+      v-if="activeTab === 'integrations'"
+      :project-id="selectedProjectId"
+    />
 
     <!-- New key modal -->
     <div

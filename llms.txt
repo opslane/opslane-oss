@@ -25,6 +25,7 @@ This file indexes the agent-relevant documentation. All canonical content is pla
 - [Vanilla JavaScript](docs/guides/vanilla.md): initialize the browser SDK without a framework integration
 - [Source maps](docs/guides/source-maps.md): upload Vite source maps and troubleshoot resolution failures
 - [Connecting GitHub](docs/guides/github-app.md): configure a GitHub App or personal access token for investigations and fix PRs
+- [Slack notifications](docs/guides/slack-notifications.md): send new-issue notifications to Slack via incoming webhooks
 - [Replay privacy and masking](docs/guides/replay-privacy.md): understand replay capture, masking, storage, and controls
 
 ## Reference (drift-checked against source by the pnpm test gate)
