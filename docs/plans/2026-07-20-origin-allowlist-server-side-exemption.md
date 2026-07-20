@@ -38,7 +38,7 @@ State this accurately; the current doc comment does not.
 
 - The allowlist is **a browser-origin control only.** `Origin` is trustworthy because browsers set it and page JavaScript cannot forge it. Any non-browser caller can send whatever `Origin` it likes, so the allowlist never constrained scripts and does not become weaker by admitting header-less ones.
 - **Do not claim rate limits bound a stolen key's blast radius.** `eventsLimiter` is an in-memory, per-process fixed-window counter (`newRateLimiter`, `auth_handlers.go:35`): every replica gets its own allowance and a restart resets it. It sheds sustained floods per pod; it is not a distributed quota and does not bound storage or worker-job cost.
-- **Assumption worth naming:** a proxy in front of ingestion that strips `Origin` would make browser traffic look header-less on `/events` and silently skip the check. Task 1 logs the exemption so that is greppable rather than invisible.
+- **Assumption worth naming:** a proxy in front of ingestion that strips `Origin` would make browser traffic look header-less on `/events` and silently skip the check. Task 1 logs each exemption at `Debug`, but `main.go:24` builds the logger at the default `Info` level and there is no `LOG_LEVEL` knob, so that line is a hook for investigation, not live detection. Closing this properly needs a counter, which is out of scope here.
 - **Why scoping to `/events` matters:** browsers always send `Origin` on POST (Fetch spec: `Origin` is included for every request whose method is not GET/HEAD, same-origin included), so a real browser hitting `/events` is never exempted. Task 4 verifies that in real Chromium instead of trusting the spec.
 
 ---

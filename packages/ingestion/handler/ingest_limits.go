@@ -74,8 +74,11 @@ func (d *Dependencies) EnforceOrigin(next http.Handler) http.Handler {
 //
 // Browsers always send Origin on POST (Fetch spec: included for any method
 // other than GET/HEAD, same-origin included), so real browser traffic is never
-// exempted here. If a proxy in front of ingestion strips Origin, browser
-// traffic would look header-less; the debug log below makes that greppable.
+// exempted here. Residual risk: a proxy in front of ingestion that strips
+// Origin would make browser traffic look header-less and skip the check. The
+// Debug line below records each exemption, but main.go builds the logger at
+// the default Info level with no LOG_LEVEL knob, so observing it takes a code
+// change today — it is a hook for investigation, not live detection.
 func (d *Dependencies) EnforceOriginAllowingServerSDK(next http.Handler) http.Handler {
 	return d.enforceOrigin(next, true)
 }
