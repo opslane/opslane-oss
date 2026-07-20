@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
-import type { Incident, AffectedUser } from '../types/api';
-import { getIncident, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
+import type { Incident, AffectedUser, SampleEvent } from '../types/api';
+import { APIError, getIncident, getSampleEvent, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
 import { getProjectId, statusBadgeClass, statusLabel, safeUrl, formatDate, formatAbsolute } from '../utils';
 import { kindBadge, fixControlsVisible } from '../components/incident-kind';
 import EvidenceCard from '../components/EvidenceCard.vue';
 import PipelineIndicator from '../components/PipelineIndicator.vue';
 import ReplayPlayer from '../components/ReplayPlayer.vue';
+import CodeBlock from '../components/CodeBlock.vue';
+import { formatBreadcrumb, getRequestContext } from '../components/sample-event';
 import type { eventWithTime } from '@rrweb/types';
 import { useSessionPlayback } from '../composables/useSessionPlayback';
 
@@ -20,6 +22,28 @@ const projectId = ref('');
 const replay = ref<ReplayRecording | null>(null);
 const replayLoading = ref(false);
 const replayError = ref<string | null>(null);
+const sampleEvent = ref<SampleEvent | null>(null);
+const sampleEventError = ref<string | null>(null);
+const requestContext = computed(() => (
+  sampleEvent.value ? getRequestContext(sampleEvent.value.context) : null
+));
+const breadcrumbs = computed(() => (
+  sampleEvent.value?.breadcrumbs.flatMap((breadcrumb) => {
+    const formatted = formatBreadcrumb(breadcrumb);
+    return formatted ? [formatted] : [];
+  }) ?? []
+));
+
+async function loadSampleEvent() {
+  sampleEvent.value = null;
+  sampleEventError.value = null;
+  try {
+    sampleEvent.value = await getSampleEvent(projectId.value, incidentId);
+  } catch (e: unknown) {
+    if (e instanceof APIError && e.status === 404) return;
+    sampleEventError.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 const pointerSessionId = computed(() => incident.value?.session_pointer?.session_id ?? '');
 const pointerErrorAt = computed(() => incident.value?.session_pointer?.error_at);
@@ -177,6 +201,9 @@ onMounted(async () => {
 
   try {
     incident.value = await getIncident(projectId.value, incidentId);
+    if (incident.value.kind === 'error') {
+      void loadSampleEvent();
+    }
     void loadReplay();
     if (incident.value.status === 'fixing') {
       startFixPolling();
@@ -370,6 +397,76 @@ onMounted(async () => {
           >
           </a>
         </div>
+
+        <!-- Representative error payload -->
+        <section
+          v-if="sampleEvent || sampleEventError"
+          data-testid="sample-event"
+          class="p-4 bg-surface border border-border rounded-lg space-y-4"
+        >
+          <p v-if="sampleEventError" class="text-sm text-amber">
+            Couldn't load stack trace.
+          </p>
+          <template v-if="sampleEvent">
+            <div>
+              <h3 class="text-xs font-medium text-text-muted uppercase tracking-wide">Stack trace</h3>
+              <CodeBlock class="mt-2" :code="sampleEvent.error.stack" />
+            </div>
+
+            <div v-if="requestContext" class="space-y-2">
+              <h3 class="text-xs font-medium text-text-muted uppercase tracking-wide">Request</h3>
+              <dl class="grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
+                <div>
+                  <dt class="text-text-muted">Method</dt>
+                  <dd class="text-text" v-text="requestContext.method || '—'"></dd>
+                </div>
+                <div>
+                  <dt class="text-text-muted">Path</dt>
+                  <dd class="text-text font-mono text-xs" v-text="requestContext.path || '—'"></dd>
+                </div>
+                <div v-if="requestContext.remote_addr">
+                  <dt class="text-text-muted">Client IP</dt>
+                  <dd class="text-text font-mono text-xs" v-text="requestContext.remote_addr"></dd>
+                </div>
+              </dl>
+              <details v-if="requestContext.headers" class="text-sm">
+                <summary class="cursor-pointer text-text-muted">Headers</summary>
+                <dl class="mt-2 space-y-1 rounded bg-surface-2 p-3">
+                  <div
+                    v-for="header in requestContext.headers"
+                    :key="header.name"
+                    class="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-3"
+                  >
+                    <dt class="font-mono text-xs text-text-muted" v-text="header.name"></dt>
+                    <dd class="break-all font-mono text-xs text-text" v-text="header.value"></dd>
+                  </div>
+                </dl>
+              </details>
+            </div>
+
+            <div v-if="breadcrumbs.length" class="space-y-2">
+              <h3 class="text-xs font-medium text-text-muted uppercase tracking-wide">Breadcrumbs</h3>
+              <ol class="space-y-2">
+                <li
+                  v-for="(breadcrumb, index) in breadcrumbs"
+                  :key="`${breadcrumb.timestamp || 'breadcrumb'}-${index}`"
+                  class="rounded border border-border p-3 text-sm"
+                >
+                  <div class="flex flex-wrap items-center gap-2 text-xs text-text-muted">
+                    <time v-if="breadcrumb.timestamp" v-text="breadcrumb.timestamp"></time>
+                    <span
+                      v-if="breadcrumb.label"
+                      class="rounded-full bg-surface-2 px-2 py-0.5 text-text"
+                      v-text="breadcrumb.label"
+                    ></span>
+                    <span v-if="breadcrumb.level" v-text="breadcrumb.level"></span>
+                  </div>
+                  <p v-if="breadcrumb.message" class="mt-1 text-text" v-text="breadcrumb.message"></p>
+                </li>
+              </ol>
+            </div>
+          </template>
+        </section>
 
         <!-- Investigation results, including context preserved on drafts and needs_human -->
         <div
