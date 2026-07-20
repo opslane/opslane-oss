@@ -57,7 +57,7 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 | POST | `/api/v1/invitations` | Cloud org admin: create an active-org invitation |
 | DELETE | `/api/v1/invitations/{invitationID}` | Cloud org admin: revoke an outstanding invitation |
 | POST | `/api/v1/invitations/accept` | Cloud: accept a single-use, verified-email-bound invitation |
-| GET | `/api/v1/admin/overview` | Operator-only cross-tenant observability overview (404 unless allowlisted) |
+| GET | `/api/v1/admin/overview` | Operator-only cross-tenant observability overview incl. best-effort agent-onboarding funnel (404 unless allowlisted) |
 | GET | `/api/v1/admin/jobs` | Operator-only recent jobs (404 unless allowlisted) |
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
