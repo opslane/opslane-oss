@@ -235,6 +235,24 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 		}
 	})
 
+	t.Run("repo missing from the installation is definitive", func(t *testing.T) {
+		installVisible, emailStatus, verifiedEmails = true, http.StatusOK, true
+		userID++
+		// The installation grants one repo; the session asks for a different
+		// one, which is what "only select repositories" looks like on the wire.
+		repoFullName = "CB-Owner/CB-granted-" + uuid.NewString()
+		session, raw := createCallbackSession(t, q, strings.ToLower("CB-Owner/CB-ungranted-"+uuid.NewString()))
+		t.Cleanup(func() { cleanupCallbackTenant(t, pool, session.ID, installationID, "") })
+		w := callback(session.ID)
+		if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "Repository not granted") {
+			t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+		}
+		_, body := pollAgentSession(t, deps, session.ID, raw)
+		if body["status"] != "failed" || body["failure_reason"] != "repo_not_granted" {
+			t.Fatalf("poll body=%v", body)
+		}
+	})
+
 	t.Run("successful empty email list is definitive", func(t *testing.T) {
 		installVisible, emailStatus, verifiedEmails = true, http.StatusOK, false
 		userID++
