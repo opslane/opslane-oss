@@ -78,10 +78,11 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 
 	r.Route("/api/v1", func(r chi.Router) {
 		// SDK endpoints (authenticated by API key, rate-limited per project).
-		// Browser endpoints (events, replays) are also origin-gated. Sourcemaps are
-		// uploaded at build time from Node (no Origin header), so EnforceOrigin is
-		// not applied there.
-		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(eventsLimiter)).Post("/events", deps.IngestEvent)
+		// Browser endpoints (replays, sessions, chunks) are origin-gated
+		// strictly. /events also accepts server-side SDKs, which send no
+		// Origin or Referer (#104). Sourcemaps are uploaded at build time from
+		// Node (no Origin header), so EnforceOrigin is not applied there.
+		r.With(deps.AuthenticateSDK, deps.EnforceOriginAllowingServerSDK, rateLimitByProject(eventsLimiter)).Post("/events", deps.IngestEvent)
 		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/init", deps.ReplayInit)
 		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/{replayID}/complete", deps.ReplayComplete)
 		r.With(deps.AuthenticateSDK, deps.EnforceOrigin, rateLimitByProject(replaysLimiter)).Post("/replays/{replayID}/fail", deps.ReplayFail)

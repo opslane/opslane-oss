@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/opslane/opslane/packages/ingestion/handler"
@@ -160,7 +161,9 @@ func TestEnforceOriginAllowingServerSDK_BrowserRequestsStillEnforced(t *testing.
 		{"foreign origin", mk("Origin", "https://evil.com"), http.StatusForbidden},
 		{"allowlisted referer", mk("Referer", "https://app.example.com/checkout"), http.StatusOK},
 		{"foreign referer", mk("Referer", "https://evil.com/x"), http.StatusForbidden},
-		// A present-but-unparseable Referer is still browser context: fail closed.
+		// A junk Referer must not be mistaken for a header-less server SDK:
+		// the header is present, so the exemption does not apply and the
+		// unusable origin falls through to the allowlist check.
 		{"malformed referer", mk("Referer", "::not a url::"), http.StatusForbidden},
 	}
 	for _, tc := range cases {
@@ -205,5 +208,37 @@ func TestEnforceOrigin_MatchIsCaseInsensitive(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("case-insensitive origin must pass, got %d", rec.Code)
+	}
+}
+
+// Router-level: a middleware unit test cannot catch the routes table wiring
+// the wrong entry point, so drive the real router. Needs DATABASE_URL.
+func TestRouter_OriginExemptionIsScopedToEvents(t *testing.T) {
+	deps, pool := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE projects SET allowed_origins = $2 WHERE id = $1`,
+		projectID, []string{"https://app.example.com"}); err != nil {
+		t.Fatalf("set allowlist: %v", err)
+	}
+	router := handler.NewRouter(deps)
+
+	post := func(path, body string) int {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", rawKey)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// /events: header-less server SDK is admitted (not 403).
+	if code := post("/api/v1/events", `{"timestamp":"2026-07-20T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"scoped","stack":"Traceback (most recent call last):\nValueError: scoped"},"breadcrumbs":[],"context":{}}`); code == http.StatusForbidden {
+		t.Fatalf("/events must not 403 a header-less server SDK, got %d", code)
+	}
+
+	// A browser-only route must still reject the same header-less caller.
+	if code := post("/api/v1/sessions/init", `{}`); code != http.StatusForbidden {
+		t.Fatalf("/sessions/init must still 403 a header-less caller, got %d", code)
 	}
 }
