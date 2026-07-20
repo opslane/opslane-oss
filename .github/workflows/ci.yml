@@ -257,7 +257,7 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "46"
+          E2E_MIN_TESTS: "53"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
           # The environments/projects suites below are pinned for the same
@@ -269,6 +269,10 @@ jobs:
           # would silently drop them while the total count still passed.
           # The python smoke's live leg is pinned for the same reason: it
           # self-skips without flask, and a skip here is a coverage hole.
+          # The origin-allowlist cases are pinned individually rather than by
+          # suite prefix: they carry the #104 security contract, and a suite
+          # prefix would let the rejection cases be deleted while the accepted
+          # case alone keeps the pattern matching.
           E2E_REQUIRED_PATTERNS: |
             ^browser smoke: Vue error to needs_human >
             ^browser smoke: React error to needs_human >
@@ -282,6 +286,13 @@ jobs:
             ^dashboard environment filtering > gates readiness and filters incidents, detail chips, and sessions in real Chromium
             ^first-class projects dashboard > switches safely from a deep link and provisions a usable project key
             ^SDK environment browser contract > sends the configured name through real Chromium
+            ^origin allowlist with a server-side SDK > accepts a backend event that carries no Origin or Referer$
+            ^origin allowlist with a server-side SDK > accepts a browser event from an allowlisted origin$
+            ^origin allowlist with a server-side SDK > rejects a browser event from an origin not on the list$
+            ^origin allowlist with a server-side SDK > rejects a referer-only event from an origin not on the list$
+            ^origin allowlist with a server-side SDK > keeps browser-only routes strict for header-less callers$
+            ^real Chromium always sends Origin to /events > rejects a page whose origin is not on the allowlist$
+            ^real Chromium always sends Origin to /events > accepts the same page once its origin is allowlisted$
         run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
       - name: Token-leak scan over logs and public HTTP surfaces
         run: |
