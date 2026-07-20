@@ -257,10 +257,17 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "40"
+          E2E_MIN_TESTS: "46"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
-          # The python smoke's live leg is listed for the same reason: it
+          # The environments/projects suites below are pinned for the same
+          # reason: they are the only end-to-end proof that events with
+          # different keys and environments resolve correctly, that the
+          # override fallbacks fire, and that the dashboard filter, project
+          # switch, and SDK environment payload work in a real browser. Without
+          # pinning, a skipIf regression (missing INGESTION_URL or Chromium)
+          # would silently drop them while the total count still passed.
+          # The python smoke's live leg is pinned for the same reason: it
           # self-skips without flask, and a skip here is a coverage hole.
           E2E_REQUIRED_PATTERNS: |
             ^browser smoke: Vue error to needs_human >
@@ -269,6 +276,12 @@ jobs:
             ^notifications contract
             ^python SDK live smoke \(Flask fixture → ingestion\) >
             ^python wire adversarial \(hostile non-SDK client\) >
+            ^first-class environment ingestion > keeps one group across key environments
+            ^first-class environment ingestion > resolves opted-in names and accepts disabled, unknown, and invalid
+            ^first-class environment ingestion > supports out-of-order events, makes the existing same-project session
+            ^dashboard environment filtering > gates readiness and filters incidents, detail chips, and sessions in real Chromium
+            ^first-class projects dashboard > switches safely from a deep link and provisions a usable project key
+            ^SDK environment browser contract > sends the configured name through real Chromium
         run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
       - name: Token-leak scan over logs and public HTTP surfaces
         run: |

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/opslane/opslane/packages/ingestion/compress"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/masking"
@@ -133,6 +134,23 @@ func (d *Dependencies) ListSessionsEndpoint(w http.ResponseWriter, r *http.Reque
 	}
 
 	query := r.URL.Query()
+	environmentID := query.Get("environment_id")
+	if environmentID != "" {
+		if _, err := uuid.Parse(environmentID); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "environment_id must be a valid UUID")
+			return
+		}
+		environmentProjectID, err := d.Queries.VerifyEnvironmentAccess(r.Context(), OrgIDFromCtx(r.Context()), environmentID)
+		if err != nil {
+			slog.Error("verify session environment failed", "error", err, "project_id", projectID, "environment_id", environmentID)
+			writeJSONError(w, http.StatusInternalServerError, "failed to verify environment")
+			return
+		}
+		if environmentProjectID != projectID {
+			writeJSONError(w, http.StatusNotFound, "environment not found")
+			return
+		}
+	}
 	from, err := parseOptionalRFC3339(query.Get("from"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid from timestamp")
@@ -159,7 +177,8 @@ func (d *Dependencies) ListSessionsEndpoint(w http.ResponseWriter, r *http.Reque
 	}
 
 	sessions, next, err := d.Queries.ListSessions(r.Context(), projectID, db.SessionFilters{
-		EndUserID: query.Get("end_user_id"), AccountID: query.Get("account_id"), From: from, To: to,
+		EndUserID: query.Get("end_user_id"), AccountID: query.Get("account_id"), EnvironmentID: environmentID,
+		From: from, To: to,
 	}, cursor, limit)
 	if err != nil {
 		slog.Error("list sessions failed", "error", err, "project_id", projectID)

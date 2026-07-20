@@ -52,6 +52,8 @@ function makePipelineInput(overrides?: Partial<PipelineInput>): PipelineInput {
     resolvedStackTrace: null,
     breadcrumbs: '[]',
     context: '{}',
+    environmentNames: [],
+    environmentTotal: 0,
     sourceFiles: [],
     visualAnalysis: null,
     repoPath: '/tmp/opslane-repo',
@@ -183,7 +185,12 @@ describe('runPipeline', () => {
 
     const previousDashboardUrl = process.env['DASHBOARD_URL'];
     process.env['DASHBOARD_URL'] = 'https://app.opslane.com';
-    const result = await runPipeline(makePipelineInput({ assertLeaseOwned }));
+    const environmentNames = ['production', 'staging'];
+    const result = await runPipeline(makePipelineInput({
+      assertLeaseOwned,
+      environmentNames,
+      environmentTotal: 2,
+    }));
     if (previousDashboardUrl === undefined) delete process.env['DASHBOARD_URL'];
     else process.env['DASHBOARD_URL'] = previousDashboardUrl;
 
@@ -194,6 +201,10 @@ describe('runPipeline', () => {
 
     // All stages called in order
     expect(mockRunAgentFix).toHaveBeenCalledTimes(1);
+    expect(mockRunAgentFix).toHaveBeenCalledWith(expect.objectContaining({
+      environmentNames,
+      environmentTotal: 2,
+    }));
     expect(mockValidateDiffPaths).toHaveBeenCalledWith(VALID_DIFF);
     expect(mockGitCommitAndPush).toHaveBeenCalledTimes(1);
     expect(mockCreatePR).toHaveBeenCalledTimes(1);
@@ -204,6 +215,8 @@ describe('runPipeline', () => {
     expect(commitMessage).toContain('https://app.opslane.com/incidents/group-12345678?project_id=project-1');
     expect(mockCreatePR).toHaveBeenCalledWith(expect.objectContaining({
       narrative: FIX_NARRATIVE,
+      environmentNames,
+      environmentTotal: 2,
       incidentUrl: 'https://app.opslane.com/incidents/group-12345678?project_id=project-1',
     }), expect.any(Function));
     expect(result.narrative).toEqual(FIX_NARRATIVE);

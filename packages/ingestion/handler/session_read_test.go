@@ -169,6 +169,52 @@ func TestSessionRead_ListAndDetailRoutes(t *testing.T) {
 	}
 }
 
+func TestSessionRead_ListValidatesAndScopesEnvironmentFilter(t *testing.T) {
+	deps, pool := testDeps(t)
+	orgID, projectID, productionID, _ := seedTenant(t, deps.Queries)
+	deps.JWTSecret = sessionReadSecret
+	token := dashboardToken(t, orgID)
+	router := handler.NewRouterWithPool(deps, pool)
+	ctx := context.Background()
+
+	staging, err := deps.Queries.CreateEnvironment(ctx, projectID, "staging")
+	if err != nil {
+		t.Fatalf("create staging environment: %v", err)
+	}
+	sibling, err := deps.Queries.CreateProject(ctx, orgID, "sibling-project", nil)
+	if err != nil {
+		t.Fatalf("create sibling project: %v", err)
+	}
+	siblingEnv, err := deps.Queries.CreateEnvironment(ctx, sibling.ID, "production")
+	if err != nil {
+		t.Fatalf("create sibling environment: %v", err)
+	}
+
+	started := time.Now().UTC().Add(-time.Hour)
+	productionSession := fmt.Sprintf("sess_env_prod_%d", time.Now().UnixNano())
+	stagingSession := fmt.Sprintf("sess_env_stage_%d", time.Now().UnixNano())
+	seedReadableSession(t, deps.Queries, projectID, productionID, productionSession, started)
+	seedReadableSession(t, deps.Queries, projectID, staging.ID, stagingSession, started.Add(time.Minute))
+
+	filtered := dashboardRequest(t, router, token,
+		"/api/v1/projects/"+projectID+"/sessions?environment_id="+productionID)
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), productionSession) || strings.Contains(filtered.Body.String(), stagingSession) {
+		t.Fatalf("environment filter returned %d: %s", filtered.Code, filtered.Body.String())
+	}
+
+	badUUID := dashboardRequest(t, router, token,
+		"/api/v1/projects/"+projectID+"/sessions?environment_id=not-a-uuid")
+	if badUUID.Code != http.StatusBadRequest {
+		t.Fatalf("bad environment UUID returned %d: %s", badUUID.Code, badUUID.Body.String())
+	}
+
+	crossProject := dashboardRequest(t, router, token,
+		"/api/v1/projects/"+projectID+"/sessions?environment_id="+siblingEnv.ID)
+	if crossProject.Code != http.StatusNotFound {
+		t.Fatalf("cross-project environment returned %d: %s", crossProject.Code, crossProject.Body.String())
+	}
+}
+
 func storageRouter(t *testing.T) (*handler.Dependencies, *pgxpool.Pool, *minioPkg.Client, http.Handler, string, string, string) {
 	t.Helper()
 	deps, pool := testDepsWithStorage(t)

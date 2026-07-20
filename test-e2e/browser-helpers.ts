@@ -18,12 +18,16 @@ export async function startFixture(opts: {
   fixtureDir: string;
   apiKey: string;
   ingestionUrl: string;
+  environment?: string;
   entryPattern: RegExp;
   plugins: PluginOption[];
 }): Promise<FixtureServer> {
   const { createServer } = await import('vite');
   const apiKey = JSON.stringify(opts.apiKey);
   const ingestionUrl = JSON.stringify(opts.ingestionUrl);
+  const environment = opts.environment === undefined
+    ? ''
+    : `\n              environment: ${JSON.stringify(opts.environment)},`;
   // Parallel test files boot the same fixture concurrently; a shared default
   // cache (node_modules/.vite) would have two optimizers racing over one dir.
   const cacheDir = mkdtempSync(join(tmpdir(), 'opslane-vite-cache-'));
@@ -56,6 +60,7 @@ export async function startFixture(opts: {
             () => `init({
               endpoint: ${ingestionUrl},
               apiKey: ${apiKey},
+              ${environment}
               flushInterval: 200,
               maxBatchSize: 1,
               replay: { enabled: true },

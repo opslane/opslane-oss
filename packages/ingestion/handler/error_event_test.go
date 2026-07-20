@@ -258,13 +258,16 @@ func TestIngest_PlatformReadBackThroughGroupQueries(t *testing.T) {
 
 func TestListErrorGroups_PlatformFilter(t *testing.T) {
 	deps, pool := testDeps(t)
-	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	_, projectID, envID, rawKey := seedTenant(t, deps.Queries)
 	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"python-only","stack":"Traceback (most recent call last):\nValueError: python-only"},"breadcrumbs":[],"context":{}}`)
 	postErrorPayload(t, deps, rawKey, `{"timestamp":"2026-07-19T00:00:01Z","platform":"javascript","error":{"type":"TypeError","message":"javascript-only","stack":"at fn (/src/app.js:1:1)"},"breadcrumbs":[],"context":{}}`)
+	// Environment-scoped, matching real friction identity: this makes the
+	// friction arm of the environment-scoped query actually participate, so a
+	// platform filter has something to suppress.
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO error_groups (project_id, fingerprint, title, first_seen, last_seen, kind, status)
-		 VALUES ($1, $2, 'friction-only', now(), now(), 'friction', 'insight')`,
-		projectID, "friction-"+t.Name()); err != nil {
+		`INSERT INTO error_groups (project_id, environment_id, fingerprint, title, first_seen, last_seen, kind, status)
+		 VALUES ($1, $2, $3, 'friction-only', now(), now(), 'friction', 'insight')`,
+		projectID, envID, "friction-"+t.Name()); err != nil {
 		t.Fatalf("insert friction incident: %v", err)
 	}
 
@@ -283,6 +286,35 @@ func TestListErrorGroups_PlatformFilter(t *testing.T) {
 	}
 	if len(all) != 3 {
 		t.Fatalf("unfiltered groups = %+v, want python, javascript, and friction", all)
+	}
+
+	// Environment-scoped listing takes a different query (a rollup CTE with a
+	// separate friction arm), so the platform filter must be asserted there too.
+	scoped, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{Platform: python, EnvironmentID: &envID})
+	if err != nil {
+		t.Fatalf("list python groups in environment: %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].Platform == nil || *scoped[0].Platform != python || scoped[0].Kind != "error" {
+		t.Fatalf("environment+platform groups = %+v, want one python error", scoped)
+	}
+
+	// Unfiltered, the same environment must still surface the friction row —
+	// otherwise the assertion above would pass even if the friction arm were
+	// broken for every query rather than suppressed only by the platform filter.
+	scopedAll, err := deps.Queries.ListErrorGroups(context.Background(), projectID,
+		&db.ErrorGroupFilters{EnvironmentID: &envID})
+	if err != nil {
+		t.Fatalf("list all groups in environment: %v", err)
+	}
+	var scopedFriction int
+	for _, group := range scopedAll {
+		if group.Kind == "friction" {
+			scopedFriction++
+		}
+	}
+	if len(scopedAll) != 3 || scopedFriction != 1 {
+		t.Fatalf("environment-scoped groups = %+v, want both errors and the friction row", scopedAll)
 	}
 }
 

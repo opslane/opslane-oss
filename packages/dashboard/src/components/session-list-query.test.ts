@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SessionFilters } from '../types/api';
-import { sessionPageRequest, snapshotSessionFilters } from './session-list-query';
+import { applySessionFilters, sessionPageRequest, snapshotSessionFilters } from './session-list-query';
 
 describe('session list pagination query', () => {
   it('keeps a cursor paired with the filters that produced it', () => {
@@ -19,5 +19,18 @@ describe('session list pagination query', () => {
     const first = sessionPageRequest(applied, 'cursor-a');
     first.filters.end_user_id = 'mutated';
     expect(sessionPageRequest(applied, 'cursor-b').filters.end_user_id).toBe('user-a');
+  });
+
+  it('includes environment_id and resets the cursor when filters are applied', () => {
+    expect(applySessionFilters({
+      account_id: 'account-a',
+      environment_id: 'env-staging',
+    })).toEqual({
+      filters: {
+        account_id: 'account-a',
+        environment_id: 'env-staging',
+      },
+      cursor: null,
+    });
   });
 });

@@ -137,6 +137,14 @@ func main() {
 
 	queries := db.New(pool)
 	queries.DashboardURL = os.Getenv("DASHBOARD_URL")
+	go func() {
+		ran, err := queries.RunRollupBackfill(context.Background())
+		if err != nil {
+			slog.Error("environment rollup backfill failed", "error", err)
+		} else if ran {
+			slog.Info("environment rollup backfill complete")
+		}
+	}()
 	notifySender := notify.NewSender(0, notifyExtraHosts)
 	deps := &handler.Dependencies{
 		Queries:               queries,

@@ -15,6 +15,7 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const projectId = ref('');
 const currentFilters = ref<IncidentFilters>({});
+let fetchGeneration = 0;
 
 const statusOrder: Record<ErrorGroupStatus, number> = {
   candidate: -1,
@@ -48,7 +49,6 @@ const { sorted: sortedIncidents, toggleSort, sortIndicator } = useTableSort<Sort
 
 const newIncidentCount = ref(0);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
-let fetchGeneration = 0;
 
 async function fetchIncidents(filters?: IncidentFilters) {
   const generation = ++fetchGeneration;
@@ -57,18 +57,14 @@ async function fetchIncidents(filters?: IncidentFilters) {
   newIncidentCount.value = 0;
   try {
     const result = await listIncidents(projectId.value, filters);
-    if (generation === fetchGeneration) {
-      incidents.value = result;
-    }
+    if (generation !== fetchGeneration) return;
+    incidents.value = result;
   } catch (e: unknown) {
-    if (generation === fetchGeneration) {
-      const msg = e instanceof Error ? e.message : String(e);
-      error.value = `Failed to load incidents: ${msg}`;
-    }
+    if (generation !== fetchGeneration) return;
+    const msg = e instanceof Error ? e.message : String(e);
+    error.value = `Failed to load incidents: ${msg}`;
   } finally {
-    if (generation === fetchGeneration) {
-      loading.value = false;
-    }
+    if (generation === fetchGeneration) loading.value = false;
   }
 }
 
@@ -183,9 +179,13 @@ onUnmounted(() => stopPolling());
             </th>
             <th
               class="py-2.5 px-4 text-right text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
+              :title="currentFilters.environment_id ? 'users across all environments' : undefined"
               @click="toggleSort('users')"
             >
               Users{{ sortIndicator('users') }}
+              <span v-if="currentFilters.environment_id" class="block text-[10px] normal-case tracking-normal">
+                across all environments
+              </span>
             </th>
             <th
               class="py-2.5 px-4 text-right text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"

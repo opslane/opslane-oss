@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, toRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import type { Account, IncidentFilters } from '../types/api';
 import { listAccounts } from '../api';
+import { environmentFilterQuery, useEnvironmentFilter } from '../composables/useEnvironmentFilter';
 
 const props = defineProps<{
   projectId: string;
@@ -23,6 +24,11 @@ const selectedPlatform = ref<'' | 'javascript' | 'python'>(
 );
 const rawEndUserId = route.query['end_user_id'];
 const selectedEndUserId = ref(typeof rawEndUserId === 'string' ? rawEndUserId : '');
+const {
+  environments,
+  rollupReady,
+  selectedEnvironmentId,
+} = useEnvironmentFilter(toRef(props, 'projectId'));
 
 onMounted(() => {
   // Apply URL-derived filters immediately. Account options are auxiliary and
@@ -45,12 +51,15 @@ function emitFilters() {
   if (selectedEndUserId.value) filters.end_user_id = selectedEndUserId.value;
   if (selectedStatus.value) filters.status = selectedStatus.value;
   if (selectedPlatform.value) filters.platform = selectedPlatform.value;
+  if (rollupReady.value && selectedEnvironmentId.value) {
+    filters.environment_id = selectedEnvironmentId.value;
+  }
   emit('filter-change', filters);
 }
 
 function onFilterChange() {
   // Sync to URL query params
-  const query: Record<string, string> = { ...route.query as Record<string, string> };
+  const query = environmentFilterQuery(route.query, selectedEnvironmentId.value);
   if (selectedAccountId.value) {
     query['account_id'] = selectedAccountId.value;
   } else {
@@ -75,7 +84,10 @@ function onFilterChange() {
   emitFilters();
 }
 
-watch([selectedAccountId, selectedStatus, selectedPlatform], onFilterChange);
+watch(
+  [selectedAccountId, selectedStatus, selectedPlatform, selectedEnvironmentId, rollupReady],
+  onFilterChange,
+);
 </script>
 
 <template>
@@ -119,11 +131,29 @@ watch([selectedAccountId, selectedStatus, selectedPlatform], onFilterChange);
       <label class="text-sm text-text-muted whitespace-nowrap">Platform:</label>
       <select
         v-model="selectedPlatform"
+        aria-label="Platform"
         class="text-sm rounded-md px-2 py-1.5"
       >
         <option value="">All platforms</option>
         <option value="javascript">JavaScript</option>
         <option value="python">Python</option>
+      </select>
+    </div>
+
+    <div v-if="rollupReady" class="flex items-center gap-2">
+      <label class="text-sm text-text-muted whitespace-nowrap">Environment:</label>
+      <select
+        v-model="selectedEnvironmentId"
+        aria-label="Environment"
+        class="text-sm rounded-md px-2 py-1.5"
+      >
+        <option value="">All environments</option>
+        <option
+          v-for="environment in environments"
+          :key="environment.id"
+          :value="environment.id"
+          v-text="environment.name"
+        ></option>
       </select>
     </div>
   </div>

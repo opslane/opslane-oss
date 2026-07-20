@@ -940,6 +940,49 @@ export async function getErrorGroup(groupId: string, projectId: string): Promise
   return rows[0] ?? null;
 }
 
+export interface EnvironmentContext {
+  names: string[];
+  totalCount: number;
+}
+
+export async function getEnvironmentNamesForGroup(
+  groupId: string,
+  projectId: string,
+  kind: 'error' | 'friction',
+): Promise<EnvironmentContext> {
+  if (kind === 'friction') {
+    const { rows } = await getPool().query<{ name: string; total_count: number }>(
+      `SELECT e.name, COUNT(*) OVER()::integer AS total_count
+       FROM error_groups eg
+       JOIN environments e
+         ON e.id = eg.environment_id AND e.project_id = eg.project_id
+       WHERE eg.id = $1 AND eg.project_id = $2 AND eg.kind = 'friction'
+       LIMIT 20`,
+      [groupId, projectId],
+    );
+    return {
+      names: rows.map((row) => row.name),
+      totalCount: rows[0]?.total_count ?? 0,
+    };
+  }
+
+  const { rows } = await getPool().query<{ name: string; total_count: number }>(
+    `SELECT e.name, COUNT(*) OVER()::integer AS total_count
+     FROM error_groups eg
+     JOIN error_group_environments ege ON ege.error_group_id = eg.id
+     JOIN environments e
+       ON e.id = ege.environment_id AND e.project_id = eg.project_id
+     WHERE eg.id = $1 AND eg.project_id = $2 AND eg.kind = 'error'
+     ORDER BY e.name, e.id
+     LIMIT 20`,
+    [groupId, projectId],
+  );
+  return {
+    names: rows.map((row) => row.name),
+    totalCount: rows[0]?.total_count ?? 0,
+  };
+}
+
 /** Persist an external-CI observation, optionally promoting the draft. */
 export async function saveExternalCIResult(
   errorGroupId: string,

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
@@ -23,6 +24,7 @@ const (
 	ctxRequestID
 	ctxUserID
 	ctxAllowedOrigins
+	ctxAllowPayloadEnvironment
 	ctxRole
 )
 
@@ -64,9 +66,18 @@ func AllowedOriginsFromCtx(ctx context.Context) []string {
 	return v
 }
 
+// AllowPayloadEnvironmentFromCtx reports whether this project's SDK keys may
+// override their key-bound environment by sending a validated environment name.
+func AllowPayloadEnvironmentFromCtx(ctx context.Context) bool {
+	v, _ := ctx.Value(ctxAllowPayloadEnvironment).(bool)
+	return v
+}
+
 // Dependencies holds shared service dependencies (DB, etc.) for handlers.
 type Dependencies struct {
-	Queries *db.Queries
+	Queries       *db.Queries
+	envResolverMu sync.Mutex
+	envResolver   *environmentResolver
 	// resetSessionStore is a narrow test seam for password-reset session
 	// revocation. Production falls back to Queries.
 	resetSessionStore passwordResetSessionStore
@@ -173,6 +184,7 @@ func (d *Dependencies) AuthenticateSDK(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, ctxEnvironmentID, lookup.EnvironmentID)
 		ctx = context.WithValue(ctx, ctxOrgID, lookup.OrgID)
 		ctx = context.WithValue(ctx, ctxAllowedOrigins, lookup.AllowedOrigins)
+		ctx = context.WithValue(ctx, ctxAllowPayloadEnvironment, lookup.AllowPayloadEnvironment)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -262,6 +274,24 @@ func (d *Dependencies) RequireRole(required string) func(http.Handler) http.Hand
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !d.cloudAuthEnabled() {
 				writeJSONError(w, http.StatusNotFound, "not found")
+				return
+			}
+			if !auth.RoleSatisfies(RoleFromCtx(r.Context()), required) {
+				writeJSONError(w, http.StatusForbidden, "insufficient organization role")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequireRoleIfCloud enforces the database-backed role hierarchy when cloud
+// memberships are enabled and is intentionally transparent in OSS mode.
+func (d *Dependencies) RequireRoleIfCloud(required string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !d.cloudAuthEnabled() {
+				next.ServeHTTP(w, r)
 				return
 			}
 			if !auth.RoleSatisfies(RoleFromCtx(r.Context()), required) {

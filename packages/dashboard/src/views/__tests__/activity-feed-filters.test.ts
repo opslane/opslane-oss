@@ -117,7 +117,9 @@ describe('ActivityFeed URL filters', () => {
 
     const wrapper = mountFeed();
     await flushPromises();
-    await wrapper.findAll('select')[2]!.setValue('javascript');
+    // By label, not index: FilterBar has four selects and the environment one
+    // is conditional, so positional lookup silently drifts.
+    await wrapper.get('select[aria-label="Platform"]').setValue('javascript');
     await flushPromises();
 
     expect(wrapper.text()).toContain('JavaScript failure');

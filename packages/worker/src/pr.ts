@@ -89,6 +89,8 @@ export interface PRInput {
   } | null;
   errorType?: string;
   errorMessage?: string;
+  environmentNames?: string[];
+  environmentTotal?: number;
   kind?: 'error' | 'friction';
   evidence?: EvidenceRecord | null;
   draft?: boolean;
@@ -199,6 +201,40 @@ function buildFixLine(input: PRInput, files: string[]): string {
 function buildFileLine(files: string[]): string | null {
   if (files.length === 0) return null;
   return `Changed files: ${files.map((file) => inlineCode(file)).join(', ')}`;
+}
+
+// Removes <...> tag structures completely, repeating until the string is
+// stable so nested or unterminated input (e.g. "<scr<script>ipt>") cannot
+// leave a live tag behind. The pattern has no nested quantifier, so the loop
+// is linear, not a ReDoS.
+function stripAngleTags(value: string): string {
+  let current = value;
+  let previous: string;
+  do {
+    previous = current;
+    current = current.replace(/<[^>]*>/g, '');
+  } while (current !== previous);
+  return current;
+}
+
+function buildEnvironmentLine(
+  environmentNames?: string[],
+  environmentTotal?: number,
+): string | null {
+  const availableNames = environmentNames ?? [];
+  const names = availableNames
+    .slice(0, 20)
+    .map((name) => sanitizeInline(
+      stripAngleTags(name).replace(/[`*_~|\\]/g, ''),
+      80,
+    ))
+    .filter(Boolean);
+  if (names.length === 0) return null;
+
+  const total = Math.max(environmentTotal ?? availableNames.length, availableNames.length);
+  const omitted = Math.max(0, total - Math.min(availableNames.length, 20));
+  const suffix = omitted > 0 ? ` (+${omitted} more)` : '';
+  return `Environments: ${names.join(', ')}${suffix}`;
 }
 
 function buildStackTraceSection(stackTrace?: string): string {
@@ -361,6 +397,7 @@ export function buildPRBody(input: PRInput): string {
     const sections = renderPRSections(narrative);
     return [
       `## ${sections.title}`,
+      buildEnvironmentLine(input.environmentNames, input.environmentTotal),
       '### What happened',
       sections.whatHappened,
       replayLink
@@ -383,6 +420,7 @@ export function buildPRBody(input: PRInput): string {
 
   return [
     `## 💡 Opslane suggestion: ${sanitizeInline(input.title, 120)}`,
+    buildEnvironmentLine(input.environmentNames, input.environmentTotal),
     buildHumanSummary(input),
     '### The fix',
     buildFixLine(input, files),

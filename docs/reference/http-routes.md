@@ -35,11 +35,11 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 
 | Method | Path | Origin-gated | Purpose |
 | --- | --- | --- | --- |
-| POST | `/api/v1/events` | yes | Ingest an error event |
+| POST | `/api/v1/events` | yes | Ingest an error event; optional payload `environment` is project-gated and falls back to the key environment |
 | POST | `/api/v1/replays/init` | yes | Begin a replay upload |
 | POST | `/api/v1/replays/{replayID}/complete` | yes | Finish a replay upload |
 | POST | `/api/v1/replays/{replayID}/fail` | yes | Record a replay upload failure |
-| POST | `/api/v1/sessions/init` | yes | Register a session; returns the recording kill switch |
+| POST | `/api/v1/sessions/init` | yes | Register a tenant-owned session with optional payload `environment`; returns the recording kill switch |
 | POST | `/api/v1/sessions/{sessionID}/chunks/upload-url` | yes | Size-capped presigned POST policy for one chunk |
 | POST | `/api/v1/sessions/{sessionID}/chunks/{seq}/commit` | yes | Acknowledge an uploaded chunk exists |
 | POST | `/api/v1/sessions/{sessionID}/chunks/{seq}/inline` | yes | Keepalive tail flush on tab close (at most 64KB) |
@@ -62,7 +62,7 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
 | POST | `/api/v1/projects` | Create project |
-| PATCH | `/api/v1/projects/{projectID}` | Update project settings, including `friction_autonomy` and `pr_posture` (partial: omitted/null fields are preserved, so `github_repo` can no longer be cleared here) |
+| PATCH | `/api/v1/projects/{projectID}` | Update project settings, including `friction_autonomy`, `pr_posture`, and the admin-gated `allow_payload_environment` override flag (partial: omitted/null fields are preserved, so `github_repo` can no longer be cleared here) |
 | GET | `/api/v1/projects/{projectID}/fix-stats` | Per-kind fix generation and PR outcome receipts |
 | GET | `/api/v1/projects/{projectID}/environments` | List environments |
 | POST | `/api/v1/projects/{projectID}/environments` | Create environment |

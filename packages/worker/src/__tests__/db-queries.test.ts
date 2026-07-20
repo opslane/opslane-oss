@@ -13,6 +13,7 @@ vi.mock('pg', () => ({
 import {
   getErrorGroup,
   getErrorEvent,
+  getEnvironmentNamesForGroup,
   getProject,
   getReplayForGroup,
   getSessionPointerForGroup,
@@ -118,6 +119,48 @@ describe('getErrorGroup', () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
     const group = await getErrorGroup('nonexistent', 'p1');
     expect(group).toBeNull();
+  });
+});
+
+describe('getEnvironmentNamesForGroup', () => {
+  beforeEach(() => mockQuery.mockReset());
+
+  it('loads error-group environments from the rollup with project and kind scope', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        { name: 'production', total_count: 2 },
+        { name: 'staging', total_count: 2 },
+      ],
+    });
+
+    const names = await getEnvironmentNamesForGroup('g1', 'p1', 'error');
+
+    expect(names).toEqual({ names: ['production', 'staging'], totalCount: 2 });
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('error_group_environments');
+    expect(sql).toContain("eg.kind = 'error'");
+    expect(sql).toContain('eg.project_id = $2');
+    expect(sql).toContain('e.project_id = eg.project_id');
+    expect(sql).toContain('COUNT(*) OVER()');
+    expect(sql).toContain('LIMIT 20');
+    expect(params).toEqual(['g1', 'p1']);
+  });
+
+  it('loads a friction incident environment from error_groups without consulting the rollup', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ name: 'production', total_count: 1 }] });
+
+    const names = await getEnvironmentNamesForGroup('g2', 'p1', 'friction');
+
+    expect(names).toEqual({ names: ['production'], totalCount: 1 });
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('e.id = eg.environment_id');
+    expect(sql).toContain("eg.kind = 'friction'");
+    expect(sql).not.toContain('error_group_environments');
+    expect(sql).toContain('eg.project_id = $2');
+    expect(sql).toContain('e.project_id = eg.project_id');
+    expect(sql).toContain('COUNT(*) OVER()');
+    expect(sql).toContain('LIMIT 20');
+    expect(params).toEqual(['g2', 'p1']);
   });
 });
 

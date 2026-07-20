@@ -17,7 +17,7 @@ function input(): PipelineInput {
   return {
     jobId: 'j', errorGroupId: 'grp-12345678', projectId: 'p', title: 'T',
     errorType: 'TypeError', errorMessage: 'm', stackTrace: 's', resolvedStackTrace: null,
-    breadcrumbs: '[]', context: '{}', sourceFiles: [], visualAnalysis: null,
+    breadcrumbs: '[]', context: '{}', environmentNames: [], environmentTotal: 0, sourceFiles: [], visualAnalysis: null,
     repoPath: '/tmp/r', repoUrl: 'https://github.com/o/r.git', githubRepo: 'o/r', defaultBranch: 'main',
   };
 }

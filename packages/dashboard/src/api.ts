@@ -148,6 +148,7 @@ export interface Project {
   github_repo: string | null;
   friction_autonomy: 'ask_first' | 'auto_fix' | 'auto_fix_ux';
   pr_posture: 'verified_only' | 'draft_when_unverified';
+  allow_payload_environment: boolean;
   created_at: string;
 }
 
@@ -168,6 +169,11 @@ export interface Environment {
   created_at: string;
 }
 
+export interface EnvironmentListResponse {
+  environments: Environment[];
+  rollup_ready: boolean;
+}
+
 export interface APIKey {
   id: string;
   environment_id: string;
@@ -181,7 +187,13 @@ export interface APIKeyCreated {
   id: string;
   raw_key: string;
   key_prefix: string;
-  created_at: string;
+  created_at?: string;
+}
+
+export interface ProjectProvisioningResponse {
+  project: Project;
+  environment: Environment;
+  api_key: APIKeyCreated;
 }
 
 export interface OnboardingSetupResponse {
@@ -388,8 +400,16 @@ export function listProjects(): Promise<Project[]> {
   return fetchJSON<Project[]>('/projects');
 }
 
-export function createProject(name: string, githubRepo: string): Promise<Project> {
-  return postJSON<Project>('/projects', { name, github_repo: githubRepo || undefined });
+export function createProject(
+  name: string,
+  githubRepo: string,
+  idempotencyToken: string,
+): Promise<ProjectProvisioningResponse> {
+  return postJSON<ProjectProvisioningResponse>('/projects', {
+    name,
+    github_repo: githubRepo || undefined,
+    idempotency_token: idempotencyToken,
+  });
 }
 
 export function updateProject(
@@ -398,6 +418,7 @@ export function updateProject(
     github_repo?: string;
     friction_autonomy?: Project['friction_autonomy'];
     pr_posture?: Project['pr_posture'];
+    allow_payload_environment?: Project['allow_payload_environment'];
   }
 ): Promise<Project> {
   return patchJSON<Project>(`/projects/${projectId}`, data);
@@ -407,8 +428,8 @@ export function getFixStats(projectId: string): Promise<Record<'error' | 'fricti
   return fetchJSON<Record<'error' | 'friction', FixStats>>(`/projects/${projectId}/fix-stats`);
 }
 
-export function listEnvironments(projectId: string): Promise<Environment[]> {
-  return fetchJSON<Environment[]>(`/projects/${projectId}/environments`);
+export function listEnvironments(projectId: string): Promise<EnvironmentListResponse> {
+  return fetchJSON<EnvironmentListResponse>(`/projects/${projectId}/environments`);
 }
 
 export function createEnvironment(projectId: string, name: string): Promise<Environment> {
@@ -533,6 +554,7 @@ export function listIncidents(
   if (filters?.end_user_id) params.set('end_user_id', filters.end_user_id);
   if (filters?.status) params.set('status', filters.status);
   if (filters?.platform) params.set('platform', filters.platform);
+  if (filters?.environment_id) params.set('environment_id', filters.environment_id);
   const qs = params.toString();
   return fetchJSON<Incident[]>(
     `/projects/${projectId}/incidents${qs ? `?${qs}` : ''}`
@@ -569,6 +591,7 @@ export function listSessions(
   const params = new URLSearchParams();
   if (filters?.end_user_id) params.set('end_user_id', filters.end_user_id);
   if (filters?.account_id) params.set('account_id', filters.account_id);
+  if (filters?.environment_id) params.set('environment_id', filters.environment_id);
   if (filters?.from) params.set('from', filters.from);
   if (filters?.to) params.set('to', filters.to);
   if (filters?.limit !== undefined) params.set('limit', String(filters.limit));

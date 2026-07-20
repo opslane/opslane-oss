@@ -108,6 +108,20 @@ func (d *Dependencies) ReplayInit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "session_id is required")
 		return
 	}
+	// Reject only a session that already belongs to another project. An absent
+	// session is the legacy one-shot flow (older SDKs call replays/init without
+	// a prior sessions/init), which must still succeed, so we cannot require the
+	// session to already be owned by this project.
+	ownerProjectID, err := d.Queries.SessionOwnerProject(r.Context(), req.SessionID)
+	if err != nil {
+		slog.Error("replay init session ownership check failed", "error", err, "session_id", req.SessionID)
+		writeJSONError(w, http.StatusInternalServerError, "failed to verify session ownership")
+		return
+	}
+	if ownerProjectID != "" && ownerProjectID != projectID {
+		writeJSONError(w, http.StatusNotFound, "session not found")
+		return
+	}
 
 	if d.MinIO == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "replay storage not configured")

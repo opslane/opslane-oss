@@ -16,7 +16,7 @@ interface StoredSignal {
 }
 
 const rows = new Map<string, StoredSignal>();
-const query = vi.fn(async (sql: string, params?: unknown[]) => {
+const query = vi.fn(async (sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number }> => {
   if (sql.includes('INSERT INTO friction_signals')) {
     const values = params ?? [];
     const key = `${String(values[0])}|${String(values[6])}|${String(values[4])}`;
@@ -145,6 +145,21 @@ describe('writeFrictionSignals', () => {
     ]);
     expect(insert?.[0]).not.toContain('superseded_by');
     expect(rows.get('session-1|A|1')?.supersededBy).toBeNull();
+  });
+
+  it('rebuilds every incident affected by a retraction in the same transaction', async () => {
+    query.mockImplementationOnce(async () => ({ rows: [], rowCount: 0 })); // BEGIN
+    query.mockImplementationOnce(async () => ({
+      rows: [{ incident_id: 'incident-1' }, { incident_id: 'incident-1' }, { incident_id: null }],
+      rowCount: 3,
+    }));
+
+    await writeFrictionSignals(session, [], 1);
+
+    const sql = query.mock.calls.map(([statement]) => String(statement));
+    expect(sql.some((statement) => statement.includes('FROM error_groups') && statement.includes('FOR UPDATE'))).toBe(true);
+    expect(sql.filter((statement) => statement.includes('DELETE FROM error_group_environments'))).toHaveLength(1);
+    expect(sql.at(-1)).toBe('COMMIT');
   });
 
   it('rolls back and releases the client when a write fails', async () => {

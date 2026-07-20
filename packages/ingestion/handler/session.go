@@ -33,10 +33,11 @@ func validSessionID(id string) bool {
 }
 
 type sessionInitRequest struct {
-	SessionID string `json:"session_id"`
-	StartedAt string `json:"started_at"`
-	PageURL   string `json:"page_url"`
-	User      *struct {
+	SessionID   string `json:"session_id"`
+	StartedAt   string `json:"started_at"`
+	PageURL     string `json:"page_url"`
+	Environment string `json:"environment"`
+	User        *struct {
 		ID          string `json:"id"`
 		Email       string `json:"email"`
 		AccountID   string `json:"account_id"`
@@ -98,6 +99,17 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusGone, "session has been deleted")
 		return
 	}
+	ownerProjectID, err := d.Queries.SessionOwnerProject(r.Context(), req.SessionID)
+	if err != nil {
+		slog.Error("session owner check failed", "error", err, "session_id", req.SessionID)
+		writeJSONError(w, http.StatusInternalServerError, "failed to register session")
+		return
+	}
+	if ownerProjectID != "" && ownerProjectID != projectID {
+		RecordSessionCrossProjectConflict()
+		writeJSONError(w, http.StatusConflict, "session_id belongs to another project")
+		return
+	}
 
 	enabled, err := d.Queries.ProjectRecordingEnabled(r.Context(), projectID)
 	if err != nil {
@@ -109,6 +121,22 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, sessionInitResponse{Recording: false})
 		return
 	}
+
+	resolvedEnvironmentID, fallbackReason, err := d.resolvePayloadEnvironment(
+		r.Context(), projectID, environmentID, req.Environment,
+	)
+	if err != nil {
+		slog.Error("environment resolution failed", "error", err, "project_id", projectID)
+		writeJSONError(w, http.StatusInternalServerError, "failed to register session")
+		return
+	}
+	if fallbackReason != "" {
+		RecordEnvironmentOverrideFallback(fallbackReason)
+		if shouldLogEnvironmentFallback(fallbackReason) {
+			slog.Warn("session payload environment override fell back to key environment", "reason", fallbackReason, "project_id", projectID)
+		}
+	}
+	environmentID = resolvedEnvironmentID
 
 	startedAt := time.Now()
 	if req.StartedAt != "" {
@@ -128,15 +156,24 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := d.Queries.InsertSession(r.Context(), req.SessionID, projectID, environmentID,
-		endUserID, startedAt, masking.RedactURL(req.PageURL)); err != nil {
+	registration, err := d.Queries.RegisterSession(r.Context(), req.SessionID, projectID, environmentID,
+		endUserID, startedAt, masking.RedactURL(req.PageURL))
+	if err != nil {
 		if errors.Is(err, db.ErrSessionTombstoned) {
 			writeJSONError(w, http.StatusGone, "session has been deleted")
+			return
+		}
+		if errors.Is(err, db.ErrSessionProjectConflict) {
+			RecordSessionCrossProjectConflict()
+			writeJSONError(w, http.StatusConflict, "session_id belongs to another project")
 			return
 		}
 		slog.Error("insert session failed", "error", err, "session_id", req.SessionID)
 		writeJSONError(w, http.StatusInternalServerError, "failed to register session")
 		return
+	}
+	if registration.Diverged {
+		RecordEnvironmentSessionDivergence()
 	}
 
 	writeJSON(w, http.StatusOK, sessionInitResponse{

@@ -40,6 +40,8 @@ export interface AgentFixInput {
   resolvedStackTrace: unknown;
   breadcrumbs: string;
   context: string;
+  environmentNames?: string[];
+  environmentTotal?: number;
   sourceFiles: SourceFile[];
   visualAnalysis: VisualAnalysisOutput | null;
   repoUrl: string;
@@ -88,6 +90,16 @@ const SANDBOX_REPO_PATH = '/home/user/repo';
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '... [truncated]' : s;
+}
+
+function escapeUntrustedLabel(value: string): string {
+  return value
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function shellEscape(s: string): string {
@@ -391,6 +403,22 @@ ${truncate(input.errorMessage, MAX_ERROR_MESSAGE)}
 <untrusted_user_data>
 ${truncate(input.stackTrace, MAX_STACK_TRACE)}
 </untrusted_user_data>`);
+
+  const availableEnvironmentNames = (input.environmentNames ?? [])
+    .map(escapeUntrustedLabel)
+    .filter(Boolean);
+  const environmentNames = availableEnvironmentNames.slice(0, 20);
+  if (environmentNames.length > 0) {
+    const total = Math.max(
+      input.environmentTotal ?? availableEnvironmentNames.length,
+      availableEnvironmentNames.length,
+    );
+    const omitted = Math.max(0, total - environmentNames.length);
+    const omittedLine = omitted > 0 ? `\n[${omitted} more environments omitted]` : '';
+    sections.push(
+      `## Environments\n<untrusted_user_data>\n${environmentNames.join('\n')}${omittedLine}\n</untrusted_user_data>`,
+    );
+  }
 
   if (preloadedFiles && preloadedFiles.length > 0) {
     const fileBlocks = preloadedFiles.map(f =>

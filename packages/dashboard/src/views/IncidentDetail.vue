@@ -282,6 +282,17 @@ onMounted(async () => {
             {{ incident.confidence }} confidence
           </span>
         </div>
+        <div v-if="incident.environments?.length" class="mt-3 flex flex-wrap items-center gap-2">
+          <span class="text-xs font-medium uppercase tracking-wide text-text-muted">Environments</span>
+          <span
+            v-for="environment in incident.environments"
+            :key="environment.id"
+            class="inline-flex items-center rounded-full border border-border bg-surface px-2.5 py-1 text-xs text-text-muted"
+            :title="`Last seen ${formatAbsolute(environment.last_seen)}`"
+          >
+            {{ environment.name }} · {{ environment.occurrence_count }} · {{ formatDate(environment.last_seen) }}
+          </span>
+        </div>
       </div>
 
       <!-- Pipeline -->

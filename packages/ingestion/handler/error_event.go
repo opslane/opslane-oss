@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"time"
@@ -70,6 +71,7 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 		SDKVersion  string          `json:"sdk_version"`
 		Release     string          `json:"release"`
 		SessionID   string          `json:"session_id"`
+		Environment string          `json:"environment"`
 	}
 
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -168,6 +170,36 @@ func (d *Dependencies) ingestErrorEvent(w http.ResponseWriter, r *http.Request, 
 		writeJSONError(w, http.StatusInternalServerError, "database unavailable")
 		return
 	}
+
+	resolvedEnvironmentID, fallbackReason, err := d.resolvePayloadEnvironment(
+		r.Context(), projectID, environmentID, payload.Environment,
+	)
+	if err != nil {
+		RecordIngestError("environment_resolution")
+		writeJSONError(w, http.StatusInternalServerError, "failed to process event")
+		return
+	}
+	if fallbackReason != "" {
+		RecordEnvironmentOverrideFallback(fallbackReason)
+		if shouldLogEnvironmentFallback(fallbackReason) {
+			slog.Warn("payload environment override fell back to key environment", "reason", fallbackReason, "project_id", projectID)
+		}
+	}
+	if payload.SessionID != "" {
+		sessionEnvironmentID, lookupErr := d.Queries.SessionEnvironment(r.Context(), payload.SessionID, projectID)
+		if lookupErr != nil {
+			RecordIngestError("session_environment_lookup")
+			writeJSONError(w, http.StatusInternalServerError, "failed to process event")
+			return
+		}
+		if sessionEnvironmentID != "" {
+			if sessionEnvironmentID != resolvedEnvironmentID {
+				RecordEnvironmentSessionDivergence()
+			}
+			resolvedEnvironmentID = sessionEnvironmentID
+		}
+	}
+	environmentID = resolvedEnvironmentID
 
 	// Redact secrets before persistence. End-user identity was already extracted
 	// from raw context above, so B2B tracking remains intact. RedactBreadcrumbs walks

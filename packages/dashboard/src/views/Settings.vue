@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import {
   listProjects,
+  createProject,
   updateProject,
   getFixStats,
   listEnvironments,
@@ -18,6 +20,7 @@ import {
   type APIKey,
   type APIKeyCreated,
   type FixStats,
+  type ProjectProvisioningResponse,
 } from '../api';
 import type { AuthMembership, GitHubConfig, GitHubAppStatus } from '../types/api';
 import { formatDate, safeUrl } from '../utils';
@@ -25,18 +28,41 @@ import CopyButton from '../components/CopyButton.vue';
 import IntegrationsSettings from '../components/IntegrationsSettings.vue';
 import RepoSelector from '../components/RepoSelector.vue';
 import InvitationsPanel from '../components/InvitationsPanel.vue';
+import {
+  canDismissProvisionedKey,
+  createProvisioningAttempt,
+} from '../components/project-provisioning';
+import {
+  applyProjectSelection,
+  projectSwitchQuery,
+} from '../components/project-switcher';
 
 type SettingsTab = 'project' | 'environments' | 'api-keys' | 'integrations' | 'organization';
+const route = useRoute();
+const router = useRouter();
 const activeTab = ref<SettingsTab>('project');
 const activeRole = ref<AuthMembership['role']>();
+const activeRoleResolved = ref(false);
 
 // Project tab
 const projects = ref<Project[]>([]);
 const selectedProjectId = ref(localStorage.getItem('opslane_project_id') ?? '');
-const manualId = ref('');
-const showManual = ref(false);
-const saved = ref(false);
 const loadingProjects = ref(true);
+const showNewProjectForm = ref(false);
+const newProjectName = ref('');
+const newProjectRepo = ref('');
+const projectAttemptToken = ref('');
+const creatingProject = ref(false);
+const projectCreateError = ref('');
+const provisionedProject = ref<ProjectProvisioningResponse | null>(null);
+const provisioningKeyAcknowledged = ref(false);
+const canProvision = computed(() =>
+  !activeRole.value || activeRole.value === 'admin' || activeRole.value === 'owner',
+);
+const canManagePayloadEnvironment = computed(() =>
+  activeRoleResolved.value
+    && (!activeRole.value || activeRole.value === 'admin' || activeRole.value === 'owner'),
+);
 
 // Friction autonomy
 const autonomyOptions = [
@@ -60,16 +86,23 @@ const autonomyOptions = [
 const selectedProject = computed(() =>
   projects.value.find((project) => project.id === selectedProjectId.value) ?? null,
 );
+const activeProjectName = computed(() =>
+  selectedProject.value?.name ?? localStorage.getItem('opslane_project_name') ?? 'No project selected',
+);
 const autonomy = ref<Project['friction_autonomy']>('ask_first');
 const autonomySaving = ref(false);
 const autonomyError = ref('');
 const prPosture = ref<Project['pr_posture']>('verified_only');
 const prPostureSaving = ref(false);
 const prPostureError = ref('');
+const allowPayloadEnvironment = ref(false);
+const payloadEnvironmentSaving = ref(false);
+const payloadEnvironmentError = ref('');
 const fixStats = ref<Record<'error' | 'friction', FixStats> | null>(null);
 let statsRequestToken = 0;
 let autonomySaveToken = 0;
 let prPostureSaveToken = 0;
+let payloadEnvironmentSaveToken = 0;
 let lastLoadedProjectId: string | null = null;
 
 // Environments tab
@@ -100,7 +133,10 @@ const creatingKey = ref(false);
 const keyError = ref('');
 
 onMounted(async () => {
-  getMe().then((user) => { activeRole.value = user.active_role; }).catch(() => {});
+  getMe().then((user) => {
+    activeRole.value = user.active_role;
+    activeRoleResolved.value = true;
+  }).catch(() => {});
   try {
     projects.value = await listProjects();
     // Load GitHub App status + per-project config
@@ -109,7 +145,8 @@ onMounted(async () => {
       loadGitHubConfig(selectedProjectId.value);
     }
   } catch {
-    showManual.value = true;
+    // The active project remains available from local storage; project-scoped
+    // requests below will surface their own failures.
   } finally {
     loadingProjects.value = false;
   }
@@ -122,6 +159,8 @@ watch(selectedProjectId, () => {
   autonomySaving.value = false;
   prPostureSaveToken += 1;
   prPostureSaving.value = false;
+  payloadEnvironmentSaveToken += 1;
+  payloadEnvironmentSaving.value = false;
   void loadAutonomyAndStats();
 }, { immediate: true });
 watch(projects, () => {
@@ -131,6 +170,7 @@ watch(projects, () => {
   // refetching stats, which would flicker the receipts for nothing).
   autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
   prPosture.value = selectedProject.value?.pr_posture ?? 'verified_only';
+  allowPayloadEnvironment.value = selectedProject.value?.allow_payload_environment ?? false;
   if ((selectedProject.value?.id ?? null) !== lastLoadedProjectId) {
     void loadAutonomyAndStats();
   }
@@ -140,9 +180,11 @@ async function loadAutonomyAndStats(): Promise<void> {
   const token = ++statsRequestToken;
   autonomyError.value = '';
   prPostureError.value = '';
+  payloadEnvironmentError.value = '';
   fixStats.value = null;
   autonomy.value = selectedProject.value?.friction_autonomy ?? 'ask_first';
   prPosture.value = selectedProject.value?.pr_posture ?? 'verified_only';
+  allowPayloadEnvironment.value = selectedProject.value?.allow_payload_environment ?? false;
 
   const id = selectedProjectId.value;
   lastLoadedProjectId = selectedProject.value?.id ?? null;
@@ -156,6 +198,63 @@ async function loadAutonomyAndStats(): Promise<void> {
   } catch {
     // Stats are best-effort; the autonomy setting works without them.
   }
+}
+
+function openNewProjectForm(): void {
+  showNewProjectForm.value = true;
+  projectCreateError.value = '';
+  projectAttemptToken.value = createProvisioningAttempt(() => crypto.randomUUID()).idempotencyToken;
+}
+
+function cancelNewProjectForm(): void {
+  if (creatingProject.value) return;
+  showNewProjectForm.value = false;
+  newProjectName.value = '';
+  newProjectRepo.value = '';
+  projectAttemptToken.value = '';
+  projectCreateError.value = '';
+}
+
+async function handleCreateProject(): Promise<void> {
+  if (!newProjectName.value.trim() || !projectAttemptToken.value || creatingProject.value) return;
+  creatingProject.value = true;
+  projectCreateError.value = '';
+  try {
+    const result = await createProject(
+      newProjectName.value.trim(),
+      newProjectRepo.value.trim(),
+      projectAttemptToken.value,
+    );
+    provisionedProject.value = result;
+    provisioningKeyAcknowledged.value = false;
+    projects.value = [
+      ...projects.value.filter((project) => project.id !== result.project.id),
+      result.project,
+    ];
+    showNewProjectForm.value = false;
+  } catch (caught: unknown) {
+    projectCreateError.value = caught instanceof Error
+      ? caught.message
+      : 'Failed to create project';
+  } finally {
+    creatingProject.value = false;
+  }
+}
+
+async function dismissProvisionedProject(): Promise<void> {
+  if (!canDismissProvisionedKey(provisioningKeyAcknowledged.value)) return;
+  const result = provisionedProject.value;
+  if (!result) return;
+
+  applyProjectSelection(localStorage, result.project);
+  await router.push({ path: '/', query: projectSwitchQuery(route.query) });
+  window.dispatchEvent(new Event('opslane-projects-changed'));
+
+  provisionedProject.value = null;
+  provisioningKeyAcknowledged.value = false;
+  newProjectName.value = '';
+  newProjectRepo.value = '';
+  projectAttemptToken.value = '';
 }
 
 async function savePRPosture(value: Project['pr_posture']): Promise<void> {
@@ -189,6 +288,39 @@ async function savePRPosture(value: Project['pr_posture']): Promise<void> {
 function onPRPostureChange(event: Event): void {
   const checked = event.target instanceof HTMLInputElement && event.target.checked;
   void savePRPosture(checked ? 'draft_when_unverified' : 'verified_only');
+}
+
+async function savePayloadEnvironment(value: boolean): Promise<void> {
+  if (!selectedProject.value || !canManagePayloadEnvironment.value) return;
+
+  const projectId = selectedProject.value.id;
+  const saveToken = ++payloadEnvironmentSaveToken;
+  const previous = allowPayloadEnvironment.value;
+  allowPayloadEnvironment.value = value;
+  payloadEnvironmentSaving.value = true;
+  payloadEnvironmentError.value = '';
+  try {
+    const updated = await updateProject(projectId, { allow_payload_environment: value });
+    projects.value = projects.value.map((project) =>
+      project.id === updated.id ? updated : project,
+    );
+  } catch (err: unknown) {
+    if (saveToken === payloadEnvironmentSaveToken && selectedProjectId.value === projectId) {
+      allowPayloadEnvironment.value = previous;
+      payloadEnvironmentError.value = err instanceof Error
+        ? err.message
+        : 'Failed to save SDK environment override setting';
+    }
+  } finally {
+    if (saveToken === payloadEnvironmentSaveToken) {
+      payloadEnvironmentSaving.value = false;
+    }
+  }
+}
+
+function onPayloadEnvironmentChange(event: Event): void {
+  const checked = event.target instanceof HTMLInputElement && event.target.checked;
+  void savePayloadEnvironment(checked);
 }
 
 async function saveAutonomy(value: Project['friction_autonomy']): Promise<void> {
@@ -235,27 +367,6 @@ function optionStats(value: Project['friction_autonomy']): string {
   }
 }
 
-function save(): void {
-  const id = showManual.value ? manualId.value.trim() : selectedProjectId.value;
-  if (!id) return;
-
-  selectedProjectId.value = id;
-  localStorage.setItem('opslane_project_id', id);
-
-  const project = projects.value.find((p) => p.id === id);
-  if (project) {
-    localStorage.setItem('opslane_project_name', project.name);
-  } else {
-    localStorage.removeItem('opslane_project_name');
-  }
-
-  saved.value = true;
-  setTimeout(() => { saved.value = false; }, 2000);
-
-  // Reload GitHub config for newly selected project
-  loadGitHubConfig(id);
-}
-
 function switchTab(tab: SettingsTab): void {
   activeTab.value = tab;
   const pid = selectedProjectId.value || localStorage.getItem('opslane_project_id') || '';
@@ -270,7 +381,7 @@ function switchTab(tab: SettingsTab): void {
 async function loadEnvironments(pid: string): Promise<void> {
   loadingEnvs.value = true;
   try {
-    environments.value = await listEnvironments(pid);
+    environments.value = (await listEnvironments(pid)).environments;
   } catch {
     // Non-fatal
   } finally {
@@ -437,63 +548,67 @@ async function handleCreateKey(): Promise<void> {
         see in the activity feed.
       </p>
 
+      <div v-if="canProvision" class="mb-6">
+        <button
+          v-if="!showNewProjectForm"
+          type="button"
+          class="btn-primary"
+          @click="openNewProjectForm"
+        >
+          New project
+        </button>
+        <form
+          v-else
+          class="space-y-3 rounded-lg border border-border bg-surface p-4"
+          @submit.prevent="handleCreateProject"
+        >
+          <h3 class="text-sm font-medium text-text">Create project</h3>
+          <label class="block text-xs text-text-muted">
+            Name
+            <input
+              v-model="newProjectName"
+              name="new-project-name"
+              class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
+              maxlength="100"
+              required
+            />
+          </label>
+          <label class="block text-xs text-text-muted">
+            GitHub repository (optional)
+            <input
+              v-model="newProjectRepo"
+              name="new-project-repo"
+              placeholder="owner/repository"
+              class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
+            />
+          </label>
+          <p v-if="projectCreateError" class="text-sm text-red" v-text="projectCreateError"></p>
+          <div class="flex gap-3">
+            <button
+              type="submit"
+              class="btn-primary"
+              :disabled="creatingProject || !newProjectName.trim()"
+            >
+              {{ creatingProject ? 'Creating...' : 'Create project' }}
+            </button>
+            <button type="button" class="btn-secondary" :disabled="creatingProject" @click="cancelNewProjectForm">
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+
       <div v-if="loadingProjects" class="text-sm text-text-muted">Loading projects...</div>
 
-      <form v-else @submit.prevent="save" class="space-y-4">
-        <div v-if="!showManual">
-          <label for="settings-project-select" class="block text-sm font-medium text-text-muted">
-            Project
-          </label>
-          <select
-            id="settings-project-select"
-            v-model="selectedProjectId"
-            class="mt-1 block w-full rounded-md px-3 py-2 text-sm"
-          >
-            <option value="" disabled>Select a project</option>
-            <option
-              v-for="project in projects"
-              :key="project.id"
-              :value="project.id"
-              v-text="project.name"
-            ></option>
-          </select>
-          <button
-            type="button"
-            @click="showManual = true"
-            class="mt-2 text-xs text-text-muted hover:text-text underline"
-          >
-            Enter project ID manually
-          </button>
+      <div v-else class="rounded-lg border border-border bg-surface p-4">
+        <div class="text-xs font-medium uppercase tracking-wide text-text-muted">Active project</div>
+        <div class="mt-1 text-sm font-medium text-text">
+          {{ activeProjectName }}
         </div>
-
-        <div v-else>
-          <label for="manual-project-id" class="block text-sm font-medium text-text-muted">
-            Project ID
-          </label>
-          <input
-            id="manual-project-id"
-            v-model="manualId"
-            type="text"
-            placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000"
-            class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal"
-          />
-          <button
-            v-if="projects.length > 0"
-            type="button"
-            @click="showManual = false"
-            class="mt-2 text-xs text-text-muted hover:text-text underline"
-          >
-            Select from projects list
-          </button>
-        </div>
-
-        <div class="flex items-center gap-3">
-          <button type="submit" class="btn-primary">
-            Save
-          </button>
-          <span v-if="saved" class="text-sm text-green">Saved.</span>
-        </div>
-      </form>
+        <p class="mt-2 text-xs text-text-muted">
+          Use the project switcher in the header to change projects safely.
+        </p>
+      </div>
 
       <!-- GitHub Integration -->
       <div class="mt-8 pt-6 border-t border-border">
@@ -604,6 +719,47 @@ async function handleCreateKey(): Promise<void> {
             : 'Verified only (default) — fixes below the ready bar remain needs-human incidents.' }}
         </p>
         <p v-if="prPostureError" class="text-sm text-red" v-text="prPostureError"></p>
+      </section>
+
+      <!-- SDK-provided environment override -->
+      <section class="mt-8 p-4 bg-surface border border-border rounded-lg space-y-3">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <h3 id="payload-environment-heading" class="text-sm font-medium text-text">
+              Allow SDK environment override
+            </h3>
+            <p id="payload-environment-desc" class="mt-1 text-xs text-text-muted">
+              This relaxes the boundary provided by an environment-bound API key. SDK event
+              and replay payloads may select any existing environment in this project. Enable
+              it only when you trust clients to choose the correct environment.
+            </p>
+          </div>
+          <label class="relative inline-flex shrink-0 items-center" :class="canManagePayloadEnvironment ? 'cursor-pointer' : 'cursor-not-allowed'">
+            <input
+              type="checkbox"
+              class="peer sr-only"
+              role="switch"
+              aria-labelledby="payload-environment-heading"
+              aria-describedby="payload-environment-desc"
+              :checked="allowPayloadEnvironment"
+              :disabled="!selectedProject || !canManagePayloadEnvironment || payloadEnvironmentSaving"
+              @change="onPayloadEnvironmentChange"
+            />
+            <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
+          </label>
+        </div>
+        <p v-if="!selectedProject" class="text-xs text-text-faint">
+          Select one of your projects above to manage SDK environment overrides.
+        </p>
+        <p v-else-if="!canManagePayloadEnvironment" class="text-xs text-text-faint">
+          Only organization admins can change this setting.
+        </p>
+        <p v-else class="text-xs text-text-faint">
+          {{ allowPayloadEnvironment
+            ? 'Enabled — SDK payloads may override the key-bound environment.'
+            : 'Disabled (default) — the API key always determines the environment.' }}
+        </p>
+        <p v-if="payloadEnvironmentError" class="text-sm text-red" v-text="payloadEnvironmentError"></p>
       </section>
 
       <!-- Friction autonomy (Batch 5, issue #57) -->
@@ -757,6 +913,37 @@ async function handleCreateKey(): Promise<void> {
       v-if="activeTab === 'integrations'"
       :project-id="selectedProjectId"
     />
+
+    <!-- One-time project provisioning key -->
+    <div
+      v-if="provisionedProject"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+    >
+      <div class="bg-surface rounded-lg border border-border max-w-lg w-full mx-4 p-6">
+        <h3 class="text-lg font-medium text-text">Project created</h3>
+        <p class="mt-1 text-sm text-text-muted">
+          The production environment is ready. Save this API key now; it cannot be shown again.
+        </p>
+        <div class="mt-4 rounded-lg bg-surface-2 text-text p-4 font-mono text-sm break-all relative">
+          <span v-text="provisionedProject.api_key.raw_key"></span>
+          <div class="absolute top-2 right-2">
+            <CopyButton :text="provisionedProject.api_key.raw_key" />
+          </div>
+        </div>
+        <label class="mt-4 flex items-start gap-2 text-sm text-text-muted">
+          <input v-model="provisioningKeyAcknowledged" type="checkbox" class="mt-0.5" />
+          <span>I have copied and stored this key securely.</span>
+        </label>
+        <button
+          type="button"
+          class="mt-4 w-full btn-primary"
+          :disabled="!canDismissProvisionedKey(provisioningKeyAcknowledged)"
+          @click="dismissProvisionedProject"
+        >
+          Done
+        </button>
+      </div>
+    </div>
 
     <!-- New key modal -->
     <div

@@ -90,6 +90,7 @@ export function buildPayload(
     sdk_version: SDK_VERSION,
     release: config.release || undefined,
     session_id: getSessionId() || undefined,
+    environment: config.environment || undefined,
   };
 }
 

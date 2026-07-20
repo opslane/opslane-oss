@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/opslane/opslane/packages/ingestion/db"
@@ -19,32 +20,40 @@ import (
 // incidentJSON is the JSON representation of an incident, matching the
 // Incident type in shared/src/types.ts. Fields use snake_case.
 type incidentJSON struct {
-	ID                   string              `json:"id"`
-	ProjectID            string              `json:"project_id"`
-	Fingerprint          string              `json:"fingerprint"`
-	Title                string              `json:"title"`
-	Status               string              `json:"status"`
-	Kind                 string              `json:"kind"`
-	Platform             *string             `json:"platform,omitempty"`
-	EnvironmentID        *string             `json:"environment_id,omitempty"`
-	AdjudicationStatus   *string             `json:"adjudication_status,omitempty"`
-	FirstSeen            string              `json:"first_seen"`
-	LastSeen             string              `json:"last_seen"`
-	OccurrenceCount      int                 `json:"occurrence_count"`
-	AffectedUsersCount   int                 `json:"affected_users_count"`
-	Confidence           *string             `json:"confidence,omitempty"`
-	PrURL                *string             `json:"pr_url,omitempty"`
-	ReplayID             *string             `json:"replay_id,omitempty"`
-	SessionPointer       *sessionPointerJSON `json:"session_pointer,omitempty"`
-	Reason               *needsHumanReason   `json:"reason,omitempty"`
-	RootCause            *string             `json:"root_cause,omitempty"`
-	SuggestedMitigation  *string             `json:"suggested_mitigation,omitempty"`
-	VerificationEvidence json.RawMessage     `json:"verification_evidence,omitempty"`
-	CandidateDiff        *string             `json:"candidate_diff,omitempty"`
-	MergedAt             *string             `json:"merged_at,omitempty"`
-	ResolvedAt           *string             `json:"resolved_at,omitempty"`
-	ArchivedAt           *string             `json:"archived_at,omitempty"`
-	TraceURL             *string             `json:"trace_url,omitempty"`
+	ID                   string                    `json:"id"`
+	ProjectID            string                    `json:"project_id"`
+	Fingerprint          string                    `json:"fingerprint"`
+	Title                string                    `json:"title"`
+	Status               string                    `json:"status"`
+	Kind                 string                    `json:"kind"`
+	Platform             *string                   `json:"platform,omitempty"`
+	EnvironmentID        *string                   `json:"environment_id,omitempty"`
+	AdjudicationStatus   *string                   `json:"adjudication_status,omitempty"`
+	FirstSeen            string                    `json:"first_seen"`
+	LastSeen             string                    `json:"last_seen"`
+	OccurrenceCount      int                       `json:"occurrence_count"`
+	AffectedUsersCount   int                       `json:"affected_users_count"`
+	Confidence           *string                   `json:"confidence,omitempty"`
+	PrURL                *string                   `json:"pr_url,omitempty"`
+	ReplayID             *string                   `json:"replay_id,omitempty"`
+	SessionPointer       *sessionPointerJSON       `json:"session_pointer,omitempty"`
+	Reason               *needsHumanReason         `json:"reason,omitempty"`
+	RootCause            *string                   `json:"root_cause,omitempty"`
+	SuggestedMitigation  *string                   `json:"suggested_mitigation,omitempty"`
+	VerificationEvidence json.RawMessage           `json:"verification_evidence,omitempty"`
+	CandidateDiff        *string                   `json:"candidate_diff,omitempty"`
+	MergedAt             *string                   `json:"merged_at,omitempty"`
+	ResolvedAt           *string                   `json:"resolved_at,omitempty"`
+	ArchivedAt           *string                   `json:"archived_at,omitempty"`
+	TraceURL             *string                   `json:"trace_url,omitempty"`
+	Environments         []incidentEnvironmentJSON `json:"environments,omitempty"`
+}
+
+type incidentEnvironmentJSON struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	OccurrenceCount int64  `json:"occurrence_count"`
+	LastSeen        string `json:"last_seen"`
 }
 
 type sessionPointerJSON struct {
@@ -120,22 +129,24 @@ func toIncidentJSON(g db.ErrorGroup) incidentJSON {
 
 // projectJSON is the JSON representation of a project for the dashboard API.
 type projectJSON struct {
-	ID               string  `json:"id"`
-	Name             string  `json:"name"`
-	GithubRepo       *string `json:"github_repo"`
-	FrictionAutonomy string  `json:"friction_autonomy"`
-	PrPosture        string  `json:"pr_posture"`
-	CreatedAt        string  `json:"created_at"`
+	ID                      string  `json:"id"`
+	Name                    string  `json:"name"`
+	GithubRepo              *string `json:"github_repo"`
+	FrictionAutonomy        string  `json:"friction_autonomy"`
+	PrPosture               string  `json:"pr_posture"`
+	AllowPayloadEnvironment bool    `json:"allow_payload_environment"`
+	CreatedAt               string  `json:"created_at"`
 }
 
 func toProjectJSON(p db.Project) projectJSON {
 	return projectJSON{
-		ID:               p.ID,
-		Name:             p.Name,
-		GithubRepo:       p.GithubRepo,
-		FrictionAutonomy: p.FrictionAutonomy,
-		PrPosture:        p.PrPosture,
-		CreatedAt:        p.CreatedAt.Format(time.RFC3339),
+		ID:                      p.ID,
+		Name:                    p.Name,
+		GithubRepo:              p.GithubRepo,
+		FrictionAutonomy:        p.FrictionAutonomy,
+		PrPosture:               p.PrPosture,
+		AllowPayloadEnvironment: p.AllowPayloadEnvironment,
+		CreatedAt:               p.CreatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -217,12 +228,34 @@ func (d *Dependencies) ListIncidents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid platform")
 		return
 	}
-	if accountID != "" || endUserID != "" || status != "" || platform != "" {
+	environmentID := r.URL.Query().Get("environment_id")
+	if environmentID != "" {
+		if _, err := uuid.Parse(environmentID); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "environment_id must be a valid UUID")
+			return
+		}
+		environmentProjectID, err := d.Queries.VerifyEnvironmentAccess(
+			r.Context(), OrgIDFromCtx(r.Context()), environmentID,
+		)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to verify environment access")
+			return
+		}
+		if environmentProjectID != projectID {
+			writeJSONError(w, http.StatusNotFound, "environment not found")
+			return
+		}
+	}
+	if accountID != "" || endUserID != "" || status != "" || environmentID != "" || platform != "" {
 		filters = &db.ErrorGroupFilters{
-			AccountID: accountID,
-			EndUserID: endUserID,
-			Status:    status,
-			Platform:  platform,
+			AccountID:     accountID,
+			EndUserID:     endUserID,
+			Status:        status,
+			Platform:      platform,
+			EnvironmentID: nil,
+		}
+		if environmentID != "" {
+			filters.EnvironmentID = &environmentID
 		}
 	}
 
@@ -261,6 +294,20 @@ func (d *Dependencies) GetIncident(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inc := toIncidentJSON(*group)
+	environments, err := d.Queries.ListGroupEnvironments(r.Context(), projectID, incidentID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to get incident environments")
+		return
+	}
+	inc.Environments = make([]incidentEnvironmentJSON, 0, len(environments))
+	for _, environment := range environments {
+		inc.Environments = append(inc.Environments, incidentEnvironmentJSON{
+			ID:              environment.ID,
+			Name:            environment.Name,
+			OccurrenceCount: environment.OccurrenceCount,
+			LastSeen:        environment.LastSeen.Format(time.RFC3339),
+		})
+	}
 
 	// Attach latest job trace URL (best-effort, non-fatal)
 	traceURL, err := d.Queries.GetLatestJobTraceURL(r.Context(), projectID, incidentID)
@@ -542,8 +589,9 @@ func (d *Dependencies) CreateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
 	var req struct {
-		Name       string `json:"name"`
-		GithubRepo string `json:"github_repo"`
+		Name             string `json:"name"`
+		GithubRepo       string `json:"github_repo"`
+		IdempotencyToken string `json:"idempotency_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -557,13 +605,23 @@ func (d *Dependencies) CreateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusBadRequest, "name must be 100 characters or less")
 		return
 	}
+	if strings.TrimSpace(req.IdempotencyToken) == "" {
+		writeJSONError(w, http.StatusBadRequest, "idempotency_token is required")
+		return
+	}
+	if len(req.IdempotencyToken) > 128 {
+		writeJSONError(w, http.StatusBadRequest, "idempotency_token must be 128 characters or less")
+		return
+	}
 
 	var githubRepo *string
 	if req.GithubRepo != "" {
 		githubRepo = &req.GithubRepo
 	}
 
-	project, err := d.Queries.CreateProject(r.Context(), orgID, req.Name, githubRepo)
+	provisioning, err := d.Queries.ProvisionProject(
+		r.Context(), orgID, req.Name, githubRepo, req.IdempotencyToken,
+	)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to create project")
 		return
@@ -571,7 +629,20 @@ func (d *Dependencies) CreateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(toProjectJSON(*project))
+	json.NewEncoder(w).Encode(map[string]any{
+		"project": toProjectJSON(provisioning.Project),
+		"environment": environmentJSON{
+			ID:        provisioning.Environment.ID,
+			ProjectID: provisioning.Environment.ProjectID,
+			Name:      provisioning.Environment.Name,
+			CreatedAt: provisioning.Environment.CreatedAt.Format(time.RFC3339),
+		},
+		"api_key": map[string]any{
+			"id":         provisioning.APIKey.ID,
+			"raw_key":    provisioning.APIKey.RawKey,
+			"key_prefix": provisioning.APIKey.KeyPrefix,
+		},
+	})
 }
 
 // UpdateProjectEndpoint updates a project's settings.
@@ -585,9 +656,10 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
 	var req struct {
-		GithubRepo       *string `json:"github_repo"`
-		FrictionAutonomy *string `json:"friction_autonomy"`
-		PrPosture        *string `json:"pr_posture"`
+		GithubRepo              *string `json:"github_repo"`
+		FrictionAutonomy        *string `json:"friction_autonomy"`
+		PrPosture               *string `json:"pr_posture"`
+		AllowPayloadEnvironment *bool   `json:"allow_payload_environment"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -614,7 +686,7 @@ func (d *Dependencies) UpdateProjectEndpoint(w http.ResponseWriter, r *http.Requ
 	}
 
 	project, err := d.Queries.UpdateProject(
-		r.Context(), orgID, projectID, req.GithubRepo, req.FrictionAutonomy, req.PrPosture,
+		r.Context(), orgID, projectID, req.GithubRepo, req.FrictionAutonomy, req.PrPosture, req.AllowPayloadEnvironment,
 	)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to update project")
@@ -660,6 +732,11 @@ func (d *Dependencies) ListEnvironmentsEndpoint(w http.ResponseWriter, r *http.R
 		writeJSONError(w, http.StatusInternalServerError, "failed to list environments")
 		return
 	}
+	rollupReady, err := d.Queries.RollupReady(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to read environment rollup readiness")
+		return
+	}
 
 	result := make([]environmentJSON, 0, len(envs))
 	for _, e := range envs {
@@ -672,7 +749,10 @@ func (d *Dependencies) ListEnvironmentsEndpoint(w http.ResponseWriter, r *http.R
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(map[string]any{
+		"environments": result,
+		"rollup_ready": rollupReady,
+	})
 }
 
 // CreateEnvironmentEndpoint creates a new environment for a project.
@@ -695,8 +775,8 @@ func (d *Dependencies) CreateEnvironmentEndpoint(w http.ResponseWriter, r *http.
 		writeJSONError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if len(req.Name) > 100 {
-		writeJSONError(w, http.StatusBadRequest, "name must be 100 characters or less")
+	if !environmentNamePattern.MatchString(req.Name) {
+		writeJSONError(w, http.StatusBadRequest, "name must be 1-64 characters using letters, numbers, dot, underscore, or hyphen")
 		return
 	}
 
