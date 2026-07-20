@@ -8,12 +8,16 @@ import {
   signup,
   verifyEmail,
 } from '../api';
+import { AGENT_ONBOARDING_ENABLED } from '../agent-onboarding';
+import AgentOnboardingCard from '../components/AgentOnboardingCard.vue';
 import SocialLoginButtons from '../components/SocialLoginButtons.vue';
 import { socialProviderButtons } from '../composables/socialProviders';
 import { useLoginFlow } from '../composables/useLoginFlow';
 import { completePostAuth } from '../post-auth';
 
 const router = useRouter();
+const agentCardEnabled = AGENT_ONBOARDING_ENABLED;
+const origin = window.location.origin;
 const {
   mode,
   config,
@@ -254,6 +258,15 @@ onMounted(loadConfig);
           </button>
         </form>
       </div>
+
+      <template v-if="agentCardEnabled && (mode === 'redirect' || mode === 'signin' || mode === 'signup')">
+        <div class="my-6 flex items-center gap-3">
+          <div class="h-px flex-1 bg-border"></div>
+          <span class="text-xs text-text-faint">or</span>
+          <div class="h-px flex-1 bg-border"></div>
+        </div>
+        <AgentOnboardingCard :origin="origin" />
+      </template>
     </div>
   </div>
 </template>

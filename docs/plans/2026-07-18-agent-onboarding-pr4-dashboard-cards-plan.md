@@ -1,6 +1,8 @@
 # Agent Onboarding PR 4 — Dashboard Cards Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Execution:** Execute task-by-task with a commit per task (Claude: use the `superpowers:executing-plans` sub-skill; Codex/other executors: follow the same task-by-task flow — the sub-skill is not required).
+
+> **Status:** Revised after round-4 review (3 P1, 1 P2, all plan-scoped). Enabled-state integration tests, correct self-hosted-origin visual check, and Step 1 installed-state clarification folded in below.
 
 **Goal:** Add the "Let your agent do it" card to `Login.vue` and SetupWizard Step 1, flag-off by default (design decision 13 — PR 7 flips it on), with the one-liner templated for self-hosted origins (F15).
 
@@ -11,7 +13,7 @@
 **Context you need:**
 - Design doc v5: PR 4 section, decision 13, F15/R4 (origin prefix), F17 ("one GitHub authorization step", never "one click").
 - `packages/dashboard/src/views/Login.vue` — 32 lines, single centered `max-w-sm` card (`bg-surface rounded-lg border border-border p-8`); the card goes below the sign-in button inside that card, after an "or" divider.
-- `packages/dashboard/src/views/SetupWizard.vue` — Step 1 template is lines ~213-256 (`<div v-if="step === 1">`); the card goes after the "Skip for now" button inside the `v-else` (not-installed) block AND after the Continue button in the installed block? **No — one placement only:** at the bottom of the Step 1 `<div>`, outside the installed/not-installed branches, so it shows in both states.
+- `packages/dashboard/src/views/SetupWizard.vue` — Step 1 template is lines ~213-256 (`<div v-if="step === 1">`). **Placement + coverage (R4-3):** the card goes at the bottom of the Step 1 `<div>`. Note that `onMounted` **auto-advances to Step 2 when GitHub is already installed** (`SetupWizard.vue:50-54`), so in practice Step 1 only renders in the *loading* and *not-installed* states — which is exactly when the terminal alternative is useful. Do NOT claim the card shows in the installed state; installed users never see Step 1. If installed users must also see it, that's a separate change to the auto-advance/placement and is out of scope here.
 - `src/components/CopyButton.vue` takes a single prop `text: string`.
 - Tokens: `bg-surface`, `bg-surface-2`, `border-border`, `text-text`, `text-text-muted`, `text-teal`; component classes `.btn-primary`/`.btn-secondary` exist in `style.css`.
 - Dashboard is served same-origin by ingestion → `window.location.origin` IS the API origin (pattern precedent: `InvitationsPanel.vue:37`).
@@ -178,11 +180,49 @@ In the template, after the sign-in `<button>` (inside the same card `div`):
           </div>
 ```
 
-**Step 3: Flag-off render test.** Add `packages/dashboard/src/views/__tests__/login-agent-card.test.ts` (jsdom): mount `Login.vue`; with the shipped flag value (false), assert the text does NOT contain "Let your agent do it". (This pins the dark launch — the test flips when PR 7 flips the const, which is intentional and PR 7 updates it.)
+**Step 3: Wiring integration tests (R4-1).** A flag-off-only render test is insufficient — it passes even if the card is never imported or is placed wrong, and it duplicates Task 1's default-off unit assertion. Instead, prove the wiring in both states with a partial mock of the flag module. Add `packages/dashboard/src/views/__tests__/agent-card-wiring.test.ts` (jsdom):
+
+```ts
+// @vitest-environment jsdom
+import { mount } from '@vue/test-utils';
+import { describe, it, expect, vi } from 'vitest';
+
+// Partial-mock only the flag; keep the real buildAgentPrompt.
+vi.mock('../../agent-onboarding', async (orig) => ({
+  ...(await orig<typeof import('../../agent-onboarding')>()),
+  AGENT_ONBOARDING_ENABLED: true,
+}));
+
+import Login from '../Login.vue';
+import SetupWizard from '../SetupWizard.vue';
+
+describe('agent card wiring (flag enabled)', () => {
+  it('Login renders the divider and card', () => {
+    const w = mount(Login);
+    expect(w.findComponent({ name: 'AgentOnboardingCard' }).exists()).toBe(true);
+    expect(w.text()).toContain('Let your agent do it');
+  });
+
+  it('SetupWizard Step 1 (not installed) renders the card', async () => {
+    // getGitHubAppStatus is async in onMounted; stub it to "not installed"
+    // so the wizard stays on Step 1. Mock ../../api accordingly.
+    const w = mount(SetupWizard);
+    await flushPromises(); // import { flushPromises } from '@vue/test-utils'
+    expect(w.findComponent({ name: 'AgentOnboardingCard' }).exists()).toBe(true);
+  });
+});
+```
+
+Stub `../../api` (`getGitHubAppStatus` → `{ installed: false, install_url: '...' }`, plus whatever else `onMounted` calls) so the wizard remains on Step 1; assert the card mounts. The **default-off** guarantee stays as the unit assertion in Task 1 (`AGENT_ONBOARDING_ENABLED === false`) — not duplicated here. These integration tests are flag-agnostic in intent: PR 7 flips the shipped const and only Task 1's unit expectation changes; these keep passing.
 
 **Step 4:** `pnpm --filter @opslane/dashboard build && pnpm --filter @opslane/dashboard test` → PASS (build proves `vue-tsc` is happy; unused-component warnings acceptable only if vue-tsc is silent).
 
-**Step 5:** Visual check (flag flipped locally, not committed): temporarily set the const to `true`, `docker compose up -d` + `pnpm --filter @opslane/dashboard dev`, eyeball `/login` and `/setup` step 1, flip back. State in the commit message that the visual check was done.
+**Step 5: Visual acceptance (R4-2, R4-4) — flag flipped locally, not committed.** The card reads `window.location.origin`, so it MUST be viewed through the **same-origin production path**, not the Vite dev server: `pnpm --filter @opslane/dashboard build`, then `docker compose up -d` and open the ingestion-served dashboard (its own origin, e.g. `http://localhost:8082`). Do NOT use `pnpm dev` for this check — Vite serves on `:3000` and proxies only `/api` + `/auth/*` (`vite.config.ts`), so the card would render `OPSLANE_API_URL=http://localhost:3000`, which is not the API origin and would ship a broken prompt. (If a dev-server check is ever wanted, add an explicit API-origin override prop rather than trusting `window.location.origin` under Vite.)
+
+Acceptance checks (verify the copied value, not just appearance):
+- **Clipboard content is exact:** click Copy, paste, confirm the prompt matches `buildAgentPrompt(<ingestion origin>)` character-for-character — including that on this self-hosted origin it is prefixed `OPSLANE_API_URL=http://localhost:8082 — …`.
+- **Layout:** `/login` and `/setup` (Step 1, not-installed) at mobile (~375px) and desktop widths, in both light and dark themes; the long prompt wraps with **no horizontal overflow** inside the `max-w-sm` (Login) / `max-w-lg` (wizard) card.
+- Per the workspace visual-task contract, run `$visual-verdict` during iteration and record the verdict in the commit message; flip the const back to `false` before committing.
 
 **Step 6:** Commit: `feat(dashboard): agent onboarding cards on login + setup wizard (flag-off)`
 
