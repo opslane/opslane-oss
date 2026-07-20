@@ -19,6 +19,108 @@ import (
 	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
+type recordingProvider struct {
+	authorizeCalls int
+	lastReq        auth.AuthRequest
+}
+
+func (*recordingProvider) Name() string { return "workos" }
+func (provider *recordingProvider) AuthorizeURL(req auth.AuthRequest) (string, error) {
+	provider.authorizeCalls++
+	provider.lastReq = req
+	return "https://auth.example/authorize?provider=" + string(req.SocialProvider), nil
+}
+func (*recordingProvider) ExchangeCode(context.Context, string) (auth.Identity, error) {
+	return auth.Identity{}, nil
+}
+func (*recordingProvider) SupportsLocalPasswordForm() bool { return false }
+
+type oauthStateStoreSpy struct{ calls int }
+
+func (store *oauthStateStoreSpy) StoreOAuthLoginState(context.Context, string, time.Time) error {
+	store.calls++
+	return nil
+}
+
+func newLoginDeps(provider auth.AuthProvider, cfg auth.SocialProviderConfig, store *oauthStateStoreSpy) *Dependencies {
+	return &Dependencies{
+		AuthProvider:       provider,
+		SocialProviders:    cfg,
+		oauthStateStore:    store,
+		JWTSecret:          []byte("test-secret-at-least-32-bytes-long!!"),
+		AuthCallbackOrigin: "https://app.example",
+	}
+}
+
+func TestOAuthLoginPassesSocialProviderThrough(t *testing.T) {
+	cfg, err := auth.ParseSocialProviders("google,github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingProvider{}
+	store := &oauthStateStoreSpy{}
+	recorder := httptest.NewRecorder()
+	newLoginDeps(provider, cfg, store).OAuthLoginStart(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/auth/login?provider=google", nil),
+	)
+
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if provider.lastReq.SocialProvider != auth.SocialProviderGoogle {
+		t.Fatalf("provider received SocialProvider=%q, want google", provider.lastReq.SocialProvider)
+	}
+	if store.calls != 1 {
+		t.Fatalf("want exactly one StoreOAuthLoginState call, got %d", store.calls)
+	}
+}
+
+func TestOAuthLoginBareUsesEmptyProvider(t *testing.T) {
+	cfg, err := auth.ParseSocialProviders("google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingProvider{}
+	recorder := httptest.NewRecorder()
+	newLoginDeps(provider, cfg, &oauthStateStoreSpy{}).OAuthLoginStart(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/auth/login", nil),
+	)
+	if recorder.Code != http.StatusFound || provider.lastReq.SocialProvider != "" {
+		t.Fatalf("bare login status=%d social=%q (want 302, empty)", recorder.Code, provider.lastReq.SocialProvider)
+	}
+}
+
+func TestOAuthLoginRejectsWithoutSideEffects(t *testing.T) {
+	cfg, err := auth.ParseSocialProviders("google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingProvider{}
+	store := &oauthStateStoreSpy{}
+	deps := newLoginDeps(provider, cfg, store)
+
+	for _, target := range []string{
+		"/auth/login?provider=github",
+		"/auth/login?provider=evil",
+		"/auth/login?provider=",
+		"/auth/login?provider=google&provider=github",
+	} {
+		recorder := httptest.NewRecorder()
+		deps.OAuthLoginStart(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d, want 400", target, recorder.Code)
+		}
+		if recorder.Header().Get("Location") != "" || recorder.Header().Get("Set-Cookie") != "" {
+			t.Fatalf("%s produced a Location/cookie side effect", target)
+		}
+	}
+	if store.calls != 0 || provider.authorizeCalls != 0 {
+		t.Fatalf("rejections must not store state (%d) or call the provider (%d)", store.calls, provider.authorizeCalls)
+	}
+}
+
 func TestValidOAuthState(t *testing.T) {
 	if validOAuthState("", "x") {
 		t.Error("empty cookie must fail")
@@ -358,5 +460,78 @@ func TestGitHubProvisioningResolvesIdentityFirstAndWritesFreshIdentity(t *testin
 	gotUserID, err := q.GetUserIDByIdentity(ctx, "github", strconv.FormatInt(freshID, 10))
 	if err != nil || gotUserID != fresh.ID {
 		t.Fatalf("fresh identity user=%q err=%v, want %s", gotUserID, err, fresh.ID)
+	}
+}
+
+func TestProvisionGitHubIdentityGrantsOwnerMembership(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	deps := &Dependencies{Queries: q}
+	request := httptest.NewRequest("GET", "/auth/callback", nil)
+
+	freshID := time.Now().UnixNano()
+	fresh, err := deps.provisionGitHubIdentity(request, auth.Identity{
+		Provider: "github", ProviderSubject: strconv.FormatInt(freshID, 10),
+		Email:         fmt.Sprintf("github-owner-%d@example.com", freshID),
+		EmailVerified: true, Name: "Owner", Username: fmt.Sprintf("owner-%d", freshID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupGitHubOAuthOrg(t, pool, fresh.OrgID) })
+	role, err := q.GetMembership(ctx, fresh.ID, fresh.OrgID)
+	if err != nil || role != "owner" {
+		t.Fatalf("new GitHub user role=%q err=%v, want owner", role, err)
+	}
+}
+
+func TestProvisionGitHubIdentityHealsMissingMembership(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	org, err := q.CreateOrg(ctx, fmt.Sprintf("github-heal-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupGitHubOAuthOrg(t, pool, org.ID) })
+	githubID := time.Now().UnixNano()
+	user, err := q.CreateUserGitHub(ctx, org.ID, fmt.Sprintf("github-heal-%d@example.com", githubID), "Heal", githubID, "heal", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := strconv.FormatInt(githubID, 10)
+	if err := q.UpsertIdentity(ctx, user.ID, "github", subject); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a legacy account created before membership rows existed.
+	if _, err := pool.Exec(ctx, `DELETE FROM memberships WHERE user_id = $1 AND org_id = $2`, user.ID, org.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &Dependencies{Queries: q}
+	request := httptest.NewRequest("GET", "/auth/callback", nil)
+	identity := auth.Identity{
+		Provider: "github", ProviderSubject: subject, Email: user.Email,
+		EmailVerified: true, Name: "Heal", Username: "heal",
+	}
+	if _, err := deps.provisionGitHubIdentity(request, identity); err != nil {
+		t.Fatal(err)
+	}
+	role, err := q.GetMembership(ctx, user.ID, org.ID)
+	if err != nil || role != "owner" {
+		t.Fatalf("healed role=%q err=%v, want owner", role, err)
+	}
+
+	// A deliberately downgraded role must survive later logins.
+	if err := q.SetMembershipRole(ctx, user.ID, org.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deps.provisionGitHubIdentity(request, identity); err != nil {
+		t.Fatal(err)
+	}
+	role, err = q.GetMembership(ctx, user.ID, org.ID)
+	if err != nil || role != "member" {
+		t.Fatalf("downgraded role=%q err=%v, want member preserved", role, err)
 	}
 }

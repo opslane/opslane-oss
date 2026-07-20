@@ -203,8 +203,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The friction e2e gate runs the worker's session-analysis pipeline
-      # in-process (issue #56), so the built worker package must exist.
-      - run: pnpm --filter @opslane/shared --filter @opslane/worker build
+      # in-process (issue #56), so the built worker package must exist. The
+      # login browser smoke serves the dashboard's dist via vite preview, so
+      # the dashboard build must exist too.
+      - run: pnpm --filter @opslane/shared --filter @opslane/worker --filter @opslane/dashboard build
       - name: Install Playwright chromium (browser smoke)
         run: pnpm --filter @opslane/test-e2e exec playwright install --with-deps chromium
       - name: Assert the LLM key is absent
@@ -214,6 +216,10 @@ jobs:
             exit 1
           fi
       - name: Boot the stack without an LLM key
+        env:
+          # The notifications contract test runs a webhook sink on the runner;
+          # the container reaches it via the extra_hosts host-gateway mapping.
+          NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS: host.docker.internal:9999
         run: |
           docker compose up -d postgres minio minio-setup
           docker compose run --rm migrate
@@ -239,7 +245,7 @@ jobs:
         env:
           # The with-secrets PR pipeline suite is the only allowed skip here.
           E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
-          E2E_MIN_TESTS: "33"
+          E2E_MIN_TESTS: "37"
           # The browser smoke suites must be collected AND pass by name, so a
           # future edit cannot drop them while keeping the total count intact.
           # The environments/projects suites below are pinned for the same
@@ -253,6 +259,7 @@ jobs:
             ^browser smoke: Vue error to needs_human >
             ^browser smoke: React error to needs_human >
             ^browser smoke: rage click to friction signal >
+            ^notifications contract
             ^first-class environment ingestion > keeps one group across key environments
             ^first-class environment ingestion > resolves opted-in names and accepts disabled, unknown, and invalid
             ^first-class environment ingestion > supports out-of-order events, makes the existing same-project session

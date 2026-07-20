@@ -8,13 +8,16 @@ Every variable each service actually reads, from `os.Getenv` (ingestion) and `pr
 | --- | --- | --- |
 | `DATABASE_URL` | yes | Postgres connection string |
 | `PORT` | no (8080) | HTTP listen port |
-| `JWT_SECRET` | yes | Signs session tokens (≥32 bytes) |
+| `JWT_SECRET` | yes | Signs session tokens and derives the notification destination encryption key (≥32 bytes). Rotating it invalidates stored webhook configs; users must re-enter their webhook URLs. |
 | `AUTH_PROVIDER` | no | Identity provider: `github` (default) or `workos`. Selection is explicit and invalid/partial WorkOS configuration fails boot. |
 | `AUTH_CALLBACK_ORIGIN` | no | Public ingestion origin used to construct the allowlisted `/auth/callback` URL. Never derived from the request Host header. Defaults to the local ingestion port; Compose sets `http://localhost:8082`. |
 | `WORKOS_API_KEY` | when `AUTH_PROVIDER=workos` | WorkOS secret API key used for AuthKit code exchange. |
 | `WORKOS_CLIENT_ID` | when `AUTH_PROVIDER=workos` | WorkOS project client ID used for AuthKit authorization. |
+| `AUTH_WORKOS_SOCIAL` | no | Comma-separated social login buttons to show under `AUTH_PROVIDER=workos` (e.g. `google,github`). UI capability only; the WorkOS dashboard governs which methods actually work. |
 | `DASHBOARD_DIR` | no | Directory of built dashboard SPA to serve (set in the Docker image) |
 | `DASHBOARD_ORIGIN` | no | Allowed dashboard origin for CORS **and** the OAuth redirect target. For the bundled Compose setup, set `http://localhost:8082`. This is separate from the worker's reader-facing `DASHBOARD_URL`. |
+| `DASHBOARD_URL` | no | Public or private HTTP(S) dashboard base URL used for reader-facing notification links. Configure it explicitly; loopback URLs are rejected, and `DASHBOARD_ORIGIN` is not used as a fallback. This mirrors the worker variable of the same name. |
+| `NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS` | no | **Development/test only.** Comma-separated exact `host[:port]` additions to the Slack webhook allowlist; added hosts may use HTTP. Never set this in production. |
 | `GITHUB_APP_ID` | for GitHub App | App ID |
 | `GITHUB_APP_CLIENT_ID` | for OAuth sign-in | OAuth client ID |
 | `GITHUB_APP_CLIENT_SECRET` | for OAuth sign-in | OAuth client secret |

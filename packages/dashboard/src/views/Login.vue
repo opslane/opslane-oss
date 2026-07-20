@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   fetchAuthConfig,
@@ -8,10 +8,16 @@ import {
   signup,
   verifyEmail,
 } from '../api';
+import { AGENT_ONBOARDING_ENABLED } from '../agent-onboarding';
+import AgentOnboardingCard from '../components/AgentOnboardingCard.vue';
+import SocialLoginButtons from '../components/SocialLoginButtons.vue';
+import { socialProviderButtons } from '../composables/socialProviders';
 import { useLoginFlow } from '../composables/useLoginFlow';
 import { completePostAuth } from '../post-auth';
 
 const router = useRouter();
+const agentCardEnabled = AGENT_ONBOARDING_ENABLED;
+const origin = window.location.origin;
 const {
   mode,
   config,
@@ -35,6 +41,8 @@ const {
   forgotPassword,
   completeAuthentication: () => completePostAuth(router),
 });
+
+const socialButtons = computed(() => socialProviderButtons(config.value?.social_providers ?? []));
 
 function redirectSignIn(): void {
   window.location.href = '/auth/login';
@@ -76,6 +84,8 @@ onMounted(loadConfig);
         <p class="text-sm text-text-muted mb-8">
           Continue with your configured identity provider.
         </p>
+
+        <SocialLoginButtons :buttons="socialButtons" divider-label="or" />
 
         <button
           @click="redirectSignIn"
@@ -200,6 +210,8 @@ onMounted(loadConfig);
           </button>
         </div>
 
+        <SocialLoginButtons :buttons="socialButtons" divider-label="or continue with email" />
+
         <form class="space-y-4" @submit.prevent="submitCredentials">
           <div>
             <label for="auth-email" class="block text-sm font-medium text-text mb-1.5">Email</label>
@@ -246,6 +258,15 @@ onMounted(loadConfig);
           </button>
         </form>
       </div>
+
+      <template v-if="agentCardEnabled && (mode === 'redirect' || mode === 'signin' || mode === 'signup')">
+        <div class="my-6 flex items-center gap-3">
+          <div class="h-px flex-1 bg-border"></div>
+          <span class="text-xs text-text-faint">or</span>
+          <div class="h-px flex-1 bg-border"></div>
+        </div>
+        <AgentOnboardingCard :origin="origin" />
+      </template>
     </div>
   </div>
 </template>

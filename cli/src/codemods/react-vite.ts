@@ -1,6 +1,12 @@
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Codemod, FilePatch } from './types.js';
+import {
+  hasCall,
+  lastImportStatement,
+  readSource,
+  sdkImportLocalName,
+} from './source.js';
 
 async function findMainFile(projectRoot: string): Promise<string> {
   const candidates = ['src/main.tsx', 'src/main.jsx'];
@@ -22,24 +28,30 @@ export const reactViteCodemod: Codemod = {
 
   async generate(projectRoot: string): Promise<FilePatch[]> {
     const mainFile = await findMainFile(projectRoot);
-    const patches: FilePatch[] = [];
+    const source = (await readSource(join(projectRoot, mainFile))) ?? '';
+    const initLocalName = sdkImportLocalName(source, 'init');
+    const needsImport = initLocalName === null;
+    const callName = initLocalName ?? 'init';
+    const needsInit = !hasCall(source, callName);
 
-    // Patch the main entry file
-    patches.push({
+    if (!needsImport && !needsInit) return [];
+
+    const additions: string[] = [];
+    if (needsImport) additions.push("import { init } from '@opslane/sdk';");
+    if (needsImport && needsInit) additions.push('');
+    if (needsInit) {
+      additions.push(
+        'init({',
+        '  apiKey: import.meta.env.VITE_OPSLANE_API_KEY,',
+        '});',
+      );
+    }
+
+    return [{
       filePath: mainFile,
       action: 'modify',
-      insertAfter: "from 'react-dom/client'",
-      insertContent: [
-        '',
-        "import { OpslaneSDK } from '@opslane/sdk';",
-        '',
-        "OpslaneSDK.init({",
-        "  apiKey: '<YOUR_API_KEY>',",
-        "  environment: 'production',",
-        "});",
-      ].join('\n'),
-    });
-
-    return patches;
+      insertAfter: lastImportStatement(source),
+      insertContent: additions.join('\n'),
+    } satisfies FilePatch];
   },
 };

@@ -1,0 +1,341 @@
+<script setup lang="ts">
+import { ref, watch } from 'vue';
+import {
+  createNotificationDestination,
+  deleteNotificationDestination,
+  listNotificationDestinations,
+  testNotificationDestination,
+  updateNotificationDestination,
+} from '../api';
+import type { NotificationDestination } from '../types/api';
+import { formatDate } from '../utils';
+
+const props = defineProps<{ projectId: string }>();
+
+const destinations = ref<NotificationDestination[]>([]);
+const canManage = ref(false);
+const destinationsProjectId = ref('');
+const loading = ref(false);
+const loadError = ref('');
+const newName = ref('');
+const newWebhookURL = ref('');
+const creating = ref(false);
+const mutationPending = ref<Record<string, boolean>>({});
+const testResults = ref<Record<string, { ok: boolean; message: string }>>({});
+let loadToken = 0;
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+async function loadDestinations(projectId: string): Promise<void> {
+  const token = ++loadToken;
+  destinationsProjectId.value = '';
+  loadError.value = '';
+  testResults.value = {};
+
+  if (!projectId) {
+    destinations.value = [];
+    canManage.value = false;
+    loading.value = false;
+    return;
+  }
+
+  loading.value = true;
+  try {
+    const result = await listNotificationDestinations(projectId);
+    if (token !== loadToken) return;
+    destinations.value = result.destinations;
+    canManage.value = result.can_manage;
+    destinationsProjectId.value = projectId;
+  } catch (error: unknown) {
+    if (token !== loadToken) return;
+    destinations.value = [];
+    canManage.value = false;
+    loadError.value = errorMessage(error, 'Failed to load notification destinations');
+  } finally {
+    if (token === loadToken) loading.value = false;
+  }
+}
+
+async function refresh(): Promise<void> {
+  await loadDestinations(props.projectId);
+}
+
+async function createDestination(): Promise<void> {
+  const name = newName.value.trim();
+  const webhookURL = newWebhookURL.value.trim();
+  if (!canManage.value || !props.projectId || !name || !webhookURL) return;
+
+  creating.value = true;
+  loadError.value = '';
+  try {
+    await createNotificationDestination(props.projectId, {
+      name,
+      webhook_url: webhookURL,
+    });
+    newName.value = '';
+    newWebhookURL.value = '';
+    await refresh();
+  } catch (error: unknown) {
+    loadError.value = errorMessage(error, 'Failed to add Slack notification');
+  } finally {
+    creating.value = false;
+  }
+}
+
+function setMutationPending(destinationId: string, pending: boolean): void {
+  mutationPending.value = { ...mutationPending.value, [destinationId]: pending };
+}
+
+async function setEnabled(destination: NotificationDestination, enabled: boolean): Promise<void> {
+  if (!canManage.value || mutationPending.value[destination.id]) return;
+
+  setMutationPending(destination.id, true);
+  loadError.value = '';
+  try {
+    await updateNotificationDestination(props.projectId, destination.id, { enabled });
+    await refresh();
+  } catch (error: unknown) {
+    loadError.value = errorMessage(error, 'Failed to update notification destination');
+  } finally {
+    setMutationPending(destination.id, false);
+  }
+}
+
+function onEnabledChange(destination: NotificationDestination, event: Event): void {
+  const enabled = event.target instanceof HTMLInputElement && event.target.checked;
+  void setEnabled(destination, enabled);
+}
+
+async function removeDestination(destination: NotificationDestination): Promise<void> {
+  if (!canManage.value || mutationPending.value[destination.id]) return;
+  if (!window.confirm(`Delete notification destination "${destination.name}"?`)) return;
+
+  setMutationPending(destination.id, true);
+  loadError.value = '';
+  try {
+    await deleteNotificationDestination(props.projectId, destination.id);
+    await refresh();
+  } catch (error: unknown) {
+    loadError.value = errorMessage(error, 'Failed to delete notification destination');
+  } finally {
+    setMutationPending(destination.id, false);
+  }
+}
+
+async function sendTest(destination: NotificationDestination): Promise<void> {
+  if (!canManage.value || mutationPending.value[destination.id]) return;
+
+  setMutationPending(destination.id, true);
+  const previousResults = { ...testResults.value };
+  delete previousResults[destination.id];
+  testResults.value = previousResults;
+  try {
+    const result = await testNotificationDestination(props.projectId, destination.id);
+    const status = result.status_code ? ` (HTTP ${result.status_code})` : '';
+    testResults.value = {
+      ...testResults.value,
+      [destination.id]: {
+        ok: result.ok,
+        message: result.ok
+          ? `Test delivered${status}.`
+          : `Test failed: ${result.classification}${status}.`,
+      },
+    };
+  } catch (error: unknown) {
+    testResults.value = {
+      ...testResults.value,
+      [destination.id]: {
+        ok: false,
+        message: errorMessage(error, 'Failed to test notification destination'),
+      },
+    };
+  } finally {
+    setMutationPending(destination.id, false);
+  }
+}
+
+function deliveryClass(status: string): string {
+  if (status === 'delivered') return 'bg-green/10 text-green';
+  if (status === 'failed') return 'bg-red/10 text-red';
+  return 'bg-surface-2 text-text-muted';
+}
+
+watch(
+  () => props.projectId,
+  (projectId) => { void loadDestinations(projectId); },
+  { immediate: true },
+);
+</script>
+
+<template>
+  <section class="space-y-6">
+    <div>
+      <h3 class="text-sm font-medium text-text">Notification integrations</h3>
+      <p class="mt-1 text-sm text-text-muted">
+        Send a Slack message when Opslane creates a new issue for this project.
+      </p>
+    </div>
+
+    <p v-if="!projectId" class="text-sm text-text-muted">
+      Select a project to configure notification integrations.
+    </p>
+    <p v-else-if="loading" class="text-sm text-text-muted">Loading integrations...</p>
+    <p v-if="loadError" class="text-sm text-red" role="alert" v-text="loadError"></p>
+
+    <template v-if="projectId && !loading && destinationsProjectId === projectId">
+      <ul v-if="destinations.length > 0" class="space-y-3">
+        <li
+          v-for="destination in destinations"
+          :key="destination.id"
+          class="rounded-lg border border-border bg-surface p-4"
+        >
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div class="min-w-0 space-y-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-medium text-text" v-text="destination.name"></span>
+                <span class="inline-flex rounded-full bg-indigo/10 px-2 py-0.5 text-xs font-medium text-indigo">
+                  Slack
+                </span>
+                <span
+                  v-if="!canManage"
+                  class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+                  :class="destination.enabled ? 'bg-green/10 text-green' : 'bg-surface-2 text-text-muted'"
+                >
+                  {{ destination.enabled ? 'Enabled' : 'Disabled' }}
+                </span>
+              </div>
+              <p class="break-all font-mono text-xs text-text-muted" v-text="destination.config_fingerprint"></p>
+            </div>
+
+            <label v-if="canManage" class="relative inline-flex shrink-0 cursor-pointer items-center">
+              <span class="sr-only">Enable {{ destination.name }}</span>
+              <input
+                type="checkbox"
+                role="switch"
+                class="peer sr-only"
+                :aria-label="`Enable ${destination.name}`"
+                :checked="destination.enabled"
+                :disabled="mutationPending[destination.id]"
+                @change="onEnabledChange(destination, $event)"
+              />
+              <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
+            </label>
+          </div>
+
+          <div class="mt-4 flex flex-wrap items-center gap-2 text-xs">
+            <template v-if="destination.last_delivery">
+              <span
+                class="inline-flex rounded-full px-2 py-0.5 font-medium"
+                :class="deliveryClass(destination.last_delivery.status)"
+                :title="destination.last_delivery.error ?? undefined"
+              >
+                {{ destination.last_delivery.status }}
+              </span>
+              <span class="text-text-muted">
+                {{ formatDate(destination.last_delivery.at) }}
+              </span>
+              <span
+                v-if="destination.last_delivery.error"
+                class="max-w-full truncate text-red"
+                :title="destination.last_delivery.error"
+                v-text="destination.last_delivery.error"
+              ></span>
+            </template>
+            <span v-else class="text-text-muted">No deliveries yet</span>
+            <span v-if="destination.recent_failures > 0" class="text-red">
+              {{ destination.recent_failures }} failed in the last 7 days
+            </span>
+          </div>
+
+          <div v-if="canManage" class="mt-4 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              class="btn-secondary"
+              :disabled="mutationPending[destination.id]"
+              @click="sendTest(destination)"
+            >
+              {{ mutationPending[destination.id] ? 'Working...' : 'Test' }}
+            </button>
+            <button
+              type="button"
+              class="rounded-lg px-3 py-2 text-sm font-medium text-red hover:bg-red/10 disabled:opacity-50"
+              :disabled="mutationPending[destination.id]"
+              @click="removeDestination(destination)"
+            >
+              Delete
+            </button>
+            <span
+              v-if="testResults[destination.id]"
+              class="text-sm"
+              :class="testResults[destination.id].ok ? 'text-green' : 'text-red'"
+              role="status"
+              v-text="testResults[destination.id].message"
+            ></span>
+          </div>
+        </li>
+      </ul>
+      <p v-else class="text-sm text-text-muted">No notification integrations yet.</p>
+
+      <form
+        v-if="canManage"
+        class="space-y-4 border-t border-border pt-6"
+        data-testid="add-slack-form"
+        @submit.prevent="createDestination"
+      >
+        <div>
+          <h4 class="text-sm font-medium text-text">Add Slack notification</h4>
+          <p class="mt-1 text-xs text-text-muted">
+            Create an incoming webhook in Slack, then paste its URL below.
+            <a
+              href="https://api.slack.com/messaging/webhooks"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-teal hover:underline"
+            >Slack webhook guide</a>
+          </p>
+        </div>
+        <div>
+          <label for="notification-name" class="block text-sm font-medium text-text-muted">Name</label>
+          <input
+            id="notification-name"
+            v-model="newName"
+            type="text"
+            maxlength="200"
+            required
+            placeholder="Production alerts"
+            :disabled="creating"
+            class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal disabled:opacity-50"
+          />
+        </div>
+        <div>
+          <label for="notification-webhook-url" class="block text-sm font-medium text-text-muted">
+            Webhook URL
+          </label>
+          <input
+            id="notification-webhook-url"
+            v-model="newWebhookURL"
+            type="url"
+            required
+            autocomplete="off"
+            placeholder="https://hooks.slack.com/services/..."
+            :disabled="creating"
+            class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal disabled:opacity-50"
+          />
+        </div>
+        <button
+          type="submit"
+          class="btn-primary"
+          :disabled="creating || !newName.trim() || !newWebhookURL.trim()"
+        >
+          {{ creating ? 'Adding...' : 'Add Slack notification' }}
+        </button>
+      </form>
+
+      <p v-else class="text-sm text-text-muted">
+        You can view integrations for this project, but only an organization admin can change them.
+      </p>
+    </template>
+  </section>
+</template>

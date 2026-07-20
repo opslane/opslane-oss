@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/opslane/opslane/packages/ingestion/notify"
 )
 
 // === Atomic counters for Prometheus-compatible metrics ===
@@ -160,7 +162,15 @@ func Metrics(w http.ResponseWriter, r *http.Request) {
 	sumMicro := ingestDuration.sum.Load()
 	sumSeconds := float64(sumMicro) / 1e6
 	fmt.Fprintf(w, "opslane_ingest_duration_seconds_sum %s\n", formatFloat(sumSeconds))
-	fmt.Fprintf(w, "opslane_ingest_duration_seconds_count %d\n", totalCount)
+	fmt.Fprintf(w, "opslane_ingest_duration_seconds_count %d\n\n", totalCount)
+
+	// opslane_notification_deliveries_total
+	fmt.Fprintln(w, "# HELP opslane_notification_deliveries_total Total notification delivery attempts by destination type and outcome")
+	fmt.Fprintln(w, "# TYPE opslane_notification_deliveries_total counter")
+	for _, metric := range notify.DeliveryMetricsSnapshot() {
+		fmt.Fprintf(w, "opslane_notification_deliveries_total{type=%q,outcome=%q} %d\n",
+			metric.DestinationType, metric.Outcome, metric.Count)
+	}
 }
 
 // formatFloat formats a float without trailing zeros.

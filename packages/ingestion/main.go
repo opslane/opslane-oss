@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
+	"github.com/opslane/opslane/packages/ingestion/notify"
 	"github.com/opslane/opslane/packages/ingestion/retention"
 	"github.com/opslane/opslane/packages/ingestion/scrubber"
 )
@@ -66,6 +68,21 @@ func main() {
 		slog.Error("JWT_SECRET must be set and at least 32 bytes", "length", len(jwtSecret))
 		os.Exit(1)
 	}
+	configCipher, err := notify.NewConfigCipher([]byte(jwtSecret))
+	if err != nil {
+		slog.Error("Failed to initialize notification config encryption", "error", err)
+		os.Exit(1)
+	}
+
+	var notifyExtraHosts []string
+	for _, host := range strings.Split(os.Getenv("NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS"), ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			notifyExtraHosts = append(notifyExtraHosts, host)
+		}
+	}
+	if len(notifyExtraHosts) > 0 {
+		slog.Warn("NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS set — webhook host allowlist extended (dev/test only)", "hosts", notifyExtraHosts)
+	}
 
 	// GitHub App OAuth — optional for dev environments without GitHub App.
 	githubAppID := os.Getenv("GITHUB_APP_ID")
@@ -98,6 +115,16 @@ func main() {
 		slog.Error("invalid auth provider configuration", "error", err)
 		os.Exit(1)
 	}
+	socialProviders, err := auth.ParseSocialProviders(os.Getenv("AUTH_WORKOS_SOCIAL"))
+	if err != nil {
+		slog.Error("invalid AUTH_WORKOS_SOCIAL", "error", err)
+		os.Exit(1)
+	}
+	if len(socialProviders.Ordered()) > 0 && authProvider.Name() != "workos" {
+		slog.Warn("AUTH_WORKOS_SOCIAL is set but AUTH_PROVIDER is not workos; ignoring social buttons",
+			"provider", authProvider.Name())
+		socialProviders, _ = auth.ParseSocialProviders("")
+	}
 	authCallbackOrigin := os.Getenv("AUTH_CALLBACK_ORIGIN")
 	if authCallbackOrigin == "" {
 		if authProvider.Name() == "workos" {
@@ -109,6 +136,7 @@ func main() {
 	slog.Info("auth provider selected", "provider", authProvider.Name())
 
 	queries := db.New(pool)
+	queries.DashboardURL = os.Getenv("DASHBOARD_URL")
 	go func() {
 		ran, err := queries.RunRollupBackfill(context.Background())
 		if err != nil {
@@ -117,11 +145,13 @@ func main() {
 			slog.Info("environment rollup backfill complete")
 		}
 	}()
+	notifySender := notify.NewSender(0, notifyExtraHosts)
 	deps := &handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,
 		JWTSecret:             []byte(jwtSecret),
 		AuthProvider:          authProvider,
+		SocialProviders:       socialProviders,
 		AuthCallbackOrigin:    authCallbackOrigin,
 		GitHubAppID:           githubAppID,
 		GitHubAppClientID:     githubAppClientID,
@@ -130,8 +160,13 @@ func main() {
 		GitHubAppSlug:         githubAppSlug,
 		DashboardOrigin:       dashboardOrigin,
 		AdminEmails:           handler.ParseAdminEmails(os.Getenv("ADMIN_EMAILS")),
+		ConfigCipher:          configCipher,
+		NotifyExtraHosts:      notifyExtraHosts,
+		NotifySender:          notifySender,
 	}
 	r := handler.NewRouterWithPool(deps, pool)
+	dispatcher := notify.New(pool, configCipher, notify.Options{ExtraHosts: notifyExtraHosts})
+	go dispatcher.Run(ctx)
 
 	// Periodic cleanup of expired/revoked refresh tokens and auth codes
 	go func() {

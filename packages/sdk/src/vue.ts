@@ -25,10 +25,11 @@ function extractComponentName(instance: unknown): string {
 }
 
 export const opslaneVuePlugin = {
-  install(app: VueApp): void {
-    const existingHandler = app.config.errorHandler;
+  install(app: unknown): void {
+    const vueApp = app as VueApp;
+    const existingHandler = vueApp.config.errorHandler;
 
-    app.config.errorHandler = (
+    vueApp.config.errorHandler = (
       err: unknown,
       instance: unknown,
       info: string

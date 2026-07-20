@@ -518,6 +518,16 @@ export async function cleanupTenant(orgId: string): Promise<void> {
     `DELETE FROM end_users WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
     [orgId]
   );
+  // Notification destinations and outbox events reference projects without
+  // cascade; outbound_deliveries cascades from both.
+  await db.query(
+    `DELETE FROM notification_destinations WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+    [orgId]
+  );
+  await db.query(
+    `DELETE FROM outbound_events WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
+    [orgId]
+  );
   await db.query(
     `DELETE FROM environment_api_keys WHERE environment_id IN (
        SELECT e.id FROM environments e JOIN projects p ON e.project_id = p.id WHERE p.org_id = $1

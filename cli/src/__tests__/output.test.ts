@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { jsonOutput, exitWithError } from '../output.js';
+import { jsonOutput, exitWithError, exitWithStatus } from '../output.js';
 
 describe('jsonOutput', () => {
   beforeEach(() => {
@@ -18,5 +18,17 @@ describe('jsonOutput', () => {
       expect.stringContaining('"error"')
     );
     expect(process.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('exitWithStatus prints a status-shaped body and exits with the given code', () => {
+    exitWithStatus('expired', { message: 'm' }, 1);
+    const printed = (console.log as unknown as { mock: { calls: string[][] } }).mock.calls[0][0];
+    expect(JSON.parse(printed)).toEqual({ status: 'expired', message: 'm' });
+    expect(process.exit).toHaveBeenCalledWith(1);
+  });
+
+  it('exitWithStatus can exit 0 for non-error terminal states', () => {
+    exitWithStatus('pending', {}, 0);
+    expect(process.exit).toHaveBeenCalledWith(0);
   });
 });

@@ -38,6 +38,9 @@ var ErrInvalidInvitation = errors.New("invalid invitation")
 // All query helpers MUST take tenant scope (project_id or org_id) as required parameter.
 type Queries struct {
 	pool *pgxpool.Pool
+	// DashboardURL is the reader-facing dashboard base used in notification
+	// links. Empty or invalid values omit the link.
+	DashboardURL string
 }
 
 func New(pool *pgxpool.Pool) *Queries {
@@ -664,6 +667,10 @@ func (q *Queries) InsertErrorEventAndGroup(ctx context.Context, p IngestParams) 
 		)
 		if err != nil {
 			return nil, fmt.Errorf("update group status to queued: %w", err)
+		}
+
+		if err := publishIssueCreated(ctx, tx, q.DashboardURL, p.ProjectID, p.EnvironmentID, groupID, p.Title, eventTime); err != nil {
+			return nil, fmt.Errorf("publish issue.created: %w", err)
 		}
 	} else {
 		var groupStatus, resolvedInRelease string

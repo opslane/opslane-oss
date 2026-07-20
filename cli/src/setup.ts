@@ -1,48 +1,63 @@
 import { execSync } from 'node:child_process';
-import { jsonOutput, exitWithError } from './output.js';
-import { saveAgentCredentials, loadAgentCredentials } from './agent-credentials.js';
+import { canonicalOrigin } from './origin.js';
+import { jsonOutput, exitWithStatus } from './output.js';
+import {
+  defaultCredentialsPath,
+  resolveCredentials,
+  saveAgentCredentials,
+  type AgentCredentials,
+} from './agent-credentials.js';
+import {
+  defaultPendingDir,
+  deletePendingSession,
+  loadPendingSession,
+  savePendingSession,
+  validatePollId,
+  type PendingSession,
+} from './pending.js';
+import { defaultTokenPath, loadTokensFrom } from './auth.js';
+import { defaultApiUrl } from './config.js';
 
-const DEFAULT_API_URL = process.env['OPSLANE_API_URL'] ?? 'http://localhost:8082';
-const POLL_INTERVAL_MS = 3000;
-const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const POLL_INTERVAL_MS = 3_000;
+const BLOCKING_TIMEOUT_SECONDS = 15 * 60;
+const RESUME_TIMEOUT_SECONDS = 60;
 
 export interface SetupOptions {
-  poll?: string;       // poll_id to resume polling
+  start?: boolean;
+  poll?: string;
+  timeout?: number | string;
+  force?: boolean;
+  relink?: boolean;
+  repo?: string;
   apiUrl?: string;
-  repoUrl?: string;    // override auto-detection
+  repoUrl?: string;
   agentName?: string;
+  cwd?: string;
+  credentialsPath?: string;
+  pendingDir?: string;
+  tokenPath?: string;
+  fetchFn?: typeof fetch;
+  pollIntervalMs?: number;
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
-/**
- * Extract owner/repo from a git remote URL.
- * Supports HTTPS, SSH, and already-normalized owner/repo format.
- */
+type JsonBody = Record<string, unknown>;
+
 export function normalizeRepoURL(remoteURL: string): string | null {
-  // Already in owner/repo format
-  if (/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(remoteURL)) {
-    return remoteURL;
-  }
-
-  // HTTPS: https://github.com/owner/repo.git
+  if (/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(remoteURL)) return remoteURL;
   const httpsMatch = remoteURL.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/);
-  if (httpsMatch) return httpsMatch[1];
-
-  // SSH: git@github.com:owner/repo.git
+  if (httpsMatch) return httpsMatch[1] ?? null;
   const sshMatch = remoteURL.match(/github\.com:([^/]+\/[^/]+?)(?:\.git)?$/);
-  if (sshMatch) return sshMatch[1];
-
-  return null;
+  return sshMatch?.[1] ?? null;
 }
 
-/**
- * Detect repo URL from git remote origin.
- */
 export function detectRepoFromGit(cwd?: string): string | null {
   try {
     const remote = execSync('git remote get-url origin', {
       cwd,
-      encoding: 'utf-8',
-      timeout: 5000,
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     return normalizeRepoURL(remote);
   } catch {
@@ -50,129 +65,387 @@ export function detectRepoFromGit(cwd?: string): string | null {
   }
 }
 
-/**
- * Main setup command.
- * - If --poll is provided, resume polling an existing session.
- * - Otherwise, detect repo, check for existing credentials, initiate new session.
- */
-export async function setup(options: SetupOptions = {}): Promise<void> {
-  const apiUrl = options.apiUrl ?? DEFAULT_API_URL;
+function timeoutSeconds(value: number | string | undefined, fallback: number): number | null {
+  if (value === undefined) return fallback;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
 
-  // Resume polling mode
-  if (options.poll) {
-    await pollForCompletion(apiUrl, options.poll);
-    return;
-  }
-
-  // Check for existing credentials
-  const existing = await loadAgentCredentials();
-  if (existing) {
-    jsonOutput({
-      status: 'already_configured',
-      org_id: existing.org_id,
-      project_id: existing.project_id,
-      api_key: existing.api_key.slice(0, 8) + '…',
-      repo: existing.repo,
-    });
-    return;
-  }
-
-  // Detect repo
-  const repoUrl = options.repoUrl ?? detectRepoFromGit();
-  if (!repoUrl) {
-    exitWithError('Could not detect repo from git remote. Use --repo-url to specify.');
-  }
-
-  // Initiate setup session
-  let resp: Response;
+async function responseJSON(response: Response): Promise<JsonBody | null> {
   try {
-    resp = await fetch(`${apiUrl}/api/v1/agent/setup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        repo_url: repoUrl,
-        agent_name: options.agentName,
-      }),
-    });
+    const value: unknown = await response.json();
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? value as JsonBody
+      : null;
   } catch {
-    exitWithError('Cannot reach Opslane API', { api_url: apiUrl });
-  }
-
-  const body = await resp.json() as Record<string, unknown>;
-
-  if (body['status'] === 'already_configured') {
-    jsonOutput(body);
-    return;
-  }
-
-  if (!resp.ok) {
-    exitWithError(String(body['error'] ?? 'setup failed'));
-  }
-
-  // Print auth URL and start polling
-  jsonOutput(body);
-
-  // Auto-poll if running non-interactively
-  const pollId = body['poll_id'] as string;
-  if (pollId) {
-    await pollForCompletion(apiUrl, pollId);
+    return null;
   }
 }
 
-async function pollForCompletion(apiUrl: string, pollId: string): Promise<void> {
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
+function retryAfterSeconds(response: Response, body: JsonBody): number {
+  const bodyValue = Number(body['retry_after']);
+  if (Number.isFinite(bodyValue) && bodyValue > 0) return bodyValue;
+  const headerValue = Number(response.headers.get('Retry-After'));
+  return Number.isFinite(headerValue) && headerValue > 0 ? headerValue : 60;
+}
+
+function stderrJSON(body: JsonBody): void {
+  console.error(JSON.stringify(body, null, 2));
+}
+
+function usageError(message: string): never {
+  return exitWithStatus('usage_error', { message }, 1);
+}
+
+function selectedRepo(options: SetupOptions): string | null {
+  const explicit = options.repo ?? options.repoUrl;
+  return explicit ? normalizeRepoURL(explicit) : detectRepoFromGit(options.cwd);
+}
+
+async function validateExistingCredential(
+  creds: AgentCredentials,
+  fetchFn: typeof fetch,
+): Promise<'valid' | 'invalid' | 'unreachable'> {
+  try {
+    const response = await fetchFn(
+      `${creds.api_url}/api/v1/projects/${encodeURIComponent(creds.project_id)}/event-count`,
+      { headers: { 'X-API-Key': creds.api_key } },
+    );
+    if (response.ok) return 'valid';
+    return response.status === 401 || response.status === 403 ? 'invalid' : 'unreachable';
+  } catch {
+    return 'unreachable';
+  }
+}
+
+async function pollLoop(
+  pending: PendingSession,
+  timeout: number,
+  options: SetupOptions,
+): Promise<void> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const pendingDir = options.pendingDir ?? defaultPendingDir();
+  const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
+  const sleepFn = options.sleepFn ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeout * 1_000;
+  let reachedServer = false;
 
   while (Date.now() < deadline) {
-    await sleep(POLL_INTERVAL_MS);
-
-    let resp: Response;
+    let response: Response;
     try {
-      resp = await fetch(`${apiUrl}/api/v1/agent/poll/${pollId}`);
+      response = await fetchFn(
+        `${pending.api_url}/api/v1/agent/poll/${encodeURIComponent(pending.poll_id)}`,
+        { headers: { 'X-Opslane-Poll-Token': pending.poll_token } },
+      );
+      reachedServer = true;
     } catch {
-      continue; // retry on network error
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await sleepFn(Math.min(interval, remaining));
+      continue;
     }
 
-    const body = await resp.json() as Record<string, unknown>;
+    const body = await responseJSON(response);
+    if (!body) {
+      return exitWithStatus('internal_error', { message: 'unparseable server response' }, 1);
+    }
+    const status = body['status'];
 
-    if (body['status'] === 'completed') {
-      const orgId = body['org_id'] as string | undefined;
-      const projectId = body['project_id'] as string | undefined;
-      const apiKey = body['api_key'] as string | undefined;
-      const repo = body['repo'] as string | undefined;
+    if (status === 'pending') {
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await sleepFn(Math.min(interval, remaining));
+      continue;
+    }
 
-      if (!orgId || !projectId || !apiKey || !repo) {
-        exitWithError('Setup completed but credentials were not returned. Run setup again.');
+    if (status === 'rate_limited' || response.status === 429) {
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        await sleepFn(Math.min(retryAfterSeconds(response, body) * 1_000, remaining));
+      }
+      continue;
+    }
+
+    if (status === 'completed') {
+      const apiKey = typeof body['api_key'] === 'string' ? body['api_key'] : null;
+      if (!apiKey) {
+        await deletePendingSession(pending.poll_id, pendingDir);
+        return exitWithStatus('key_unavailable', {
+          project_id: body['project_id'],
+          remediation: 'run "opslane login" then "opslane setup --relink"',
+        }, 1);
       }
 
-      // Save credentials locally
-      await saveAgentCredentials({
-        org_id: orgId,
-        project_id: projectId,
-        api_key: apiKey,
-        repo: repo,
-        api_url: apiUrl,
-      });
-
-      jsonOutput({
-        status: 'completed',
-        org_id: orgId,
-        project_id: projectId,
-        api_key: apiKey,
-        repo: repo,
-      });
+      const orgId = typeof body['org_id'] === 'string' ? body['org_id'] : null;
+      const projectId = typeof body['project_id'] === 'string' ? body['project_id'] : null;
+      const repo = typeof body['repo'] === 'string' ? body['repo'] : pending.repo;
+      if (!orgId || !projectId) {
+        return exitWithStatus('internal_error', { message: 'completed response omitted project credentials' }, 1);
+      }
+      try {
+        await saveAgentCredentials({
+          org_id: orgId,
+          project_id: projectId,
+          api_key: apiKey,
+          repo,
+          api_url: pending.api_url,
+        }, credentialsPath);
+      } catch {
+        return exitWithStatus('internal_error', {
+          message: 'could not save completed credentials; retry this poll while the key is available',
+        }, 1);
+      }
+      await deletePendingSession(pending.poll_id, pendingDir);
+      jsonOutput({ ...body, status: 'completed' });
       return;
     }
 
-    if (resp.status === 410) {
-      exitWithError('Session expired. Run setup again.');
+    if (status === 'failed') {
+      await deletePendingSession(pending.poll_id, pendingDir);
+      return exitWithStatus('failed', {
+        failure_reason: body['failure_reason'],
+        message: body['message'],
+      }, 1);
     }
 
-    // Still pending — continue polling
+    if (status === 'not_found' || response.status === 404) {
+      await deletePendingSession(pending.poll_id, pendingDir);
+      return exitWithStatus('not_found', { poll_id: pending.poll_id }, 1);
+    }
+
+    if (status === 'expired' || response.status === 410) {
+      await deletePendingSession(pending.poll_id, pendingDir);
+      return exitWithStatus('expired', { remediation: 're-run setup' }, 1);
+    }
+
+    if (status === 'internal_error') {
+      return exitWithStatus('internal_error', { message: body['message'] ?? 'server error' }, 1);
+    }
+
+    return exitWithStatus('internal_error', {
+      message: 'unrecognized server status',
+      server_status: status,
+    }, 1);
   }
 
-  exitWithError('Setup timed out. Run setup again.');
+  if (!reachedServer) {
+    return exitWithStatus('api_unreachable', { api_url: pending.api_url }, 1);
+  }
+  jsonOutput({
+    status: 'pending',
+    poll_id: pending.poll_id,
+    message: 'Authorization is still pending. Run setup --poll again.',
+  });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+async function resumePolling(options: SetupOptions): Promise<void> {
+  const timeout = timeoutSeconds(options.timeout, RESUME_TIMEOUT_SECONDS);
+  if (timeout === null) return usageError('--timeout must be a finite positive number');
+  const pollId = options.poll ?? '';
+  try {
+    validatePollId(pollId);
+  } catch {
+    return usageError('--poll must be a UUID');
+  }
+  const pending = await loadPendingSession(pollId, options.pendingDir ?? defaultPendingDir());
+  if (!pending) return exitWithStatus('not_found', { poll_id: pollId }, 1);
+  await pollLoop(pending, timeout, options);
+}
+
+interface ProjectResponse { id: string; github_repo?: string | null }
+interface EnvironmentResponse { id: string; name: string }
+
+async function relink(options: SetupOptions, repo: string, apiUrl: string): Promise<void> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const token = await loadTokensFrom(options.tokenPath ?? defaultTokenPath(), apiUrl);
+  if (!token) {
+    return exitWithStatus('login_required', {
+      message: 'Run "opslane login" first (requires a browser).',
+    }, 1);
+  }
+  const authHeaders = { Authorization: `Bearer ${token.accessToken}` };
+
+  let projectsResponse: Response;
+  try {
+    projectsResponse = await fetchFn(`${apiUrl}/api/v1/projects`, { headers: authHeaders });
+  } catch {
+    return exitWithStatus('api_unreachable', { api_url: apiUrl }, 1);
+  }
+  if (projectsResponse.status === 401 || projectsResponse.status === 403) {
+    return exitWithStatus('login_required', { message: 'Run "opslane login" again.' }, 1);
+  }
+  let projects: unknown;
+  try { projects = await projectsResponse.json(); } catch { projects = null; }
+  if (!projectsResponse.ok || !Array.isArray(projects)) {
+    return exitWithStatus('internal_error', { message: 'could not list projects' }, 1);
+  }
+  const project = (projects as ProjectResponse[]).find((candidate) =>
+    typeof candidate.github_repo === 'string' && candidate.github_repo.toLowerCase() === repo.toLowerCase(),
+  );
+  if (!project) {
+    return exitWithStatus('project_not_in_active_org', {
+      repo,
+      remediation: 'switch to the owning org in the dashboard, or pass --org <id>',
+    }, 1);
+  }
+
+  const environmentsResponse = await fetchFn(
+    `${apiUrl}/api/v1/projects/${encodeURIComponent(project.id)}/environments`,
+    { headers: authHeaders },
+  ).catch(() => null);
+  if (!environmentsResponse?.ok) {
+    return exitWithStatus('internal_error', { message: 'could not list project environments' }, 1);
+  }
+  let environments: unknown;
+  try { environments = await environmentsResponse.json(); } catch { environments = null; }
+  if (!Array.isArray(environments) || environments.length === 0) {
+    return exitWithStatus('internal_error', { message: 'project has no environments' }, 1);
+  }
+  const candidates = environments as EnvironmentResponse[];
+  const environment = candidates.find((candidate) => candidate.name === 'production') ?? candidates[0];
+  if (!environment?.id) return exitWithStatus('internal_error', { message: 'invalid environment response' }, 1);
+
+  const keyResponse = await fetchFn(
+    `${apiUrl}/api/v1/environments/${encodeURIComponent(environment.id)}/api-keys`,
+    { method: 'POST', headers: authHeaders },
+  ).catch(() => null);
+  if (!keyResponse?.ok) {
+    return exitWithStatus('internal_error', { message: 'could not create API key' }, 1);
+  }
+  const keyBody = await responseJSON(keyResponse);
+  const apiKey = typeof keyBody?.['raw_key'] === 'string' ? keyBody['raw_key'] : null;
+  if (!apiKey) return exitWithStatus('internal_error', { message: 'key response omitted raw_key' }, 1);
+
+  const previous = await resolveCredentials({
+    apiUrl,
+    repo,
+    filePath: options.credentialsPath,
+  });
+  try {
+    await saveAgentCredentials({
+      org_id: previous?.org_id ?? '',
+      project_id: project.id,
+      api_key: apiKey,
+      repo,
+      api_url: apiUrl,
+    }, options.credentialsPath ?? defaultCredentialsPath());
+  } catch {
+    return exitWithStatus('internal_error', {
+      message: 'could not save the replacement credential; the previous credential was preserved',
+    }, 1);
+  }
+  jsonOutput({ status: 'relinked', project_id: project.id, api_key: apiKey, repo });
+}
+
+export async function setup(options: SetupOptions = {}): Promise<void> {
+  if (options.start && options.poll) return usageError('--start and --poll cannot be used together');
+  if (options.relink && (options.start || options.poll || options.force)) {
+    return usageError('--relink cannot be combined with --start, --poll, or --force');
+  }
+  if (options.poll) return resumePolling(options);
+
+  const blockingTimeout = timeoutSeconds(options.timeout, BLOCKING_TIMEOUT_SECONDS);
+  if (blockingTimeout === null) return usageError('--timeout must be a finite positive number');
+  let apiUrl: string;
+  try {
+    apiUrl = canonicalOrigin(options.apiUrl ?? defaultApiUrl());
+  } catch {
+    return usageError('--api-url must be a valid http(s) URL');
+  }
+  const repo = selectedRepo(options);
+  if (!repo) {
+    return exitWithStatus('repo_not_detected', {
+      message: 'Could not detect repo from git remote. Use --repo owner/repo.',
+    }, 1);
+  }
+  if (options.relink) return relink(options, repo, apiUrl);
+
+  const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
+  const existing = await resolveCredentials({ apiUrl, repo, filePath: credentialsPath });
+  if (existing && !options.force) {
+    const validity = await validateExistingCredential(existing, options.fetchFn ?? fetch);
+    if (validity === 'valid') {
+      jsonOutput({
+        status: 'already_configured',
+        org_id: existing.org_id,
+        project_id: existing.project_id,
+        repo: existing.repo,
+      });
+      return;
+    }
+    if (validity === 'unreachable') {
+      return exitWithStatus('api_unreachable', { api_url: existing.api_url }, 1);
+    }
+    return exitWithStatus('credentials_invalid', {
+      remediation: 'run "opslane setup --force" for a new repo, or "opslane login" then "opslane setup --relink" for an existing project',
+    }, 1);
+  }
+
+  let response: Response;
+  try {
+    response = await (options.fetchFn ?? fetch)(`${apiUrl}/api/v1/agent/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo_url: repo, agent_name: options.agentName }),
+    });
+  } catch {
+    return exitWithStatus('api_unreachable', { api_url: apiUrl }, 1);
+  }
+
+  const body = await responseJSON(response);
+  if (!body) return exitWithStatus('internal_error', { message: 'unparseable server response' }, 1);
+  const status = body['status'];
+  if (status === 'rate_limited' || response.status === 429) {
+    return exitWithStatus('rate_limited', {
+      retry_after: retryAfterSeconds(response, body),
+      message: body['message'],
+    }, 1);
+  }
+  if (status === 'already_configured') {
+    if (options.force) {
+      return exitWithStatus('already_configured', {
+        repo,
+        remediation: 'run "opslane login" then "opslane setup --relink"',
+      }, 1);
+    }
+    jsonOutput(body);
+    return;
+  }
+  if (status === 'internal_error') {
+    return exitWithStatus('internal_error', { message: body['message'] ?? 'server error' }, 1);
+  }
+  if (status !== 'auth_required' || !response.ok) {
+    return exitWithStatus('internal_error', {
+      message: 'unrecognized setup response',
+      server_status: status,
+    }, 1);
+  }
+
+  const pollId = typeof body['poll_id'] === 'string' ? body['poll_id'] : '';
+  const pollToken = typeof body['poll_token'] === 'string' ? body['poll_token'] : '';
+  const authUrl = typeof body['auth_url'] === 'string' ? body['auth_url'] : '';
+  try { validatePollId(pollId); } catch {
+    return exitWithStatus('internal_error', { message: 'server returned an invalid poll ID' }, 1);
+  }
+  if (!pollToken || !authUrl) {
+    return exitWithStatus('internal_error', { message: 'server omitted setup credentials' }, 1);
+  }
+  const pending: PendingSession = {
+    poll_id: pollId,
+    poll_token: pollToken,
+    api_url: apiUrl,
+    repo,
+    created_at: new Date().toISOString(),
+  };
+  try {
+    await savePendingSession(pending, options.pendingDir ?? defaultPendingDir());
+  } catch {
+    return exitWithStatus('internal_error', { message: 'could not save pending setup state' }, 1);
+  }
+
+  if (options.start) {
+    jsonOutput(body);
+    return;
+  }
+  stderrJSON(body);
+  await pollLoop(pending, blockingTimeout, options);
 }

@@ -59,6 +59,7 @@ services:
       AUTH_CALLBACK_ORIGIN: ${AUTH_CALLBACK_ORIGIN:-http://localhost:8082}
       WORKOS_API_KEY: ${WORKOS_API_KEY:-}
       WORKOS_CLIENT_ID: ${WORKOS_CLIENT_ID:-}
+      AUTH_WORKOS_SOCIAL: ${AUTH_WORKOS_SOCIAL:-}
       ALLOW_REGISTRATION: "true"
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
@@ -69,8 +70,14 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS: ${NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS:-}
       INTERNAL_READ_TOKEN: ${INTERNAL_READ_TOKEN:-dev-internal-token}
       ADMIN_EMAILS: ${OPSLANE_ADMIN_EMAILS:-}
+    # Lets the e2e webhook sink on the host be reached from the container on
+    # Linux; Docker Desktop resolves host.docker.internal natively.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

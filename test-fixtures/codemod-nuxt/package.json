@@ -1,0 +1,17 @@
+{
+  "name": "opslane-codemod-nuxt-fixture",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "check": "nuxt prepare \"${CODEMOD_PROJECT:-.}\" && tsc --noEmit -p \"${CODEMOD_PROJECT:-.}/.nuxt/tsconfig.json\""
+  },
+  "dependencies": {
+    "@opslane/sdk": "workspace:*",
+    "nuxt": "3.17.7"
+  },
+  "devDependencies": {
+    "@nuxt/cli": "3.25.1",
+    "typescript": "^5.4.0"
+  }
+}

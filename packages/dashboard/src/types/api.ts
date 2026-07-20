@@ -15,11 +15,14 @@ export interface AuthUser {
   memberships?: AuthMembership[];
 }
 
+export type SocialProviderId = 'google' | 'github';
+
 export interface AuthConfig {
   provider: string;
   supports_password: boolean;
   supports_signup: boolean;
   supports_reset: boolean;
+  social_providers: SocialProviderId[];
 }
 
 export type PasswordAuthResult =
@@ -45,6 +48,29 @@ export interface OrgInvitation {
   created_at: string;
   accepted_at?: string;
   revoked_at?: string;
+}
+
+export interface NotificationDestination {
+  id: string;
+  type: 'slack';
+  name: string;
+  config_fingerprint: string;
+  event_types: string[];
+  enabled: boolean;
+  created_at: string;
+  last_delivery: { status: string; at: string; error: string | null } | null;
+  recent_failures: number;
+}
+
+export interface NotificationDestinationList {
+  can_manage: boolean;
+  destinations: NotificationDestination[];
+}
+
+export interface NotificationTestResult {
+  ok: boolean;
+  classification: string;
+  status_code: number;
 }
 
 export type ErrorGroupStatus =
