@@ -212,7 +212,8 @@ func simpleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // corsMiddleware applies a split CORS policy:
-//   - SDK endpoints reflect Origin; server-side EnforceOrigin is the real gate.
+//   - SDK endpoints reflect Origin; the server-side origin middleware is the
+//     real gate (EnforceOrigin, or EnforceOriginAllowingServerSDK on /events).
 //   - Dashboard endpoints are restricted to DASHBOARD_ORIGIN env var.
 func corsMiddleware() func(http.Handler) http.Handler {
 	dashboardOrigin := os.Getenv("DASHBOARD_ORIGIN")
