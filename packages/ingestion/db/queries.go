@@ -295,6 +295,7 @@ type ErrorGroup struct {
 	AffectedUsersCount   int
 	Status               string
 	Kind                 string
+	Platform             *string
 	EnvironmentID        *string
 	AdjudicationStatus   *string
 	ReasonCode           *string
@@ -612,7 +613,7 @@ type ErrorGroupFilters struct {
 // ListErrorGroups returns error groups for a project with optional filters. Tenant-scoped.
 func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters *ErrorGroupFilters) ([]ErrorGroup, error) {
 	query := `SELECT DISTINCT eg.id, eg.project_id, eg.fingerprint, eg.title, eg.first_seen, eg.last_seen,
-		        eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind,
+		        eg.occurrence_count, eg.affected_users_count, eg.status, eg.kind, eg.platform,
 		        eg.environment_id, eg.adjudication_status,
 		        eg.reason_code, eg.reason_message, eg.remediation,
 		        eg.confidence, eg.pr_url, eg.root_cause, eg.suggested_mitigation,
@@ -665,7 +666,7 @@ func (q *Queries) ListErrorGroups(ctx context.Context, projectID string, filters
 		var g ErrorGroup
 		err := rows.Scan(
 			&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+			&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind, &g.Platform,
 			&g.EnvironmentID, &g.AdjudicationStatus,
 			&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 			&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,
@@ -807,7 +808,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 	var g ErrorGroup
 	err := q.pool.QueryRow(ctx,
 		`SELECT id, project_id, fingerprint, title, first_seen, last_seen,
-		        occurrence_count, affected_users_count, status, kind,
+		        occurrence_count, affected_users_count, status, kind, platform,
 		        environment_id, adjudication_status,
 		        reason_code, reason_message, remediation,
 		        confidence, pr_url, root_cause, suggested_mitigation,
@@ -821,7 +822,7 @@ func (q *Queries) GetErrorGroup(ctx context.Context, projectID, groupID string) 
 		groupID, projectID,
 	).Scan(
 		&g.ID, &g.ProjectID, &g.Fingerprint, &g.Title, &g.FirstSeen, &g.LastSeen,
-		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind,
+		&g.OccurrenceCount, &g.AffectedUsersCount, &g.Status, &g.Kind, &g.Platform,
 		&g.EnvironmentID, &g.AdjudicationStatus,
 		&g.ReasonCode, &g.ReasonMessage, &g.Remediation,
 		&g.Confidence, &g.PrURL, &g.RootCause, &g.SuggestedMitigation,

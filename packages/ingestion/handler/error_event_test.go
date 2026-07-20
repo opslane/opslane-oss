@@ -231,6 +231,28 @@ func TestIngest_NoPlatformDefaultsToJavascript(t *testing.T) {
 	}
 }
 
+func TestIngest_PlatformReadBackThroughGroupQueries(t *testing.T) {
+	deps, _ := testDeps(t)
+	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"boom","stack":"Traceback (most recent call last):\ngarbage"},"breadcrumbs":[],"context":{},"sdk_version":"0.1.0a2"}`
+	response := postErrorPayload(t, deps, rawKey, body)
+
+	groups, err := deps.Queries.ListErrorGroups(context.Background(), projectID, nil)
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Platform == nil || *groups[0].Platform != "python" {
+		t.Fatalf("ListErrorGroups platform = %+v, want python", groups)
+	}
+	group, err := deps.Queries.GetErrorGroup(context.Background(), projectID, response["group_id"])
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	if group.Platform == nil || *group.Platform != "python" {
+		t.Fatalf("GetErrorGroup platform = %v, want python", group.Platform)
+	}
+}
+
 func TestIngest_SamePythonErrorGroupsTogether(t *testing.T) {
 	deps, pool := testDeps(t)
 	_, projectID, _, rawKey := seedTenant(t, deps.Queries)
