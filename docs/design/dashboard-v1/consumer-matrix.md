@@ -1,0 +1,35 @@
+# Owned component consumer matrix
+
+This matrix records direct production imports. A component with no production
+consumer is a failed extraction and must not ship. Update this file whenever a
+new owned primitive or domain component is added.
+
+| Owned component | Production consumers | Boundary |
+|---|---|---|
+| `Button.vue` | `views/IncidentDetail.vue` | semantic actions |
+| `EmptyState.vue` | `views/ActivityFeed.vue` | empty incident ledger |
+| `IconButton.vue` | `components/ui/ModalSurface.vue` | icon-only action |
+| `InlineAlert.vue` | `views/ActivityFeed.vue` | route feedback |
+| `ModalSurface.vue` | `views/Settings.vue`, `components/layout/NavDrawer.vue` | accessible modal foundation |
+| `SelectField.vue` | `views/SessionsList.vue` | labelled select |
+| `SkeletonBlock.vue` | `views/ActivityFeed.vue` | loading placeholder |
+| `StatusLabel.vue` | `views/IncidentDetail.vue`, `components/incidents/IncidentLedgerRow.vue`, `components/incidents/IncidentLifecycle.vue` | typed status signal |
+| `TabList.vue` | `views/Settings.vue` | tab semantics |
+| `TextInput.vue` | `views/SessionsList.vue` | labelled text input |
+| `TextareaField.vue` | `views/IncidentDetail.vue` | labelled textarea |
+| `AppNavigation.vue` | `components/layout/AppRail.vue`, `components/layout/NavDrawer.vue` | shared navigation content |
+| `AppRail.vue` | `App.vue` | desktop navigation |
+| `NavDrawer.vue` | `App.vue` | mobile navigation |
+| `EvidenceCheck.vue` | `components/evidence/EvidenceWell.vue` | verification check row |
+| `EvidenceWell.vue` | `views/IncidentDetail.vue` | dark evidence surface |
+| `ProvenanceFooter.vue` | `components/evidence/EvidenceWell.vue` | evidence provenance |
+| `IncidentLedgerRow.vue` | `views/ActivityFeed.vue` | incident list row |
+| `IncidentConclusion.vue` | `views/IncidentDetail.vue` | outcome and next action |
+| `IncidentLifecycle.vue` | `views/IncidentDetail.vue` | truthful current-state summary |
+| `layout/navigation.ts` | `components/layout/AppNavigation.vue` | navigation model and active-route rule |
+| `session.ts` | `App.vue` | tenant-scoped client state teardown on sign-out |
+
+Existing specialized components outside the new owned directories remain
+feature components, not public design-system primitives. If `components/ui/`,
+`components/layout/`, or `components/evidence/` is introduced, every exported
+file must receive a non-empty row here in the same change.
