@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { AREAS, classify, areasFor, parsePaths } from '../ci-changed-areas.mjs';
+
+const CLI = fileURLToPath(new URL('../ci-changed-areas.mjs', import.meta.url));
 
 const all = () => Object.fromEntries(AREAS.map((a) => [a, true]));
 const none = () => Object.fromEntries(AREAS.map((a) => [a, false]));
@@ -64,7 +68,16 @@ test('executable or unknown .github paths turn every area on', () => {
 test('docs and docs-site turn on js only, because docs-site builds ../docs', () => {
   assert.deepEqual(areasFor(['docs/install.md']), jsOnly());
   assert.deepEqual(areasFor(['docs/contracts/events.md']), jsOnly());
+  assert.deepEqual(areasFor(['docs/images/architecture.png']), jsOnly());
   assert.deepEqual(areasFor(['docs-site/src/pages/index.astro']), jsOnly());
+});
+
+test('an executable file under docs/ is NOT prose and turns every area on', () => {
+  // docs/ holds only .md and .png today. The docs rule matches by extension so
+  // a tool added there later fails closed instead of being silently inert.
+  assert.deepEqual(areasFor(['docs/tools/gen.mjs']), all());
+  assert.deepEqual(areasFor(['docs/deploy.sh']), all());
+  assert.equal(classify('docs/tools/gen.mjs'), 'UNKNOWN');
 });
 
 test('top-level markdown turns on js only', () => {
@@ -105,6 +118,11 @@ test('ci.yml is matched by the global rule before the .github rule', () => {
   assert.notEqual(classify('.github/workflows/ci.yml'), 'meta');
 });
 
+test('the .yaml spelling of the gate file is still global, not inert meta', () => {
+  assert.equal(classify('.github/workflows/ci.yaml'), 'global');
+  assert.deepEqual(areasFor(['.github/workflows/ci.yaml']), all());
+});
+
 // --- input parsing ---
 
 test('parsePaths splits NUL-separated input and drops the trailing empty', () => {
@@ -114,4 +132,34 @@ test('parsePaths splits NUL-separated input and drops the trailing empty', () =>
 
 test('parsePaths keeps paths containing spaces intact', () => {
   assert.deepEqual(parsePaths('docs/a b.md\0'), ['docs/a b.md']);
+});
+
+// --- the CLI wrapper: its stdout IS $GITHUB_OUTPUT ---
+
+const runCli = (stdin) => execFileSync(process.execPath, [CLI], { input: stdin, encoding: 'utf8' });
+
+test('CLI emits exactly one area=value line per area, in AREAS order', () => {
+  assert.equal(runCli('docs/install.md\0'), 'go=false\njs=true\npython=false\ne2e=false\nreliability=false\n');
+});
+
+test('CLI emits every area true for an unrecognised path', () => {
+  assert.equal(runCli('packages/worker/src/index.ts\0'), AREAS.map((a) => `${a}=true`).join('\n') + '\n');
+});
+
+test('CLI emits every area true for empty stdin, not an empty output', () => {
+  // An empty $GITHUB_OUTPUT would leave every `needs.changes.outputs.*` unset,
+  // which check-ci-ok.mjs rejects -- but failing open here would be worse.
+  assert.equal(runCli(''), AREAS.map((a) => `${a}=true`).join('\n') + '\n');
+});
+
+test('CLI cannot inject extra lines into $GITHUB_OUTPUT via a crafted filename', () => {
+  // Per-path classification goes to stderr; only area=value reaches stdout.
+  // The name is also not prose (it does not end in .md), so it fails closed.
+  const hostile = 'docs/x.md\ngo=true\nreliability=true\0';
+  assert.equal(runCli(hostile), AREAS.map((a) => `${a}=true`).join('\n') + '\n');
+});
+
+test('a filename with a trailing newline after .md is not treated as prose', () => {
+  // JS `$` also matches before a trailing newline, so PROSE is lookahead-anchored.
+  assert.deepEqual(areasFor(['docs/x.md\n']), all());
 });

@@ -39,11 +39,19 @@ const ALL = AREAS;
 const JS_ONLY = ['js'];
 const NONE = [];
 const INERT_META_PATHS = new Set(['.github/dependabot.yml', '.github/CLA.md']);
+/**
+ * File types that are read by humans and rendered, never executed.
+ * Anchored with a negative lookahead rather than `$`: `$` also matches before a
+ * trailing newline, and a filename may legally contain one.
+ */
+const PROSE = /\.(md|png|jpe?g|svg|gif|webp)(?![\s\S])/;
 
 // Ordered. First match wins.
 const RULES = [
   // The gate itself: any change here must run everything.
-  { tag: 'global', areas: ALL, test: (p) => p === '.github/workflows/ci.yml' },
+  // Matched as ya?ml so a rename to ci.yaml cannot fall through to the meta
+  // rule below, which would make the gate file itself inert.
+  { tag: 'global', areas: ALL, test: (p) => /^\.github\/workflows\/ci\.ya?ml$/.test(p) },
 
   // Other top-level workflow YAML and explicitly known repo-meta files.
   // Action pinning is covered by the always-on repo-checks job, secret
@@ -58,7 +66,16 @@ const RULES = [
 
   // Prose. Feeds js because docs-site/astro.config.mjs processes ../docs and
   // its build runs check-built-links.mjs, and the js job runs `pnpm -r build`.
-  { tag: 'docs', areas: JS_ONLY, test: (p) => p.startsWith('docs/') },
+  //
+  // docs/ is matched by extension, not by prefix: it holds only .md and .png
+  // today and nothing there is executed, but a future docs/tools/gen.mjs or
+  // docs/deploy.sh under a prefix rule would be silently inert to go, python,
+  // e2e, and reliability. Anything else under docs/ falls through to UNKNOWN.
+  //
+  // docs-site/ IS matched by prefix, deliberately: it is a pnpm workspace
+  // package, so its code is genuinely covered by `pnpm -r build` and
+  // `pnpm test:unit`, both of which the js area turns on.
+  { tag: 'docs', areas: JS_ONLY, test: (p) => p.startsWith('docs/') && PROSE.test(p) },
   { tag: 'docs-site', areas: JS_ONLY, test: (p) => p.startsWith('docs-site/') },
 
   // Top level only. Markdown nested inside a package is NOT inert:
