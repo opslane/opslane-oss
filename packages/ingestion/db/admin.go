@@ -47,11 +47,29 @@ type AdminOutcomeOverview struct {
 	Closed7D     int64            `json:"closed_7d"`
 }
 
+// AdminOnboardingOverview is the agent-onboarding funnel over v2 sessions in
+// the last 30 days. The v2 writer markers define the cohort because telemetry
+// columns are nullable, so a time filter alone cannot exclude pre-v2 rows.
+//
+// AuthClicked and KeyClaimed are best-effort stamps. FirstEventReceived is
+// project activation for a completed session, not a strictly ordered funnel
+// stage, and can therefore exceed KeyClaimed.
+type AdminOnboardingOverview struct {
+	Started            int64            `json:"started"`
+	AuthClicked        int64            `json:"auth_clicked"`
+	Completed          int64            `json:"completed"`
+	KeyClaimed         int64            `json:"key_claimed"`
+	FirstEventReceived int64            `json:"first_event_received"`
+	Failed             int64            `json:"failed"`
+	ByFailureReason    map[string]int64 `json:"by_failure_reason"`
+}
+
 type AdminOverview struct {
-	Events   AdminEventOverview   `json:"events"`
-	Jobs     AdminJobOverview     `json:"jobs"`
-	Workers  AdminWorkerOverview  `json:"workers"`
-	Outcomes AdminOutcomeOverview `json:"outcomes"`
+	Events     AdminEventOverview      `json:"events"`
+	Jobs       AdminJobOverview        `json:"jobs"`
+	Workers    AdminWorkerOverview     `json:"workers"`
+	Outcomes   AdminOutcomeOverview    `json:"outcomes"`
+	Onboarding AdminOnboardingOverview `json:"onboarding"`
 }
 
 type AdminJob struct {
@@ -77,7 +95,66 @@ func (q *Queries) AdminOverviewData(ctx context.Context) (*AdminOverview, error)
 			ByStatus: map[string]int64{"pending": 0, "claimed": 0, "completed": 0, "failed": 0, "dead_letter": 0},
 			ByType:   map[string]int64{"investigate": 0, "fix": 0, "error_fix": 0, "setup_pr": 0, "session_analysis": 0, "ci_watch": 0},
 		},
-		Outcomes: AdminOutcomeOverview{ByStatus: make(map[string]int64)},
+		Outcomes:   AdminOutcomeOverview{ByStatus: make(map[string]int64)},
+		Onboarding: AdminOnboardingOverview{ByFailureReason: make(map[string]int64)},
+	}
+
+	rows, err := q.pool.Query(ctx, `
+		WITH funnel AS (
+			SELECT *
+			FROM agent_sessions
+			WHERE poll_token_hash IS NOT NULL
+			  AND agent_key_pub IS NOT NULL
+			  AND created_at >= now() - interval '30 days'
+		)
+		SELECT
+			'totals' AS kind,
+			NULL::text AS reason,
+			count(*),
+			count(auth_clicked_at),
+			count(*) FILTER (WHERE status = 'completed'),
+			count(key_claimed_at),
+			count(*) FILTER (
+				WHERE status = 'completed'
+				  AND project_id IS NOT NULL
+				  AND EXISTS (
+					SELECT 1 FROM error_events e WHERE e.project_id = funnel.project_id
+				  )
+			),
+			count(*) FILTER (WHERE status = 'failed')
+		FROM funnel
+		UNION ALL
+		SELECT 'reason', failure_reason, count(*), 0, 0, 0, 0, 0
+		FROM funnel
+		WHERE status = 'failed' AND failure_reason IS NOT NULL
+		GROUP BY failure_reason`)
+	if err != nil {
+		return nil, fmt.Errorf("admin onboarding funnel: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var reason *string
+		var started, authClicked, completed, keyClaimed, firstEventReceived, failed int64
+		if err := rows.Scan(
+			&kind, &reason, &started, &authClicked, &completed,
+			&keyClaimed, &firstEventReceived, &failed,
+		); err != nil {
+			return nil, fmt.Errorf("scan admin onboarding funnel: %w", err)
+		}
+		if kind == "totals" {
+			result.Onboarding.Started = started
+			result.Onboarding.AuthClicked = authClicked
+			result.Onboarding.Completed = completed
+			result.Onboarding.KeyClaimed = keyClaimed
+			result.Onboarding.FirstEventReceived = firstEventReceived
+			result.Onboarding.Failed = failed
+		} else if reason != nil {
+			result.Onboarding.ByFailureReason[*reason] = started
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate admin onboarding funnel: %w", err)
 	}
 
 	if err := q.pool.QueryRow(ctx, `
@@ -90,7 +167,7 @@ func (q *Queries) AdminOverviewData(ctx context.Context) (*AdminOverview, error)
 		return nil, fmt.Errorf("admin event totals: %w", err)
 	}
 
-	rows, err := q.pool.Query(ctx, `
+	rows, err = q.pool.Query(ctx, `
 		WITH buckets AS (
 			SELECT generate_series(
 				date_trunc('hour', now(), 'UTC') - interval '47 hours',
