@@ -87,6 +87,28 @@ jobs:
           go test ./... -v 2>&1 | tee /tmp/go-test.log
           ../../scripts/check-go-skips.mjs /tmp/go-test.log
 
+  # Repo-wide static checks: docs drift/scope, action pinning, wire-fixture
+  # policy tests. Deliberately unconditional, and deliberately NOT inside the
+  # js job -- these are the checks that read docs/, .github/workflows/, and
+  # Go/worker/SDK source, so leaving them in js would make js un-skippable for
+  # almost every change. Keeping them always-on is also what makes it safe to
+  # skip everything else on a docs-only or workflow-only PR.
+  repo-checks:
+    name: Repo-wide checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:repo
+
   js:
     name: JS build and test
     runs-on: ubuntu-latest
@@ -122,7 +144,7 @@ jobs:
       - name: Install Playwright chromium (SDK browser tests)
         run: pnpm --filter @opslane/sdk exec playwright install --with-deps chromium
       - run: pnpm -r build
-      - run: pnpm test
+      - run: pnpm test:unit
       - name: License-boundary check (MIT-published packages)
         run: node scripts/check-licenses.mjs
 
@@ -328,7 +350,7 @@ jobs:
         run: docker compose down -v
 
   security:
-    name: Secret scan and action pinning
+    name: Secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -340,14 +362,11 @@ jobs:
           docker run --rm -v "$PWD:/repo:ro"
           ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
           dir /repo --config /repo/.gitleaks.toml --no-banner --redact
-      - name: Enforce SHA-pinned actions
-        run: node scripts/check-action-pins.mjs
-
   ci-ok:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security, sdk-python]
+    needs: [go, js, compose, docker, e2e-keyless, reliability-system, security, sdk-python, repo-checks]
     if: always()
     steps:
       - name: Report job results
