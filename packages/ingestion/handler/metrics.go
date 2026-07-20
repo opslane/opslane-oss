@@ -11,12 +11,17 @@ import (
 // === Atomic counters for Prometheus-compatible metrics ===
 
 var (
-	eventsIngestedTotal  atomic.Int64
-	jobsEnqueuedTotal    atomic.Int64
-	stacklessEventsTotal atomic.Int64
-	ingestErrorsTotal    struct {
-		mu      sync.Mutex
-		byType  map[string]*atomic.Int64
+	eventsIngestedTotal                atomic.Int64
+	jobsEnqueuedTotal                  atomic.Int64
+	stacklessEventsTotal               atomic.Int64
+	ingestEnvironmentFallbackDisabled  atomic.Int64
+	ingestEnvironmentFallbackUnknown   atomic.Int64
+	ingestEnvironmentFallbackInvalid   atomic.Int64
+	ingestEnvironmentSessionDivergence atomic.Int64
+	ingestSessionCrossProjectConflict  atomic.Int64
+	ingestErrorsTotal                  struct {
+		mu     sync.Mutex
+		byType map[string]*atomic.Int64
 	}
 
 	// Histogram for ingest duration (seconds)
@@ -51,6 +56,22 @@ func RecordJobEnqueued() {
 func RecordStacklessAccepted() {
 	stacklessEventsTotal.Add(1)
 }
+
+// RecordEnvironmentOverrideFallback keeps the label cardinality fixed.
+func RecordEnvironmentOverrideFallback(reason string) {
+	switch reason {
+	case "disabled":
+		ingestEnvironmentFallbackDisabled.Add(1)
+	case "unknown_name":
+		ingestEnvironmentFallbackUnknown.Add(1)
+	case "invalid_name":
+		ingestEnvironmentFallbackInvalid.Add(1)
+	}
+}
+
+func RecordEnvironmentSessionDivergence() { ingestEnvironmentSessionDivergence.Add(1) }
+
+func RecordSessionCrossProjectConflict() { ingestSessionCrossProjectConflict.Add(1) }
 
 // RecordIngestError increments the error counter for the given error type.
 func RecordIngestError(errType string) {
@@ -98,6 +119,20 @@ func Metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP opslane_stackless_events_total Total accepted events with no stack trace\n")
 	fmt.Fprintf(w, "# TYPE opslane_stackless_events_total counter\n")
 	fmt.Fprintf(w, "opslane_stackless_events_total %d\n\n", stacklessEventsTotal.Load())
+
+	fmt.Fprintln(w, "# HELP opslane_ingest_env_override_fallback_total Total payload environment overrides that fell back to the key-bound environment")
+	fmt.Fprintln(w, "# TYPE opslane_ingest_env_override_fallback_total counter")
+	fmt.Fprintf(w, "opslane_ingest_env_override_fallback_total{reason=\"disabled\"} %d\n", ingestEnvironmentFallbackDisabled.Load())
+	fmt.Fprintf(w, "opslane_ingest_env_override_fallback_total{reason=\"unknown_name\"} %d\n", ingestEnvironmentFallbackUnknown.Load())
+	fmt.Fprintf(w, "opslane_ingest_env_override_fallback_total{reason=\"invalid_name\"} %d\n\n", ingestEnvironmentFallbackInvalid.Load())
+
+	fmt.Fprintln(w, "# HELP opslane_ingest_env_session_divergence_total Total environment mismatches involving an existing or out-of-order session")
+	fmt.Fprintln(w, "# TYPE opslane_ingest_env_session_divergence_total counter")
+	fmt.Fprintf(w, "opslane_ingest_env_session_divergence_total %d\n\n", ingestEnvironmentSessionDivergence.Load())
+
+	fmt.Fprintln(w, "# HELP opslane_ingest_session_cross_project_conflict_total Total session registrations rejected because the id belongs to another project")
+	fmt.Fprintln(w, "# TYPE opslane_ingest_session_cross_project_conflict_total counter")
+	fmt.Fprintf(w, "opslane_ingest_session_cross_project_conflict_total %d\n\n", ingestSessionCrossProjectConflict.Load())
 
 	// opslane_ingest_errors_total
 	fmt.Fprintf(w, "# HELP opslane_ingest_errors_total Total ingest errors by type\n")

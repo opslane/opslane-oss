@@ -109,6 +109,14 @@ func main() {
 	slog.Info("auth provider selected", "provider", authProvider.Name())
 
 	queries := db.New(pool)
+	go func() {
+		ran, err := queries.RunRollupBackfill(context.Background())
+		if err != nil {
+			slog.Error("environment rollup backfill failed", "error", err)
+		} else if ran {
+			slog.Info("environment rollup backfill complete")
+		}
+	}()
 	deps := &handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,

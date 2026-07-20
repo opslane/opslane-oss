@@ -146,6 +146,20 @@ describe('Core Error Capture', () => {
     expect(payload.breadcrumbs.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('includes an explicitly configured environment in error payloads', () => {
+    resetConfig();
+    loadConfig({ apiKey: 'key-abc', environment: 'staging' });
+
+    const payload = buildPayload('Error', 'boom', 'at app.js:1:1', {
+      type: 'error',
+      timestamp: new Date().toISOString(),
+      category: 'error',
+      message: 'boom',
+    });
+
+    expect(payload.environment).toBe('staging');
+  });
+
   it('should restore original handlers on uninstall', () => {
     const originalOnError = window.onerror;
     const originalOnUnhandled = window.onunhandledrejection;

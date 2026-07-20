@@ -96,6 +96,7 @@ describe('SDK emits the frozen wire shape', () => {
       maxBatchSize: 100,
       errorThrottleMs: 0,
       release: 'web@2026.07.16',
+      environment: 'staging',
     });
     setUser({
       id: 'user-123',

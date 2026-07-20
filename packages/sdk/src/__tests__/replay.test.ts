@@ -146,6 +146,22 @@ describe('continuous chunked recording', () => {
     expect(fetchMock.mock.invocationCallOrder[0]).toBeLessThan(rrwebState.record.mock.invocationCallOrder[0]);
   });
 
+  it('sends the configured environment when registering a replay session', async () => {
+    resetConfig();
+    loadConfig({
+      apiKey: 'key-abc',
+      endpoint: 'https://ingest.example.com',
+      environment: 'staging',
+      replay: { enabled: true },
+    });
+
+    await startEnabled();
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      environment: 'staging',
+    });
+  });
+
   it('registers the latest identity when it changes during initial session registration', async () => {
     let resolveInitial!: (value: { ok: boolean; json: () => Promise<{ recording: boolean }> }) => void;
     fetchMock

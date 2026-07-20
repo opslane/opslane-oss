@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { getMe, clearAuth, isAuthenticated, listProjects, type AuthUser, type Project } from './api';
 import { routeNeedsProject } from './route-project';
 import OrgSwitcher from './components/OrgSwitcher.vue';
+import ProjectSwitcher from './components/ProjectSwitcher.vue';
+import { getProjectId } from './utils';
 
 const route = useRoute();
 const router = useRouter();
 const user = ref<AuthUser | null>(null);
 const projectName = ref(localStorage.getItem('opslane_project_name') ?? '');
+const projects = ref<Project[]>([]);
+const activeProjectId = ref(getProjectId());
 
 // Routes that hide the header and use full-page layout
 const fullPageRoutes = ['login', 'register', 'setup', 'auth-complete', 'invite-accept', 'reset-password'];
@@ -25,14 +29,6 @@ function navLinkClass(routeName: string): string {
     : 'rounded-lg px-3 py-1.5 text-sm text-text-muted hover:text-text hover:bg-surface-2';
 }
 
-// Project selection prompt state
-const showProjectPrompt = ref(false);
-const promptProjects = ref<Project[]>([]);
-const promptSelectedId = ref('');
-const shouldShowProjectPrompt = computed(
-  () => showProjectPrompt.value && routeNeedsProject(route.name),
-);
-
 async function loadUser(): Promise<void> {
   if (!isAuthenticated()) return;
   try {
@@ -44,41 +40,32 @@ async function loadUser(): Promise<void> {
 
 async function checkProject(): Promise<void> {
   if (!isAuthenticated()) return;
-  if (fullPageRoutes.includes(route.name as string)) return;
-  if (!routeNeedsProject(route.name)) return;
-
-  const pid = localStorage.getItem('opslane_project_id');
-  if (pid) {
-    projectName.value = localStorage.getItem('opslane_project_name') ?? '';
-    return;
-  }
-
-  // No project selected -- fetch and decide
   try {
-    const projects = await listProjects();
-    if (projects.length === 0) {
-      router.push('/setup');
-    } else if (projects.length === 1) {
-      localStorage.setItem('opslane_project_id', projects[0].id);
-      localStorage.setItem('opslane_project_name', projects[0].name);
-      projectName.value = projects[0].name;
-    } else {
-      promptProjects.value = projects;
-      promptSelectedId.value = projects[0].id;
-      showProjectPrompt.value = true;
+    projects.value = await listProjects();
+    if (projects.value.length === 0) {
+      if (routeNeedsProject(route.name)) await router.push('/setup');
+      return;
     }
+    const effectiveID = getProjectId();
+    const active = projects.value.find((project) => project.id === effectiveID) ?? projects.value[0];
+    if (!effectiveID || active.id !== effectiveID) {
+      localStorage.setItem('opslane_project_id', active.id);
+    }
+    localStorage.setItem('opslane_project_name', active.name);
+    activeProjectId.value = active.id;
+    projectName.value = active.name;
   } catch {
     // Silently ignore -- project listing failed, user can set via Settings
   }
 }
 
-function selectProject(): void {
-  const project = promptProjects.value.find((p) => p.id === promptSelectedId.value);
-  if (!project) return;
-  localStorage.setItem('opslane_project_id', project.id);
-  localStorage.setItem('opslane_project_name', project.name);
+function onProjectChange(project: Project): void {
+  activeProjectId.value = project.id;
   projectName.value = project.name;
-  showProjectPrompt.value = false;
+}
+
+function onProjectsChanged(): void {
+  void checkProject();
 }
 
 async function logout(): Promise<void> {
@@ -90,13 +77,20 @@ async function logout(): Promise<void> {
   localStorage.removeItem('opslane_project_id');
   localStorage.removeItem('opslane_project_name');
   user.value = null;
+  projects.value = [];
+  activeProjectId.value = '';
   projectName.value = '';
   router.push('/login');
 }
 
 onMounted(() => {
-  loadUser();
-  checkProject();
+  void loadUser();
+  void checkProject();
+  window.addEventListener('opslane-projects-changed', onProjectsChanged);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('opslane-projects-changed', onProjectsChanged);
 });
 
 // After login redirect, user ref is still null -- fetch it on route change
@@ -108,6 +102,8 @@ watch(
     }
     // Refresh project name from localStorage in case Login.vue just set it
     projectName.value = localStorage.getItem('opslane_project_name') ?? '';
+    activeProjectId.value = getProjectId();
+    if (isAuthenticated() && projects.value.length === 0) void checkProject();
   }
 );
 </script>
@@ -131,6 +127,11 @@ watch(
           v-if="user?.memberships?.length"
           :memberships="user.memberships"
           :active-org-id="user.active_org_id ?? user.org_id"
+        />
+        <ProjectSwitcher
+          :projects="projects"
+          :active-project-id="activeProjectId"
+          @project-change="onProjectChange"
         />
       </div>
       <nav class="flex items-center gap-2 h-14">
@@ -161,47 +162,10 @@ watch(
       </nav>
     </header>
 
-    <!-- Project selection prompt -->
-    <div
-      v-if="shouldShowProjectPrompt && !isFullPage"
-      class="max-w-lg mx-auto mt-12 bg-surface rounded-md border border-border p-8"
-    >
-      <h2 class="text-base font-medium text-text mb-2">Select a project</h2>
-      <p class="text-sm text-text-muted mb-4">
-        Choose which project to view.
-      </p>
-      <div class="space-y-4">
-        <div>
-          <label for="app-project-select" class="block text-sm font-medium text-text-muted">
-            Project
-          </label>
-          <select
-            id="app-project-select"
-            v-model="promptSelectedId"
-            class="mt-1 block w-full rounded-md px-3 py-2 text-sm"
-          >
-            <option
-              v-for="project in promptProjects"
-              :key="project.id"
-              :value="project.id"
-              v-text="project.name"
-            ></option>
-          </select>
-        </div>
-        <button
-          @click="selectProject"
-          class="btn-primary"
-        >
-          Continue
-        </button>
-      </div>
-    </div>
-
     <main
-      v-if="!shouldShowProjectPrompt"
       :class="!isFullPage ? 'max-w-7xl mx-auto px-6 py-8' : ''"
     >
-      <router-view :key="$route.fullPath" />
+      <router-view :key="`${activeProjectId}:${$route.fullPath}`" />
     </main>
   </div>
 </template>

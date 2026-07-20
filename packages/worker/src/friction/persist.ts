@@ -1,5 +1,6 @@
 import { getPool, type SessionRow } from '../db.js';
 import type { DetectedSignal } from './analyzer.js';
+import { recomputeIncidentImpact } from './promotion-db.js';
 
 /** Writes one whole-session analysis pass at a single rule version. */
 export async function writeFrictionSignals(
@@ -10,6 +11,29 @@ export async function writeFrictionSignals(
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
+    // Signals may already be attached from an earlier analysis pass. Lock all
+    // affected groups in deterministic UUID order before changing source rows,
+    // then rebuild each group exactly once from the final source snapshot.
+    const attached = await client.query<{ incident_id: string }>(
+      `SELECT DISTINCT incident_id
+       FROM friction_signals
+       WHERE session_id = $1 AND project_id = $2 AND rule_version = $3
+         AND incident_id IS NOT NULL
+       ORDER BY incident_id`,
+      [session.id, session.project_id, ruleVersion],
+    );
+    const affectedIncidents = [...new Set(
+      attached.rows.flatMap((row) => row.incident_id ? [row.incident_id] : []),
+    )].sort();
+    if (affectedIncidents.length > 0) {
+      await client.query(
+        `SELECT id FROM error_groups
+         WHERE project_id = $1 AND id = ANY($2::uuid[])
+         ORDER BY id
+         FOR UPDATE`,
+        [session.project_id, affectedIncidents],
+      );
+    }
     for (const signal of signals) {
       await client.query(
         `INSERT INTO friction_signals
@@ -44,6 +68,9 @@ export async function writeFrictionSignals(
          AND fingerprint <> ALL($4::text[])`,
       [session.id, session.project_id, ruleVersion, signals.map((signal) => signal.fingerprint)],
     );
+    for (const incidentId of affectedIncidents) {
+      await recomputeIncidentImpact(client, incidentId, session.project_id);
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

@@ -108,19 +108,19 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateUserSession, deps.RequireAdmin).Get("/admin/jobs", deps.AdminJobs)
 
 		// Onboarding
-		r.With(deps.AuthenticateUserSession).Post("/onboarding/setup", deps.OnboardingSetup)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Post("/onboarding/setup", deps.OnboardingSetup)
 
 		// Project CRUD
 		r.With(deps.AuthenticateUserSession).Get("/projects", deps.ListProjects)
-		r.With(deps.AuthenticateUserSession).Post("/projects", deps.CreateProjectEndpoint)
-		r.With(deps.AuthenticateUserSession).Patch("/projects/{projectID}", deps.UpdateProjectEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Post("/projects", deps.CreateProjectEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Patch("/projects/{projectID}", deps.UpdateProjectEndpoint)
 
 		// Environment CRUD
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/environments", deps.ListEnvironmentsEndpoint)
-		r.With(deps.AuthenticateUserSession).Post("/projects/{projectID}/environments", deps.CreateEnvironmentEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Post("/projects/{projectID}/environments", deps.CreateEnvironmentEndpoint)
 
 		// API Key CRUD
-		r.With(deps.AuthenticateUserSession).Post("/environments/{envID}/api-keys", deps.CreateAPIKeyEndpoint)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Post("/environments/{envID}/api-keys", deps.CreateAPIKeyEndpoint)
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/api-keys", deps.ListAPIKeysEndpoint)
 
 		// Stats (session or SDK auth — CLI uses API key, dashboard uses JWT)

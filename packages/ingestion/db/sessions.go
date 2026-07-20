@@ -21,6 +21,46 @@ var ErrSessionNotFound = errors.New("session not found for project")
 // ErrSessionTombstoned prevents retention races from recreating deleted ids.
 var ErrSessionTombstoned = errors.New("session has been deleted")
 
+var ErrSessionProjectConflict = errors.New("session id belongs to another project")
+
+type SessionRegistration struct {
+	EnvironmentID string
+	Diverged      bool
+}
+
+// SessionEnvironment returns the environment for a same-project live session.
+// A globally-colliding session id owned by another project is intentionally
+// indistinguishable from an absent session on event ingest.
+func (q *Queries) SessionEnvironment(ctx context.Context, sessionID, projectID string) (string, error) {
+	var environmentID string
+	err := q.pool.QueryRow(ctx,
+		`SELECT environment_id FROM sessions
+		 WHERE id = $1 AND project_id = $2 AND status <> 'deleting'`,
+		sessionID, projectID,
+	).Scan(&environmentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read session environment: %w", err)
+	}
+	return environmentID, nil
+}
+
+// SessionOwnerProject is used only to classify a globally-colliding client id
+// during registration. Callers must not expose the returned tenant id.
+func (q *Queries) SessionOwnerProject(ctx context.Context, sessionID string) (string, error) {
+	var projectID string
+	err := q.pool.QueryRow(ctx, `SELECT project_id FROM sessions WHERE id = $1`, sessionID).Scan(&projectID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read session owner: %w", err)
+	}
+	return projectID, nil
+}
+
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
@@ -28,8 +68,14 @@ func isUniqueViolation(err error) bool {
 
 // InsertSession registers a client-generated session. It is idempotent so a
 // retried init request neither errors nor resets session progress.
-func (q *Queries) InsertSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string) error {
-	tag, err := q.pool.Exec(ctx,
+func (q *Queries) RegisterSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string) (*SessionRegistration, error) {
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("register session: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, err = tx.Exec(ctx,
 		`INSERT INTO sessions (id, project_id, environment_id, end_user_id, started_at, page_url)
 		 SELECT $1, $2, $3, $4, $5, $6
 		 WHERE NOT EXISTS (SELECT 1 FROM session_tombstones WHERE session_id = $1)
@@ -37,18 +83,57 @@ func (q *Queries) InsertSession(ctx context.Context, sessionID, projectID, envir
 		sessionID, projectID, environmentID, endUserID, startedAt, pageURL,
 	)
 	if err != nil {
-		return fmt.Errorf("insert session: %w", err)
+		return nil, fmt.Errorf("insert session: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		tombstoned, checkErr := q.SessionIsTombstoned(ctx, sessionID)
-		if checkErr != nil {
-			return checkErr
+
+	var storedProjectID, storedEnvironmentID string
+	err = tx.QueryRow(ctx,
+		`SELECT project_id, environment_id FROM sessions WHERE id = $1`,
+		sessionID,
+	).Scan(&storedProjectID, &storedEnvironmentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var tombstoned bool
+		if checkErr := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id = $1)`,
+			sessionID,
+		).Scan(&tombstoned); checkErr != nil {
+			return nil, fmt.Errorf("tombstone check: %w", checkErr)
 		}
 		if tombstoned {
-			return ErrSessionTombstoned
+			return nil, ErrSessionTombstoned
 		}
+		return nil, fmt.Errorf("register session: insert produced no session")
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("register session: read owner: %w", err)
+	}
+	if storedProjectID != projectID {
+		return nil, ErrSessionProjectConflict
+	}
+
+	var priorEventDivergence bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM error_events
+		   WHERE session_id = $1 AND project_id = $2 AND environment_id <> $3
+		 )`,
+		sessionID, projectID, storedEnvironmentID,
+	).Scan(&priorEventDivergence); err != nil {
+		return nil, fmt.Errorf("register session: check event divergence: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("register session: commit: %w", err)
+	}
+	return &SessionRegistration{
+		EnvironmentID: storedEnvironmentID,
+		Diverged:      storedEnvironmentID != environmentID || priorEventDivergence,
+	}, nil
+}
+
+// InsertSession preserves the existing idempotent API for internal callers.
+func (q *Queries) InsertSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string) error {
+	_, err := q.RegisterSession(ctx, sessionID, projectID, environmentID, endUserID, startedAt, pageURL)
+	return err
 }
 
 // SessionBelongsToProject is the ownership gate for every session-scoped route.

@@ -295,9 +295,10 @@ func TestUpdateProjectEndpoint_FrictionAutonomy(t *testing.T) {
 		t.Fatalf("valid autonomy status = %d, want 200: %s", response.Code, response.Body.String())
 	}
 	var project struct {
-		GithubRepo       *string `json:"github_repo"`
-		FrictionAutonomy string  `json:"friction_autonomy"`
-		PrPosture        string  `json:"pr_posture"`
+		GithubRepo              *string `json:"github_repo"`
+		FrictionAutonomy        string  `json:"friction_autonomy"`
+		PrPosture               string  `json:"pr_posture"`
+		AllowPayloadEnvironment bool    `json:"allow_payload_environment"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&project); err != nil {
 		t.Fatalf("decode project response: %v", err)
@@ -324,6 +325,17 @@ func TestUpdateProjectEndpoint_FrictionAutonomy(t *testing.T) {
 	}
 	if project.GithubRepo == nil || *project.GithubRepo != "org/other" {
 		t.Fatalf("github_repo = %v, want org/other", project.GithubRepo)
+	}
+
+	response = patch(`{"allow_payload_environment":true}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("payload environment PATCH status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if err := json.NewDecoder(response.Body).Decode(&project); err != nil {
+		t.Fatalf("decode payload environment response: %v", err)
+	}
+	if !project.AllowPayloadEnvironment {
+		t.Fatal("allow_payload_environment = false after true PATCH")
 	}
 }
 

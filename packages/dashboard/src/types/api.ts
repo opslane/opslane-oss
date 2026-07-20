@@ -131,6 +131,14 @@ export interface Incident {
     session_id: string;
     error_at: string;
   };
+  environments?: IncidentEnvironment[];
+}
+
+export interface IncidentEnvironment {
+  id: string;
+  name: string;
+  occurrence_count: number;
+  last_seen: string;
 }
 
 // === Session replay browsing ===
@@ -184,6 +192,7 @@ export interface SessionListResponse {
 export interface SessionFilters {
   end_user_id?: string;
   account_id?: string;
+  environment_id?: string;
   from?: string;
   to?: string;
   limit?: number;
@@ -213,6 +222,7 @@ export interface IncidentFilters {
   account_id?: string;
   end_user_id?: string;
   status?: string;
+  environment_id?: string;
 }
 
 // === GitHub integration ===

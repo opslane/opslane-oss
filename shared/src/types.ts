@@ -13,6 +13,7 @@ export interface Project {
   github_repo: string;
   default_branch: string;
   pr_posture: PRPosture;
+  allow_payload_environment: boolean;
   created_at: string;
 }
 
@@ -67,6 +68,7 @@ export interface ErrorEventPayload {
   sdk_version: string;
   release?: string;      // source map lookup
   session_id?: string;   // links error event to replay
+  environment?: string;  // project-scoped environment name override
 }
 
 export interface Breadcrumb {
@@ -234,6 +236,12 @@ export interface Incident {
   last_seen: string;
   occurrence_count: number;
   affected_users_count: number;
+  environments?: Array<{
+    id: string;
+    name: string;
+    occurrence_count: number;
+    last_seen: string;
+  }>;
   confidence?: ConfidenceLevel;
   pr_url?: string;
   replay_id?: string;

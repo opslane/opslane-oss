@@ -8,6 +8,7 @@ import {
   recomputeIncidentImpact,
   type FoldSignal,
 } from '../promotion-db.js';
+import { writeFrictionSignals } from '../persist.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'];
 const describeDb = DATABASE_URL ? describe : describe.skip;
@@ -40,13 +41,13 @@ export interface SeededSignal {
   sessionId: string;
 }
 
-async function seedSession(id?: string): Promise<string> {
+async function seedSession(id?: string, envId = environmentId): Promise<string> {
   const sessionId = id ?? `sess-${crypto.randomUUID()}`;
   await pool.query(
     `INSERT INTO sessions (id, project_id, environment_id, started_at)
      VALUES ($1, $2, $3, now() - interval '10 minutes')
      ON CONFLICT (id) DO NOTHING`,
-    [sessionId, projectId, environmentId]
+    [sessionId, projectId, envId]
   );
   return sessionId;
 }
@@ -66,6 +67,7 @@ async function seedSignal(opts: {
   sessionId?: string;
   fingerprint?: string;
   occurredAt?: string;
+  occurrenceCount?: number;
   endUserId?: string | null;
   status?: string;
 }): Promise<SeededSignal> {
@@ -73,8 +75,9 @@ async function seedSignal(opts: {
   const res = await pool.query<{ id: string }>(
     `INSERT INTO friction_signals
        (session_id, project_id, environment_id, end_user_id, rule_version,
-        signal_type, fingerprint, page_url_normalized, occurred_at, adjudication_status)
-     VALUES ($1, $2, $3, $4, 1, 'rage_click', $5, '/checkout', $6, $7)
+        signal_type, fingerprint, page_url_normalized, occurred_at,
+        occurrence_count, adjudication_status)
+     VALUES ($1, $2, $3, $4, 1, 'rage_click', $5, '/checkout', $6, $7, $8)
      RETURNING id`,
     [
       sessionId,
@@ -83,6 +86,7 @@ async function seedSignal(opts: {
       opts.endUserId ?? null,
       opts.fingerprint ?? 'fp-rage-checkout',
       opts.occurredAt ?? new Date().toISOString(),
+      opts.occurrenceCount ?? 1,
       opts.status ?? 'pending',
     ]
   );
@@ -351,6 +355,41 @@ describeDb('promotion-db integration', () => {
       expect(new Date(session.retain_until).getTime()).toBe(expectedPin);
     });
 
+    it('records an accepted fold in the error group environment rollup', async () => {
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
+      await pool.query(
+        `INSERT INTO error_group_environments
+           (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+         VALUES ($1, $2, $3, $3, 1)`,
+        [groupId, environmentId, at(5)]
+      );
+      const seeded = await seedSignal({ sessionId, occurredAt: at(0), occurrenceCount: 3 });
+
+      expect(
+        await applyFoldOutcome({
+          signal: await loadSignalRow(seeded.id),
+          verdict: { accepted: true, reason: 'real friction' },
+          meta: META,
+        })
+      ).toBe('attached');
+
+      const { rows } = await pool.query(
+        `SELECT environment_id, first_seen, last_seen, occurrence_count
+         FROM error_group_environments
+         WHERE error_group_id = $1`,
+        [groupId]
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        environment_id: environmentId,
+        occurrence_count: '4',
+      });
+      expect(new Date(rows[0]!.first_seen).getTime()).toBe(new Date(at(0)).getTime());
+      expect(new Date(rows[0]!.last_seen).getTime()).toBe(new Date(at(5)).getTime());
+      expect((await groupState(groupId)).occurrence_count).toBe(4);
+    });
+
     it('is idempotent: a second call is a no-op', async () => {
       const sessionId = await seedSession();
       const { groupId } = await seedErrorGroupWithEvent({ sessionId, eventAt: at(5) });
@@ -480,6 +519,112 @@ describeDb('promotion-db integration', () => {
   });
 
   describe('recomputeIncidentImpact', () => {
+    it('rebuilds environment rollups with the same weighted source semantics as backfill', async () => {
+      const t0 = new Date('2026-07-16T12:00:00.000Z');
+      const at = (deltaSeconds: number) =>
+        new Date(t0.getTime() + deltaSeconds * 1000).toISOString();
+      const envB = (await pool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [projectId, `staging-${crypto.randomUUID()}`]
+      )).rows[0]!.id;
+      const obsoleteEnv = (await pool.query<{ id: string }>(
+        `INSERT INTO environments (project_id, name) VALUES ($1, $2) RETURNING id`,
+        [projectId, `obsolete-${crypto.randomUUID()}`]
+      )).rows[0]!.id;
+      const sessionA = await seedSession();
+      const sessionB = await seedSession(undefined, envB);
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId: sessionA,
+        eventAt: at(10),
+      });
+      await pool.query(
+        `UPDATE error_events SET created_at = $2 WHERE error_group_id = $1`,
+        [groupId, at(100)]
+      );
+      await pool.query(
+        `INSERT INTO error_events
+           (project_id, environment_id, timestamp, error_type, error_message,
+            stack_trace_raw, breadcrumbs, context, session_id, error_group_id, created_at)
+         VALUES ($1, $2, $3, 'TypeError', 'boom', '', '[]'::jsonb, '{}'::jsonb, $4, $5, $6)`,
+        [projectId, envB, at(20), sessionB, groupId, at(200)]
+      );
+      const active = await seedSignal({
+        sessionId: sessionA,
+        occurredAt: at(5),
+        occurrenceCount: 4,
+        status: 'accepted',
+      });
+      const retracted = await seedSignal({
+        sessionId: sessionA,
+        fingerprint: 'fp-retracted-rollup',
+        occurredAt: at(30),
+        occurrenceCount: 7,
+        status: 'accepted',
+      });
+      const superseded = await seedSignal({
+        sessionId: sessionA,
+        fingerprint: 'fp-superseded-rollup',
+        occurredAt: at(35),
+        occurrenceCount: 9,
+        status: 'accepted',
+      });
+      await pool.query(
+        `UPDATE friction_signals
+         SET incident_id = $2,
+             retracted_at = CASE WHEN id = $3 THEN now() ELSE NULL END,
+             superseded_by = CASE WHEN id = $4 THEN $5::uuid ELSE NULL END
+         WHERE id = ANY($1::uuid[])`,
+        [[active.id, retracted.id, superseded.id], groupId, retracted.id, superseded.id, active.id]
+      );
+
+      // Stale and obsolete rows prove the rebuild is absolute, not additive.
+      await pool.query(
+        `INSERT INTO error_group_environments
+           (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+         VALUES ($1, $2, $4, $4, 99), ($1, $3, $4, $4, 99)`,
+        [groupId, environmentId, obsoleteEnv, at(40)]
+      );
+
+      const client = await getPool().connect();
+      try {
+        await recomputeIncidentImpact(client, groupId, projectId);
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query<{
+        environment_id: string;
+        first_seen: Date;
+        last_seen: Date;
+        occurrence_count: string;
+      }>(
+        `SELECT environment_id, first_seen, last_seen, occurrence_count
+         FROM error_group_environments
+         WHERE error_group_id = $1
+         ORDER BY environment_id`,
+        [groupId]
+      );
+      expect(rows.map((row) => ({
+        environmentId: row.environment_id,
+        firstSeen: row.first_seen.toISOString(),
+        lastSeen: row.last_seen.toISOString(),
+        occurrenceCount: row.occurrence_count,
+      }))).toEqual([
+        {
+          environmentId: environmentId,
+          firstSeen: at(5),
+          lastSeen: at(10),
+          occurrenceCount: '5',
+        },
+        {
+          environmentId: envB,
+          firstSeen: at(20),
+          lastSeen: at(20),
+          occurrenceCount: '1',
+        },
+      ].sort((a, b) => a.environmentId.localeCompare(b.environmentId)));
+    });
+
     it('rebuilds impact from active source rows after retraction', async () => {
       const sessionId = await seedSession();
       const userA = await seedEndUser('recompute-a');
@@ -535,6 +680,138 @@ describeDb('promotion-db integration', () => {
       );
       expect(junctions.rows).toHaveLength(1);
       expect(junctions.rows[0]!.end_user_id).toBe(userA);
+    });
+
+    it('keeps attached-signal weight, retraction, and resurrection exact through persistence', async () => {
+      const t0 = new Date('2026-07-16T14:00:00.000Z');
+      const at = (deltaSeconds: number) => new Date(t0.getTime() + deltaSeconds * 1000);
+      const sessionId = await seedSession();
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId,
+        eventAt: at(10).toISOString(),
+      });
+      await pool.query(
+        `INSERT INTO error_group_environments
+           (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+         VALUES ($1, $2, $3, $3, 1)`,
+        [groupId, environmentId, at(10).toISOString()],
+      );
+      const seeded = await seedSignal({
+        sessionId,
+        fingerprint: 'fp-persist-exact',
+        occurredAt: at(5).toISOString(),
+        occurrenceCount: 3,
+      });
+      const signalRow = (await pool.query(
+        `SELECT id, project_id, environment_id, end_user_id, session_id, fingerprint,
+                occurred_at::text AS occurred_at
+         FROM friction_signals WHERE id = $1`,
+        [seeded.id],
+      )).rows[0] as FoldSignal;
+      await applyFoldOutcome({
+        signal: signalRow,
+        verdict: { accepted: true, reason: 'real friction' },
+        meta: { modelId: 'stub-model', promptVersion: 1, jobId: '' },
+      });
+
+      const session = {
+        id: sessionId,
+        project_id: projectId,
+        environment_id: environmentId,
+        end_user_id: null,
+        status: 'pending',
+      };
+      const detected = (occurredAt: Date, occurrenceCount: number) => ({
+        signalType: 'rage_click' as const,
+        fingerprint: 'fp-persist-exact',
+        elementSelector: '#checkout',
+        pageUrlNormalized: '/checkout',
+        occurredAt: occurredAt.getTime(),
+        occurrenceCount,
+        ruleVersion: 1,
+      });
+      const impact = async () => {
+        const group = (await pool.query<{ occurrence_count: number }>(
+          `SELECT occurrence_count FROM error_groups WHERE id = $1`,
+          [groupId],
+        )).rows[0]!;
+        const rollup = (await pool.query<{
+          occurrence_count: string;
+          first_seen: Date;
+          last_seen: Date;
+        }>(
+          `SELECT occurrence_count, first_seen, last_seen
+           FROM error_group_environments
+           WHERE error_group_id = $1 AND environment_id = $2`,
+          [groupId, environmentId],
+        )).rows[0]!;
+        return { group: group.occurrence_count, rollup };
+      };
+
+      await writeFrictionSignals(session, [detected(at(20), 5)], 1);
+      let current = await impact();
+      expect(current.group).toBe(6);
+      expect(current.rollup.occurrence_count).toBe('6');
+      expect(current.rollup.first_seen.toISOString()).toBe(at(10).toISOString());
+      expect(current.rollup.last_seen.toISOString()).toBe(at(20).toISOString());
+
+      await writeFrictionSignals(session, [], 1);
+      current = await impact();
+      expect(current.group).toBe(1);
+      expect(current.rollup.occurrence_count).toBe('1');
+
+      await writeFrictionSignals(session, [detected(at(0), 4)], 1);
+      current = await impact();
+      expect(current.group).toBe(5);
+      expect(current.rollup.occurrence_count).toBe('5');
+      expect(current.rollup.first_seen.toISOString()).toBe(at(0).toISOString());
+      expect(current.rollup.last_seen.toISOString()).toBe(at(10).toISOString());
+    });
+
+    it('rejects a mismatched project without deleting another tenant impact', async () => {
+      const sessionId = await seedSession();
+      const userId = await seedEndUser('recompute-tenant-scope');
+      const { groupId } = await seedErrorGroupWithEvent({
+        sessionId,
+        eventAt: new Date().toISOString(),
+      });
+      await pool.query(
+        `INSERT INTO error_group_environments
+           (error_group_id, environment_id, first_seen, last_seen, occurrence_count)
+         VALUES ($1, $2, now(), now(), 1)`,
+        [groupId, environmentId],
+      );
+      await pool.query(
+        `INSERT INTO error_group_affected_users
+           (error_group_id, end_user_id, first_seen, last_seen, occurrence_count)
+         VALUES ($1, $2, now(), now(), 1)`,
+        [groupId, userId],
+      );
+      const otherOrg = (await pool.query<{ id: string }>(
+        `INSERT INTO orgs (name) VALUES ($1) RETURNING id`,
+        [`recompute-other-${crypto.randomUUID()}`],
+      )).rows[0]!.id;
+      const otherProject = (await pool.query<{ id: string }>(
+        `INSERT INTO projects (org_id, name) VALUES ($1, 'other') RETURNING id`,
+        [otherOrg],
+      )).rows[0]!.id;
+
+      const client = await getPool().connect();
+      try {
+        await expect(recomputeIncidentImpact(client, groupId, otherProject)).rejects.toThrow();
+      } finally {
+        client.release();
+      }
+      const remaining = await pool.query<{ rollups: string; users: string }>(
+        `SELECT
+           (SELECT count(*) FROM error_group_environments WHERE error_group_id = $1)::text AS rollups,
+           (SELECT count(*) FROM error_group_affected_users WHERE error_group_id = $1)::text AS users`,
+        [groupId],
+      );
+      expect(remaining.rows[0]).toEqual({ rollups: '1', users: '1' });
+
+      await pool.query(`DELETE FROM projects WHERE id = $1`, [otherProject]);
+      await pool.query(`DELETE FROM orgs WHERE id = $1`, [otherOrg]);
     });
   });
 });

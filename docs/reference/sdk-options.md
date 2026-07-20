@@ -7,6 +7,7 @@ All options accepted by `init()` from `@opslane/sdk`, mirrored from `SdkInitOpti
 | `apiKey` | `string` | *(required)* | Per-environment ingest key. `init` refuses to start without it. |
 | `endpoint` | `string` | `https://api.opslane.com` | Your Opslane instance; validated as an http(s) URL. |
 | `release` | `string` | `''` | Immutable build identifier (git SHA); must match uploaded source maps. |
+| `environment` | `string` | `''` | Optional deployment name sent with events and session initialization. The server uses it only when payload overrides are enabled for the project; existing session environment assignment takes precedence. |
 | `maxBreadcrumbs` | `number` | `50` | Ring-buffer size for breadcrumbs attached to each event. |
 | `breadcrumbMaxAge` | `number` | `30000` | Milliseconds before a breadcrumb is considered stale and dropped. |
 | `flushInterval` | `number` | `5000` | Milliseconds between transport flushes. |
