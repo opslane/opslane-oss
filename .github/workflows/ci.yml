@@ -187,6 +187,18 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # docs-sync's runnable-snippet tests reach test:repo through
+      # docs:map:test, and they type-check the docs' examples for real: each
+      # runs `pnpm build` inside test-fixtures/react-app or vue-app, which
+      # resolve @opslane/sdk over the workspace link and therefore need
+      # packages/sdk/dist on disk. This job used to be part of js, which ran
+      # `pnpm -r build` first and supplied that implicitly.
+      #
+      # Only the SDK is needed: it has no workspace dependencies of its own,
+      # and those two fixtures depend on nothing else in the repo. Should a
+      # future runnable snippet import another package, this job fails --
+      # it is always-on, so the gap surfaces immediately rather than rotting.
+      - run: pnpm --filter @opslane/sdk build
       - run: pnpm test:repo
 
   js:
