@@ -1,5 +1,6 @@
 import type {
   Incident, AffectedUser, Account, IncidentFilters,
+  SampleEvent,
   GitHubConfig, GitHubAppStatus, GitHubRepo, SetupPrStatus,
   SessionDetail, SessionFilters, SessionListResponse,
   AdminOverview, AdminJobsResponse, HealthResponse,
@@ -531,6 +532,7 @@ export function listIncidents(
   if (filters?.account_id) params.set('account_id', filters.account_id);
   if (filters?.end_user_id) params.set('end_user_id', filters.end_user_id);
   if (filters?.status) params.set('status', filters.status);
+  if (filters?.platform) params.set('platform', filters.platform);
   const qs = params.toString();
   return fetchJSON<Incident[]>(
     `/projects/${projectId}/incidents${qs ? `?${qs}` : ''}`
@@ -543,6 +545,15 @@ export function getIncident(
 ): Promise<Incident> {
   return fetchJSON<Incident>(
     `/projects/${projectId}/incidents/${incidentId}`
+  );
+}
+
+export function getSampleEvent(
+  projectId: string,
+  incidentId: string
+): Promise<SampleEvent> {
+  return fetchJSON<SampleEvent>(
+    `/projects/${projectId}/incidents/${incidentId}/sample-event`
   );
 }
 
