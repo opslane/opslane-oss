@@ -63,8 +63,10 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
+      # Pinned, not @latest: npm 12 requires Node ^22.22.2 and would fail
+      # EBADENGINE against the Node in .nvmrc. Bump alongside .nvmrc.
       - name: Update npm (trusted publishing requires >= 11.5.1)
-        run: npm install -g npm@latest && npm --version
+        run: npm install -g npm@11.18.0 && npm --version
       - name: Install (lifecycle scripts blocked)
         run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Build publishable packages
