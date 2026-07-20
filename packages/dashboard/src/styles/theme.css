@@ -1,0 +1,37 @@
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+@import './tokens.css';
+@import './base.css';
+
+@theme inline {
+  --color-background: var(--ds-background);
+  --color-surface: var(--ds-surface);
+  --color-surface-subtle: var(--ds-surface-subtle);
+  --color-border: var(--ds-border);
+  --color-border-strong: var(--ds-border-strong);
+  --color-text: var(--ds-text);
+  --color-muted: var(--ds-muted);
+  --color-faint: var(--ds-faint);
+  --color-accent: var(--ds-accent);
+  --color-accent-hover: var(--ds-accent-hover);
+  --color-on-accent: var(--ds-on-accent);
+  --color-danger: var(--ds-danger);
+  --color-danger-subtle: var(--ds-danger-subtle);
+  --color-success: var(--ds-success);
+  --color-success-subtle: var(--ds-success-subtle);
+  --color-warning: var(--ds-warning);
+  --color-warning-subtle: var(--ds-warning-subtle);
+  --color-progress: var(--ds-progress);
+  --color-progress-subtle: var(--ds-progress-subtle);
+  --color-insight: var(--ds-insight);
+  --color-insight-subtle: var(--ds-insight-subtle);
+  --color-evidence: var(--ds-evidence);
+  --color-evidence-surface: var(--ds-evidence-surface);
+  --color-evidence-border: var(--ds-evidence-border);
+  --color-evidence-text: var(--ds-evidence-text);
+  --color-evidence-muted: var(--ds-evidence-muted);
+  --font-sans: var(--ds-font-sans);
+  --font-mono: var(--ds-font-mono);
+  --shadow-card: var(--ds-shadow-card);
+}

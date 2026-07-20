@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { listSessions } from '../api';
-import type { SessionFilters, SessionSummary } from '../types/api';
+import type { SessionFilters, SessionStatus, SessionSummary } from '../types/api';
 import { formatDate, getProjectId, safeUrl } from '../utils';
+import { sessionStatusRecipe } from '../status-recipes';
 import { applySessionFilters, sessionPageRequest } from '../components/session-list-query';
 import { useEnvironmentFilter } from '../composables/useEnvironmentFilter';
+import SelectField from '../components/ui/SelectField.vue';
+import TextInput from '../components/ui/TextInput.vue';
+import Button from '../components/ui/Button.vue';
 
 const sessions = ref<SessionSummary[]>([]);
 const projectId = ref('');
@@ -23,6 +27,15 @@ const {
   rollupReady,
   selectedEnvironmentId,
 } = useEnvironmentFilter(projectId);
+const environmentOptions = computed(() => [
+  { value: '', label: 'All environments' },
+  ...environments.value.map((environment) => ({ value: environment.id, label: environment.name })),
+]);
+
+function selectEnvironment(value: string): void {
+  selectedEnvironmentId.value = value;
+  applyFilters();
+}
 
 watch(rollupReady, (ready) => {
   if (ready) applyFilters();
@@ -100,12 +113,8 @@ function formatBytes(bytes: number): string {
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 }
 
-function sessionBadge(status: string): string {
-  if (status === 'recording') return 'bg-teal/10 text-teal';
-  if (status === 'analysis_failed') return 'bg-red/10 text-red';
-  if (status === 'analyzing') return 'bg-indigo/10 text-indigo';
-  if (status === 'analyzed') return 'bg-green/10 text-green';
-  return 'bg-surface-2 text-text-muted';
+function sessionBadge(status: SessionStatus): string {
+  return sessionStatusRecipe(status).class;
 }
 
 onMounted(() => {
@@ -124,52 +133,37 @@ onMounted(() => {
     <div class="flex items-center justify-between gap-4 mb-4">
       <div>
         <h2 class="text-lg font-medium text-text">Sessions</h2>
-        <p class="mt-1 text-sm text-text-muted">Browse scrubbed recordings by user, account, and time.</p>
+        <p class="mt-1 text-sm text-muted">Browse scrubbed recordings by user, account, and time.</p>
       </div>
     </div>
 
     <form class="grid gap-3 mb-5 md:grid-cols-2 xl:grid-cols-6" @submit.prevent="applyFilters">
-      <input v-model="endUserId" type="text" placeholder="End-user ID" class="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm" />
-      <input v-model="accountId" type="text" placeholder="Account ID" class="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm" />
-      <label v-if="rollupReady" class="text-xs text-text-muted">
-        Environment
-        <select
-          v-model="selectedEnvironmentId"
-          class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
-          @change="applyFilters"
-        >
-          <option value="">All environments</option>
-          <option
-            v-for="environment in environments"
-            :key="environment.id"
-            :value="environment.id"
-            v-text="environment.name"
-          ></option>
-        </select>
-      </label>
-      <label class="text-xs text-text-muted">
-        From
-        <input v-model="from" type="datetime-local" class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text" />
-      </label>
-      <label class="text-xs text-text-muted">
-        To
-        <input v-model="to" type="datetime-local" class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text" />
-      </label>
-      <button type="submit" class="btn-primary self-end" :disabled="loading">Apply filters</button>
+      <TextInput v-model="endUserId" label="End-user ID" placeholder="End-user ID" />
+      <TextInput v-model="accountId" label="Account ID" placeholder="Account ID" />
+      <SelectField
+        v-if="rollupReady"
+        :model-value="selectedEnvironmentId"
+        label="Environment"
+        :options="environmentOptions"
+        @update:model-value="selectEnvironment"
+      />
+      <TextInput v-model="from" label="From" type="datetime-local" />
+      <TextInput v-model="to" label="To" type="datetime-local" />
+      <Button variant="primary" class="self-end" type="submit" :disabled="loading">Apply filters</Button>
     </form>
 
-    <div v-if="loading" class="text-text-muted">Loading sessions...</div>
-    <div v-else-if="error" class="rounded-md bg-red/10 border border-red/20 p-4 text-sm text-red">
+    <div v-if="loading" class="text-muted">Loading sessions...</div>
+    <div v-else-if="error" class="rounded-md bg-danger/10 border border-danger/20 p-4 text-sm text-danger">
       <p v-text="error"></p>
     </div>
     <div v-else-if="sessions.length === 0" class="py-16 text-center">
       <h3 class="text-sm font-medium text-text">No sessions found</h3>
-      <p class="mt-1 text-sm text-text-muted">Recordings appear after their first chunk has been accepted.</p>
+      <p class="mt-1 text-sm text-muted">Recordings appear after their first chunk has been accepted.</p>
     </div>
     <div v-else class="border border-border rounded-lg overflow-x-auto">
       <table class="min-w-full text-sm">
         <thead>
-          <tr class="border-b border-border bg-surface text-left text-xs font-medium uppercase tracking-wider text-text-muted">
+          <tr class="border-b border-border bg-surface text-left text-xs font-medium uppercase tracking-wider text-muted">
             <th class="py-2.5 px-4">Started</th>
             <th class="py-2.5 px-4">User</th>
             <th class="py-2.5 px-4">Duration</th>
@@ -180,28 +174,28 @@ onMounted(() => {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="item in sessions" :key="item.id" class="border-b border-border-subtle hover:bg-surface transition-colors">
+          <tr v-for="item in sessions" :key="item.id" class="border-b border-border hover:bg-surface transition-colors">
             <td class="py-2.5 px-4 whitespace-nowrap">
               <router-link
                 v-if="item.playable_chunk_count > 0"
                 :to="{ name: 'session-detail', params: { sessionId: item.id } }"
-                class="text-teal hover:underline font-medium"
+                class="text-accent hover:underline font-medium"
               >{{ formatDate(item.started_at) }}</router-link>
               <span v-else>{{ formatDate(item.started_at) }}</span>
             </td>
-            <td class="py-2.5 px-4 text-text-muted" v-text="item.end_user?.email || item.end_user?.external_user_id || '\u2014'"></td>
-            <td class="py-2.5 px-4 text-text-muted whitespace-nowrap">{{ duration(item) }}</td>
-            <td class="py-2.5 px-4 text-text-muted whitespace-nowrap">
+            <td class="py-2.5 px-4 text-muted" v-text="item.end_user?.email || item.end_user?.external_user_id || '\u2014'"></td>
+            <td class="py-2.5 px-4 text-muted whitespace-nowrap">{{ duration(item) }}</td>
+            <td class="py-2.5 px-4 text-muted whitespace-nowrap">
               {{ item.playable_chunk_count }}/{{ item.chunk_count }}
-              <span v-if="item.playable_chunk_count === 0" class="ml-1 text-amber">processing</span>
+              <span v-if="item.playable_chunk_count === 0" class="ml-1 text-warning">processing</span>
             </td>
-            <td class="py-2.5 px-4 text-text-muted whitespace-nowrap">{{ formatBytes(item.bytes_stored) }}</td>
+            <td class="py-2.5 px-4 text-muted whitespace-nowrap">{{ formatBytes(item.bytes_stored) }}</td>
             <td class="py-2.5 px-4">
               <span class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium" :class="sessionBadge(item.status)" v-text="item.status.replace('_', ' ')"></span>
             </td>
             <td class="py-2.5 px-4 max-w-72 truncate">
-              <a v-if="safeUrl(item.page_url ?? undefined)" :href="safeUrl(item.page_url ?? undefined)" target="_blank" rel="noopener noreferrer" class="text-teal hover:underline" v-text="item.page_url"></a>
-              <span v-else class="text-text-faint">\u2014</span>
+              <a v-if="safeUrl(item.page_url ?? undefined)" :href="safeUrl(item.page_url ?? undefined)" target="_blank" rel="noopener noreferrer" class="text-accent hover:underline" v-text="item.page_url"></a>
+              <span v-else class="text-faint">\u2014</span>
             </td>
           </tr>
         </tbody>
@@ -209,9 +203,9 @@ onMounted(() => {
     </div>
 
     <div v-if="nextCursor" class="mt-4 text-center">
-      <button class="btn-secondary text-sm" :disabled="loadingMore" @click="fetchSessions(nextCursor)">
+      <Button variant="secondary" :disabled="loadingMore" @click="fetchSessions(nextCursor)">
         {{ loadingMore ? 'Loading...' : 'Load more' }}
-      </button>
+      </Button>
     </div>
   </div>
 </template>

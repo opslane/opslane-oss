@@ -1,0 +1,57 @@
+:root {
+  color-scheme: light;
+
+  /* Forensic Ledger reference palette. Product code consumes semantic roles. */
+  --ledger-paper: #fbfaf7;
+  --ledger-white: #ffffff;
+  --ledger-stone-50: #f5f3ee;
+  --ledger-stone-100: #e8e4dc;
+  --ledger-stone-300: #b9b2a6;
+  --ledger-ink: #24211d;
+  --ledger-ink-muted: #625d55;
+  --ledger-ink-faint: #746e65;
+  --ledger-ember: #b74420;
+  --ledger-ember-hover: #923719;
+
+  --ds-background: var(--ledger-paper);
+  --ds-surface: var(--ledger-white);
+  --ds-surface-subtle: var(--ledger-stone-50);
+  --ds-border: var(--ledger-stone-100);
+  --ds-border-strong: var(--ledger-stone-300);
+  --ds-text: var(--ledger-ink);
+  --ds-muted: var(--ledger-ink-muted);
+  --ds-faint: var(--ledger-ink-faint);
+  --ds-accent: var(--ledger-ember);
+  --ds-accent-hover: var(--ledger-ember-hover);
+  --ds-on-accent: #ffffff;
+  --ds-danger: #a5342f;
+  --ds-danger-subtle: #f8e9e6;
+  --ds-success: #276749;
+  --ds-success-subtle: #e5f2eb;
+  --ds-warning: #8a570d;
+  --ds-warning-subtle: #f8eed8;
+  --ds-progress: #315f7d;
+  --ds-progress-subtle: #e4edf2;
+  --ds-insight: #28685f;
+  --ds-insight-subtle: #e3f0ed;
+  --ds-evidence: #15191c;
+  --ds-evidence-surface: #1d2327;
+  --ds-evidence-border: #3c464c;
+  --ds-evidence-text: #f2f0ea;
+  --ds-evidence-muted: #b8c0c3;
+  --ds-focus: #b74420;
+
+  --ds-shadow-card: 0 1px 2px rgb(36 33 29 / 5%), 0 5px 18px rgb(36 33 29 / 6%);
+  --ds-font-sans: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --ds-font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/*
+ * A `[data-theme='dark']` palette was defined here but nothing ever set
+ * `data-theme`, and there was no `prefers-color-scheme` fallback, so it could
+ * never activate. It was removed rather than shipped unreachable. Reinstating
+ * dark mode means restoring the token block *and* adding the switch that sets
+ * `data-theme` on the document element. Note that base.css hardcodes the
+ * select-chevron stroke to the light muted ink (`%23625d55`); that has to
+ * become a token at the same time or the control is near-invisible in dark.
+ */

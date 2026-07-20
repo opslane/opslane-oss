@@ -8,7 +8,7 @@ defineProps<{
 </script>
 
 <template>
-  <div class="relative rounded-lg bg-surface-2 text-text text-sm">
+  <div class="relative rounded-lg bg-surface-subtle text-text text-sm">
     <div class="absolute top-2 right-2">
       <CopyButton :text="code" />
     </div>

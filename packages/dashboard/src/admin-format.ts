@@ -1,4 +1,5 @@
-import type { AdminOverview } from './types/api';
+import type { AdminJobStatus, AdminOverview, ErrorGroupStatus } from './types/api';
+import { adminJobStatusRecipe, incidentStatusRecipe } from './status-recipes';
 
 type AdminOnboardingOverview = NonNullable<AdminOverview['onboarding']>;
 type OnboardingStageKey =
@@ -44,32 +45,24 @@ export function onboardingFunnelStages(onboarding: AdminOnboardingOverview): Onb
 
 // Keep the shared statuses aligned with statusBadgeClass in utils.ts so the
 // same status never renders a different color on the admin page.
+export type AdminDisplayedStatus = AdminJobStatus | ErrorGroupStatus;
+
+const ADMIN_JOB_STATUSES: readonly AdminJobStatus[] = ['pending', 'claimed', 'completed', 'failed', 'dead_letter'];
+const INCIDENT_STATUSES: readonly ErrorGroupStatus[] = [
+  'new', 'queued', 'analyzing', 'investigated', 'fixing', 'pr_draft', 'pr_created',
+  'needs_human', 'resolved', 'merged', 'archived', 'candidate', 'awaiting_approval', 'insight',
+];
+
+function isAdminJobStatus(status: string): status is AdminJobStatus {
+  return ADMIN_JOB_STATUSES.some((candidate) => candidate === status);
+}
+
+function isIncidentStatus(status: string): status is ErrorGroupStatus {
+  return INCIDENT_STATUSES.some((candidate) => candidate === status);
+}
+
 export function adminStatusBadgeClass(status: string): string {
-  switch (status) {
-    case 'completed':
-    case 'insight':
-    case 'resolved':
-    case 'merged':
-    case 'pr_created':
-      return 'bg-green/10 text-green';
-    case 'pr_draft':
-      return 'bg-amber/10 text-amber';
-    case 'claimed':
-    case 'analyzing':
-    case 'queued':
-      return 'bg-indigo/10 text-indigo';
-    case 'fixing':
-      return 'bg-indigo/10 text-indigo animate-pulse';
-    case 'awaiting_approval':
-    case 'investigated':
-      return 'bg-teal/10 text-teal';
-    case 'pending':
-    case 'needs_human':
-      return 'bg-amber/10 text-amber';
-    case 'failed':
-    case 'dead_letter':
-      return 'bg-red/10 text-red';
-    default:
-      return 'bg-surface-2 text-text-muted';
-  }
+  if (isAdminJobStatus(status)) return adminJobStatusRecipe(status).class;
+  if (isIncidentStatus(status)) return incidentStatusRecipe(status).class;
+  return 'border-border-strong bg-surface-subtle text-muted';
 }

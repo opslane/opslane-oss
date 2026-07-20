@@ -77,7 +77,9 @@ describe('SessionsList environment pagination', () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain('https://production.example.test');
-    await wrapper.get('button.btn-secondary').trigger('click');
+    const loadMore = wrapper.findAll('button').find((button) => button.text().includes('Load more'));
+    expect(loadMore).toBeDefined();
+    await loadMore!.trigger('click');
     const environmentSelect = wrapper.get('select');
     await environmentSelect.setValue('env-staging');
     await environmentSelect.trigger('change');

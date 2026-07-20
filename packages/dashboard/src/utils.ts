@@ -1,5 +1,6 @@
 import { formatDistanceToNow, format } from 'date-fns';
 import type { ErrorGroupStatus } from './types/api';
+import { incidentStatusRecipe } from './status-recipes';
 
 export function formatDate(iso: string): string {
   const d = new Date(iso);
@@ -23,34 +24,11 @@ export function getProjectId(): string {
 }
 
 export function statusBadgeClass(status: ErrorGroupStatus): string {
-  switch (status) {
-    case 'insight':
-    case 'resolved':
-    case 'merged':
-    case 'pr_created':
-      return 'bg-green/10 text-green';
-    case 'pr_draft':
-    case 'needs_human':
-      return 'bg-amber/10 text-amber';
-    case 'analyzing':
-    case 'queued':
-      return 'bg-indigo/10 text-indigo';
-    case 'awaiting_approval':
-    case 'investigated':
-      return 'bg-teal/10 text-teal';
-    case 'fixing':
-      return 'bg-indigo/10 text-indigo animate-pulse';
-    case 'archived':
-      return 'bg-surface-2 text-text-faint';
-    default:
-      return 'bg-surface-2 text-text';
-  }
+  return incidentStatusRecipe(status).class;
 }
 
 export function statusLabel(status: ErrorGroupStatus): string {
-  if (status === 'pr_draft') return 'Draft PR';
-  if (status === 'pr_created') return 'PR Created';
-  return status.replace(/_/g, ' ');
+  return incidentStatusRecipe(status).label;
 }
 
 export function safeUrl(url: string | undefined): string | undefined {

@@ -120,14 +120,14 @@ watch(
   <div class="space-y-3">
     <div ref="containerRef" class="replay-container bg-black/5 rounded-lg overflow-hidden" />
     <div class="flex flex-wrap items-center gap-3">
-      <button class="btn-secondary text-sm" :disabled="!replayer" @click="isPlaying ? pause() : play()">
+      <button class="inline-flex min-h-10 items-center justify-center border border-border-strong bg-surface px-4 py-2 text-sm font-semibold text-text hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 text-sm" :disabled="!replayer" @click="isPlaying ? pause() : play()">
         {{ isPlaying ? 'Pause' : 'Play' }}
       </button>
-      <button class="btn-secondary text-sm" :disabled="!replayer" @click="jumpToCrash">
+      <button class="inline-flex min-h-10 items-center justify-center border border-border-strong bg-surface px-4 py-2 text-sm font-semibold text-text hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 text-sm" :disabled="!replayer" @click="jumpToCrash">
         Jump to crash
       </button>
       <div class="relative">
-        <button class="btn-secondary text-sm" :disabled="!replayer" @click="showSpeedMenu = !showSpeedMenu">
+        <button class="inline-flex min-h-10 items-center justify-center border border-border-strong bg-surface px-4 py-2 text-sm font-semibold text-text hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 text-sm" :disabled="!replayer" @click="showSpeedMenu = !showSpeedMenu">
           {{ speed }}x
         </button>
         <div v-if="showSpeedMenu" class="absolute bottom-full mb-1 bg-surface border border-border rounded-lg py-1">
@@ -152,7 +152,7 @@ watch(
         :disabled="!replayer"
         @input="seek(parseFloat(($event.target as HTMLInputElement).value))"
       />
-      <span class="text-sm text-text-muted min-w-[96px] text-right">
+      <span class="text-sm text-muted min-w-[96px] text-right">
         {{ formatTime(currentTime) }} / {{ formatTime(duration) }}
       </span>
     </div>

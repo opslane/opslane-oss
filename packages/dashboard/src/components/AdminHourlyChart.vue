@@ -55,7 +55,7 @@ const bars = computed(() => {
         :width="bar.width"
         :height="bar.height"
         rx="2"
-        class="fill-teal/70 hover:fill-teal"
+        class="fill-accent/70 hover:fill-accent"
       >
         <title>{{ bar.label }} UTC: {{ bar.count.toLocaleString() }} events</title>
       </rect>
@@ -63,7 +63,7 @@ const bars = computed(() => {
         v-if="index % 6 === 0"
         :x="bar.x"
         :y="height - 8"
-        class="fill-text-muted text-[10px]"
+        class="fill-muted text-[10px]"
       >
         {{ bar.label }}
       </text>

@@ -77,8 +77,6 @@ function mountView() {
   return mount(IncidentDetail, {
     global: {
       stubs: {
-        EvidenceCard: true,
-        PipelineIndicator: true,
         ReplayPlayer: true,
         RouterLink: { template: '<a><slot /></a>' },
       },
@@ -151,6 +149,33 @@ describe('IncidentDetail sample event', () => {
     expect(wrapper.text()).toContain('ValueError: boom');
     expect(api.getSampleEvent).not.toHaveBeenCalled();
     expect(wrapper.find('[data-testid="sample-event"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it.each(['javascript:alert(1)', 'data:text/html,<script>alert(1)</script>'])(
+    'does not render an unsafe external trace URL: %s',
+    async (traceUrl) => {
+      api.getIncident.mockResolvedValue({ ...incident, trace_url: traceUrl });
+
+      const wrapper = mountView();
+      await flushPromises();
+
+      expect(wrapper.find('a[href^="javascript:"]').exists()).toBe(false);
+      expect(wrapper.find('a[href^="data:"]').exists()).toBe(false);
+      expect(wrapper.text()).not.toContain('View in Langfuse');
+
+      wrapper.unmount();
+    },
+  );
+
+  it('renders a guarded HTTPS trace URL', async () => {
+    api.getIncident.mockResolvedValue({ ...incident, trace_url: 'https://trace.example.test/i1' });
+
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(wrapper.get('a[href="https://trace.example.test/i1"]').attributes('rel')).toContain('noopener');
 
     wrapper.unmount();
   });
