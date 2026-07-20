@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { verify, GATED, ALWAYS } from '../check-ci-ok.mjs';
 
@@ -162,4 +163,47 @@ test('CLI exits 0 and says so when everything matches', () => {
   const NEEDS = JSON.stringify(needs({ areas: allOn }));
   const out = execFileSync(process.execPath, [CLI], { env: { ...process.env, NEEDS }, encoding: 'utf8' });
   assert.match(out, /ran or skipped exactly as/);
+});
+
+// --- ci.yml and this script must agree about the job list ---
+
+function workflowJobs(yml) {
+  const jobsStart = yml.indexOf('\njobs:\n');
+  assert.notEqual(jobsStart, -1, 'ci.yml must contain a jobs block');
+  const jobsSection = yml.slice(jobsStart + '\njobs:\n'.length);
+  const matches = [...jobsSection.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)];
+  return new Map(matches.map((match, index) => {
+    const end = matches[index + 1]?.index ?? jobsSection.length;
+    return [match[1], jobsSection.slice(match.index, end)];
+  }));
+}
+
+test('ci-ok.needs matches exactly the jobs check-ci-ok.mjs knows about', () => {
+  const yml = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const ciOk = workflowJobs(yml).get('ci-ok');
+  const needsLine = ciOk.match(/^    needs: \[([^\]]+)\]/m);
+  assert.ok(needsLine, 'ci-ok must declare a single-line needs list');
+  const listed = needsLine[1].split(',').map((s) => s.trim()).sort();
+  const known = [...Object.keys(GATED), ...ALWAYS].sort();
+  assert.deepEqual(listed, known);
+});
+
+test('every workflow job is covered by the gate or explicitly downstream', () => {
+  const yml = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const listed = [...workflowJobs(yml).keys()].sort();
+  const expected = [...Object.keys(GATED), ...ALWAYS, 'ci-ok', 'candidate-images'].sort();
+  assert.deepEqual(listed, expected);
+});
+
+test('every gated job depends on changes and gates on its assigned area', () => {
+  const yml = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const jobs = workflowJobs(yml);
+  for (const [job, area] of Object.entries(GATED)) {
+    const block = jobs.get(job);
+    assert.ok(block, `${job} is missing from ci.yml`);
+    assert.match(block, /^    needs: \[changes\]$/m, `${job} must depend directly on changes`);
+    const condition = block.match(/^    if: (.+)$/m);
+    assert.ok(condition, `${job} must have a job-level if condition`);
+    assert.equal(condition[1].trim(), `needs.changes.outputs.${area} == 'true'`, `${job} gates on the wrong area`);
+  }
 });

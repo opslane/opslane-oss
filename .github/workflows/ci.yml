@@ -13,8 +13,81 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Classifies the PR's changed files into the areas the heavy jobs gate on.
+  #
+  # INVARIANT this design depends on: ci-ok and wire-fixtures are the ONLY
+  # required status checks on main. A job-level `if:` that evaluates false
+  # reports SUCCESS to the status API, not pending -- so if an individual job
+  # below is ever marked required directly, a filtered-out PR would pass with
+  # that check green and nothing behind it. Check before changing:
+  #   gh api repos/opslane/opslane-oss/branches/main/protection \
+  #     --jq '.required_status_checks.contexts'
+  #
+  # Push to main deliberately classifies nothing and turns every area on:
+  # candidate-images is published off a green ci-ok, so it must be backed by a
+  # full run, and a classifier mistake then shows up as a red main rather than
+  # a silent hole.
+  changes:
+    name: Classify changed files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.classify.outputs.go }}
+      js: ${{ steps.classify.outputs.js }}
+      python: ${{ steps.classify.outputs.python }}
+      e2e: ${{ steps.classify.outputs.e2e }}
+      reliability: ${{ steps.classify.outputs.reliability }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Classify
+        id: classify
+        env:
+          # base.sha is the base ref tip at event time; the three-dot diff
+          # below is what resolves the merge base from it. If main advanced
+          # since, the merge base is the same or older, so the file set is the
+          # same or larger -- wrong in the safe direction.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Not a pull request; running every area."
+            for area in go js python e2e reliability; do
+              echo "$area=true" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            echo "pull_request.base.sha is empty; cannot classify." >&2
+            exit 1
+          fi
+          # --no-renames: a detected rename reports only the destination, so
+          # moving an active file into docs/ could otherwise suppress the jobs
+          # that covered it. Without rename detection it is a delete plus an
+          # add, and both paths get classified.
+          git diff --no-renames --name-only -z "$BASE_SHA...HEAD" \
+            | node scripts/ci-changed-areas.mjs \
+            | tee -a "$GITHUB_OUTPUT"
+      - name: Summarize
+        run: |
+          {
+            echo "### Changed-file classification"
+            echo '```'
+            echo "go=${{ steps.classify.outputs.go }}"
+            echo "js=${{ steps.classify.outputs.js }}"
+            echo "python=${{ steps.classify.outputs.python }}"
+            echo "e2e=${{ steps.classify.outputs.e2e }}"
+            echo "reliability=${{ steps.classify.outputs.reliability }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   go:
     name: Go build and test
+    needs: [changes]
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -111,6 +184,8 @@ jobs:
 
   js:
     name: JS build and test
+    needs: [changes]
+    if: needs.changes.outputs.js == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -150,6 +225,8 @@ jobs:
 
   sdk-python:
     name: Python SDK tests (${{ matrix.python-version }})
+    needs: [changes]
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -193,6 +270,8 @@ jobs:
 
   e2e-keyless:
     name: Keyless smoke E2E
+    needs: [changes]
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -314,6 +393,8 @@ jobs:
 
   reliability-system:
     name: Deterministic event-to-PR reliability
+    needs: [changes]
+    if: needs.changes.outputs.reliability == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -352,16 +433,20 @@ jobs:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [go, js, compose, e2e-keyless, reliability-system, security, sdk-python, repo-checks]
+    needs: [changes, repo-checks, go, js, sdk-python, compose, e2e-keyless, reliability-system, security]
     if: always()
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Report job results
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: echo "$RESULTS"
-      - name: Fail on any failed, cancelled, or skipped required job
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
-        run: exit 1
+      - name: Verify every job ran or skipped exactly as classified
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/check-ci-ok.mjs
 
   # Candidate images: only on push to main, only after ci-ok. The unique tag
   # main-<sha>-<run-id>-<attempt> IS the candidate's identity (no stored
