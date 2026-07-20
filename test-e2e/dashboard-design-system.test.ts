@@ -38,11 +38,16 @@ function sourceFiles(directory: string): string[] {
 describe('dashboard V1 safeguards', () => {
   it('pins API types, requests, and router source to the reviewed baseline', () => {
     const requestManifest = JSON.parse(read('docs/design/dashboard-v1/request-manifest.json')) as {
-      sourceHashes: Record<string, string>;
+      // A list of {path, sha256} rather than a path-keyed map: keying a 64-char
+      // hex value by a path containing "api" trips gitleaks' generic-api-key
+      // rule. These are content hashes of committed files, so the manifest
+      // changes shape instead of the secret scanner losing a rule.
+      sourceHashes: Array<{ path: string; sha256: string }>;
       requests: Array<{ method: string; path: string }>;
     };
-    for (const [path, expected] of Object.entries(requestManifest.sourceHashes)) {
-      expect(sha256(path), `${path} changed outside the frozen frontend contract`).toBe(expected);
+    expect(requestManifest.sourceHashes.length).toBeGreaterThan(0);
+    for (const entry of requestManifest.sourceHashes) {
+      expect(sha256(entry.path), `${entry.path} changed outside the frozen frontend contract`).toBe(entry.sha256);
     }
     expect(requestManifest.requests.length).toBeGreaterThan(40);
     const keys = requestManifest.requests.map((request) => `${request.method} ${request.path}`);
