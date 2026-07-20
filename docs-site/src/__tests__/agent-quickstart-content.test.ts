@@ -46,7 +46,14 @@ describe('agent quickstart content', () => {
 
   it('is a covered draft with exactly one H1', () => {
     expect(parseDraft(markdown)).toBe(true); // PR 7 deletes this line.
-    expect(markdown).toMatch(/^---\n[\s\S]*\ncovers:\n(?:\s+-\s+[^\n]+\n)+[\s\S]*?\n---\n/);
+    // Match the frontmatter block first, then the covers entries within it.
+    // Horizontal-whitespace classes only: `\s` matches newlines, which makes
+    // the per-entry repetition ambiguous and quadratic (CodeQL js/redos).
+    const frontmatter = /^---[ \t]*\n([\s\S]*?)\n---[ \t]*(?:\n|$)/.exec(markdown)?.[1];
+    expect(frontmatter).toBeDefined();
+    expect(frontmatter).toMatch(
+      /(?:^|\n)covers:\n[ \t]+-[ \t]+[^\n]+(?:\n[ \t]+-[ \t]+[^\n]+)*/,
+    );
     expect(extractTitle(markdown, 'docs/quickstart/agent.md')).toBe('Agent quickstart');
   });
 
