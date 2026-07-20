@@ -18,7 +18,7 @@
   ```bash
   git fetch origin && git checkout -b abhishekray07/python-sdk-batch3 origin/main
   ```
-- **Prerequisite:** PR #127 (issue #104, origin allowlist rejects backend SDK events) must be merged before Task 19's live leg. Everything up to Task 18 is independent of it.
+- **Prerequisite: satisfied.** Issue #104 (origin allowlist rejected backend SDK events, which would have broken the live Python e2e) was fixed by PR #127, merged 2026-07-20 as `0d76674`. No longer a blocker.
 - **DB-backed Go tests** skip without `DATABASE_URL`. Use a disposable Postgres, never the shared 5434 instance:
   ```bash
   docker run -d --rm --name b3-pg -e POSTGRES_USER=opslane -e POSTGRES_PASSWORD=opslane \
@@ -944,8 +944,8 @@ docker compose config --quiet
 
 Expected: all green. `pnpm test` includes the docs-drift check that Step 1 satisfies.
 
-**Step 3: Live sandbox + live PR smoke.** Requires #127 merged and the Task 12
-template rebuild published. Real Flask fixture → real event → real E2B sandbox →
+**Step 3: Live sandbox + live PR smoke.** Requires the Task 12 template rebuild
+published (#127 already landed). Real Flask fixture → real event → real E2B sandbox →
 real PR. Record: the PR URL, that its diff fixes the bug, that pytest passed
 in-sandbox, and that the body shows both runtime versions.
 

@@ -377,7 +377,7 @@ deployment**. The code default stays off, or D0 stops being true.
 | 2+ Python eval cases pass quality gate | 6 | Eval runner |
 | `pnpm -r build` passes | all | CI |
 
-The live leg needs **#104**. PR #127 fixes it; land that first.
+The live leg needed **#104**; PR #127 fixed it and merged 2026-07-20 (`0d76674`).
 
 ---
 
