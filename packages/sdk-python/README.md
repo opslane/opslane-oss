@@ -33,8 +33,4 @@ hook is cleared.
 Client IP addresses (`remote_addr`) are only sent when you opt in with
 `opslane.init(..., send_pii=True)`.
 
-If your Opslane project has a browser origin allowlist configured, backend
-events are rejected: server-side requests carry no `Origin` header. Send
-backend errors to a project with an empty allowlist (or a separate project).
-
 Licensed under the MIT License.
