@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
 	"github.com/opslane/opslane/packages/ingestion/handler"
 	minioPkg "github.com/opslane/opslane/packages/ingestion/minio"
@@ -345,6 +346,126 @@ func TestGetSampleEvent_TenantScopedRoundTrip(t *testing.T) {
 	}
 	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, response["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("hidden candidate's sample event must be pgx.ErrNoRows, got %v", err)
+	}
+}
+
+func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
+	deps, pool := testDeps(t)
+	orgID, projectID, _, rawKey := seedTenant(t, deps.Queries)
+	deps.JWTSecret = []byte(authTestJWTSecret)
+	router := handler.NewRouter(deps)
+	body := `{"timestamp":"2026-07-19T00:00:00Z","platform":"python","error":{"type":"ValueError","message":"endpoint sample","stack":"Traceback (most recent call last):\n  File \"/app/api/x.py\", line 1, in f\nValueError: endpoint sample"},"breadcrumbs":[{"type":"log","message":"near expiry"}],"context":{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer client-secret","content-type":"application/json"}}}}`
+	posted := postErrorPayload(t, deps, rawKey, body)
+
+	// Simulate a historical row written before the expanded deny-list. Read-side
+	// protection must redact the whole payload and remove sensitive header keys.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_events
+		 SET breadcrumbs = $2::jsonb, context = $3::jsonb
+		 WHERE id = $1`, posted["event_id"],
+		`[{"type":"http","message":"token ghp_historicalmessage","data":{"Proxy-Authorization":"historical-breadcrumb-secret","content-type":"application/json"}}]`,
+		`{"request":{"method":"GET","path":"/users/1","remote_addr":"203.0.113.9","headers":{"Authorization":"Bearer historical-header-secret","content-type":"application/json"}},"nested":{"x-auth-token":"historical-context-secret"}}`); err != nil {
+		t.Fatalf("seed historical secrets: %v", err)
+	}
+
+	token, err := auth.SignAccessToken([]byte(authTestJWTSecret), "sample-user", orgID, "sample@example.com")
+	if err != nil {
+		t.Fatalf("sign session token: %v", err)
+	}
+	get := func(path string, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+	path := "/api/v1/projects/" + projectID + "/incidents/" + posted["group_id"] + "/sample-event"
+	response := get(path, map[string]string{"Authorization": "Bearer " + token})
+	if response.Code != http.StatusOK {
+		t.Fatalf("sample-event response = %d (%s), want 200", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
+	for _, leak := range []string{"historical-header-secret", "historical-breadcrumb-secret", "historical-context-secret", "ghp_historicalmessage"} {
+		if strings.Contains(response.Body.String(), leak) {
+			t.Errorf("sample-event leaked %q: %s", leak, response.Body.String())
+		}
+	}
+	var sample struct {
+		Error struct {
+			Type  string `json:"type"`
+			Stack string `json:"stack"`
+		} `json:"error"`
+		Breadcrumbs []map[string]any `json:"breadcrumbs"`
+		Context     map[string]any   `json:"context"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&sample); err != nil {
+		t.Fatalf("decode sample event: %v", err)
+	}
+	if sample.Error.Type != "ValueError" || !strings.HasPrefix(sample.Error.Stack, "Traceback") || len(sample.Breadcrumbs) != 1 {
+		t.Fatalf("unexpected sample event: %+v", sample)
+	}
+	requestContext, ok := sample.Context["request"].(map[string]any)
+	if !ok || requestContext["remote_addr"] != "203.0.113.9" {
+		t.Fatalf("request context = %#v", sample.Context["request"])
+	}
+	headers, ok := requestContext["headers"].(map[string]any)
+	if !ok || headers["content-type"] != "application/json" {
+		t.Fatalf("filtered headers = %#v", requestContext["headers"])
+	}
+	if _, exists := headers["Authorization"]; exists {
+		t.Fatalf("Authorization header survived: %#v", headers)
+	}
+
+	unknown := get("/api/v1/projects/"+projectID+"/incidents/"+uuid.NewString()+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown incident = %d (%s), want 404", unknown.Code, unknown.Body.String())
+	}
+	sibling, err := deps.Queries.CreateProject(context.Background(), orgID, "sample-event-sibling", nil)
+	if err != nil {
+		t.Fatalf("create sibling project: %v", err)
+	}
+	crossProject := get("/api/v1/projects/"+sibling.ID+"/incidents/"+posted["group_id"]+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if crossProject.Code != http.StatusNotFound {
+		t.Fatalf("cross-project incident = %d (%s), want 404", crossProject.Code, crossProject.Body.String())
+	}
+	sdkResponse := get(path, map[string]string{"X-API-Key": rawKey})
+	if sdkResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("SDK-key sample event = %d (%s), want 401", sdkResponse.Code, sdkResponse.Body.String())
+	}
+
+	malformed := postErrorPayload(t, deps, rawKey,
+		`{"timestamp":"2026-07-19T00:00:01Z","platform":"python","error":{"type":"RuntimeError","message":"malformed headers","stack":"Traceback\nRuntimeError: malformed headers"},"breadcrumbs":{},"context":{"request":{"headers":[["Authorization","array-secret"]]}}}`)
+	malformedResponse := get("/api/v1/projects/"+projectID+"/incidents/"+malformed["group_id"]+"/sample-event",
+		map[string]string{"Authorization": "Bearer " + token})
+	if malformedResponse.Code != http.StatusOK {
+		t.Fatalf("malformed sample = %d (%s), want 200", malformedResponse.Code, malformedResponse.Body.String())
+	}
+	if strings.Contains(malformedResponse.Body.String(), "array-secret") {
+		t.Fatalf("malformed headers leaked: %s", malformedResponse.Body.String())
+	}
+	var malformedSample struct {
+		Breadcrumbs []any          `json:"breadcrumbs"`
+		Context     map[string]any `json:"context"`
+	}
+	if err := json.NewDecoder(malformedResponse.Body).Decode(&malformedSample); err != nil {
+		t.Fatalf("decode malformed sample: %v", err)
+	}
+	if malformedSample.Breadcrumbs == nil {
+		t.Fatal("non-array breadcrumbs must normalize to []")
+	}
+	if request, ok := malformedSample.Context["request"].(map[string]any); ok {
+		if headers, exists := request["headers"]; exists {
+			if headerMap, isMap := headers.(map[string]any); !isMap || len(headerMap) != 0 {
+				t.Fatalf("malformed headers must be dropped or empty, got %#v", headers)
+			}
+		}
 	}
 }
 

@@ -128,3 +128,21 @@ func TestIncidentJSON_AdjudicationFieldsOmittedForErrors(t *testing.T) {
 		t.Errorf("error incidents must omit adjudication fields, got %s", data)
 	}
 }
+
+func TestFilterSensitiveHeaders(t *testing.T) {
+	in := map[string]json.RawMessage{"content-type": json.RawMessage(`"application/json"`)}
+	for _, k := range []string{
+		"Authorization", "PROXY-AUTHORIZATION", "authentication",
+		"Cookie", "set-cookie", "x-api-key", "X-CSRF-Token",
+		"x-auth-token", "X-Access-Token", "x-amz-security-token",
+	} {
+		in[k] = json.RawMessage(`"secret"`)
+	}
+	out := filterSensitiveHeaders(in)
+	if len(out) != 1 {
+		t.Fatalf("expected only content-type to survive, got %v", out)
+	}
+	if _, ok := out["content-type"]; !ok {
+		t.Fatal("benign header must survive")
+	}
+}

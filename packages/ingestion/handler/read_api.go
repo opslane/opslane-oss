@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/opslane/opslane/packages/ingestion/db"
+	"github.com/opslane/opslane/packages/ingestion/masking"
 )
 
 // incidentJSON is the JSON representation of an incident, matching the
@@ -54,6 +56,20 @@ type needsHumanReason struct {
 	ReasonCode    string `json:"reason_code"`
 	ReasonMessage string `json:"reason_message"`
 	Remediation   string `json:"remediation"`
+}
+
+type sampleEventJSON struct {
+	Timestamp   string          `json:"timestamp"`
+	Platform    string          `json:"platform"`
+	Error       sampleErrorJSON `json:"error"`
+	Breadcrumbs json.RawMessage `json:"breadcrumbs"`
+	Context     json.RawMessage `json:"context"`
+}
+
+type sampleErrorJSON struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Stack   string `json:"stack"`
 }
 
 // fmtTimePtr formats a nullable time as an RFC3339 string pointer.
@@ -266,6 +282,97 @@ func (d *Dependencies) GetIncident(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(inc)
+}
+
+func filterSensitiveHeaders(headers map[string]json.RawMessage) map[string]json.RawMessage {
+	filtered := make(map[string]json.RawMessage, len(headers))
+	for name, value := range headers {
+		if !masking.IsSensitiveHeader(name) {
+			filtered[name] = value
+		}
+	}
+	return filtered
+}
+
+func sanitizeSampleContext(raw []byte) json.RawMessage {
+	redacted := masking.RedactContext(raw)
+	var contextObject map[string]json.RawMessage
+	if err := json.Unmarshal(redacted, &contextObject); err != nil || contextObject == nil {
+		return json.RawMessage(`{}`)
+	}
+
+	requestRaw, hasRequest := contextObject["request"]
+	if hasRequest {
+		var requestObject map[string]json.RawMessage
+		if err := json.Unmarshal(requestRaw, &requestObject); err != nil || requestObject == nil {
+			delete(contextObject, "request")
+		} else {
+			if headersRaw, hasHeaders := requestObject["headers"]; hasHeaders {
+				var headersObject map[string]json.RawMessage
+				if err := json.Unmarshal(headersRaw, &headersObject); err != nil || headersObject == nil {
+					delete(requestObject, "headers")
+				} else if filtered, err := json.Marshal(filterSensitiveHeaders(headersObject)); err == nil {
+					requestObject["headers"] = filtered
+				} else {
+					delete(requestObject, "headers")
+				}
+			}
+			if encoded, err := json.Marshal(requestObject); err == nil {
+				contextObject["request"] = encoded
+			} else {
+				delete(contextObject, "request")
+			}
+		}
+	}
+
+	encoded, err := json.Marshal(contextObject)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return encoded
+}
+
+func normalizeSampleBreadcrumbs(raw []byte) json.RawMessage {
+	redacted := masking.RedactBreadcrumbs(raw)
+	var breadcrumbs []json.RawMessage
+	if err := json.Unmarshal(redacted, &breadcrumbs); err != nil || breadcrumbs == nil {
+		return json.RawMessage(`[]`)
+	}
+	return redacted
+}
+
+// GetSampleEvent returns the representative error event for an incident.
+func (d *Dependencies) GetSampleEvent(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
+	if !d.verifyProjectAccess(w, r, projectID) {
+		return
+	}
+
+	incidentID := chi.URLParam(r, "incidentID")
+	event, err := d.Queries.GetSampleEvent(r.Context(), projectID, incidentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSONError(w, http.StatusNotFound, "no sample event")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to get sample event")
+		return
+	}
+
+	response := sampleEventJSON{
+		Timestamp: event.Timestamp.Format(time.RFC3339),
+		Platform:  event.Platform,
+		Error: sampleErrorJSON{
+			Type:    event.ErrorType,
+			Message: event.ErrorMessage,
+			Stack:   event.StackTraceRaw,
+		},
+		Breadcrumbs: normalizeSampleBreadcrumbs(event.Breadcrumbs),
+		Context:     sanitizeSampleContext(event.Context),
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // === B2B endpoints ===

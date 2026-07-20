@@ -14,17 +14,26 @@ import (
 
 func TestRedactHeaders_SensitiveHeadersRedacted(t *testing.T) {
 	headers := map[string]string{
-		"Authorization": "Bearer sk_live_abc123",
-		"Cookie":        "session=xyz",
-		"Set-Cookie":    "session=xyz; HttpOnly",
-		"X-Api-Key":     "key-12345",
-		"X-CSRF-Token":  "csrf-value",
-		"Content-Type":  "application/json",
+		"Authorization":        "Bearer sk_live_abc123",
+		"Proxy-Authorization":  "Basic xyz",
+		"Authentication":       "secret",
+		"Cookie":               "session=xyz",
+		"Set-Cookie":           "session=xyz; HttpOnly",
+		"X-Api-Key":            "key-12345",
+		"X-CSRF-Token":         "csrf-value",
+		"X-Auth-Token":         "auth-value",
+		"X-Access-Token":       "access-value",
+		"X-Amz-Security-Token": "aws-value",
+		"Content-Type":         "application/json",
 	}
 
 	got := masking.RedactHeaders(headers)
 
-	sensitive := []string{"Authorization", "Cookie", "Set-Cookie", "X-Api-Key", "X-CSRF-Token"}
+	sensitive := []string{
+		"Authorization", "Proxy-Authorization", "Authentication", "Cookie",
+		"Set-Cookie", "X-Api-Key", "X-CSRF-Token", "X-Auth-Token",
+		"X-Access-Token", "X-Amz-Security-Token",
+	}
 	for _, key := range sensitive {
 		if got[key] != "[REDACTED]" {
 			t.Errorf("RedactHeaders[%q] = %q, want %q", key, got[key], "[REDACTED]")

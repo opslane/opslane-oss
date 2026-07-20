@@ -11,11 +11,24 @@ const redacted = "[REDACTED]"
 // sensitiveHeaders is the set of HTTP header names whose values must be
 // redacted before persistence. Comparison is case-insensitive.
 var sensitiveHeaders = map[string]struct{}{
-	"authorization": {},
-	"cookie":        {},
-	"set-cookie":    {},
-	"x-api-key":     {},
-	"x-csrf-token":  {},
+	"authorization":        {},
+	"proxy-authorization":  {},
+	"authentication":       {},
+	"cookie":               {},
+	"set-cookie":           {},
+	"x-api-key":            {},
+	"x-csrf-token":         {},
+	"x-auth-token":         {},
+	"x-access-token":       {},
+	"x-amz-security-token": {},
+}
+
+// IsSensitiveHeader reports whether a header name (any case) must never be
+// exposed or persisted in cleartext. It is the single source of truth for
+// write-side redaction and read-side filtering.
+func IsSensitiveHeader(name string) bool {
+	_, ok := sensitiveHeaders[strings.ToLower(name)]
+	return ok
 }
 
 // apiKeyPrefixRe matches well-known API key prefixes followed by
@@ -44,7 +57,7 @@ var passwordFieldRe = regexp.MustCompile(
 func RedactHeaders(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for k, v := range headers {
-		if _, ok := sensitiveHeaders[strings.ToLower(k)]; ok {
+		if IsSensitiveHeader(k) {
 			out[k] = redacted
 		} else {
 			out[k] = v
@@ -128,7 +141,7 @@ func redactValue(v interface{}) interface{} {
 	case map[string]interface{}:
 		for k, child := range val {
 			lk := strings.ToLower(k)
-			if _, ok := sensitiveHeaders[lk]; ok {
+			if IsSensitiveHeader(lk) {
 				val[k] = redacted
 				continue
 			}
@@ -151,9 +164,9 @@ func redactValue(v interface{}) interface{} {
 	}
 }
 
-// RedactBreadcrumbs parses a JSON-encoded breadcrumbs array, redacts
-// any sensitive header-like data inside each breadcrumb's "data" field,
-// and returns the re-serialised JSON.
+// RedactBreadcrumbs parses a JSON-encoded breadcrumbs array, recursively
+// redacts sensitive keys and string values throughout every breadcrumb, and
+// returns the re-serialised JSON.
 //
 // If the input is nil, empty, or not valid JSON, it is returned as-is.
 func RedactBreadcrumbs(breadcrumbs []byte) []byte {
@@ -161,42 +174,13 @@ func RedactBreadcrumbs(breadcrumbs []byte) []byte {
 		return breadcrumbs
 	}
 
-	var crumbs []map[string]json.RawMessage
+	var crumbs []interface{}
 	if err := json.Unmarshal(breadcrumbs, &crumbs); err != nil {
 		// Not valid JSON array -- return unchanged.
 		return breadcrumbs
 	}
 
-	for i, crumb := range crumbs {
-		dataRaw, ok := crumb["data"]
-		if !ok {
-			continue
-		}
-
-		// Parse data as map[string]interface{} to handle mixed-type values
-		// (e.g., {"Authorization": "Bearer x", "status_code": 200}).
-		var dataMap map[string]interface{}
-		if err := json.Unmarshal(dataRaw, &dataMap); err != nil {
-			// Data is not an object. Apply body-level redaction on raw JSON.
-			redactedRaw := RedactURL(RedactBody(string(dataRaw)))
-			crumbs[i]["data"] = json.RawMessage(redactedRaw)
-			continue
-		}
-
-		// Recurse so nested header/token values (e.g.
-		// data.request.headers.Authorization) are redacted too, not just
-		// top-level keys. redactValue walks maps/arrays, redacts sensitive
-		// keys at any depth, and scrubs every string value.
-		redactedData := redactValue(dataMap)
-
-		encoded, err := json.Marshal(redactedData)
-		if err != nil {
-			continue
-		}
-		crumbs[i]["data"] = json.RawMessage(encoded)
-	}
-
-	out, err := json.Marshal(crumbs)
+	out, err := json.Marshal(redactValue(crumbs))
 	if err != nil {
 		return breadcrumbs
 	}
