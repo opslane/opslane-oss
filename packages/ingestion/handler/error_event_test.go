@@ -440,6 +440,27 @@ func TestGetSampleEventEndpoint_SessionOnlyAndRedacted(t *testing.T) {
 		t.Fatalf("SDK-key sample event = %d (%s), want 401", sdkResponse.Code, sdkResponse.Body.String())
 	}
 
+	// Lock the event-project join itself: sample_event_id has no same-project
+	// constraint, so a corrupt pointer must not expose another tenant's event.
+	_, _, _, otherRawKey := seedTenant(t, deps.Queries)
+	otherEvent := postErrorPayload(t, deps, otherRawKey,
+		`{"timestamp":"2026-07-19T00:00:02Z","platform":"python","error":{"type":"SecretError","message":"other tenant","stack":"Traceback\nSecretError: other tenant"},"breadcrumbs":[],"context":{"secret":"other-tenant-secret"}}`)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE error_groups SET sample_event_id = $1 WHERE id = $2`,
+		otherEvent["event_id"], posted["group_id"]); err != nil {
+		t.Fatalf("corrupt cross-project sample pointer: %v", err)
+	}
+	if _, err := deps.Queries.GetSampleEvent(context.Background(), projectID, posted["group_id"]); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("corrupt cross-project sample pointer must be pgx.ErrNoRows, got %v", err)
+	}
+	corruptPointer := get(path, map[string]string{"Authorization": "Bearer " + token})
+	if corruptPointer.Code != http.StatusNotFound {
+		t.Fatalf("corrupt cross-project pointer = %d (%s), want 404", corruptPointer.Code, corruptPointer.Body.String())
+	}
+	if strings.Contains(corruptPointer.Body.String(), "other-tenant-secret") {
+		t.Fatalf("corrupt cross-project pointer leaked another tenant: %s", corruptPointer.Body.String())
+	}
+
 	malformed := postErrorPayload(t, deps, rawKey,
 		`{"timestamp":"2026-07-19T00:00:01Z","platform":"python","error":{"type":"RuntimeError","message":"malformed headers","stack":"Traceback\nRuntimeError: malformed headers"},"breadcrumbs":{},"context":{"request":{"headers":[["Authorization","array-secret"]]}}}`)
 	malformedResponse := get("/api/v1/projects/"+projectID+"/incidents/"+malformed["group_id"]+"/sample-event",
