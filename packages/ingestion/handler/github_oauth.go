@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,40 @@ import (
 
 type oauthLoginStateStore interface {
 	StoreOAuthLoginState(ctx context.Context, tokenHash string, expiresAt time.Time) error
+}
+
+type cliPKCEConsumer interface {
+	ConsumeCLIPKCERequest(context.Context, string) (*db.CLIPKCERequest, error)
+}
+
+type oauthContinuation struct {
+	FlowKind    string
+	TargetOrgID string
+
+	CLIClientID            string
+	CLIRedirectURI         string
+	CLIOAuthState          string
+	CLICodeChallenge       string
+	CLICodeChallengeMethod string
+
+	// GitHub App installation context is live-request-only. It is deliberately
+	// never persisted in an email-verification continuation.
+	SetupAction    string
+	InstallationID string
+}
+
+type completionMode int
+
+const (
+	completionBrowser completionMode = iota
+	completionCLI
+)
+
+type oauthCompletion struct {
+	Mode                      completionMode
+	RedirectTo                string
+	AccessToken, RefreshToken string
+	OrgID                     string
 }
 
 // OAuthLoginStart begins the configured browser identity-provider flow.
@@ -146,84 +181,165 @@ func (d *Dependencies) OAuthLoginCallback(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "missing code parameter")
 		return
 	}
-	identity, err := d.provider().ExchangeCode(r.Context(), code)
+
+	// Decide whether this is a CLI flow before the provider round trip. The
+	// source PKCE row expires sooner than an email-verification continuation,
+	// so this classification and snapshot must not be deferred.
+	cont := oauthContinuation{
+		FlowKind:       "browser",
+		TargetOrgID:    installTargetOrgID,
+		SetupAction:    r.URL.Query().Get("setup_action"),
+		InstallationID: r.URL.Query().Get("installation_id"),
+	}
+	cliStore := d.cliPKCEStore
+	if cliStore == nil && d.Queries != nil {
+		cliStore = d.Queries
+	}
+	if cliStore != nil {
+		pendingCLI, err := cliStore.ConsumeCLIPKCERequest(r.Context(), auth.HashToken(state))
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if pendingCLI != nil {
+			cont.FlowKind = "cli"
+			cont.CLIClientID = pendingCLI.ClientID
+			cont.CLIRedirectURI = pendingCLI.RedirectURI
+			cont.CLIOAuthState = pendingCLI.OAuthState
+			cont.CLICodeChallenge = pendingCLI.CodeChallenge
+			cont.CLICodeChallengeMethod = pendingCLI.CodeChallengeMethod
+		}
+	}
+
+	providerCtx, cancel := providerContext(r)
+	defer cancel()
+	identity, err := d.provider().ExchangeCode(providerCtx, code)
 	if err != nil {
+		var pending *auth.PendingVerificationError
+		if errors.As(err, &pending) {
+			if cont.SetupAction == "install" {
+				slog.Error("OAuth email verification cannot preserve GitHub App installation context")
+				writeJSONError(w, http.StatusConflict, "email verification cannot continue during GitHub App installation; sign in again")
+				return
+			}
+			d.startOAuthEmailVerification(w, r, pending, cont)
+			return
+		}
 		slog.Warn("identity provider code exchange failed", "provider", d.provider().Name(), "error", err)
 		writeJSONError(w, http.StatusBadGateway, "authentication failed")
 		return
 	}
 
+	completion, err := d.completeOAuthIdentity(r.Context(), identity, cont)
+	if err != nil {
+		slog.Error("OAuth login completion failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "could not complete authentication")
+		return
+	}
+	if completion.Mode == completionBrowser {
+		setAuthCookies(w, r, completion.AccessToken, completion.RefreshToken)
+	}
+	http.Redirect(w, r, completion.RedirectTo, http.StatusFound)
+}
+
+func (d *Dependencies) completeOAuthIdentity(ctx context.Context, identity auth.Identity, cont oauthContinuation) (*oauthCompletion, error) {
+	if d.oauthCompletion != nil {
+		return d.oauthCompletion(ctx, identity, cont)
+	}
+	if d.Queries == nil {
+		return nil, fmt.Errorf("authentication database is not configured")
+	}
+	if cont.FlowKind != "browser" && cont.FlowKind != "cli" {
+		return nil, fmt.Errorf("invalid OAuth continuation kind %q", cont.FlowKind)
+	}
+
 	var user *db.User
+	var err error
 	if d.cloudAuthEnabled() {
-		userID, _, err := d.Queries.ProvisionFromIdentity(r.Context(), identity)
-		if err != nil {
-			slog.Error("cloud identity provisioning failed", "error", err)
-			writeJSONError(w, http.StatusConflict, "could not provision identity")
-			return
+		userID, _, provisionErr := d.Queries.ProvisionFromIdentity(ctx, identity)
+		if provisionErr != nil {
+			return nil, fmt.Errorf("provision cloud identity: %w", provisionErr)
 		}
-		user, err = d.Queries.GetUserByID(r.Context(), userID)
-		if err != nil || user == nil {
-			writeJSONError(w, http.StatusInternalServerError, "could not load provisioned user")
-			return
+		user, err = d.Queries.GetUserByID(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("load provisioned user: %w", err)
+		}
+		if user == nil {
+			return nil, fmt.Errorf("load provisioned user: not found")
 		}
 	} else {
-		user, err = d.provisionGitHubIdentity(r, identity)
+		user, err = d.provisionGitHubIdentityContext(ctx, identity)
 		if err != nil {
-			slog.Error("GitHub identity provisioning failed", "error", err)
-			writeJSONError(w, http.StatusConflict, "could not provision identity")
-			return
+			return nil, fmt.Errorf("provision GitHub identity: %w", err)
 		}
 	}
 
-	if err := d.applyCombinedGitHubInstallation(r, user, identity, installTargetOrgID); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
+	if err := d.applyCombinedGitHubInstallationContext(ctx, user, identity, cont.TargetOrgID, cont.SetupAction, cont.InstallationID); err != nil {
+		return nil, err
 	}
 
-	// A matching pending record means this callback belongs to a CLI PKCE flow.
-	pending, err := d.Queries.ConsumeCLIPKCERequest(r.Context(), auth.HashToken(state))
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if pending != nil {
+	if cont.FlowKind == "cli" {
+		if cont.CLIClientID == "" || cont.CLIRedirectURI == "" || cont.CLIOAuthState == "" ||
+			cont.CLICodeChallenge == "" || cont.CLICodeChallengeMethod == "" {
+			return nil, fmt.Errorf("incomplete CLI OAuth continuation; start a fresh login")
+		}
 		rawCode, codeHash, err := auth.GenerateAuthCode()
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "internal error")
-			return
+			return nil, fmt.Errorf("generate CLI authorization code: %w", err)
 		}
-		if err := d.Queries.StoreAuthorizationCode(r.Context(), user.ID, codeHash,
-			pending.CodeChallenge, pending.CodeChallengeMethod, pending.RedirectURI,
-			pending.ClientID, time.Now().Add(authCodeTTL)); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "internal error")
-			return
+		if err := d.Queries.StoreAuthorizationCode(ctx, user.ID, codeHash,
+			cont.CLICodeChallenge, cont.CLICodeChallengeMethod, cont.CLIRedirectURI,
+			cont.CLIClientID, time.Now().Add(authCodeTTL)); err != nil {
+			return nil, fmt.Errorf("store CLI authorization code: %w", err)
 		}
-		redirectURL := fmt.Sprintf("%s?code=%s&state=%s", pending.RedirectURI,
-			url.QueryEscape(rawCode), url.QueryEscape(pending.OAuthState))
-		http.Redirect(w, r, redirectURL, http.StatusFound)
-		return
+		redirectURL := fmt.Sprintf("%s?code=%s&state=%s", cont.CLIRedirectURI,
+			url.QueryEscape(rawCode), url.QueryEscape(cont.CLIOAuthState))
+		return &oauthCompletion{Mode: completionCLI, RedirectTo: redirectURL, OrgID: user.OrgID}, nil
 	}
 
-	sessionOrgID := user.OrgID
-	if installTargetOrgID != "" {
-		sessionOrgID = installTargetOrgID
-	}
+	sessionOrgID := d.oauthSessionOrgID(ctx, user, cont.TargetOrgID)
 	accessToken, err := auth.SignAccessToken(d.JWTSecret, user.ID, sessionOrgID, user.Email)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to sign token")
-		return
+		return nil, fmt.Errorf("sign access token: %w", err)
 	}
 	rawRefresh, hashRefresh, err := auth.GenerateRefreshToken()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to generate refresh token")
-		return
+		return nil, fmt.Errorf("generate refresh token: %w", err)
 	}
-	if err := d.Queries.StoreRefreshToken(r.Context(), user.ID, hashRefresh, uuid.NewString(), sessionOrgID, time.Now().Add(refreshTokenTTL)); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "failed to store refresh token")
-		return
+	if err := d.Queries.StoreRefreshToken(ctx, user.ID, hashRefresh, uuid.NewString(), sessionOrgID, time.Now().Add(refreshTokenTTL)); err != nil {
+		return nil, fmt.Errorf("store refresh token: %w", err)
 	}
-	setAuthCookies(w, r, accessToken, rawRefresh)
-	http.Redirect(w, r, d.DashboardOrigin+"/auth/complete", http.StatusFound)
+	return &oauthCompletion{
+		Mode: completionBrowser, RedirectTo: d.DashboardOrigin + "/auth/complete",
+		AccessToken: accessToken, RefreshToken: rawRefresh, OrgID: sessionOrgID,
+	}, nil
+}
+
+func (d *Dependencies) oauthSessionOrgID(ctx context.Context, user *db.User, targetOrgID string) string {
+	sessionOrgID := user.OrgID
+	if targetOrgID == "" {
+		return sessionOrgID
+	}
+	lookup := d.membershipLookup
+	if lookup == nil && d.Queries != nil {
+		lookup = d.Queries.GetMembership
+	}
+	if lookup == nil {
+		slog.Error("target organization membership revalidation unavailable; using home organization",
+			"user_id", user.ID, "target_org_id", targetOrgID)
+		return sessionOrgID
+	}
+	role, membershipErr := lookup(ctx, user.ID, targetOrgID)
+	if membershipErr != nil {
+		slog.Error("target organization membership revalidation failed; using home organization",
+			"user_id", user.ID, "target_org_id", targetOrgID, "error", membershipErr)
+	} else if role != "" {
+		sessionOrgID = targetOrgID
+	} else {
+		slog.Warn("target organization membership no longer exists; using home organization",
+			"user_id", user.ID, "target_org_id", targetOrgID)
+	}
+	return sessionOrgID
 }
 
 func (d *Dependencies) GitHubOAuthCallback(w http.ResponseWriter, r *http.Request) {
@@ -231,25 +347,29 @@ func (d *Dependencies) GitHubOAuthCallback(w http.ResponseWriter, r *http.Reques
 }
 
 func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Identity) (*db.User, error) {
+	return d.provisionGitHubIdentityContext(r.Context(), identity)
+}
+
+func (d *Dependencies) provisionGitHubIdentityContext(ctx context.Context, identity auth.Identity) (*db.User, error) {
 	githubID, err := strconv.ParseInt(identity.ProviderSubject, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid GitHub subject: %w", err)
 	}
-	userID, err := d.Queries.GetUserIDByIdentity(r.Context(), "github", identity.ProviderSubject)
+	userID, err := d.Queries.GetUserIDByIdentity(ctx, "github", identity.ProviderSubject)
 	if err != nil {
 		return nil, err
 	}
 	var user *db.User
 	if userID != "" {
-		user, err = d.Queries.GetUserByID(r.Context(), userID)
+		user, err = d.Queries.GetUserByID(ctx, userID)
 	} else {
-		user, err = d.Queries.GetUserByGitHubID(r.Context(), githubID)
+		user, err = d.Queries.GetUserByGitHubID(ctx, githubID)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if user == nil {
-		existing, err := d.Queries.GetUserByEmail(r.Context(), identity.Email)
+		existing, err := d.Queries.GetUserByEmail(ctx, identity.Email)
 		if err != nil {
 			return nil, err
 		}
@@ -257,7 +377,7 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 			if !identity.EmailVerified {
 				return nil, fmt.Errorf("unverified GitHub email cannot link an existing account")
 			}
-			if err := d.Queries.LinkUserGitHub(r.Context(), existing.ID, githubID, identity.Username, identity.AvatarURL); err != nil {
+			if err := d.Queries.LinkUserGitHub(ctx, existing.ID, githubID, identity.Username, identity.AvatarURL); err != nil {
 				return nil, err
 			}
 			user = existing
@@ -268,11 +388,11 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 			if !identity.EmailVerified {
 				return nil, fmt.Errorf("unverified GitHub email cannot create an account")
 			}
-			org, err := d.Queries.CreateOrg(r.Context(), identity.Username)
+			org, err := d.Queries.CreateOrg(ctx, identity.Username)
 			if err != nil {
 				return nil, err
 			}
-			user, err = d.Queries.CreateUserGitHub(r.Context(), org.ID, identity.Email,
+			user, err = d.Queries.CreateUserGitHub(ctx, org.ID, identity.Email,
 				identity.Name, githubID, identity.Username, identity.AvatarURL)
 			if err != nil {
 				return nil, err
@@ -283,19 +403,19 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 	// accounts created before membership rows existed have none, so grant the
 	// home-org owner row here without touching an existing (possibly
 	// downgraded) role.
-	role, err := d.Queries.GetMembership(r.Context(), user.ID, user.OrgID)
+	role, err := d.Queries.GetMembership(ctx, user.ID, user.OrgID)
 	if err != nil {
 		return nil, err
 	}
 	if role == "" {
-		if err := d.Queries.CreateMembership(r.Context(), user.ID, user.OrgID, "owner"); err != nil {
+		if err := d.Queries.CreateMembership(ctx, user.ID, user.OrgID, "owner"); err != nil {
 			return nil, err
 		}
 	}
-	if err := d.Queries.UpdateUserGitHub(r.Context(), user.ID, identity.Username, identity.AvatarURL, identity.Email); err != nil {
+	if err := d.Queries.UpdateUserGitHub(ctx, user.ID, identity.Username, identity.AvatarURL, identity.Email); err != nil {
 		slog.Warn("refresh GitHub profile failed", "user_id", user.ID, "error", err)
 	}
-	if err := d.Queries.UpsertIdentityDetails(r.Context(), user.ID, "github", identity.ProviderSubject, identity.Email, identity.EmailVerified); err != nil {
+	if err := d.Queries.UpsertIdentityDetails(ctx, user.ID, "github", identity.ProviderSubject, identity.Email, identity.EmailVerified); err != nil {
 		return nil, err
 	}
 	user.Email = db.NormalizeEmail(identity.Email)
@@ -303,10 +423,14 @@ func (d *Dependencies) provisionGitHubIdentity(r *http.Request, identity auth.Id
 }
 
 func (d *Dependencies) applyCombinedGitHubInstallation(r *http.Request, user *db.User, identity auth.Identity, targetOrgID string) error {
-	if d.provider().Name() != "github" || r.URL.Query().Get("setup_action") != "install" {
+	return d.applyCombinedGitHubInstallationContext(r.Context(), user, identity, targetOrgID,
+		r.URL.Query().Get("setup_action"), r.URL.Query().Get("installation_id"))
+}
+
+func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Context, user *db.User, identity auth.Identity, targetOrgID, setupAction, installationIDText string) error {
+	if d.provider().Name() != "github" || setupAction != "install" {
 		return nil
 	}
-	installationIDText := r.URL.Query().Get("installation_id")
 	if installationIDText == "" {
 		return nil
 	}
@@ -336,7 +460,7 @@ func (d *Dependencies) applyCombinedGitHubInstallation(r *http.Request, user *db
 	}
 	orgID := user.OrgID
 	if targetOrgID != "" {
-		role, err := d.Queries.GetMembership(r.Context(), user.ID, targetOrgID)
+		role, err := d.Queries.GetMembership(ctx, user.ID, targetOrgID)
 		if err != nil {
 			return fmt.Errorf("verify target organization membership: %w", err)
 		}
@@ -345,7 +469,7 @@ func (d *Dependencies) applyCombinedGitHubInstallation(r *http.Request, user *db
 		}
 		orgID = targetOrgID
 	}
-	return d.Queries.SetOrgGitHubInstallation(r.Context(), orgID, installationID)
+	return d.Queries.SetOrgGitHubInstallation(ctx, orgID, installationID)
 }
 
 // === helpers ===

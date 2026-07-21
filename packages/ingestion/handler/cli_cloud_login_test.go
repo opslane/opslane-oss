@@ -75,6 +75,11 @@ func TestCloudCLILoginBridgesPKCEThroughProviderAndRejectsReplay(t *testing.T) {
 	if callbackResponse.Code != http.StatusFound {
 		t.Fatalf("callback status=%d body=%s", callbackResponse.Code, callbackResponse.Body.String())
 	}
+	for _, cookie := range callbackResponse.Result().Cookies() {
+		if cookie.Name == handler.AccessCookieName || cookie.Name == handler.RefreshCookieName {
+			t.Fatalf("CLI completion minted browser session cookie %q", cookie.Name)
+		}
+	}
 	localRedirect, err := url.Parse(callbackResponse.Header().Get("Location"))
 	if err != nil || localRedirect.Scheme != "http" || localRedirect.Host != "127.0.0.1:34567" {
 		t.Fatalf("local redirect=%q err=%v", callbackResponse.Header().Get("Location"), err)

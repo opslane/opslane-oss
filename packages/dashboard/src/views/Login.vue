@@ -7,6 +7,7 @@ import {
   passwordLogin,
   signup,
   verifyEmail,
+  verifyOAuthEmail,
 } from '../api';
 import { AGENT_ONBOARDING_ENABLED } from '../agent-onboarding';
 import AgentOnboardingCard from '../components/AgentOnboardingCard.vue';
@@ -41,6 +42,8 @@ const {
   showSignin,
   showSignup,
   showForgot,
+  beginOAuthVerification,
+  restartAuthentication,
   submitCredentials,
   submitVerification,
   submitForgotPassword,
@@ -49,8 +52,10 @@ const {
   passwordLogin,
   signup,
   verifyEmail,
+  verifyOAuthEmail,
   forgotPassword,
   completeAuthentication: () => completePostAuth(router),
+  navigate: (target) => { window.location.href = target; },
 });
 
 const socialButtons = computed(() => socialProviderButtons(config.value?.social_providers ?? []));
@@ -87,6 +92,11 @@ watch(mode, () => {
 });
 
 onMounted(() => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('challenge') === 'email') {
+    beginOAuthVerification();
+    return;
+  }
   void loadConfig();
 });
 </script>
@@ -146,7 +156,9 @@ onMounted(() => {
         <div v-else-if="mode === 'verify-code'">
           <h1 class="text-xl font-semibold text-text text-center mb-1">Verify your email</h1>
           <p class="text-sm text-muted text-center mb-6">
-            Enter the 6-digit code sent to <span class="text-text" v-text="email"></span>.
+            Enter the 6-digit code sent to
+            <span v-if="email" class="text-text" v-text="email"></span>
+            <template v-else>your email address</template>.
           </p>
           <form class="space-y-4" @submit.prevent="submitVerification">
             <div>
@@ -171,7 +183,7 @@ onMounted(() => {
           </form>
           <p class="mt-5 text-center text-sm text-muted">
             Lost the code?
-            <button type="button" class="text-accent hover:underline" @click="showSignin">
+            <button type="button" class="text-accent hover:underline" @click="restartAuthentication">
               Sign in again to get a new one.
             </button>
           </p>

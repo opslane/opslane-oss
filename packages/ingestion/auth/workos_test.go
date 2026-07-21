@@ -136,6 +136,29 @@ func TestAuthenticateWithPasswordTranslatesErrors(t *testing.T) {
 	}
 }
 
+func TestExchangeCodeTranslatesEmailVerificationChallenge(t *testing.T) {
+	provider := newWorkOSProviderWithClient(&fakeWorkOSClient{
+		err: &workos.APIError{
+			ErrorCode:                  workos.EmailVerificationRequiredCode,
+			PendingAuthenticationToken: "pat_abc",
+			EmailVerificationID:        "ev_123",
+		},
+	})
+
+	_, err := provider.ExchangeCode(context.Background(), "code_1")
+
+	var pending *PendingVerificationError
+	if !errors.As(err, &pending) {
+		t.Fatalf("want *PendingVerificationError, got %T: %v", err, err)
+	}
+	if pending.PendingAuthenticationToken != "pat_abc" {
+		t.Fatalf("pending token lost: %q", pending.PendingAuthenticationToken)
+	}
+	if pending.EmailVerificationID != "ev_123" {
+		t.Fatalf("verification id lost: %q", pending.EmailVerificationID)
+	}
+}
+
 func TestRegisterUserTranslatesProviderValidation(t *testing.T) {
 	tests := []struct {
 		name string

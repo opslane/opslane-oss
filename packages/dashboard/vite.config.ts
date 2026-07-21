@@ -35,6 +35,10 @@ export default defineConfig({
         target: process.env.VITE_API_URL || 'http://localhost:8082',
         changeOrigin: true,
       },
+      '/auth/oauth': {
+        target: process.env.VITE_API_URL || 'http://localhost:8082',
+        changeOrigin: true,
+      },
       '/auth/refresh': {
         target: process.env.VITE_API_URL || 'http://localhost:8082',
         changeOrigin: true,

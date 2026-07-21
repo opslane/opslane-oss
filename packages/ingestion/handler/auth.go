@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -84,6 +85,7 @@ type Dependencies struct {
 	Health            *HealthChecker
 	MinIO             *minioPkg.Client
 	JWTSecret         []byte
+	PendingCipher     *auth.PendingCipher
 	// AuthProvider is selected explicitly at boot. Nil retains the OSS GitHub
 	// default for narrow tests that construct Dependencies directly.
 	AuthProvider auth.AuthProvider
@@ -92,7 +94,15 @@ type Dependencies struct {
 	SocialProviders auth.SocialProviderConfig
 	// oauthStateStore is a narrow test seam for OAuth login-state persistence.
 	// Production falls back to Queries.
-	oauthStateStore    oauthLoginStateStore
+	oauthStateStore oauthLoginStateStore
+	// oauthVerificationStore is a narrow test seam. Production falls back to
+	// Queries, which owns the atomic reservation and consume operations.
+	oauthVerificationStore oauthVerificationStore
+	// oauthCompletion is a narrow test seam for delivery/race tests. Production
+	// always uses completeOAuthIdentity's database-backed implementation.
+	oauthCompletion    func(context.Context, auth.Identity, oauthContinuation) (*oauthCompletion, error)
+	cliPKCEStore       cliPKCEConsumer
+	membershipLookup   func(context.Context, string, string) (string, error)
 	AuthCallbackOrigin string
 	// GitHub App OAuth
 	GitHubAppID           string
@@ -105,6 +115,18 @@ type Dependencies struct {
 	ConfigCipher          *notify.ConfigCipher
 	NotifyExtraHosts      []string
 	NotifySender          *notify.Sender
+}
+
+// NewDependencies validates production-only invariants that direct, narrow
+// handler tests intentionally bypass when constructing Dependencies literals.
+func NewDependencies(deps *Dependencies) (*Dependencies, error) {
+	if deps == nil {
+		return nil, fmt.Errorf("handler dependencies are required")
+	}
+	if deps.PendingCipher == nil {
+		return nil, fmt.Errorf("pending OAuth verification cipher is required")
+	}
+	return deps, nil
 }
 
 func (d *Dependencies) provider() auth.AuthProvider {

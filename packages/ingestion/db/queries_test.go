@@ -3,7 +3,9 @@ package db_test
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,6 +48,228 @@ func seedGroup(t *testing.T, pool *pgxpool.Pool, q *db.Queries, name string) (or
 		t.Fatalf("InsertErrorEventAndGroup: %v", err)
 	}
 	return org.ID, proj.ID, env.ID, result.GroupID
+}
+
+// oauthContinuationQueries isolates continuation tests in a disposable
+// database. These records contain sealed bearer credentials, so tests never
+// apply the migration or insert fixtures into a retained development database.
+func oauthContinuationQueries(t *testing.T) (*pgxpool.Pool, *db.Queries) {
+	t.Helper()
+	admin := testPool(t)
+	pool, dsn := disposableDB(t, admin)
+	if err := applyMigration(t, findPsql(t), dsn, "migrations/020_oauth_verification_continuations.sql"); err != nil {
+		t.Fatalf("apply OAuth continuation migration: %v", err)
+	}
+	return pool, db.New(pool)
+}
+
+func testOAuthContinuation(kind string) db.OAuthVerificationContinuation {
+	return db.OAuthVerificationContinuation{
+		PendingTokenSealed: []byte("sealed-pending-token"),
+		FlowKind:           kind,
+	}
+}
+
+func TestOAuthVerificationContinuationReserveAndNullableBrowserSnapshot(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	continuation := testOAuthContinuation("browser")
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-browser", continuation, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+
+	reserved, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-browser")
+	if err != nil {
+		t.Fatalf("ReserveOAuthVerificationAttempt: %v", err)
+	}
+	if reserved == nil {
+		t.Fatal("ReserveOAuthVerificationAttempt returned nil")
+	}
+	if reserved.Attempts != 1 || reserved.FlowKind != "browser" {
+		t.Fatalf("reserved = %+v, want browser attempt 1", reserved)
+	}
+	if string(reserved.PendingTokenSealed) != string(continuation.PendingTokenSealed) {
+		t.Fatalf("sealed token = %q, want %q", reserved.PendingTokenSealed, continuation.PendingTokenSealed)
+	}
+	if reserved.TargetOrgID != "" || reserved.CLIClientID != "" || reserved.CLIRedirectURI != "" ||
+		reserved.CLIOAuthState != "" || reserved.CLICodeChallenge != "" || reserved.CLICodeChallengeMethod != "" {
+		t.Fatalf("nullable browser snapshot did not scan as empty strings: %+v", reserved)
+	}
+}
+
+func TestOAuthVerificationContinuationAttemptCap(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-cap", testOAuthContinuation("browser"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+
+	for want := 1; want <= db.MaxOAuthVerificationAttempts; want++ {
+		reserved, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-cap")
+		if err != nil {
+			t.Fatalf("reserve attempt %d: %v", want, err)
+		}
+		if reserved == nil || reserved.Attempts != want {
+			t.Fatalf("reserve attempt %d = %+v", want, reserved)
+		}
+	}
+	exhausted, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-cap")
+	if err != nil {
+		t.Fatalf("reserve exhausted flow: %v", err)
+	}
+	if exhausted != nil {
+		t.Fatalf("reserve beyond cap = %+v, want nil", exhausted)
+	}
+}
+
+func TestOAuthVerificationContinuationConcurrentReservationsAreAtomic(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-concurrent", testOAuthContinuation("browser"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+
+	const callers = 12
+	start := make(chan struct{})
+	attempts := make(chan int, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			reserved, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-concurrent")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if reserved != nil {
+				attempts <- reserved.Attempts
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(attempts)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reserve: %v", err)
+		}
+	}
+
+	got := make([]int, 0, db.MaxOAuthVerificationAttempts)
+	for attempt := range attempts {
+		got = append(got, attempt)
+	}
+	sort.Ints(got)
+	if len(got) != db.MaxOAuthVerificationAttempts {
+		t.Fatalf("successful reservations = %v, want exactly %d", got, db.MaxOAuthVerificationAttempts)
+	}
+	for i, attempt := range got {
+		if want := i + 1; attempt != want {
+			t.Fatalf("attempt numbers = %v, want distinct sequence 1..%d", got, db.MaxOAuthVerificationAttempts)
+		}
+	}
+}
+
+func TestOAuthVerificationContinuationConsumeIsSingleUse(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-consume", testOAuthContinuation("browser"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+
+	consumed, err := q.ConsumeOAuthVerificationContinuation(ctx, "flow-consume")
+	if err != nil || !consumed {
+		t.Fatalf("first consume = (%v, %v), want (true, nil)", consumed, err)
+	}
+	consumed, err = q.ConsumeOAuthVerificationContinuation(ctx, "flow-consume")
+	if err != nil || consumed {
+		t.Fatalf("second consume = (%v, %v), want (false, nil)", consumed, err)
+	}
+	reserved, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-consume")
+	if err != nil || reserved != nil {
+		t.Fatalf("reserve consumed flow = (%+v, %v), want (nil, nil)", reserved, err)
+	}
+}
+
+func TestOAuthVerificationContinuationExpiredFlowCannotBeReserved(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-expired", testOAuthContinuation("browser"), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+	reserved, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-expired")
+	if err != nil || reserved != nil {
+		t.Fatalf("reserve expired flow = (%+v, %v), want (nil, nil)", reserved, err)
+	}
+}
+
+func TestOAuthVerificationContinuationStoresCLISnapshot(t *testing.T) {
+	_, q := oauthContinuationQueries(t)
+	ctx := context.Background()
+	want := db.OAuthVerificationContinuation{
+		PendingTokenSealed:     []byte("sealed-cli-token"),
+		FlowKind:               "cli",
+		TargetOrgID:            "7d39cf66-bb9e-47ad-aa06-f8d15684f673",
+		CLIClientID:            "opslane-cli",
+		CLIRedirectURI:         "http://127.0.0.1:49152/callback",
+		CLIOAuthState:          "cli-state",
+		CLICodeChallenge:       "pkce-challenge",
+		CLICodeChallengeMethod: "S256",
+	}
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-cli", want, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("StoreOAuthVerificationContinuation: %v", err)
+	}
+	got, err := q.ReserveOAuthVerificationAttempt(ctx, "flow-cli")
+	if err != nil || got == nil {
+		t.Fatalf("ReserveOAuthVerificationAttempt = (%+v, %v)", got, err)
+	}
+	if string(got.PendingTokenSealed) != string(want.PendingTokenSealed) ||
+		got.FlowKind != want.FlowKind || got.TargetOrgID != want.TargetOrgID ||
+		got.CLIClientID != want.CLIClientID || got.CLIRedirectURI != want.CLIRedirectURI ||
+		got.CLIOAuthState != want.CLIOAuthState || got.CLICodeChallenge != want.CLICodeChallenge ||
+		got.CLICodeChallengeMethod != want.CLICodeChallengeMethod {
+		t.Fatalf("reserved CLI snapshot = %+v, want %+v", got, want)
+	}
+}
+
+func TestCleanupExpiredTokensRemovesAgedOAuthVerificationContinuations(t *testing.T) {
+	admin := testPool(t)
+	pool, dsn := disposableDB(t, admin)
+	psql := findPsql(t)
+	for _, file := range migrationFiles(t) {
+		if err := applyMigration(t, psql, dsn, file); err != nil {
+			t.Fatalf("apply migration %s: %v", file, err)
+		}
+	}
+
+	ctx := context.Background()
+	q := db.New(pool)
+	continuation := testOAuthContinuation("browser")
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-aged", continuation, time.Now().Add(-25*time.Hour)); err != nil {
+		t.Fatalf("store aged continuation: %v", err)
+	}
+	if err := q.StoreOAuthVerificationContinuation(ctx, "flow-recent", continuation, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("store recent continuation: %v", err)
+	}
+
+	if _, _, err := q.CleanupExpiredTokens(ctx); err != nil {
+		t.Fatalf("CleanupExpiredTokens: %v", err)
+	}
+	var aged, recent int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE flow_hash = 'flow-aged'),
+		        count(*) FILTER (WHERE flow_hash = 'flow-recent')
+		 FROM oauth_verification_continuations`,
+	).Scan(&aged, &recent); err != nil {
+		t.Fatalf("count continuations after cleanup: %v", err)
+	}
+	if aged != 0 || recent != 1 {
+		t.Fatalf("continuations after cleanup: aged=%d recent=%d, want 0 and 1", aged, recent)
+	}
 }
 
 func TestRollupUpsertTracksErrorOccurrencesPerEnvironment(t *testing.T) {

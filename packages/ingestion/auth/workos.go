@@ -147,7 +147,7 @@ func identityFromWorkOSUser(user *workos.User) Identity {
 func (p *WorkOSProvider) ExchangeCode(ctx context.Context, code string) (Identity, error) {
 	response, err := p.client.AuthenticateCode(ctx, code)
 	if err != nil {
-		return Identity{}, err
+		return Identity{}, translateWorkOSError(err)
 	}
 	if response == nil || response.User == nil {
 		return Identity{}, fmt.Errorf("WorkOS authentication response did not include a user")

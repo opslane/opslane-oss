@@ -16,6 +16,7 @@ vi.mock('../../api', () => ({
     message: 'Unable to sign up',
   }),
   verifyEmail: vi.fn(),
+  verifyOAuthEmail: vi.fn(),
   forgotPassword: vi.fn(),
 }));
 vi.mock('../../post-auth', () => ({ completePostAuth: vi.fn() }));

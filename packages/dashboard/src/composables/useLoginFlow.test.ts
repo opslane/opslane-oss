@@ -20,8 +20,10 @@ function dependencies(overrides: Partial<LoginFlowDependencies> = {}): LoginFlow
     passwordLogin: authResult({ status: 'error', code: 401, message: 'invalid email or password' }),
     signup: authResult({ status: 'error', code: 409, message: 'email already registered' }),
     verifyEmail: authResult({ status: 'error', code: 401, message: 'invalid code' }),
+    verifyOAuthEmail: () => Promise.resolve({ status: 'error', code: 401, message: 'invalid code' }),
     forgotPassword: () => Promise.resolve({ status: 'sent' }),
     completeAuthentication: () => Promise.resolve(),
+    navigate: vi.fn(),
     ...overrides,
   };
 }
@@ -79,6 +81,53 @@ describe('useLoginFlow', () => {
 
     expect(flow.mode.value).toBe('verify-code');
     expect(flow.pendingAuthenticationToken.value).toBe('pat_123');
+  });
+
+  it('begins OAuth code verification without holding a pending token', () => {
+    const flow = useLoginFlow(dependencies());
+
+    flow.beginOAuthVerification();
+
+    expect(flow.mode.value).toBe('verify-code');
+    expect(flow.verificationMode.value).toBe('oauth');
+    expect(flow.pendingAuthenticationToken.value).toBe('');
+  });
+
+  it('submits only the code for OAuth verification and navigates to the returned redirect', async () => {
+    const verifyEmail = vi.fn();
+    const verifyOAuthEmail = vi.fn().mockResolvedValue({
+      status: 'verified',
+      redirect_to: 'http://127.0.0.1:8765/callback?code=cli-code',
+    });
+    const completeAuthentication = vi.fn();
+    const navigate = vi.fn();
+    const flow = useLoginFlow(dependencies({
+      verifyEmail,
+      verifyOAuthEmail,
+      completeAuthentication,
+      navigate,
+    }));
+    flow.beginOAuthVerification();
+    flow.code.value = ' 123456 ';
+
+    await flow.submitVerification();
+
+    expect(verifyOAuthEmail).toHaveBeenCalledWith('123456');
+    expect(verifyEmail).not.toHaveBeenCalled();
+    expect(completeAuthentication).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledWith('http://127.0.0.1:8765/callback?code=cli-code');
+    expect(flow.mode.value).toBe('success');
+  });
+
+  it('restarts an OAuth challenge through the hosted login route', () => {
+    const navigate = vi.fn();
+    const flow = useLoginFlow(dependencies({ navigate }));
+    flow.beginOAuthVerification();
+
+    flow.restartAuthentication();
+
+    expect(navigate).toHaveBeenCalledWith('/auth/login');
+    expect(flow.mode.value).toBe('verify-code');
   });
 
   it('shows a neutral check-email state after a reset request', async () => {

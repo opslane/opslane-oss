@@ -73,6 +73,11 @@ func main() {
 		slog.Error("Failed to initialize notification config encryption", "error", err)
 		os.Exit(1)
 	}
+	pendingCipher, err := auth.NewPendingCipher([]byte(jwtSecret))
+	if err != nil {
+		slog.Error("Failed to initialize OAuth verification encryption", "error", err)
+		os.Exit(1)
+	}
 
 	var notifyExtraHosts []string
 	for _, host := range strings.Split(os.Getenv("NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS"), ",") {
@@ -146,10 +151,11 @@ func main() {
 		}
 	}()
 	notifySender := notify.NewSender(0, notifyExtraHosts)
-	deps := &handler.Dependencies{
+	deps, err := handler.NewDependencies(&handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,
 		JWTSecret:             []byte(jwtSecret),
+		PendingCipher:         pendingCipher,
 		AuthProvider:          authProvider,
 		SocialProviders:       socialProviders,
 		AuthCallbackOrigin:    authCallbackOrigin,
@@ -163,6 +169,10 @@ func main() {
 		ConfigCipher:          configCipher,
 		NotifyExtraHosts:      notifyExtraHosts,
 		NotifySender:          notifySender,
+	})
+	if err != nil {
+		slog.Error("Failed to initialize handler dependencies", "error", err)
+		os.Exit(1)
 	}
 	r := handler.NewRouterWithPool(deps, pool)
 	dispatcher := notify.New(pool, configCipher, notify.Options{ExtraHosts: notifyExtraHosts})

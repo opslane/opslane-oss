@@ -1,5 +1,12 @@
 import { ref, type Ref } from 'vue';
-import type { AuthConfig, ForgotPasswordResult, PasswordAuthResult } from '../types/api';
+import type {
+  AuthConfig,
+  ForgotPasswordResult,
+  OAuthEmailVerificationResult,
+  PasswordAuthResult,
+} from '../types/api';
+
+export type VerificationMode = 'embedded' | 'oauth';
 
 export type LoginFlowMode =
   | 'loading'
@@ -17,8 +24,10 @@ export interface LoginFlowDependencies {
   passwordLogin: (email: string, password: string) => Promise<PasswordAuthResult>;
   signup: (email: string, password: string) => Promise<PasswordAuthResult>;
   verifyEmail: (pendingToken: string, code: string) => Promise<PasswordAuthResult>;
+  verifyOAuthEmail: (code: string) => Promise<OAuthEmailVerificationResult>;
   forgotPassword: (email: string) => Promise<ForgotPasswordResult>;
   completeAuthentication: () => Promise<void>;
+  navigate: (target: string) => void;
 }
 
 export interface LoginFlow {
@@ -28,12 +37,15 @@ export interface LoginFlow {
   password: Ref<string>;
   code: Ref<string>;
   pendingAuthenticationToken: Ref<string>;
+  verificationMode: Ref<VerificationMode>;
   error: Ref<string>;
   submitting: Ref<boolean>;
   loadConfig: () => Promise<void>;
   showSignin: () => void;
   showSignup: () => void;
   showForgot: () => void;
+  beginOAuthVerification: () => void;
+  restartAuthentication: () => void;
   submitCredentials: () => Promise<void>;
   submitVerification: () => Promise<void>;
   submitForgotPassword: () => Promise<void>;
@@ -46,6 +58,7 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
   const password = ref('');
   const code = ref('');
   const pendingAuthenticationToken = ref('');
+  const verificationMode = ref<VerificationMode>('embedded');
   const error = ref('');
   const submitting = ref(false);
 
@@ -65,6 +78,7 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
     error.value = '';
     code.value = '';
     pendingAuthenticationToken.value = '';
+    verificationMode.value = 'embedded';
     mode.value = 'signin';
   }
 
@@ -78,6 +92,24 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
     if (!config.value?.supports_reset) return;
     error.value = '';
     mode.value = 'forgot';
+  }
+
+  function beginOAuthVerification(): void {
+    email.value = '';
+    password.value = '';
+    code.value = '';
+    pendingAuthenticationToken.value = '';
+    verificationMode.value = 'oauth';
+    error.value = '';
+    mode.value = 'verify-code';
+  }
+
+  function restartAuthentication(): void {
+    if (verificationMode.value === 'oauth') {
+      deps.navigate('/auth/login');
+      return;
+    }
+    showSignin();
   }
 
   async function finishAuthentication(fallbackMode: 'signin' | 'signup' | 'verify-code'): Promise<void> {
@@ -100,6 +132,7 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
     }
     if (result.status === 'email_verification_required') {
       pendingAuthenticationToken.value = result.pending_authentication_token;
+      verificationMode.value = 'embedded';
       password.value = '';
       code.value = '';
       error.value = '';
@@ -125,10 +158,21 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
   }
 
   async function submitVerification(): Promise<void> {
-    if (mode.value !== 'verify-code' || !pendingAuthenticationToken.value) return;
+    if (mode.value !== 'verify-code') return;
+    if (verificationMode.value === 'embedded' && !pendingAuthenticationToken.value) return;
     error.value = '';
     submitting.value = true;
     try {
+      if (verificationMode.value === 'oauth') {
+        const result = await deps.verifyOAuthEmail(code.value.trim());
+        if (result.status === 'verified') {
+          mode.value = 'success';
+          deps.navigate(result.redirect_to);
+        } else {
+          error.value = result.message;
+        }
+        return;
+      }
       const result = await deps.verifyEmail(pendingAuthenticationToken.value, code.value.trim());
       await handleAuthResult(result, 'verify-code');
     } finally {
@@ -159,12 +203,15 @@ export function useLoginFlow(deps: LoginFlowDependencies): LoginFlow {
     password,
     code,
     pendingAuthenticationToken,
+    verificationMode,
     error,
     submitting,
     loadConfig,
     showSignin,
     showSignup,
     showForgot,
+    beginOAuthVerification,
+    restartAuthentication,
     submitCredentials,
     submitVerification,
     submitForgotPassword,
