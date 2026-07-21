@@ -1240,8 +1240,13 @@ func (q *Queries) TriggerFixJob(ctx context.Context, projectID, groupID, guidanc
 	// Create fix job
 	var jobID string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, guidance, triggered_by)
-		 VALUES ($1, $2, 'fix', $3, 'human')
+		// Carry the group's platform onto the job so a human retry inherits the
+		// same durable routing decision an automatic fix job would. Without it
+		// the worker falls back to the live feature flag and can re-run a Python
+		// incident through the JavaScript pipeline.
+		`INSERT INTO error_group_jobs (error_group_id, project_id, job_type, guidance, triggered_by, platform)
+		 VALUES ($1, $2, 'fix', $3, 'human',
+		         (SELECT platform FROM error_groups WHERE id = $1 AND project_id = $2))
 		 RETURNING id`,
 		groupID, projectID, nilIfEmpty(guidance),
 	).Scan(&jobID)

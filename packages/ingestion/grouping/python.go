@@ -13,8 +13,14 @@ import (
 
 var (
 	rePyFrame        = regexp.MustCompile(`(?m)^\s*File "([^"]+)", line \d+, in (.+)$`)
-	rePyDeployPrefix = regexp.MustCompile(`^/?(?:app|srv|opt|usr/src)/|^/?home/[^/]+/`)
-	rePyLibPath      = regexp.MustCompile(`(?:site-packages|dist-packages)/|/venv/|\.tox/|lib/python\d+(?:\.\d+)?/`)
+	// Deployment roots, matched whole in a single pass so nested roots like
+	// /usr/src/app/ still reduce to the same relative path as a bare /app/.
+	// Stripping iteratively would also eat a real leading package directory,
+	// turning /app/app/main.py into main.py.
+	rePyDeployPrefix = regexp.MustCompile(`^/?(?:usr/src/|home/[^/]+/)?(?:app|srv|opt)/|^/?home/[^/]+/`)
+	rePyLibPath      = regexp.MustCompile(`(?:site-packages|dist-packages)/|/\.?venv/|\.tox/|lib/python\d+(?:\.\d+)?/`)
+	// "<string>", "<frozen importlib._bootstrap>", "<stdin>" — never repo files.
+	rePyPseudoPath = regexp.MustCompile(`^<.*>$`)
 )
 
 // Markers include surrounding newlines so exception messages that merely
@@ -34,33 +40,22 @@ func isExceptionGroupTraceback(stack string) bool {
 	return strings.Contains(stack, "Exception Group Traceback (most recent call last):")
 }
 
-// pythonFrames returns at most five unique application frames, newest first.
-func pythonFrames(stack string) []string {
-	segment := stack
-	for _, marker := range pyChainMarkers {
-		if i := strings.LastIndex(segment, marker); i >= 0 {
-			segment = segment[i+len(marker):]
-		}
-	}
-
+// collectPythonFrames extracts "path:function" identities from one traceback
+// segment, oldest first, skipping library and interpreter pseudo-frames.
+func collectPythonFrames(segment string) []string {
 	matches := rePyFrame.FindAllStringSubmatch(segment, -1)
 	frames := make([]string, 0, len(matches))
 	seen := make(map[string]bool, len(matches))
 	for _, match := range matches {
 		file, function := match[1], match[2]
-		if rePyLibPath.MatchString(file) {
+		if rePyLibPath.MatchString(file) || rePyPseudoPath.MatchString(file) {
 			continue
 		}
 
-		// Advance an index past each anchored match instead of rebuilding the
-		// string: paths are attacker-sized (bounded only by the request-body
-		// cap), and per-iteration copies would make this quadratic.
+		// Strip the deployment root exactly once. Repeating it would eat a real
+		// leading package directory: "/app/app/main.py" must stay "app/main.py".
 		relative := file
-		for {
-			loc := rePyDeployPrefix.FindStringIndex(relative)
-			if loc == nil || loc[1] == 0 {
-				break
-			}
+		if loc := rePyDeployPrefix.FindStringIndex(relative); loc != nil && loc[1] > 0 {
 			relative = relative[loc[1]:]
 		}
 
@@ -70,6 +65,24 @@ func pythonFrames(stack string) []string {
 		}
 		seen[identity] = true
 		frames = append(frames, identity)
+	}
+	return frames
+}
+
+// pythonFrames returns at most five unique application frames, newest first.
+func pythonFrames(stack string) []string {
+	segment := stack
+	for _, marker := range pyChainMarkers {
+		if i := strings.LastIndex(segment, marker); i >= 0 {
+			segment = segment[i+len(marker):]
+		}
+	}
+
+	frames := collectPythonFrames(segment)
+	// An exception message can quote a chain marker verbatim, which would
+	// otherwise segment away every real frame. Fall back to the whole stack.
+	if len(frames) == 0 && segment != stack {
+		frames = collectPythonFrames(stack)
 	}
 
 	for i, j := 0, len(frames)-1; i < j; i, j = i+1, j-1 {

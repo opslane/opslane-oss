@@ -1,10 +1,43 @@
 package grouping
 
 import (
+	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+type pythonTracebackFixture struct {
+	Name           string `json:"name"`
+	Traceback      string `json:"traceback"`
+	ExpectedFrames []struct {
+		Path     string `json:"path"`
+		Function string `json:"function"`
+	} `json:"expectedFrames"`
+}
+
+func TestPythonFramesSharedContract(t *testing.T) {
+	raw, err := os.ReadFile("../../../test-fixtures/python-tracebacks/cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []pythonTracebackFixture
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range cases {
+		t.Run(fixture.Name, func(t *testing.T) {
+			want := make([]string, 0, len(fixture.ExpectedFrames))
+			for _, frame := range fixture.ExpectedFrames {
+				want = append(want, frame.Path+":"+frame.Function)
+			}
+			if got := pythonFrames(fixture.Traceback); !reflect.DeepEqual(got, want) {
+				t.Fatalf("got %v want %v", got, want)
+			}
+		})
+	}
+}
 
 const pyStandard = `Traceback (most recent call last):
   File "/app/api/routes/users.py", line 42, in get_user
@@ -37,6 +70,34 @@ func TestPythonFrames_DeploymentPrefixInvariance(t *testing.T) {
 	c := pythonFrames(strings.ReplaceAll(pyStandard, "/app/", "/home/deploy/"))
 	if !reflect.DeepEqual(a, b) || !reflect.DeepEqual(a, c) {
 		t.Fatalf("frames differ across deployment roots: %v / %v / %v", a, b, c)
+	}
+}
+
+// A leading package directory named app/ must survive prefix stripping, or the
+// most common Python container layout fingerprints to the wrong file.
+func TestPythonFrames_LeadingAppPackagePreserved(t *testing.T) {
+	stack := "Traceback (most recent call last):\n  File \"/app/app/main.py\", line 1, in run\n    boom()\nValueError: boom"
+	want := []string{"app/main.py:run"}
+	if got := pythonFrames(stack); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestPythonFrames_PseudoFramesFiltered(t *testing.T) {
+	stack := "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"<frozen importlib._bootstrap>\", line 1, in _gcd_import\nImportError: x"
+	if got := pythonFrames(stack); len(got) != 0 {
+		t.Fatalf("expected no frames for interpreter pseudo-paths, got %v", got)
+	}
+}
+
+// An exception message may quote a chain marker; segmenting on it would drop
+// every real frame and collapse distinct errors into one stackless fingerprint.
+func TestPythonFrames_ChainMarkerInsideMessage(t *testing.T) {
+	stack := "Traceback (most recent call last):\n  File \"/srv/svc/cart.py\", line 9, in total\n    boom()\n" +
+		"RuntimeError: upstream said:\nDuring handling of the above exception, another exception occurred:\n"
+	want := []string{"svc/cart.py:total"}
+	if got := pythonFrames(stack); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
 	}
 }
 
