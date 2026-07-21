@@ -361,8 +361,14 @@ jobs:
           --outputFile=${{ runner.temp }}/e2e-results.json
       - name: Enforce zero unexpected skips
         env:
-          # The with-secrets PR pipeline suite is the only allowed skip here.
-          E2E_ALLOWED_SKIP_PATTERN: '^pr_created pipeline \(full flow\)'
+          # Two suites may skip. The with-secrets PR pipeline suite needs
+          # credentials this job does not have. The dashboard screenshot suite
+          # is an opt-in generator, not a test: it writes PNGs into
+          # docs/design/dashboard-v1/screenshots/ and only runs when
+          # CAPTURE_DASHBOARD_SCREENSHOTS=1, which CI never sets, so it can
+          # only ever skip here. It asserts nothing about product behaviour and
+          # belongs outside the graded suite; allowlisting is the narrow fix.
+          E2E_ALLOWED_SKIP_PATTERN: '^(pr_created pipeline \(full flow\)|dashboard approved-fixture screenshot capture)'
           # The exact collected total, not a slack floor, so any silently
           # dropped test trips it. Re-derive from an actual run's
           # numTotalTests — NOT from `vitest list`, which does not expand
