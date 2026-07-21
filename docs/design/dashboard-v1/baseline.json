@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-07-20T20:29:40Z",
+  "gitCommit": "11b8e2607406a90fe926ec1e379ca66605ef96ae",
+  "commands": {
+    "build": "pnpm --filter @opslane/dashboard build",
+    "test": "pnpm --filter @opslane/dashboard test"
+  },
+  "build": {
+    "status": "passed",
+    "transformedModules": 411,
+    "durationSeconds": 1.55,
+    "artifacts": {
+      "javascript": {
+        "files": 4,
+        "bytes": 486640,
+        "reportedGzipKilobytes": 154.86
+      },
+      "css": {
+        "files": 1,
+        "bytes": 28553,
+        "reportedGzipKilobytes": 6.49
+      }
+    },
+    "files": [
+      { "logicalName": "entry-css", "bytes": 28553 },
+      { "logicalName": "session-detail-js", "bytes": 4613 },
+      { "logicalName": "sessions-list-js", "bytes": 7099 },
+      { "logicalName": "admin-view-js", "bytes": 16842 },
+      { "logicalName": "entry-js", "bytes": 458086 }
+    ],
+    "note": "Hashed filenames are intentionally omitted; logical names and byte counts are the stable comparison surface."
+  },
+  "tests": {
+    "status": "passed",
+    "filesPassed": 34,
+    "testsPassed": 135,
+    "filesFailed": 0,
+    "testsFailed": 0,
+    "durationSeconds": 3.39
+  },
+  "thresholds": {
+    "javascriptGrowthPercent": 5,
+    "cssGrowthPercent": 15,
+    "javascriptMaxBytes": 510972,
+    "cssMaxBytes": 32835
+  },
+  "provenance": "Measured from the clean worktree at the named commit before design-system production edits."
+}

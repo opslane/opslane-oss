@@ -1,4 +1,5 @@
 import type { ErrorGroupStatus } from '../types/api';
+import { incidentKindRecipe } from '../status-recipes';
 
 export interface KindBadge {
   label: string;
@@ -15,12 +16,10 @@ export function kindBadge(
   adjudicationStatus: string | undefined,
 ): KindBadge {
   if (kind === 'friction' && adjudicationStatus === 'unchecked') {
-    return { label: 'Unchecked', class: 'bg-amber/10 text-amber' };
+    return { label: 'Unchecked', class: 'border-warning/30 bg-warning-subtle text-warning' };
   }
-  if (kind === 'friction') {
-    return { label: 'Friction', class: 'bg-purple/10 text-purple' };
-  }
-  return { label: 'Error', class: 'bg-surface-2 text-text' };
+  const badge = incidentKindRecipe(kind);
+  return { label: badge.label, class: badge.class };
 }
 
 /**

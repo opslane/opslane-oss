@@ -34,9 +34,9 @@ function onSelect(event: Event): void {
 
 <template>
   <div>
-    <div v-if="loading" class="text-sm text-text-muted">Loading repositories...</div>
-    <div v-else-if="error" class="text-sm text-red" v-text="error"></div>
-    <div v-else-if="repos.length === 0" class="text-sm text-text-muted">
+    <div v-if="loading" class="text-sm text-muted">Loading repositories...</div>
+    <div v-else-if="error" class="text-sm text-danger" v-text="error"></div>
+    <div v-else-if="repos.length === 0" class="text-sm text-muted">
       No repositories found. Check your GitHub App permissions.
     </div>
     <select

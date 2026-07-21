@@ -93,7 +93,7 @@ watch(
 <template>
   <div class="flex flex-wrap gap-3 items-center py-3">
     <div class="flex items-center gap-2">
-      <label class="text-sm text-text-muted whitespace-nowrap">Account:</label>
+      <label class="text-sm text-muted whitespace-nowrap">Account:</label>
       <select
         v-model="selectedAccountId"
         class="text-sm rounded-md px-2 py-1.5"
@@ -109,7 +109,7 @@ watch(
     </div>
 
     <div class="flex items-center gap-2">
-      <label class="text-sm text-text-muted whitespace-nowrap">Status:</label>
+      <label class="text-sm text-muted whitespace-nowrap">Status:</label>
       <select
         v-model="selectedStatus"
         class="text-sm rounded-md px-2 py-1.5"
@@ -128,7 +128,7 @@ watch(
     </div>
 
     <div class="flex items-center gap-2">
-      <label class="text-sm text-text-muted whitespace-nowrap">Platform:</label>
+      <label class="text-sm text-muted whitespace-nowrap">Platform:</label>
       <select
         v-model="selectedPlatform"
         aria-label="Platform"
@@ -141,7 +141,7 @@ watch(
     </div>
 
     <div v-if="rollupReady" class="flex items-center gap-2">
-      <label class="text-sm text-text-muted whitespace-nowrap">Environment:</label>
+      <label class="text-sm text-muted whitespace-nowrap">Environment:</label>
       <select
         v-model="selectedEnvironmentId"
         aria-label="Environment"

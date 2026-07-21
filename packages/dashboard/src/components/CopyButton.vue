@@ -24,8 +24,8 @@ async function copy(): Promise<void> {
     @click="copy"
     class="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium transition-colors"
     :class="copied
-      ? 'bg-green/10 text-green'
-      : 'bg-surface-2 text-text-muted hover:bg-border'"
+      ? 'bg-success/10 text-success'
+      : 'bg-surface-subtle text-muted hover:bg-border'"
   >
     {{ copied ? 'Copied!' : 'Copy' }}
   </button>

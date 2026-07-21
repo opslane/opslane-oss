@@ -1,0 +1,33 @@
+import { clearAuth } from './api';
+
+/**
+ * Every tenant-scoped key this app persists, in one place.
+ *
+ * Sign-out must clear all of them. `clearAuth()` only removes the auth hint and
+ * the legacy pre-cookie token keys, so before this existed a sign-out left the
+ * project id/name and the selected environment id behind. On a shared browser
+ * the surviving environment id is re-applied as an `environment_id` query param
+ * under the *next* user's session.
+ *
+ * The environment key is spelled out rather than imported from
+ * composables/useEnvironmentFilter.ts because that module imports from ./api,
+ * and this module does too — importing it here would close a cycle.
+ * session-teardown.test.ts asserts the literal matches the exported constant.
+ *
+ * This lives outside api.ts deliberately: api.ts is a denied path under
+ * scripts/check-frontend-scope.sh, and this branch is frontend-only.
+ */
+const TENANT_LOCAL_KEYS = [
+  'opslane_project_id',
+  'opslane_project_name',
+  'opslane_environment_id',
+] as const;
+
+const TENANT_SESSION_KEYS = ['opslane_post_auth_path'] as const;
+
+/** Clears auth plus all tenant-scoped client state. Use on sign-out. */
+export function clearClientSession(): void {
+  clearAuth();
+  for (const key of TENANT_LOCAL_KEYS) localStorage.removeItem(key);
+  for (const key of TENANT_SESSION_KEYS) sessionStorage.removeItem(key);
+}

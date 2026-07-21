@@ -28,6 +28,10 @@ import CopyButton from '../components/CopyButton.vue';
 import IntegrationsSettings from '../components/IntegrationsSettings.vue';
 import RepoSelector from '../components/RepoSelector.vue';
 import InvitationsPanel from '../components/InvitationsPanel.vue';
+import ModalSurface from '../components/ui/ModalSurface.vue';
+import Button from '../components/ui/Button.vue';
+import TextInput from '../components/ui/TextInput.vue';
+import TabList from '../components/ui/TabList.vue';
 import {
   canDismissProvisionedKey,
   createProvisioningAttempt,
@@ -43,6 +47,19 @@ const router = useRouter();
 const activeTab = ref<SettingsTab>('project');
 const activeRole = ref<AuthMembership['role']>();
 const activeRoleResolved = ref(false);
+const settingsTabs = computed(() => [
+  { id: 'project', label: 'Project' },
+  { id: 'environments', label: 'Environments' },
+  { id: 'api-keys', label: 'API Keys' },
+  { id: 'integrations', label: 'Integrations' },
+  ...(activeRole.value ? [{ id: 'organization', label: 'Organization' }] : []),
+]);
+
+function selectSettingsTab(value: string): void {
+  if (['project', 'environments', 'api-keys', 'integrations', 'organization'].includes(value)) {
+    switchTab(value as SettingsTab);
+  }
+}
 
 // Project tab
 const projects = ref<Project[]>([]);
@@ -499,113 +516,54 @@ async function handleCreateKey(): Promise<void> {
   <div class="max-w-3xl">
     <h2 class="text-lg font-medium text-text mb-4">Settings</h2>
 
-    <!-- Tabs -->
-    <div class="border-b border-border mb-6 pb-3">
-      <nav class="flex gap-2">
-        <button
-          class="text-sm font-medium transition-colors"
-          :class="activeTab === 'project' ? 'tab-active' : 'tab-inactive'"
-          @click="switchTab('project')"
-        >
-          Project
-        </button>
-        <button
-          class="text-sm font-medium transition-colors"
-          :class="activeTab === 'environments' ? 'tab-active' : 'tab-inactive'"
-          @click="switchTab('environments')"
-        >
-          Environments
-        </button>
-        <button
-          class="text-sm font-medium transition-colors"
-          :class="activeTab === 'api-keys' ? 'tab-active' : 'tab-inactive'"
-          @click="switchTab('api-keys')"
-        >
-          API Keys
-        </button>
-        <button
-          class="text-sm font-medium transition-colors"
-          :class="activeTab === 'integrations' ? 'tab-active' : 'tab-inactive'"
-          @click="switchTab('integrations')"
-        >
-          Integrations
-        </button>
-        <button
-          v-if="activeRole"
-          class="text-sm font-medium transition-colors"
-          :class="activeTab === 'organization' ? 'tab-active' : 'tab-inactive'"
-          @click="switchTab('organization')"
-        >
-          Organization
-        </button>
-      </nav>
-    </div>
+    <TabList
+      class="mb-6"
+      :model-value="activeTab"
+      :tabs="settingsTabs"
+      label="Settings sections"
+      id-prefix="settings"
+      @update:model-value="selectSettingsTab"
+    />
 
     <!-- Project tab -->
-    <div v-if="activeTab === 'project'" class="max-w-lg">
-      <p class="text-sm text-text-muted mb-6">
+    <div v-if="activeTab === 'project'" id="settings-project-panel" role="tabpanel" aria-labelledby="settings-project-tab" tabindex="0" class="max-w-lg">
+      <p class="text-sm text-muted mb-6">
         Configure your active project. This determines which project's incidents you
         see in the activity feed.
       </p>
 
       <div v-if="canProvision" class="mb-6">
-        <button
-          v-if="!showNewProjectForm"
-          type="button"
-          class="btn-primary"
-          @click="openNewProjectForm"
-        >
+        <Button variant="primary" v-if="!showNewProjectForm" @click="openNewProjectForm">
           New project
-        </button>
+        </Button>
         <form
           v-else
           class="space-y-3 rounded-lg border border-border bg-surface p-4"
           @submit.prevent="handleCreateProject"
         >
           <h3 class="text-sm font-medium text-text">Create project</h3>
-          <label class="block text-xs text-text-muted">
-            Name
-            <input
-              v-model="newProjectName"
-              name="new-project-name"
-              class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
-              maxlength="100"
-              required
-            />
-          </label>
-          <label class="block text-xs text-text-muted">
-            GitHub repository (optional)
-            <input
-              v-model="newProjectRepo"
-              name="new-project-repo"
-              placeholder="owner/repository"
-              class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text"
-            />
-          </label>
-          <p v-if="projectCreateError" class="text-sm text-red" v-text="projectCreateError"></p>
+          <TextInput v-model="newProjectName" label="Name" name="new-project-name" maxlength="100" required />
+          <TextInput v-model="newProjectRepo" label="GitHub repository (optional)" name="new-project-repo" placeholder="owner/repository" />
+          <p v-if="projectCreateError" class="text-sm text-danger" v-text="projectCreateError"></p>
           <div class="flex gap-3">
-            <button
-              type="submit"
-              class="btn-primary"
-              :disabled="creatingProject || !newProjectName.trim()"
-            >
+            <Button variant="primary" type="submit" :disabled="creatingProject || !newProjectName.trim()">
               {{ creatingProject ? 'Creating...' : 'Create project' }}
-            </button>
-            <button type="button" class="btn-secondary" :disabled="creatingProject" @click="cancelNewProjectForm">
+            </Button>
+            <Button variant="secondary" :disabled="creatingProject" @click="cancelNewProjectForm">
               Cancel
-            </button>
+            </Button>
           </div>
         </form>
       </div>
 
-      <div v-if="loadingProjects" class="text-sm text-text-muted">Loading projects...</div>
+      <div v-if="loadingProjects" class="text-sm text-muted">Loading projects...</div>
 
       <div v-else class="rounded-lg border border-border bg-surface p-4">
-        <div class="text-xs font-medium uppercase tracking-wide text-text-muted">Active project</div>
+        <div class="text-xs font-medium uppercase tracking-wide text-muted">Active project</div>
         <div class="mt-1 text-sm font-medium text-text">
           {{ activeProjectName }}
         </div>
-        <p class="mt-2 text-xs text-text-muted">
+        <p class="mt-2 text-xs text-muted">
           Use the project switcher in the header to change projects safely.
         </p>
       </div>
@@ -613,21 +571,21 @@ async function handleCreateKey(): Promise<void> {
       <!-- GitHub Integration -->
       <div class="mt-8 pt-6 border-t border-border">
         <h3 class="text-sm font-medium text-text mb-1">GitHub Integration</h3>
-        <p class="text-sm text-text-muted mb-3">
+        <p class="text-sm text-muted mb-3">
           Install the Opslane GitHub App and select a repository to enable automated fix PRs.
         </p>
 
-        <div v-if="loadingGithub" class="text-sm text-text-muted">Loading...</div>
+        <div v-if="loadingGithub" class="text-sm text-muted">Loading...</div>
 
         <!-- GitHub App not installed -->
         <div v-else-if="!githubAppStatus?.installed" class="space-y-3">
-          <p class="text-sm text-text-muted">
+          <p class="text-sm text-muted">
             The Opslane GitHub App needs to be installed on your organization to access repositories.
           </p>
           <a
             v-if="githubAppStatus?.install_url"
             :href="safeUrl(githubAppStatus.install_url)"
-            class="inline-flex items-center gap-2 btn-secondary"
+            class="inline-flex items-center gap-2 inline-flex min-h-10 items-center justify-center border border-border-strong bg-surface px-4 py-2 text-sm font-semibold text-text hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
           >
             <svg class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
               <path fill-rule="evenodd" d="M10 0C4.477 0 0 4.477 0 10c0 4.42 2.865 8.166 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.604-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0110 4.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C17.137 18.163 20 14.418 20 10c0-5.523-4.477-10-10-10z" clip-rule="evenodd" />
@@ -639,12 +597,12 @@ async function handleCreateKey(): Promise<void> {
         <!-- GitHub App installed -->
         <div v-else class="space-y-4">
           <div class="flex items-center gap-2">
-            <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-green/10 text-green">
+            <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-success/10 text-success">
               GitHub App installed
             </span>
           </div>
 
-          <div class="rounded-md border border-amber/20 bg-amber/10 p-3 text-xs text-amber">
+          <div class="rounded-md border border-warning/20 bg-warning/10 p-3 text-xs text-warning">
             Draft PR verification requires the GitHub App's <strong>Checks: read</strong>
             permission. If you installed the App before this permission was added, approve
             the permission upgrade in GitHub. Until then, drafts stay drafts and show a
@@ -654,32 +612,24 @@ async function handleCreateKey(): Promise<void> {
           <!-- Repo connected -->
           <div v-if="githubConfig?.connected" class="space-y-3">
             <div class="flex items-center gap-3">
-              <span class="text-sm text-text-muted">Repository:</span>
+              <span class="text-sm text-muted">Repository:</span>
               <span class="text-sm text-text font-mono" v-text="githubConfig.github_repo"></span>
             </div>
-            <button
-              @click="handleDisconnectGithub"
-              :disabled="disconnectingGithub"
-              class="rounded-md bg-red/10 px-3 py-1.5 text-sm font-medium text-red hover:bg-red/20 focus:outline-none focus:ring-2 focus:ring-red focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50"
-            >
+            <Button variant="dangerSubtle" size="sm" @click="handleDisconnectGithub" :disabled="disconnectingGithub">
               {{ disconnectingGithub ? 'Disconnecting...' : 'Disconnect repo' }}
-            </button>
+            </Button>
           </div>
 
           <!-- Repo not connected — show selector -->
           <div v-else class="space-y-3">
             <div>
-              <label class="block text-sm font-medium text-text-muted mb-1">Repository</label>
+              <label class="block text-sm font-medium text-muted mb-1">Repository</label>
               <RepoSelector v-model="selectedRepo" />
             </div>
-            <div v-if="githubError" class="text-sm text-red" v-text="githubError"></div>
-            <button
-              @click="handleConnectGithub"
-              :disabled="connectingGithub || !selectedRepo"
-              class="btn-primary"
-            >
+            <div v-if="githubError" class="text-sm text-danger" v-text="githubError"></div>
+            <Button variant="primary" @click="handleConnectGithub" :disabled="connectingGithub || !selectedRepo">
               {{ connectingGithub ? 'Connecting...' : 'Connect repository' }}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -689,7 +639,7 @@ async function handleCreateKey(): Promise<void> {
         <div class="flex items-start justify-between gap-4">
           <div>
             <h3 id="pr-posture-heading" class="text-sm font-medium text-text">Draft PRs for unverified fixes</h3>
-            <p id="pr-posture-desc" class="mt-1 text-xs text-text-muted">
+            <p id="pr-posture-desc" class="mt-1 text-xs text-muted">
               When enabled, a judge-approved fix with a passing build and no negative test
               evidence can be published as a clearly labeled draft. Repository CI must pass
               before Opslane marks it ready for review.
@@ -706,19 +656,19 @@ async function handleCreateKey(): Promise<void> {
               :disabled="!selectedProject || prPostureSaving"
               @change="onPRPostureChange"
             />
-            <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
+            <span class="h-6 w-11 rounded-full bg-border-strong transition-colors peer-checked:bg-accent peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
           </label>
         </div>
-        <p v-if="!selectedProject" class="text-xs text-text-faint">
+        <p v-if="!selectedProject" class="text-xs text-faint">
           Select one of your projects above to manage draft PR delivery.
           (Manually entered project IDs can't be managed here.)
         </p>
-        <p v-else class="text-xs text-text-faint">
+        <p v-else class="text-xs text-faint">
           {{ prPosture === 'draft_when_unverified'
             ? 'Enabled — eligible unverified fixes may open as drafts.'
             : 'Verified only (default) — fixes below the ready bar remain needs-human incidents.' }}
         </p>
-        <p v-if="prPostureError" class="text-sm text-red" v-text="prPostureError"></p>
+        <p v-if="prPostureError" class="text-sm text-danger" v-text="prPostureError"></p>
       </section>
 
       <!-- SDK-provided environment override -->
@@ -728,7 +678,7 @@ async function handleCreateKey(): Promise<void> {
             <h3 id="payload-environment-heading" class="text-sm font-medium text-text">
               Allow SDK environment override
             </h3>
-            <p id="payload-environment-desc" class="mt-1 text-xs text-text-muted">
+            <p id="payload-environment-desc" class="mt-1 text-xs text-muted">
               This relaxes the boundary provided by an environment-bound API key. SDK event
               and replay payloads may select any existing environment in this project. Enable
               it only when you trust clients to choose the correct environment.
@@ -745,33 +695,33 @@ async function handleCreateKey(): Promise<void> {
               :disabled="!selectedProject || !canManagePayloadEnvironment || payloadEnvironmentSaving"
               @change="onPayloadEnvironmentChange"
             />
-            <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
+            <span class="h-6 w-11 rounded-full bg-border-strong transition-colors peer-checked:bg-accent peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
           </label>
         </div>
-        <p v-if="!selectedProject" class="text-xs text-text-faint">
+        <p v-if="!selectedProject" class="text-xs text-faint">
           Select one of your projects above to manage SDK environment overrides.
         </p>
-        <p v-else-if="!canManagePayloadEnvironment" class="text-xs text-text-faint">
+        <p v-else-if="!canManagePayloadEnvironment" class="text-xs text-faint">
           Only organization admins can change this setting.
         </p>
-        <p v-else class="text-xs text-text-faint">
+        <p v-else class="text-xs text-faint">
           {{ allowPayloadEnvironment
             ? 'Enabled — SDK payloads may override the key-bound environment.'
             : 'Disabled (default) — the API key always determines the environment.' }}
         </p>
-        <p v-if="payloadEnvironmentError" class="text-sm text-red" v-text="payloadEnvironmentError"></p>
+        <p v-if="payloadEnvironmentError" class="text-sm text-danger" v-text="payloadEnvironmentError"></p>
       </section>
 
       <!-- Friction autonomy (Batch 5, issue #57) -->
       <section class="mt-8 p-4 bg-surface border border-border rounded-lg space-y-3">
         <div>
           <h3 id="friction-autonomy-heading" class="text-sm font-medium text-text">Friction autonomy</h3>
-          <p id="friction-autonomy-desc" class="mt-1 text-xs text-text-muted">
+          <p id="friction-autonomy-desc" class="mt-1 text-xs text-muted">
             How Opslane acts on friction incidents (rage clicks, dead clicks, form abandonment)
             that have a code cause. Error fixes are unaffected.
           </p>
         </div>
-        <p v-if="!selectedProject" class="text-xs text-text-faint">
+        <p v-if="!selectedProject" class="text-xs text-faint">
           Select one of your projects above to manage autonomy.
           (Manually entered project IDs can't be managed here.)
         </p>
@@ -785,11 +735,11 @@ async function handleCreateKey(): Promise<void> {
           <label
             v-for="option in autonomyOptions"
             :key="option.value"
-            class="flex items-start gap-3 p-3 border rounded-lg transition-colors focus-within:ring-1 focus-within:ring-teal"
+            class="flex items-start gap-3 p-3 border rounded-lg transition-colors focus-within:ring-1 focus-within:ring-accent"
             :class="[
               autonomy === option.value
-                ? 'border-teal bg-teal/5'
-                : 'border-border hover:border-text-faint hover:bg-surface-2',
+                ? 'border-accent bg-accent/5'
+                : 'border-border hover:border-border-strong hover:bg-surface-subtle',
               autonomySaving ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer',
             ]"
           >
@@ -804,22 +754,22 @@ async function handleCreateKey(): Promise<void> {
             />
             <span>
               <span class="block text-sm text-text" v-text="option.label"></span>
-              <span class="block text-xs text-text-muted" v-text="option.description"></span>
+              <span class="block text-xs text-muted" v-text="option.description"></span>
               <span
                 v-if="fixStats"
-                class="block mt-1 text-xs text-text-faint"
+                class="block mt-1 text-xs text-faint"
                 v-text="optionStats(option.value)"
               ></span>
             </span>
           </label>
         </div>
-        <p v-if="autonomyError" class="text-sm text-red" v-text="autonomyError"></p>
+        <p v-if="autonomyError" class="text-sm text-danger" v-text="autonomyError"></p>
       </section>
     </div>
 
     <!-- Environments tab -->
-    <div v-if="activeTab === 'environments'">
-      <div v-if="loadingEnvs" class="text-sm text-text-muted">Loading environments...</div>
+    <div v-if="activeTab === 'environments'" id="settings-environments-panel" role="tabpanel" aria-labelledby="settings-environments-tab" tabindex="0">
+      <div v-if="loadingEnvs" class="text-sm text-muted">Loading environments...</div>
 
       <div v-else>
         <ul v-if="environments.length > 0" class="space-y-2 mb-6">
@@ -830,11 +780,11 @@ async function handleCreateKey(): Promise<void> {
           >
             <div>
               <span class="text-sm font-medium text-text" v-text="env.name"></span>
-              <span class="ml-2 text-xs text-text-muted">created {{ formatDate(env.created_at) }}</span>
+              <span class="ml-2 text-xs text-muted">created {{ formatDate(env.created_at) }}</span>
             </div>
           </li>
         </ul>
-        <div v-else class="text-sm text-text-muted mb-6">No environments yet.</div>
+        <div v-else class="text-sm text-muted mb-6">No environments yet.</div>
 
         <form @submit.prevent="handleCreateEnvironment" class="flex gap-3">
           <input
@@ -842,40 +792,36 @@ async function handleCreateKey(): Promise<void> {
             type="text"
             placeholder="Environment name (e.g. staging)"
             :disabled="creatingEnv"
-            class="flex-1 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal disabled:opacity-50"
+            class="flex-1 rounded-md border border-border bg-surface-subtle px-3 py-2 text-sm text-text focus:border-accent focus:ring-1 focus:ring-accent disabled:opacity-50"
           />
-          <button
-            type="submit"
-            :disabled="creatingEnv || !newEnvName.trim()"
-            class="btn-primary"
-          >
+          <Button variant="primary" type="submit" :disabled="creatingEnv || !newEnvName.trim()">
             {{ creatingEnv ? 'Creating...' : 'Create environment' }}
-          </button>
+          </Button>
         </form>
-        <div v-if="envError" class="mt-2 text-sm text-red" v-text="envError"></div>
+        <div v-if="envError" class="mt-2 text-sm text-danger" v-text="envError"></div>
       </div>
     </div>
 
     <!-- API Keys tab -->
-    <div v-if="activeTab === 'api-keys'">
-      <div v-if="loadingKeys" class="text-sm text-text-muted">Loading API keys...</div>
+    <div v-if="activeTab === 'api-keys'" id="settings-api-keys-panel" role="tabpanel" aria-labelledby="settings-api-keys-tab" tabindex="0">
+      <div v-if="loadingKeys" class="text-sm text-muted">Loading API keys...</div>
 
       <div v-else>
         <div v-if="apiKeys.length > 0" class="border border-border rounded-lg overflow-hidden mb-6">
           <table class="min-w-full text-sm">
             <thead>
               <tr class="border-b border-border bg-surface">
-                <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">Prefix</th>
-                <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">Environment</th>
-                <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">Created</th>
-                <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">Status</th>
+                <th class="py-2.5 px-4 text-left text-xs font-medium text-muted uppercase tracking-wider">Prefix</th>
+                <th class="py-2.5 px-4 text-left text-xs font-medium text-muted uppercase tracking-wider">Environment</th>
+                <th class="py-2.5 px-4 text-left text-xs font-medium text-muted uppercase tracking-wider">Created</th>
+                <th class="py-2.5 px-4 text-left text-xs font-medium text-muted uppercase tracking-wider">Status</th>
               </tr>
             </thead>
             <tbody>
               <tr
                 v-for="key in apiKeys"
                 :key="key.id"
-                class="border-b border-border-subtle hover:bg-surface transition-colors"
+                class="border-b border-border hover:bg-surface transition-colors"
               >
                 <td class="py-2.5 px-4 font-mono text-xs" v-text="key.key_prefix"></td>
                 <td class="py-2.5 px-4" v-text="key.environment_name"></td>
@@ -884,8 +830,8 @@ async function handleCreateKey(): Promise<void> {
                   <span
                     class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
                     :class="key.revoked_at
-                      ? 'bg-red/10 text-red'
-                      : 'bg-green/10 text-green'"
+                      ? 'bg-danger/10 text-danger'
+                      : 'bg-success/10 text-success'"
                   >
                     {{ key.revoked_at ? 'Revoked' : 'Active' }}
                   </span>
@@ -894,97 +840,78 @@ async function handleCreateKey(): Promise<void> {
             </tbody>
           </table>
         </div>
-        <div v-else class="text-sm text-text-muted mb-6">No API keys yet.</div>
+        <div v-else class="text-sm text-muted mb-6">No API keys yet.</div>
 
-        <button
-          @click="openNewKeyModal"
-          class="btn-primary"
-        >
+        <Button variant="primary" @click="openNewKeyModal">
           Generate new key
-        </button>
+        </Button>
       </div>
     </div>
 
-    <div v-if="activeTab === 'organization'">
+    <div v-if="activeTab === 'organization'" id="settings-organization-panel" role="tabpanel" aria-labelledby="settings-organization-tab" tabindex="0">
       <InvitationsPanel :active-role="activeRole" />
     </div>
 
-    <IntegrationsSettings
-      v-if="activeTab === 'integrations'"
-      :project-id="selectedProjectId"
-    />
+    <div v-if="activeTab === 'integrations'" id="settings-integrations-panel" role="tabpanel" aria-labelledby="settings-integrations-tab" tabindex="0">
+      <IntegrationsSettings :project-id="selectedProjectId" />
+    </div>
 
     <!-- One-time project provisioning key -->
-    <div
-      v-if="provisionedProject"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+    <ModalSurface
+      :open="Boolean(provisionedProject)"
+      title="Project created"
+      description="The production environment is ready. Save this API key now; it cannot be shown again."
+      :close-on-overlay="false"
     >
-      <div class="bg-surface rounded-lg border border-border max-w-lg w-full mx-4 p-6">
-        <h3 class="text-lg font-medium text-text">Project created</h3>
-        <p class="mt-1 text-sm text-text-muted">
-          The production environment is ready. Save this API key now; it cannot be shown again.
-        </p>
-        <div class="mt-4 rounded-lg bg-surface-2 text-text p-4 font-mono text-sm break-all relative">
+      <template v-if="provisionedProject">
+        <div class="mt-4 rounded-lg bg-surface-subtle text-text p-4 font-mono text-sm break-all relative">
           <span v-text="provisionedProject.api_key.raw_key"></span>
           <div class="absolute top-2 right-2">
             <CopyButton :text="provisionedProject.api_key.raw_key" />
           </div>
         </div>
-        <label class="mt-4 flex items-start gap-2 text-sm text-text-muted">
+        <label class="mt-4 flex items-start gap-2 text-sm text-muted">
           <input v-model="provisioningKeyAcknowledged" type="checkbox" class="mt-0.5" />
           <span>I have copied and stored this key securely.</span>
         </label>
-        <button
-          type="button"
-          class="mt-4 w-full btn-primary"
-          :disabled="!canDismissProvisionedKey(provisioningKeyAcknowledged)"
-          @click="dismissProvisionedProject"
-        >
+        <Button variant="primary" class="mt-4 w-full" :disabled="!canDismissProvisionedKey(provisioningKeyAcknowledged)" @click="dismissProvisionedProject">
           Done
-        </button>
-      </div>
-    </div>
+        </Button>
+      </template>
+    </ModalSurface>
 
     <!-- New key modal -->
-    <div
-      v-if="showNewKeyModal"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      @click.self="showNewKeyModal = false"
+    <ModalSurface
+      v-model:open="showNewKeyModal"
+      :title="newKeyResult ? 'API key created' : 'Generate new API key'"
+      initial-focus="#key-env-select"
     >
-      <div class="bg-surface rounded-lg border border-border max-w-md w-full mx-4 p-6">
-        <h3 class="text-lg font-medium text-text mb-4">
-          {{ newKeyResult ? 'API key created' : 'Generate new API key' }}
-        </h3>
-
         <!-- Key created view -->
         <div v-if="newKeyResult">
-          <div class="rounded-lg bg-surface-2 text-text p-4 font-mono text-sm break-all relative">
+          <div class="rounded-lg bg-surface-subtle text-text p-4 font-mono text-sm break-all relative">
             <span v-text="newKeyResult.raw_key"></span>
             <div class="absolute top-2 right-2">
               <CopyButton :text="newKeyResult.raw_key" />
             </div>
           </div>
-          <div class="mt-3 rounded-md bg-amber/10 border border-amber/20 p-3">
-            <p class="text-sm text-amber">
+          <div class="mt-3 rounded-md bg-warning/10 border border-warning/20 p-3">
+            <p class="text-sm text-warning">
               Save this key -- you won't see it again.
             </p>
           </div>
-          <button
-            @click="showNewKeyModal = false"
-            class="mt-4 w-full btn-secondary"
-          >
+          <Button variant="secondary" class="mt-4 w-full" @click="showNewKeyModal = false">
             Done
-          </button>
+          </Button>
         </div>
 
         <!-- Environment selector -->
         <div v-else>
-          <div v-if="environments.length === 0" class="text-sm text-text-muted mb-4">
+          <div v-if="environments.length === 0" class="text-sm text-muted mb-4">
             Create an environment first in the Environments tab.
           </div>
           <div v-else class="space-y-4">
             <div>
-              <label for="key-env-select" class="block text-sm font-medium text-text-muted">
+              <label for="key-env-select" class="block text-sm font-medium text-muted">
                 Environment
               </label>
               <select
@@ -1000,25 +927,17 @@ async function handleCreateKey(): Promise<void> {
                 ></option>
               </select>
             </div>
-            <div v-if="keyError" class="text-sm text-red" v-text="keyError"></div>
+            <div v-if="keyError" class="text-sm text-danger" v-text="keyError"></div>
             <div class="flex gap-3">
-              <button
-                @click="handleCreateKey"
-                :disabled="creatingKey || !newKeyEnvId"
-                class="flex-1 btn-primary"
-              >
+              <Button variant="primary" class="flex-1" @click="handleCreateKey" :disabled="creatingKey || !newKeyEnvId">
                 {{ creatingKey ? 'Generating...' : 'Generate key' }}
-              </button>
-              <button
-                @click="showNewKeyModal = false"
-                class="btn-secondary"
-              >
+              </Button>
+              <Button variant="secondary" @click="showNewKeyModal = false">
                 Cancel
-              </button>
+              </Button>
             </div>
           </div>
         </div>
-      </div>
-    </div>
+    </ModalSurface>
   </div>
 </template>

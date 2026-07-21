@@ -1,0 +1,10 @@
+# Captures are derived artifacts: deterministic, regenerable in seconds, and a
+# couple of megabytes of binaries no reviewer can diff. Committing them failed
+# once already — a stale set stood as evidence for a UI that was never released,
+# and nothing caught it because a changed PNG reads as a byte-count delta.
+#
+# Regenerate:
+#   CAPTURE_DASHBOARD_SCREENSHOTS=1 pnpm --filter @opslane/test-e2e exec vitest run dashboard-screenshots.test.ts
+after/*.png
+after/manifest.json
+after/index.html

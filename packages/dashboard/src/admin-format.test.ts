@@ -10,12 +10,12 @@ describe('admin formatting', () => {
   });
 
   it('highlights dead letters as failures', () => {
-    expect(adminStatusBadgeClass('dead_letter')).toContain('text-red');
+    expect(adminStatusBadgeClass('dead_letter')).toContain('text-danger');
   });
 
   it('distinguishes draft PRs from ready PRs', () => {
-    expect(adminStatusBadgeClass('pr_draft')).toContain('text-amber');
-    expect(adminStatusBadgeClass('pr_created')).toContain('text-green');
+    expect(adminStatusBadgeClass('pr_draft')).toContain('text-warning');
+    expect(adminStatusBadgeClass('pr_created')).toContain('text-success');
   });
 
   it('formats the onboarding funnel in order with conversion from started', () => {

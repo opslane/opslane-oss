@@ -9,6 +9,7 @@ import {
 } from '../api';
 import type { NotificationDestination } from '../types/api';
 import { formatDate } from '../utils';
+import Button from './ui/Button.vue';
 
 const props = defineProps<{ projectId: string }>();
 
@@ -157,9 +158,9 @@ async function sendTest(destination: NotificationDestination): Promise<void> {
 }
 
 function deliveryClass(status: string): string {
-  if (status === 'delivered') return 'bg-green/10 text-green';
-  if (status === 'failed') return 'bg-red/10 text-red';
-  return 'bg-surface-2 text-text-muted';
+  if (status === 'delivered') return 'bg-success/10 text-success';
+  if (status === 'failed') return 'bg-danger/10 text-danger';
+  return 'bg-surface-subtle text-muted';
 }
 
 watch(
@@ -173,16 +174,16 @@ watch(
   <section class="space-y-6">
     <div>
       <h3 class="text-sm font-medium text-text">Notification integrations</h3>
-      <p class="mt-1 text-sm text-text-muted">
+      <p class="mt-1 text-sm text-muted">
         Send a Slack message when Opslane creates a new issue for this project.
       </p>
     </div>
 
-    <p v-if="!projectId" class="text-sm text-text-muted">
+    <p v-if="!projectId" class="text-sm text-muted">
       Select a project to configure notification integrations.
     </p>
-    <p v-else-if="loading" class="text-sm text-text-muted">Loading integrations...</p>
-    <p v-if="loadError" class="text-sm text-red" role="alert" v-text="loadError"></p>
+    <p v-else-if="loading" class="text-sm text-muted">Loading integrations...</p>
+    <p v-if="loadError" class="text-sm text-danger" role="alert" v-text="loadError"></p>
 
     <template v-if="projectId && !loading && destinationsProjectId === projectId">
       <ul v-if="destinations.length > 0" class="space-y-3">
@@ -195,18 +196,18 @@ watch(
             <div class="min-w-0 space-y-1">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="text-sm font-medium text-text" v-text="destination.name"></span>
-                <span class="inline-flex rounded-full bg-indigo/10 px-2 py-0.5 text-xs font-medium text-indigo">
+                <span class="inline-flex rounded-full bg-progress/10 px-2 py-0.5 text-xs font-medium text-progress">
                   Slack
                 </span>
                 <span
                   v-if="!canManage"
                   class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
-                  :class="destination.enabled ? 'bg-green/10 text-green' : 'bg-surface-2 text-text-muted'"
+                  :class="destination.enabled ? 'bg-success/10 text-success' : 'bg-surface-subtle text-muted'"
                 >
                   {{ destination.enabled ? 'Enabled' : 'Disabled' }}
                 </span>
               </div>
-              <p class="break-all font-mono text-xs text-text-muted" v-text="destination.config_fingerprint"></p>
+              <p class="break-all font-mono text-xs text-muted" v-text="destination.config_fingerprint"></p>
             </div>
 
             <label v-if="canManage" class="relative inline-flex shrink-0 cursor-pointer items-center">
@@ -220,7 +221,7 @@ watch(
                 :disabled="mutationPending[destination.id]"
                 @change="onEnabledChange(destination, $event)"
               />
-              <span class="h-6 w-11 rounded-full bg-text-faint transition-colors peer-checked:bg-teal peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
+              <span class="h-6 w-11 rounded-full bg-border-strong transition-colors peer-checked:bg-accent peer-disabled:cursor-not-allowed peer-disabled:opacity-50 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5"></span>
             </label>
           </div>
 
@@ -233,50 +234,40 @@ watch(
               >
                 {{ destination.last_delivery.status }}
               </span>
-              <span class="text-text-muted">
+              <span class="text-muted">
                 {{ formatDate(destination.last_delivery.at) }}
               </span>
               <span
                 v-if="destination.last_delivery.error"
-                class="max-w-full truncate text-red"
+                class="max-w-full truncate text-danger"
                 :title="destination.last_delivery.error"
                 v-text="destination.last_delivery.error"
               ></span>
             </template>
-            <span v-else class="text-text-muted">No deliveries yet</span>
-            <span v-if="destination.recent_failures > 0" class="text-red">
+            <span v-else class="text-muted">No deliveries yet</span>
+            <span v-if="destination.recent_failures > 0" class="text-danger">
               {{ destination.recent_failures }} failed in the last 7 days
             </span>
           </div>
 
           <div v-if="canManage" class="mt-4 flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              class="btn-secondary"
-              :disabled="mutationPending[destination.id]"
-              @click="sendTest(destination)"
-            >
+            <Button variant="secondary" :disabled="mutationPending[destination.id]" @click="sendTest(destination)">
               {{ mutationPending[destination.id] ? 'Working...' : 'Test' }}
-            </button>
-            <button
-              type="button"
-              class="rounded-lg px-3 py-2 text-sm font-medium text-red hover:bg-red/10 disabled:opacity-50"
-              :disabled="mutationPending[destination.id]"
-              @click="removeDestination(destination)"
-            >
+            </Button>
+            <Button variant="danger" class="rounded-lg text-danger hover:bg-danger/10" :disabled="mutationPending[destination.id]" @click="removeDestination(destination)">
               Delete
-            </button>
+            </Button>
             <span
               v-if="testResults[destination.id]"
               class="text-sm"
-              :class="testResults[destination.id].ok ? 'text-green' : 'text-red'"
+              :class="testResults[destination.id].ok ? 'text-success' : 'text-danger'"
               role="status"
               v-text="testResults[destination.id].message"
             ></span>
           </div>
         </li>
       </ul>
-      <p v-else class="text-sm text-text-muted">No notification integrations yet.</p>
+      <p v-else class="text-sm text-muted">No notification integrations yet.</p>
 
       <form
         v-if="canManage"
@@ -286,18 +277,18 @@ watch(
       >
         <div>
           <h4 class="text-sm font-medium text-text">Add Slack notification</h4>
-          <p class="mt-1 text-xs text-text-muted">
+          <p class="mt-1 text-xs text-muted">
             Create an incoming webhook in Slack, then paste its URL below.
             <a
               href="https://api.slack.com/messaging/webhooks"
               target="_blank"
               rel="noopener noreferrer"
-              class="text-teal hover:underline"
+              class="text-accent hover:underline"
             >Slack webhook guide</a>
           </p>
         </div>
         <div>
-          <label for="notification-name" class="block text-sm font-medium text-text-muted">Name</label>
+          <label for="notification-name" class="block text-sm font-medium text-muted">Name</label>
           <input
             id="notification-name"
             v-model="newName"
@@ -306,11 +297,11 @@ watch(
             required
             placeholder="Production alerts"
             :disabled="creating"
-            class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal disabled:opacity-50"
+            class="mt-1 block w-full rounded-md border border-border bg-surface-subtle px-3 py-2 text-sm text-text focus:border-accent focus:ring-1 focus:ring-accent disabled:opacity-50"
           />
         </div>
         <div>
-          <label for="notification-webhook-url" class="block text-sm font-medium text-text-muted">
+          <label for="notification-webhook-url" class="block text-sm font-medium text-muted">
             Webhook URL
           </label>
           <input
@@ -321,19 +312,15 @@ watch(
             autocomplete="off"
             placeholder="https://hooks.slack.com/services/..."
             :disabled="creating"
-            class="mt-1 block w-full rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text focus:border-teal focus:ring-1 focus:ring-teal disabled:opacity-50"
+            class="mt-1 block w-full rounded-md border border-border bg-surface-subtle px-3 py-2 text-sm text-text focus:border-accent focus:ring-1 focus:ring-accent disabled:opacity-50"
           />
         </div>
-        <button
-          type="submit"
-          class="btn-primary"
-          :disabled="creating || !newName.trim() || !newWebhookURL.trim()"
-        >
+        <Button variant="primary" type="submit" :disabled="creating || !newName.trim() || !newWebhookURL.trim()">
           {{ creating ? 'Adding...' : 'Add Slack notification' }}
-        </button>
+        </Button>
       </form>
 
-      <p v-else class="text-sm text-text-muted">
+      <p v-else class="text-sm text-muted">
         You can view integrations for this project, but only an organization admin can change them.
       </p>
     </template>

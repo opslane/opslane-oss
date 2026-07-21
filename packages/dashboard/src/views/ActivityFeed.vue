@@ -2,11 +2,13 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 import type { Incident, IncidentFilters, ErrorGroupStatus } from '../types/api';
 import { listIncidents } from '../api';
-import { getProjectId, statusBadgeClass, statusLabel, formatDate } from '../utils';
-import { kindBadge } from '../components/incident-kind';
-import { platformBadge } from '../components/platform-badge';
+import { getProjectId } from '../utils';
 import { useTableSort } from '../composables/useTableSort';
 import FilterBar from '../components/FilterBar.vue';
+import IncidentLedgerRow from '../components/incidents/IncidentLedgerRow.vue';
+import InlineAlert from '../components/ui/InlineAlert.vue';
+import EmptyState from '../components/ui/EmptyState.vue';
+import SkeletonBlock from '../components/ui/SkeletonBlock.vue';
 
 const POLL_INTERVAL = 30_000; // 30 seconds
 
@@ -115,8 +117,17 @@ onUnmounted(() => stopPolling());
 </script>
 
 <template>
-  <div>
-    <h2 class="text-lg font-medium text-text mb-2">Incidents</h2>
+  <div class="mx-auto w-full max-w-[1120px]">
+    <header class="mb-7 border-b border-border pb-5">
+      <p class="text-xs font-semibold uppercase tracking-[0.18em] text-accent">Incident ledger</p>
+      <div class="mt-2 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 class="text-2xl font-semibold tracking-tight text-text">Production incidents</h1>
+          <p class="mt-1 max-w-2xl text-sm text-muted">Review current outcomes, affected users, and the evidence behind each investigation.</p>
+        </div>
+        <p v-if="!loading && !error" class="font-mono text-xs text-muted">{{ incidents.length }} record{{ incidents.length === 1 ? '' : 's' }}</p>
+      </div>
+    </header>
 
     <FilterBar
       v-if="projectId"
@@ -126,59 +137,65 @@ onUnmounted(() => stopPolling());
 
     <button
       v-if="newIncidentCount > 0"
-      class="w-full mb-3 rounded-md bg-teal/10 border border-teal/20 px-4 py-2 text-sm text-teal font-medium hover:bg-teal/20 transition-colors text-center"
+      class="mb-4 w-full border border-accent bg-surface px-4 py-2 text-center text-sm font-semibold text-accent hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       @click="loadNewIncidents"
     >
       {{ newIncidentCount }} new incident{{ newIncidentCount === 1 ? '' : 's' }} — click to refresh
     </button>
 
-    <div v-if="loading" class="text-text-muted">Loading incidents...</div>
-
     <div
-      v-else-if="error"
-      class="rounded-md bg-red/10 border border-red/20 p-4 text-sm text-red"
+      v-if="loading"
+      role="status"
+      aria-busy="true"
+      aria-label="Loading incident ledger"
+      class="grid gap-3 border-y border-border py-5"
     >
-      <p v-text="error"></p>
+      <SkeletonBlock class="h-14" />
+      <SkeletonBlock class="h-14" />
+      <SkeletonBlock class="h-14" />
     </div>
 
-    <div v-else-if="incidents.length === 0" class="flex flex-col items-center justify-center py-16 text-center">
-      <svg class="h-12 w-12 text-text-faint mb-4" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-      </svg>
-      <h3 class="text-sm font-medium text-text">No incidents yet</h3>
-      <p class="mt-1 text-sm text-text-muted">Events will appear once your SDK starts reporting errors.</p>
+    <InlineAlert
+      v-else-if="error"
+      tone="danger"
+      title="Unable to load incidents"
+    >
+      <p v-text="error"></p>
+    </InlineAlert>
+
+    <EmptyState v-else-if="incidents.length === 0" title="No incidents yet" description="Events will appear once your SDK starts reporting errors.">
       <router-link
         to="/setup"
-        class="mt-4 inline-flex items-center btn-primary"
+        class="inline-flex min-h-10 items-center bg-accent px-4 py-2 text-sm font-semibold text-on-accent hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
       >
         Setup guide
       </router-link>
-    </div>
+    </EmptyState>
 
-    <div v-else class="border border-border rounded-lg overflow-hidden">
-      <table class="min-w-full text-sm">
+    <div v-else class="overflow-x-auto border-y border-border">
+      <table class="min-w-full text-sm" aria-label="Production incidents">
         <thead>
-          <tr class="border-b border-border bg-surface">
-            <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+          <tr class="border-b border-border bg-surface-subtle">
+            <th class="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:px-5">
               Title
             </th>
-            <th class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+            <th class="hidden px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted md:table-cell">
               Kind
             </th>
             <th
-              class="py-2.5 px-4 text-left text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
+              class="cursor-pointer select-none px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text"
               @click="toggleSort('status')"
             >
               Status{{ sortIndicator('status') }}
             </th>
             <th
-              class="py-2.5 px-4 text-right text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
+              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text sm:table-cell"
               @click="toggleSort('occurrences')"
             >
               Events{{ sortIndicator('occurrences') }}
             </th>
             <th
-              class="py-2.5 px-4 text-right text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
+              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text lg:table-cell"
               :title="currentFilters.environment_id ? 'users across all environments' : undefined"
               @click="toggleSort('users')"
             >
@@ -188,7 +205,7 @@ onUnmounted(() => stopPolling());
               </span>
             </th>
             <th
-              class="py-2.5 px-4 text-right text-xs font-medium text-text-muted uppercase tracking-wider cursor-pointer hover:text-text select-none"
+              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text xl:table-cell"
               @click="toggleSort('last_seen')"
             >
               Last Seen{{ sortIndicator('last_seen') }}
@@ -196,54 +213,12 @@ onUnmounted(() => stopPolling());
           </tr>
         </thead>
         <tbody>
-          <tr
+          <IncidentLedgerRow
             v-for="incident in sortedIncidents"
             :key="incident.id"
-            class="border-b border-border-subtle hover:bg-surface transition-colors"
-          >
-            <td class="py-2.5 px-4">
-              <router-link
-                :to="{ name: 'incident', params: { id: incident.id }, query: { project_id: projectId } }"
-                class="text-teal hover:underline font-medium block truncate max-w-md"
-                v-text="incident.title"
-              >
-              </router-link>
-            </td>
-            <td class="py-2.5 px-4">
-              <div class="flex flex-wrap items-center gap-1.5">
-                <span
-                  class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
-                  :class="kindBadge(incident.kind, incident.adjudication_status).class"
-                  v-text="kindBadge(incident.kind, incident.adjudication_status).label"
-                >
-                </span>
-                <span
-                  v-if="platformBadge(incident.platform)"
-                  class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
-                  :class="platformBadge(incident.platform)?.class"
-                  v-text="platformBadge(incident.platform)?.label"
-                >
-                </span>
-              </div>
-            </td>
-            <td class="py-2.5 px-4">
-              <span
-                class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap"
-                :class="statusBadgeClass(incident.status)"
-                v-text="statusLabel(incident.status)"
-              >
-              </span>
-            </td>
-            <td class="py-2.5 px-4 text-right text-text-muted tabular-nums">
-              {{ incident.occurrence_count }}
-            </td>
-            <td class="py-2.5 px-4 text-right text-text-muted tabular-nums">
-              {{ incident.affected_users_count }}
-            </td>
-            <td class="py-2.5 px-4 text-right text-text-muted whitespace-nowrap">
-              {{ formatDate(incident.last_seen) }}
-            </td>
-          </tr>
+            :incident="incident"
+            :project-id="projectId"
+          />
         </tbody>
       </table>
     </div>
