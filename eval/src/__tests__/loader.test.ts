@@ -5,25 +5,27 @@ import path from 'node:path';
 const CASES_DIR = path.resolve(import.meta.dirname, '../../cases');
 
 describe('loadAllCases', () => {
-  it('loads all 23 eval cases', async () => {
+  it('loads all 26 eval cases', async () => {
     const cases = await loadAllCases(CASES_DIR);
-    expect(cases).toHaveLength(23);
+    expect(cases).toHaveLength(26);
   });
 
-  it('has 15 vue cases and 8 react cases', async () => {
+  it('has 15 vue, 8 react, and 3 flask cases', async () => {
     const cases = await loadAllCases(CASES_DIR);
     const vue = cases.filter(c => c.app === 'vue-app');
     const react = cases.filter(c => c.app === 'react-app');
+    const flask = cases.filter(c => c.app === 'flask-app');
     expect(vue).toHaveLength(15);
     expect(react).toHaveLength(8);
+    expect(flask).toHaveLength(3);
   });
 
-  it('has 20 fixable cases and 3 needs_human cases', async () => {
+  it('has 22 fixable cases and 4 needs_human cases', async () => {
     const cases = await loadAllCases(CASES_DIR);
     const fixable = cases.filter(c => c.expected.outcome === 'fix_pr');
     const needsHuman = cases.filter(c => c.expected.outcome === 'needs_human');
-    expect(fixable).toHaveLength(20);
-    expect(needsHuman).toHaveLength(3);
+    expect(fixable).toHaveLength(22);
+    expect(needsHuman).toHaveLength(4);
   });
 
   it('fixable cases have bug_patch, needs_human cases have null', async () => {

@@ -1,7 +1,11 @@
 import type { ReasonCode } from '@opslane/shared';
+import type { Platform } from '../../packages/worker/src/platform.js';
+import type { RuntimeInfo } from '../../packages/worker/src/runtime-info.js';
 
 /** The error event sent to the pipeline */
 export interface EvalErrorEvent {
+  platform?: Platform;
+  runtime?: RuntimeInfo;
   error: {
     type: string;
     message: string;

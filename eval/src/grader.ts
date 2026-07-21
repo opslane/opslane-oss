@@ -43,10 +43,7 @@ export function gradeCase(
     const qualityPassed = judgeResult ? judgeResult.quality_passed : true;
     passed = testsPassed && qualityPassed;
   } else {
-    // For needs_human: outcome match is sufficient. reason_code is tracked
-    // but not required to match — the agent harness uses different codes
-    // (budget_exhausted, infrastructure_outage) than the legacy pipeline.
-    passed = outcomeCorrect;
+    passed = outcomeCorrect && (evalCase.expected.reason_code === undefined || reasonCodeCorrect === true);
   }
 
   return {

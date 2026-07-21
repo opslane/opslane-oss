@@ -46,12 +46,22 @@ describe('callPipeline', () => {
       affectedFiles: ['src/foo.ts'],
     });
 
-    await callPipeline(makeCase(), '/tmp/cases');
+    await callPipeline(makeCase({
+      error_event: {
+        platform: 'python',
+        runtime: { name: 'CPython', version: '3.12.4' },
+        error: { type: 'TypeError', message: 'test', stack: 'at foo.ts:1:1' },
+        breadcrumbs: [],
+        context: { url: 'http://test.com' },
+      },
+    }), '/tmp/cases');
 
     expect(mockRunAgentFix).toHaveBeenCalledOnce();
     const input = mockRunAgentFix.mock.calls[0]![0];
     expect(input.errorType).toBe('TypeError');
     expect(input.errorMessage).toBe('test');
+    expect(input.platform).toBe('python');
+    expect(input.customerRuntime).toEqual({ name: 'CPython', version: '3.12.4' });
     expect(input.repoUrl).toBe('https://github.com/test/eval-app.git');
     expect(input.sourceFiles).toEqual([]);
     expect(input.setupCommands).toBeUndefined();
