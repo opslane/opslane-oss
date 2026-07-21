@@ -24,7 +24,7 @@ The worker pushes only to a reserved Opslane fix branch (`opslane/fix-<group-id>
 | Anthropic API | Error details, stack traces, relevant source file contents, test output | Only during investigation, only with `ANTHROPIC_API_KEY` set |
 | E2B sandbox | A clone of the connected repository, the candidate fix, dependency installs, test runs | Only during fix verification, only with `E2B_API_KEY` set |
 | GitHub (worker) | The fix branch (pushed **before** PR creation — if the PR call then fails, the pushed branch remains and the incident ends `needs_human`), then the PR body (root cause, diff, verification evidence). The setup-PR flow likewise pushes an `opslane/setup` branch and opens a PR. | During fix delivery and setup-PR |
-| Configured identity provider | OAuth code exchange and user/email lookup (sign-in) | During dashboard sign-in |
+| Configured identity provider | OAuth code exchange and user/email lookup (sign-in); email verification codes when the OAuth provider requires verification | During dashboard sign-in and OAuth email verification |
 | GitHub (ingestion) | Installation and repository listing (App setup) | During GitHub App setup |
 | Configured webhooks | Issue event data: issue ID, title, first-seen timestamp; project ID and name; environment | When enabled notification destinations are triggered by subscribed events |
 | WorkOS (ingestion) | Email addresses, passwords, verification codes, reset tokens | Only when password authentication is enabled; during sign-in, signup, email verification, and password reset |
@@ -74,6 +74,7 @@ See [replay privacy and masking](../guides/replay-privacy.md) for what replay da
 - **Passwords** (when password authentication is enabled) are not stored locally — registration, authentication, and reset are handled by the configured identity provider (WorkOS).
 - **GitHub App private key** and worker credentials are environment variables — supplied by your deployment, never written to the database.
 - **Notification webhook URLs** are encrypted at rest in the database; the encryption key is supplied as an environment variable.
+- **Pending OAuth verification tokens** from identity providers are sealed and stored temporarily (10-minute TTL) during email verification flows; the encryption key is supplied as an environment variable.
 
 ## Honest gaps (current state)
 
