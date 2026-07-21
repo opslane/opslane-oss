@@ -30,11 +30,21 @@ type Scrubber struct {
 	MaxInflateBytes int64
 }
 
+// resolveInterval picks the tick interval for Start. Only a non-positive
+// interval is overridden. The 30s eligibility grace in ClaimUnscrubbedChunks is
+// a separate and deliberately non-configurable floor: it outlives the
+// replayable presigned POST policy (handler.chunkUploadPolicyTTL), so it must
+// not be bound to, or shortened alongside, the tick rate.
+func resolveInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultInterval
+	}
+	return interval
+}
+
 // Start runs scrub passes until ctx is cancelled.
 func (s *Scrubber) Start(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = defaultInterval
-	}
+	interval = resolveInterval(interval)
 	if s.MaxInflateBytes <= 0 {
 		s.MaxInflateBytes = defaultMaxInflate
 	}

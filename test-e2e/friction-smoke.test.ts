@@ -15,6 +15,7 @@ import {
   getActiveFrictionSignals,
   getConfig,
   insertSessionAnalysisJob,
+  makeChunksScrubbable,
   pollScrubbedChunk,
   pollSessionForProject,
   pollSessionStatus,
@@ -89,6 +90,7 @@ describe.skipIf(hasLLMKey || !keylessWorkerRunning || !playwrightAvailable)(
         await page.click('[data-testid="edit-profile-btn"]');
 
         const sessionId = await pollSessionForProject(tenant.projectId);
+        await makeChunksScrubbable(sessionId);
         await pollScrubbedChunk(sessionId, 120_000);
 
         await insertSessionAnalysisJob(tenant.projectId, sessionId);

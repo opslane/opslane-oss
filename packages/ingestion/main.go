@@ -194,8 +194,18 @@ func main() {
 	// FOR UPDATE SKIP LOCKED to avoid duplicate work.
 	if minioClient != nil {
 		s := &scrubber.Scrubber{Q: queries, MinIO: minioClient}
-		go s.Start(context.Background(), 15*time.Second)
-		slog.Info("chunk scrubber started")
+		// Only the tick rate is tunable. The 30s eligibility grace in
+		// ClaimUnscrubbedChunks stays fixed: it outlives chunkUploadPolicyTTL,
+		// so shortening it would let a replayed upload swap raw bytes under an
+		// already-scrubbed row.
+		scrubInterval := 15 * time.Second
+		if v := os.Getenv("SCRUB_INTERVAL_SECONDS"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+				scrubInterval = time.Duration(parsed) * time.Second
+			}
+		}
+		go s.Start(context.Background(), scrubInterval)
+		slog.Info("chunk scrubber started", "interval", scrubInterval.String())
 
 		sweeper := &retention.Sweeper{Q: queries, MinIO: minioClient}
 		if v := os.Getenv("SESSION_IDLE_CLOSE_MINUTES"); v != "" {

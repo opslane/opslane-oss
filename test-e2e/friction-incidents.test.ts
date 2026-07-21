@@ -24,6 +24,7 @@ import {
   seedEnvironment,
   initSession,
   uploadChunk,
+  makeChunksScrubbable,
   waitForScrubbedChunks,
   cleanupTenant,
   type TestTenant,
@@ -136,6 +137,7 @@ async function driveRageSession(
   const sessionId = `e2e_fr_${RUN_ID}_${crypto.randomUUID().slice(0, 8)}`;
   await initSession(apiKey, sessionId, { id: userId }, PAGE);
   await uploadChunk(apiKey, sessionId, 0, rageChunk(Date.now() - 5_000, opts.selector));
+  await makeChunksScrubbable(sessionId);
   await waitForScrubbedChunks(sessionId, 1);
   await analyzeSessionInProcess(sessionId, projectId);
   return sessionId;
@@ -346,6 +348,7 @@ describeLive('friction incidents — synthetic live-service gate', () => {
       const errorBody = (await errorRes.json()) as { error_group_id: string };
 
       await uploadChunk(tenant.apiKey, sessionId, 0, rageChunk(t0, selector));
+      await makeChunksScrubbable(sessionId);
       await waitForScrubbedChunks(sessionId, 1);
       await analyzeSessionInProcess(sessionId, tenant.projectId);
 
@@ -404,6 +407,7 @@ describeLive('friction incidents — synthetic live-service gate', () => {
         }),
       });
       await uploadChunk(tenant.apiKey, sessionId, 0, rageChunk(t0, selector));
+      await makeChunksScrubbable(sessionId);
       await waitForScrubbedChunks(sessionId, 1);
       await analyzeSessionInProcess(sessionId, tenant.projectId);
 
@@ -424,6 +428,7 @@ describeLive('friction incidents — synthetic live-service gate', () => {
     const sessionId = `e2e_stepper_${RUN_ID}`;
     await initSession(tenant.apiKey, sessionId, { id: 'batch4-stepper-user' }, PAGE);
     await uploadChunk(tenant.apiKey, sessionId, 0, stepperChunk(Date.now() - 5_000));
+    await makeChunksScrubbable(sessionId);
     await waitForScrubbedChunks(sessionId, 1);
     await analyzeSessionInProcess(sessionId, tenant.projectId);
 

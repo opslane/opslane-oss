@@ -392,7 +392,8 @@ export async function pollSessionForProject(
 }
 
 /** Polls until at least one chunk for the session is scrubbed (analyzable).
- * Scrubber cadence: eligible 30s after upload, swept every 15s — expect ~45-60s. */
+ * Scrubber cadence: eligible 30s after upload, swept every SCRUB_INTERVAL_SECONDS
+ * (15s by default, 1s in CI). Call makeChunksScrubbable first to skip the grace. */
 export async function pollScrubbedChunk(
   sessionId: string,
   timeoutMs = 120_000
@@ -626,6 +627,47 @@ export async function uploadChunk(
   });
   if (commit.status !== 200) {
     throw new Error(`chunk commit failed: ${commit.status} ${await commit.text()}`);
+  }
+}
+
+/**
+ * Makes a test's own freshly-committed chunks eligible for the scrubber now.
+ *
+ * Production makes a chunk wait 30s (db/sessions.go ClaimUnscrubbedChunks)
+ * because the presigned POST policy stays replayable for the whole of
+ * handler.chunkUploadPolicyTTL. A replay inside that window could swap raw
+ * bytes under a row the scrubber has already stamped, so the grace outlives the
+ * policy on purpose. A test that owns the client and never replays has no such
+ * exposure, so it fast-forwards its own fixtures rather than waiting out a
+ * window that exists to defend against hostile callers.
+ *
+ * Scoped to one session id, so it can never touch a concurrently running
+ * suite's rows. Shifts uploaded_at relatively, so ordering within a batch (the
+ * claim query's ORDER BY uploaded_at) is preserved.
+ *
+ * Waits for the chunk to be committed first: callers that upload through a real
+ * browser SDK (friction-smoke) have no synchronous commit to await.
+ */
+export async function makeChunksScrubbable(
+  sessionId: string,
+  timeoutMs = 60_000
+): Promise<void> {
+  const db = getPool();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await db.query(
+      `UPDATE session_chunks
+          SET uploaded_at = uploaded_at - interval '1 hour'
+        WHERE session_id = $1
+          AND uploaded_at IS NOT NULL
+          AND uploaded_at > now() - interval '1 minute'`,
+      [sessionId]
+    );
+    if ((res.rowCount ?? 0) > 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(`no committed chunk for ${sessionId} within ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
   }
 }
 
