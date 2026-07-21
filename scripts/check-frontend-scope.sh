@@ -12,14 +12,35 @@ if [[ -n "${FRONTEND_SCOPE_BASE:-}" ]]; then
     echo "scope: FRONTEND_SCOPE_BASE is not a valid commit: ${FRONTEND_SCOPE_BASE}" >&2
     exit 1
   fi
-elif git rev-parse --verify origin/main >/dev/null 2>&1; then
-  base=$(git merge-base origin/main HEAD)
 else
-  # Refusing beats a silent pass: diffing HEAD against HEAD reports an empty
-  # change set, so every committed change would sail through unchecked.
-  echo "scope: origin/main unavailable; cannot determine a trustworthy base." >&2
-  echo "scope: fetch origin or set FRONTEND_SCOPE_BASE to an explicit commit." >&2
-  exit 1
+  # CI checks this repo out shallow, so origin/main and the shared ancestor may
+  # be absent. Fetch enough history to compute a real merge base before giving
+  # up: refusing is correct, but only after trying.
+  # An explicit refspec is required, not `git fetch origin main`. A shallow
+  # `clone --branch X` configures a refspec covering only X, so a bare fetch
+  # populates FETCH_HEAD without ever creating refs/remotes/origin/main.
+  #
+  # Do NOT add a FETCH_HEAD fallback here. In that same clone FETCH_HEAD
+  # resolves to HEAD, making the merge base HEAD itself, the diff empty, and
+  # this check pass while inspecting nothing.
+  refspec='+refs/heads/main:refs/remotes/origin/main'
+  if ! git rev-parse --verify --quiet origin/main >/dev/null; then
+    git fetch --no-tags --quiet origin "$refspec" >/dev/null 2>&1 || true
+  fi
+  if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    git fetch --no-tags --quiet --unshallow origin "$refspec" >/dev/null 2>&1 \
+      || git fetch --no-tags --quiet --deepen=500 origin "$refspec" >/dev/null 2>&1 || true
+  fi
+
+  if base=$(git merge-base origin/main HEAD 2>/dev/null) && [[ -n "$base" ]]; then
+    :
+  else
+    # Refusing beats a silent pass: diffing HEAD against HEAD reports an empty
+    # change set, so every committed change would sail through unchecked.
+    echo "scope: cannot determine a trustworthy base (no origin/main, and fetch failed)." >&2
+    echo "scope: fetch origin or set FRONTEND_SCOPE_BASE to an explicit commit." >&2
+    exit 1
+  fi
 fi
 
 changed_file=$(mktemp "${TMPDIR:-/tmp}/opslane-frontend-scope.XXXXXX")

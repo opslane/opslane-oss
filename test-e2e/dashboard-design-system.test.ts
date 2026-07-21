@@ -60,7 +60,12 @@ describe('dashboard V1 safeguards', () => {
   });
 
   it('keeps dashboard package changes limited to the Tailwind 4 toolchain', () => {
-    const before = JSON.parse(execFileSync('git', ['show', `${BASE_COMMIT}:packages/dashboard/package.json`], { cwd: ROOT, encoding: 'utf8' })) as Record<string, unknown>;
+    // Read the pinned manifest from a committed copy rather than `git show
+    // <base>:...`. CI checks this repo out shallow, so the base commit's tree
+    // is not present and the git form fails with "exists on disk, but not in
+    // <sha>". Same trust model as api-baseline.d.ts: the baseline is a
+    // reviewed artifact in the tree, not a history lookup.
+    const before = JSON.parse(read('docs/design/dashboard-v1/package-baseline.json')) as Record<string, unknown>;
     const after = JSON.parse(read('packages/dashboard/package.json')) as Record<string, unknown>;
     const beforeDev = before.devDependencies as Record<string, string>;
     const afterDev = after.devDependencies as Record<string, string>;
