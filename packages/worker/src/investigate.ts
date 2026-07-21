@@ -5,9 +5,13 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import { resolve, relative, normalize } from 'node:path';
 import { promisify } from 'node:util';
 import { extractStackTraceFiles } from './harness/stack-trace-utils.js';
+import type { Platform } from './platform.js';
+import type { RuntimeInfo } from './runtime-info.js';
 import { logger } from './logger.js';
 import { traceSpan } from './tracing.js';
 import type { TriageResult } from './agent-fix.js';
+import { grepExclusionArgs, isExcludedTraversalDirectory } from './harness/traversal-exclusions.js';
+import { isReasonCode, triageReasonCodes } from './reason-codes.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,6 +41,10 @@ export function safePath(repoPath: string, requested: string): string | null {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '... [truncated]' : s;
+}
+
+function runtimeLabel(value: string): string {
+  return value.replace(/[^A-Za-z0-9._+\- ]/g, '').trim().slice(0, 64) || 'unknown';
 }
 
 function addLineNumbers(content: string): string {
@@ -89,8 +97,7 @@ export async function executeSearch(
 
   const args = [
     '-r', '-n', ...includeArgs,
-    '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist',
-    '--exclude-dir=build', '--exclude-dir=coverage', '--exclude-dir=.cache',
+    ...grepExclusionArgs(),
     '-m', '5', // max 5 matches per file
   ];
 
@@ -135,7 +142,7 @@ export async function executeListFiles(
     const results: string[] = [];
 
     for (const entry of entries) {
-      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist') continue;
+      if (isExcludedTraversalDirectory(entry.name)) continue;
       if (results.length >= MAX_LIST_ENTRIES) {
         results.push(`... [truncated at ${MAX_LIST_ENTRIES} entries]`);
         break;
@@ -147,7 +154,7 @@ export async function executeListFiles(
         try {
           const subEntries = await readdir(resolve(resolved, entry.name), { withFileTypes: true });
           for (const sub of subEntries) {
-            if (sub.name === 'node_modules' || sub.name === '.git' || sub.name === 'dist') continue;
+            if (isExcludedTraversalDirectory(sub.name)) continue;
             if (results.length >= MAX_LIST_ENTRIES) break;
             const subSuffix = sub.isDirectory() ? '/' : '';
             results.push(`${dirPath === '.' ? '' : dirPath + '/'}${entry.name}/${sub.name}${subSuffix}`);
@@ -166,7 +173,8 @@ export async function executeListFiles(
   }
 }
 
-const CLASSIFY_TOOL: Anthropic.Tool = {
+function classifyTool(platform: Platform): Anthropic.Tool {
+  return {
   name: 'classify_error',
   description: 'Submit your investigation classification. Call this when you have enough evidence.',
   input_schema: {
@@ -187,13 +195,7 @@ const CLASSIFY_TOOL: Anthropic.Tool = {
       },
       reason_code: {
         type: 'string',
-        enum: [
-          'unfixable_no_app_frames',
-          'unfixable_test_error',
-          'unfixable_third_party',
-          'unfixable_infra',
-          'unfixable_no_sourcemap',
-        ],
+        enum: [...triageReasonCodes(platform)],
         description: 'Machine-readable reason code when fixable is false',
       },
       remediation: {
@@ -203,9 +205,11 @@ const CLASSIFY_TOOL: Anthropic.Tool = {
     },
     required: ['fixable', 'confidence', 'reason'],
   },
-};
+  };
+}
 
-const TOOLS: Anthropic.Tool[] = [
+function toolsFor(platform: Platform): Anthropic.Tool[] {
+  return [
   {
     name: 'read_file',
     description: 'Read a source file from the repository. Returns content with line numbers.',
@@ -255,16 +259,9 @@ const TOOLS: Anthropic.Tool[] = [
       },
     },
   },
-  CLASSIFY_TOOL,
-];
-
-const TRIAGE_REASON_CODES = [
-  'unfixable_no_app_frames',
-  'unfixable_test_error',
-  'unfixable_third_party',
-  'unfixable_infra',
-  'unfixable_no_sourcemap',
-] as const;
+    classifyTool(platform),
+  ];
+}
 
 function buildInvestigationPrompt(
   input: {
@@ -274,13 +271,17 @@ function buildInvestigationPrompt(
     stackTrace: string;
     resolvedStackTrace: unknown;
     breadcrumbs: string;
+    platform?: Platform;
+    customerRuntime?: RuntimeInfo | null;
   },
 ): string {
+  const platform = input.platform ?? 'javascript';
+  const python = platform === 'python';
   const resolvedSection = input.resolvedStackTrace
     ? `\n\nResolved Stack Trace (source-mapped):\n<untrusted_data>\n${truncate(JSON.stringify(input.resolvedStackTrace), MAX_STACK_TRACE)}\n</untrusted_data>`
     : '';
 
-  return `You are investigating a production error to determine if it can be fixed with code changes.
+  return `You are investigating a production ${python ? 'Python error from a CPython traceback' : 'JavaScript/browser error'} to determine if it can be fixed with code changes.
 
 You have read-only access to the repository via tools. Use them to investigate before classifying.
 
@@ -292,7 +293,7 @@ You have read-only access to the repository via tools. Use them to investigate b
 
 ## Classification Rules
 Set fixable to FALSE (with evidence) if:
-- You searched the codebase and the error pattern exists ONLY in third-party code (node_modules-like paths)
+- You searched the codebase and the error pattern exists ONLY in third-party code (${python ? 'site-packages or virtualenv paths' : 'node_modules-like paths'})
 - The error message is a deliberate test throw (e.g. "test error", "testing 123", "Opslane test")
 - The error is purely infrastructure/network (CORS, DNS, timeout, 502, 503) with no application code involvement
 - The stack trace files don't exist in the repository AND no related code can be found
@@ -304,7 +305,14 @@ Set fixable to TRUE if:
 
 When in doubt, classify as fixable with medium/low confidence — we'd rather investigate than miss a real bug.
 
-IMPORTANT: If a "Resolved Stack Trace" section is present, use it — it contains source-mapped paths.
+${python
+    ? 'IMPORTANT: Follow the traceback newest-first and use exact repository paths. Python runs do not use browser source maps.'
+    : 'IMPORTANT: If a "Resolved Stack Trace" section is present, use it — it contains source-mapped paths.'}
+
+Customer runtime (untrusted metadata):
+<untrusted_data>
+${input.customerRuntime ? `${runtimeLabel(input.customerRuntime.name)} ${runtimeLabel(input.customerRuntime.version)}` : 'unknown'}
+</untrusted_data>
 
 ## Error Details
 Type: ${input.errorType}
@@ -356,6 +364,8 @@ function markLastUserMessageForCaching(messages: Anthropic.MessageParam[]): void
 }
 
 export interface InvestigateInput {
+  platform?: Platform;
+  customerRuntime?: RuntimeInfo | null;
   errorType: string;
   title: string;
   errorMessage: string;
@@ -389,6 +399,9 @@ export async function investigateError(
   let lastModelText = '';
 
   const systemPrompt = buildInvestigationPrompt(input);
+  const platform = input.platform ?? 'javascript';
+  const tools = toolsFor(platform);
+  const allowedReasonCodes = triageReasonCodes(platform);
   const systemMessages: Anthropic.TextBlockParam[] = [{
     type: 'text',
     text: systemPrompt,
@@ -396,7 +409,7 @@ export async function investigateError(
   }];
 
   // Seed with file hints from stack trace to guide first tool call
-  const stackFiles = extractStackTraceFiles(input.stackTrace);
+  const stackFiles = extractStackTraceFiles(input.stackTrace, input.platform);
   const fileHints = stackFiles.length > 0
     ? `\n\nFiles from the stack trace to start with: ${stackFiles.slice(0, 5).join(', ')}`
     : '';
@@ -427,7 +440,7 @@ export async function investigateError(
         max_tokens: 4096,
         system: systemMessages,
         messages,
-        tools: TOOLS,
+        tools,
         ...(turn === MAX_TURNS - 1 ? { tool_choice: { type: 'tool' as const, name: 'classify_error' } } : {}),
       });
     } catch (err: unknown) {
@@ -490,8 +503,8 @@ export async function investigateError(
             ? rawConfidence as TriageResult['confidence']
             : 'low',
           reason: typeof raw['reason'] === 'string' ? raw['reason'] : undefined,
-          reason_code: typeof rawReasonCode === 'string' && (TRIAGE_REASON_CODES as readonly string[]).includes(rawReasonCode)
-            ? rawReasonCode as TriageResult['reason_code']
+          reason_code: isReasonCode(rawReasonCode) && allowedReasonCodes.includes(rawReasonCode)
+            ? rawReasonCode
             : undefined,
           remediation: typeof raw['remediation'] === 'string' ? raw['remediation'] : undefined,
           filesRead,

@@ -1,6 +1,7 @@
 import pg from 'pg';
 import type { ErrorGroupStatus, NeedsHumanReason, ConfidenceLevel, JobType, SetupPrStatus, EvidenceRecord, PRPosture } from '@opslane/shared';
 import { reconcileDeadLetteredSessionAnalysis } from './friction/dead-letter.js';
+import type { Platform } from './platform.js';
 
 const { Pool } = pg;
 
@@ -37,6 +38,8 @@ export interface ClaimedJob {
   leaseGeneration: string;
   triggeredBy: 'auto' | 'human' | null;
   sessionId: string | null;
+  /** Effective routing platform persisted on durable fix jobs. */
+  platform?: Platform | null;
   payload?: unknown;
 }
 
@@ -130,6 +133,7 @@ export async function claimJob(
     lease_generation: string;
     triggered_by: 'auto' | 'human' | null;
     session_id: string | null;
+    platform: string | null;
     payload: unknown;
   }>;
   try {
@@ -170,7 +174,7 @@ export async function claimJob(
      )
      RETURNING id, error_group_id, source_id, project_id, job_type, attempts, max_attempts, guidance,
                worker_id, lease_generation::text AS lease_generation,
-               triggered_by, session_id, payload`,
+               triggered_by, session_id, platform, payload`,
       [workerId, leaseDurationMs / 1000, sessionAnalysisCap]
     );
     await client.query('COMMIT');
@@ -197,6 +201,9 @@ export async function claimJob(
     leaseGeneration: row.lease_generation,
     triggeredBy: row.triggered_by,
     sessionId: row.session_id,
+    platform: row.platform === 'python'
+      ? 'python'
+      : row.platform === 'javascript' ? 'javascript' : null,
     payload: row.payload,
   };
 }
@@ -919,6 +926,7 @@ export interface ErrorGroupData {
   element_selector: string | null;
   page_url_normalized: string | null;
   confidence: ConfidenceLevel | null;
+  platform?: string | null;
   pr_url?: string | null;
   pr_number?: number | null;
   reason_code?: string | null;
@@ -931,7 +939,7 @@ export async function getErrorGroup(groupId: string, projectId: string): Promise
   const pool = getPool();
   const { rows } = await pool.query<ErrorGroupData>(
     `SELECT id, title, fingerprint, sample_event_id, occurrence_count, status,
-            kind, signal_type, element_selector, page_url_normalized, confidence,
+            kind, signal_type, element_selector, page_url_normalized, confidence, platform,
             pr_url, pr_number, reason_code, reason_message, remediation,
             verification_evidence
      FROM error_groups WHERE id = $1 AND project_id = $2`,
@@ -1037,13 +1045,14 @@ export interface ErrorEventData {
   context: string;
   release: string | null;
   session_id: string | null;
+  platform?: string | null;
 }
 
 export async function getErrorEvent(eventId: string, projectId: string): Promise<ErrorEventData | null> {
   const pool = getPool();
   const { rows } = await pool.query<ErrorEventData>(
     `SELECT id, error_type, error_message, stack_trace_raw, stack_trace_resolved,
-            breadcrumbs::text AS breadcrumbs, context::text AS context, release, session_id
+            breadcrumbs::text AS breadcrumbs, context::text AS context, release, session_id, platform
      FROM error_events WHERE id = $1 AND project_id = $2`,
     [eventId, projectId],
   );
@@ -1377,6 +1386,7 @@ export async function updateGroupAndCreateFixJob(
     rootCause?: string;
     suggestedMitigation?: string;
     confidence?: ConfidenceLevel;
+    platform?: Platform;
   },
   lease: JobLease,
   opts?: { allowFriction?: boolean },
@@ -1440,6 +1450,12 @@ export async function updateGroupAndCreateFixJob(
       && ['analyzing', 'fixing'].includes(group.rows[0]!.status)
     ) {
       await client.query(
+        `UPDATE error_group_jobs
+         SET platform = COALESCE(platform, $2), updated_at = now()
+         WHERE id = $1`,
+        [existingFix.rows[0].id, fields.platform ?? 'javascript'],
+      );
+      await client.query(
         `UPDATE error_groups
          SET status = 'fixing', updated_at = now()
          WHERE id = $1 AND project_id = $2`,
@@ -1471,10 +1487,10 @@ export async function updateGroupAndCreateFixJob(
       );
     }
     const result = await client.query<{ id: string }>(
-      `INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by)
-       VALUES ($1, $2, 'fix', 'auto')
+      `INSERT INTO error_group_jobs (error_group_id, project_id, job_type, triggered_by, platform)
+       VALUES ($1, $2, 'fix', 'auto', $3)
        RETURNING id`,
-      [errorGroupId, projectId]
+      [errorGroupId, projectId, fields.platform ?? 'javascript']
     );
     await client.query('COMMIT');
     return { created: true, fixJobId: result.rows[0]!.id };

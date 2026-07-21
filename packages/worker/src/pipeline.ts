@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { NeedsHumanReason, ConfidenceLevel, EvidenceRecord } from '@opslane/shared';
 import type { VisualAnalysisOutput } from './harness/types.js';
+import type { Platform } from './platform.js';
+import type { RuntimeInfo } from './runtime-info.js';
 import type { ReplayInput } from './pr.js';
 import { runAgentFix } from './agent-fix.js';
 import { createPR, createGitHubClient } from './pr.js';
@@ -17,6 +19,8 @@ import {
 } from './narrative.js';
 
 export interface PipelineInput {
+  platform?: Platform;
+  customerRuntime?: RuntimeInfo | null;
   jobId: string;
   errorGroupId: string;
   projectId: string;
@@ -117,11 +121,14 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     abortSignal: input.abortSignal,
     frictionEvidence: input.frictionEvidence,
     kind: input.kind,
+    platform: input.platform,
+    customerRuntime: input.customerRuntime,
   });
 
   const publishDraft = fixResult.status === 'needs_human'
     && fixResult.draftEligible === true
-    && input.prPosture === 'draft_when_unverified';
+    && input.prPosture === 'draft_when_unverified'
+    && input.platform !== 'python';
 
   if (fixResult.status === 'needs_human' && !publishDraft) {
     return {
@@ -319,6 +326,8 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
       kind: input.kind,
       evidence: fixResult.evidence ?? null,
       draft: deliveryPosture === 'draft',
+      customerRuntime: input.customerRuntime,
+      sandboxRuntime: fixResult.sandboxRuntime,
     }, () => githubClient),
   );
 

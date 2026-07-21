@@ -1,3 +1,6 @@
+import type { Platform } from '../platform.js';
+import { parsePythonFrames } from './python-frames.js';
+
 const DEV_PATH_TAIL_START =
   '(?:(?:packages|apps|src|app|pages|components|lib|server|client|shared|cli|eval|test-fixtures|test-e2e|tests|__tests__|dist|build|assets)/|[A-Za-z0-9_.-]+\\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte|py|go|rs))';
 
@@ -32,7 +35,13 @@ export function scrubDevPaths(text: string): string {
  * Handles V8/Node, Firefox/Safari, and Vite dev server formats.
  * Returns deduplicated relative paths, excluding node_modules.
  */
-export function extractStackTraceFiles(stackTrace: string): string[] {
+export function extractStackTraceFiles(
+  stackTrace: string,
+  platform: Platform = 'javascript',
+): string[] {
+  if (platform === 'python') {
+    return parsePythonFrames(stackTrace).map((frame) => frame.path);
+  }
   const paths = new Set<string>();
   // Per-line patterns to avoid cross-line false positives
   const patterns: RegExp[] = [
@@ -85,6 +94,9 @@ export function extractStackTraceFiles(stackTrace: string): string[] {
  * Minified app-bundle frames (e.g. assets/index-abc123.js) DO count as app
  * frames — they may be source-mappable, so let the normal flow try and give up.
  */
-export function hasNoAppFrames(stackTrace: string): boolean {
-  return extractStackTraceFiles(stackTrace).length === 0;
+export function hasNoAppFrames(
+  stackTrace: string,
+  platform: Platform = 'javascript',
+): boolean {
+  return extractStackTraceFiles(stackTrace, platform).length === 0;
 }

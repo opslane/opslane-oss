@@ -58,6 +58,13 @@ checkPermissions@http://localhost:5175/src/App.vue:16:16`;
 });
 
 describe('hasNoAppFrames', () => {
+  const pythonTraceback = 'Traceback (most recent call last):\n  File "/app/main.py", line 3, in run\n    boom()\nValueError: boom';
+
+  it('uses Python traceback parsing only when explicitly routed', () => {
+    expect(hasNoAppFrames(pythonTraceback, 'javascript')).toBe(true);
+    expect(hasNoAppFrames(pythonTraceback, 'python')).toBe(false);
+    expect(hasNoAppFrames(pythonTraceback)).toBe(true);
+  });
   it('is true for an empty stack (cross-origin "Script error." / non-Error rejection)', () => {
     expect(hasNoAppFrames('')).toBe(true);
   });

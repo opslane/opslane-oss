@@ -1,5 +1,13 @@
 import type { ToolDefinition, AgentState } from './types.js';
 import type { SandboxRuntime } from './sandbox-runtime.js';
+import { TRAVERSAL_EXCLUSIONS } from './traversal-exclusions.js';
+import type { Platform } from '../platform.js';
+import { buildReason, isReasonCodeForPlatform, triageReasonCodes } from '../reason-codes.js';
+
+/** Model output is typed `unknown`; keep only a usable non-blank string. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
 
 /** Max characters per tool output to prevent context overflow. */
 const MAX_OUTPUT_CHARS = 12_000;
@@ -17,7 +25,11 @@ function cap(output: string, limit = MAX_OUTPUT_CHARS): string {
   return output.slice(0, half) + `\n\n... [${omitted} chars omitted] ...\n\n` + output.slice(-half);
 }
 
-export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): ToolDefinition[] {
+export function createToolBridge(
+  sandbox: SandboxRuntime,
+  state: AgentState,
+  platform: Platform = 'javascript',
+): ToolDefinition[] {
   return [
     {
       name: 'read',
@@ -74,7 +86,7 @@ export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): To
     },
     {
       name: 'bash',
-      description: 'Run a shell command in the sandbox. Use for git, npm, test runners, etc.',
+      description: `Run a shell command in the sandbox. Use for git, ${platform === 'python' ? 'python, pip, pytest' : 'npm and test runners'}, etc.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -131,7 +143,10 @@ export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): To
         const pattern = input.pattern as string;
         const path = (input.path as string) || '.';
         const include = input.include ? `--include=${shellEscape(input.include as string)}` : '';
-        const cmd = `grep -rn ${include} ${shellEscape(pattern)} ${shellEscape(path)} 2>/dev/null | head -100`;
+        const exclusions = TRAVERSAL_EXCLUSIONS
+          .map((entry) => `--exclude-dir=${shellEscape(entry)}`)
+          .join(' ');
+        const cmd = `grep -rn ${exclusions} ${include} ${shellEscape(pattern)} ${shellEscape(path)} 2>/dev/null | head -100`;
         const result = await sandbox.commands.run(cmd, { timeoutMs: 30_000 });
         return cap(result.stdout || 'No matches found.');
       },
@@ -155,11 +170,17 @@ export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): To
     },
     {
       name: 'give_up',
-      description: 'Call this when the error cannot be fixed by code changes. Examples: infrastructure issues (CDN down, DNS failure, timeouts), errors originating from third-party code in node_modules, minified/obfuscated stack traces with no sourcemap available, errors caused by external service outages, errors thrown from the browser console or devtools (stack trace only shows <anonymous>), errors not traceable to any application source code after investigation, test/synthetic errors deliberately thrown for monitoring validation.',
+      description: platform === 'python'
+        ? 'Call this when the error cannot be fixed in application code, including third-party site-packages failures, infrastructure failures, incomplete tracebacks, or deliberate synthetic errors.'
+        : 'Call this when the error cannot be fixed by code changes. Examples: infrastructure issues, third-party node_modules errors, or minified traces without source maps.',
       inputSchema: {
         type: 'object',
         properties: {
-          reason_code: { type: 'string', description: 'Machine-readable reason code (e.g., worker_runtime_error, sourcemap_unresolved)' },
+          reason_code: {
+            type: 'string',
+            enum: [...triageReasonCodes(platform)],
+            description: 'Machine-readable reason code',
+          },
           reason_message: { type: 'string', description: 'Human-readable explanation of why this cannot be fixed' },
           remediation: { type: 'string', description: 'What a human should do to resolve this' },
         },
@@ -167,11 +188,18 @@ export function createToolBridge(sandbox: SandboxRuntime, state: AgentState): To
       },
       execute: async (input) => {
         state.gaveUp = true;
-        state.giveUpReason = {
-          reason_code: input.reason_code as string,
-          reason_message: input.reason_message as string,
-          remediation: input.remediation as string,
-        };
+        // Model output is untrusted. Every terminal needs_human must carry a
+        // non-empty reason_code, reason_message, and remediation, so fall back
+        // to the registry rather than writing through whatever the model sent.
+        const code = isReasonCodeForPlatform(input.reason_code, platform)
+          ? input.reason_code
+          : 'triage_unfixable';
+        state.giveUpReason = buildReason(
+          code,
+          nonEmptyString(input.reason_message),
+          nonEmptyString(input.remediation),
+          platform,
+        );
         return 'Acknowledged. Ending agent loop.';
       },
     },

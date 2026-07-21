@@ -16,6 +16,7 @@ import {
   renderPRSections,
   type FixNarrative,
 } from './narrative.js';
+import { formatRuntime, type RuntimeInfo } from './runtime-info.js';
 /** Extract file paths from +++ headers in a unified diff. */
 function extractFiles(diff: string): string[] {
   const files: string[] = [];
@@ -65,6 +66,8 @@ export interface ReplayInput {
 }
 
 export interface PRInput {
+  customerRuntime?: RuntimeInfo | null;
+  sandboxRuntime?: RuntimeInfo | null;
   projectId: string;
   errorGroupId: string;
   githubRepo: string; // "owner/repo"
@@ -303,6 +306,10 @@ function buildTechnicalDetails(input: PRInput): string {
     '',
     '#### Signals',
     buildReplaySignalSummary(input.replay?.signals),
+    '',
+    '#### Runtime',
+    `Customer: ${formatRuntime(input.customerRuntime)}`,
+    `Sandbox: ${formatRuntime(input.sandboxRuntime)}`,
     '',
     '</details>',
   ].join('\n');

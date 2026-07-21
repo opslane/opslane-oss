@@ -58,6 +58,42 @@ export const DEFAULT_REMEDIATION: Record<ReasonCode, string> = {
     'Upload source maps for this release so the minified stack trace resolves to original source, then retry.',
 };
 
+export function isReasonCode(value: unknown): value is ReasonCode {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(DEFAULT_REMEDIATION, value);
+}
+
+/** Reason codes whose remediation only makes sense for a browser bundle. */
+const JAVASCRIPT_ONLY_REASON_CODES: readonly ReasonCode[] = [
+  'sourcemap_unresolved',
+  'unfixable_no_sourcemap',
+];
+
+/**
+ * Reject a reason code the platform can never act on. Without this a Python
+ * incident can terminate telling the customer to upload source maps.
+ */
+export function isReasonCodeForPlatform(
+  value: unknown,
+  platform: 'javascript' | 'python',
+): value is ReasonCode {
+  if (!isReasonCode(value)) return false;
+  return platform !== 'python' || !JAVASCRIPT_ONLY_REASON_CODES.includes(value);
+}
+
+/** Codes the triage tool may return. Single source of truth for both agents. */
+export const COMMON_TRIAGE_REASON_CODES = [
+  'unfixable_no_app_frames',
+  'unfixable_test_error',
+  'unfixable_third_party',
+  'unfixable_infra',
+] as const satisfies readonly ReasonCode[];
+
+export function triageReasonCodes(platform: 'javascript' | 'python'): readonly ReasonCode[] {
+  return platform === 'python'
+    ? COMMON_TRIAGE_REASON_CODES
+    : [...COMMON_TRIAGE_REASON_CODES, 'unfixable_no_sourcemap'];
+}
+
 /**
  * Build a NeedsHumanReason, defaulting the message and/or remediation from the
  * registry so every needs_human writeup is consistent and actionable.
@@ -66,10 +102,14 @@ export function buildReason(
   code: ReasonCode,
   message?: string,
   remediation?: string,
+  platform: 'javascript' | 'python' = 'javascript',
 ): NeedsHumanReason {
+  const defaultRemediation = code === 'unfixable_no_app_frames' && platform === 'python'
+    ? 'Capture a complete Python traceback with application frames and confirm deployed file paths correspond to tracked repository files.'
+    : DEFAULT_REMEDIATION[code];
   return {
     reason_code: code,
-    reason_message: message ?? DEFAULT_REMEDIATION[code],
-    remediation: remediation ?? DEFAULT_REMEDIATION[code],
+    reason_message: message ?? defaultRemediation,
+    remediation: remediation ?? defaultRemediation,
   };
 }
