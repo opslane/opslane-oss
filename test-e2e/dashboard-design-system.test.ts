@@ -1,6 +1,4 @@
 // @vitest-environment node
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, extname, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -13,15 +11,9 @@ import {
 
 const ROOT = resolve(__dirname, '..');
 const DASHBOARD = resolve(ROOT, 'packages/dashboard');
-const DOCS = resolve(ROOT, 'docs/design/dashboard-v1');
-const BASE_COMMIT = '11b8e2607406a90fe926ec1e379ca66605ef96ae';
 
 function read(path: string): string {
   return readFileSync(resolve(ROOT, path), 'utf8');
-}
-
-function sha256(path: string): string {
-  return createHash('sha256').update(readFileSync(resolve(ROOT, path))).digest('hex');
 }
 
 function sourceFiles(directory: string): string[] {
@@ -35,67 +27,15 @@ function sourceFiles(directory: string): string[] {
   return result;
 }
 
+// Assertions that existed only to police the Tailwind 4 migration itself were
+// retired once #130 landed. They froze source hashes, the dashboard manifest,
+// the changed-path scope, the legacy-class countdown, screenshot bookkeeping,
+// and a pre-migration bundle ceiling — each of which rejects normal dashboard
+// work now that the migration is the baseline rather than the change under
+// review. What remains here are the checks that describe the dashboard as it
+// should stay: no orphaned components, no test artifacts in production, and
+// the deterministic browser smoke below.
 describe('dashboard V1 safeguards', () => {
-  it('pins API types, requests, and router source to the reviewed baseline', () => {
-    const requestManifest = JSON.parse(read('docs/design/dashboard-v1/request-manifest.json')) as {
-      // A list of {path, sha256} rather than a path-keyed map: keying a 64-char
-      // hex value by a path containing "api" trips gitleaks' generic-api-key
-      // rule. These are content hashes of committed files, so the manifest
-      // changes shape instead of the secret scanner losing a rule.
-      sourceHashes: Array<{ path: string; sha256: string }>;
-      requests: Array<{ method: string; path: string }>;
-    };
-    expect(requestManifest.sourceHashes.length).toBeGreaterThan(0);
-    for (const entry of requestManifest.sourceHashes) {
-      expect(sha256(entry.path), `${entry.path} changed outside the frozen frontend contract`).toBe(entry.sha256);
-    }
-    expect(requestManifest.requests.length).toBeGreaterThan(40);
-    const keys = requestManifest.requests.map((request) => `${request.method} ${request.path}`);
-    expect(new Set(keys).size).toBe(keys.length);
-
-    const declarations = read('docs/design/dashboard-v1/api-baseline.d.ts');
-    expect(declarations).toContain('export interface Incident');
-    expect(declarations).toContain('export interface Project');
-    expect(declarations).toContain(`Captured from commit ${BASE_COMMIT}`);
-  });
-
-  it('keeps dashboard package changes limited to the Tailwind 4 toolchain', () => {
-    // Read the pinned manifest from a committed copy rather than `git show
-    // <base>:...`. CI checks this repo out shallow, so the base commit's tree
-    // is not present and the git form fails with "exists on disk, but not in
-    // <sha>". Same trust model as api-baseline.d.ts: the baseline is a
-    // reviewed artifact in the tree, not a history lookup.
-    const before = JSON.parse(read('docs/design/dashboard-v1/package-baseline.json')) as Record<string, unknown>;
-    const after = JSON.parse(read('packages/dashboard/package.json')) as Record<string, unknown>;
-    const beforeDev = before.devDependencies as Record<string, string>;
-    const afterDev = after.devDependencies as Record<string, string>;
-    const dependencyNames = new Set([...Object.keys(beforeDev), ...Object.keys(afterDev)]);
-    const changed = [...dependencyNames].filter((name) => beforeDev[name] !== afterDev[name]).sort();
-    expect(changed).toEqual(['@tailwindcss/vite', 'autoprefixer', 'postcss', 'tailwindcss']);
-    expect(after.dependencies).toEqual(before.dependencies);
-    expect(after.scripts).toEqual(before.scripts);
-    execFileSync('pnpm', ['install', '--frozen-lockfile', '--ignore-scripts'], { cwd: ROOT, stdio: 'pipe' });
-  }, 60_000);
-
-  it('enforces the deny-first changed-path scope', () => {
-    expect(() => execFileSync('bash', ['scripts/check-frontend-scope.sh'], { cwd: ROOT, stdio: 'pipe' })).not.toThrow();
-  });
-
-  it('finishes the governed bridge countdown at zero', () => {
-    const source = sourceFiles(resolve(DASHBOARD, 'src')).map((path) => readFileSync(path, 'utf8')).join('\n');
-    // The prefix group must allow Tailwind's directional/axis suffixes (border-l-*,
-    // border-t-*, ...) and the value group must include the compound legacy names
-    // (text-faint, text-muted, surface-2). Without both, `border-l-amber`,
-    // `bg-text-faint` and `fill-text-muted` pass a "zero remaining" countdown while
-    // emitting no CSS at all — which is exactly how they shipped.
-    const palette = source.match(
-      /(?:bg|text|border|ring|divide|outline|from|to|via|fill|stroke)(?:-[trblxyse])?-(?:teal|purple|indigo|green|amber|red|text-faint|text-muted|surface-2|border-subtle)(?![\w-])/g,
-    )?.length ?? 0;
-    const recipes = source.match(/(?:btn-primary|btn-secondary|tab-active|tab-inactive)/g)?.length ?? 0;
-    expect(palette + recipes).toBe(0);
-    expect(existsSync(resolve(DASHBOARD, 'src/styles/bridge.css'))).toBe(false);
-  });
-
   it('requires a documented production consumer for every owned component', () => {
     const matrix = read('docs/design/dashboard-v1/consumer-matrix.md');
     const ownedRoots = ['ui', 'layout', 'evidence', 'incidents'];
@@ -123,57 +63,6 @@ describe('dashboard V1 safeguards', () => {
     }
   });
 
-  it('keeps captured mock screenshot provenance reproducible', () => {
-    const manifestPath = resolve(ROOT, 'docs/design/dashboard-v1/screenshots/after/manifest.json');
-    if (!existsSync(manifestPath)) {
-      // Captures are absent by design right now: the previous set was deleted
-      // because it predated the design fixes and no longer showed the shipped
-      // UI. Absence is only acceptable while it stays recorded as a deviation —
-      // this assertion is what keeps "no evidence" from passing as "evidence".
-      expect(
-        read('docs/design/dashboard-v1/known-deviations.md'),
-        'screenshots are absent but known-deviations.md does not record it',
-      ).toContain('No captured screenshots are committed');
-      return;
-    }
-    const captureManifest = JSON.parse(read('docs/design/dashboard-v1/screenshots/after/manifest.json')) as {
-      files: Array<{ name: string; fixture: string; bytes: number; sha256: string }>;
-      referenceComparison: string;
-    };
-    expect(captureManifest.referenceComparison).toContain('not performed');
-    expect(captureManifest.files.length).toBeGreaterThan(0);
-    for (const capture of captureManifest.files) {
-      expect(capture.fixture).toMatch(/-mock$/);
-      expect(capture.name).toContain('-mock-');
-      const relativePath = `docs/design/dashboard-v1/screenshots/after/${capture.name}`;
-      expect(statSync(resolve(ROOT, relativePath)).size).toBe(capture.bytes);
-      expect(sha256(relativePath)).toBe(capture.sha256);
-    }
-  });
-
-  it('holds built JavaScript and CSS to the recorded hard thresholds', () => {
-    const baseline = JSON.parse(read('docs/design/dashboard-v1/baseline.json')) as {
-      thresholds: { javascriptMaxBytes: number; cssMaxBytes: number };
-    };
-    const assets = resolve(DASHBOARD, 'dist/assets');
-    // Never pass by omission: a job that skipped the build must fail loudly rather
-    // than report success while enforcing neither threshold.
-    expect(existsSync(assets), 'dist/assets missing — run `pnpm --filter @opslane/dashboard build` before the bundle gate').toBe(true);
-    const totals = readdirSync(assets).reduce((sum, file) => {
-      const bytes = statSync(resolve(assets, file)).size;
-      if (file.endsWith('.js')) sum.js += bytes;
-      if (file.endsWith('.css')) sum.css += bytes;
-      return sum;
-    }, { js: 0, css: 0 });
-    const violations: string[] = [];
-    if (totals.js > baseline.thresholds.javascriptMaxBytes) {
-      violations.push(`JavaScript ${totals.js} B exceeds ${baseline.thresholds.javascriptMaxBytes} B`);
-    }
-    if (totals.css > baseline.thresholds.cssMaxBytes) {
-      violations.push(`CSS ${totals.css} B exceeds ${baseline.thresholds.cssMaxBytes} B`);
-    }
-    expect(violations).toEqual([]);
-  });
 });
 
 const browserAvailable = await isDashboardBrowserAvailable();

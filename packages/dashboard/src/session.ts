@@ -14,8 +14,9 @@ import { clearAuth } from './api';
  * and this module does too — importing it here would close a cycle.
  * session-teardown.test.ts asserts the literal matches the exported constant.
  *
- * This lives outside api.ts deliberately: api.ts is a denied path under
- * scripts/check-frontend-scope.sh, and this branch is frontend-only.
+ * This lives outside api.ts because api.ts was frozen during the design-system
+ * migration. That freeze has since been retired; the split is kept because the
+ * cycle note above still applies.
  */
 const TENANT_LOCAL_KEYS = [
   'opslane_project_id',
