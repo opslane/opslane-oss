@@ -231,30 +231,33 @@ func (q *Queries) ProvisionAgentSession(ctx context.Context, in AgentProvisionIn
 	if err != nil {
 		return nil, err
 	}
-	env, err := q.CreateEnvironmentTx(ctx, tx, project.ID, "production")
+	if _, err := q.CreateEnvironmentTx(ctx, tx, project.ID, "production"); err != nil {
+		return nil, err
+	}
+	development, err := q.CreateEnvironmentTx(ctx, tx, project.ID, "development")
 	if err != nil {
 		return nil, err
 	}
-	key, err := q.CreateAPIKeyTx(ctx, tx, env.ID)
+	developmentKey, err := q.CreateAPIKeyTx(ctx, tx, development.ID)
 	if err != nil {
 		return nil, err
 	}
 	if in.SealKey == nil {
 		return nil, fmt.Errorf("seal api key: no seal function")
 	}
-	sealed, err := in.SealKey(key.RawKey)
+	sealed, err := in.SealKey(developmentKey.RawKey)
 	if err != nil {
 		return nil, fmt.Errorf("seal api key: %w", err)
 	}
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE agent_sessions
-		 SET status = 'completed', org_id = $2, project_id = $3,
-		     api_key_sealed = $4, installation_id = $5, completed_at = now()
+		 SET status = 'provisioned', org_id = $2, project_id = $3,
+		     api_key_sealed = $4, installation_id = $5
 		 WHERE id = $1 AND status = 'pending'`,
 		in.SessionID, orgID, project.ID, sealed, in.InstallationID)
 	if err != nil {
-		return nil, fmt.Errorf("complete agent session: %w", err)
+		return nil, fmt.Errorf("provision agent session: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
 		return nil, ErrAgentSessionNotPending

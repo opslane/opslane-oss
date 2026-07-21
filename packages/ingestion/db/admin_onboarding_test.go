@@ -75,6 +75,10 @@ func TestAdminOverviewOnboardingFunnel(t *testing.T) {
 
 	activatedID := createSession("activated")
 	updateSession("activated", `UPDATE agent_sessions SET status = 'completed', project_id = $2, completed_at = now(), key_claimed_at = now() WHERE id = $1`, activatedID, projectWithEvent.ID)
+	for _, status := range []string{"provisioned", "key_ok", "app_reporting"} {
+		id := createSession(status)
+		updateSession(status, `UPDATE agent_sessions SET status = $2, project_id = $3 WHERE id = $1`, id, status, projectWithoutEvent.ID)
+	}
 
 	failedRepoID := createSession("failed-repo")
 	updateSession("failed-repo", `UPDATE agent_sessions SET status = 'failed', failure_reason = 'repo_not_granted' WHERE id = $1`, failedRepoID)
@@ -92,14 +96,14 @@ func TestAdminOverviewOnboardingFunnel(t *testing.T) {
 		t.Fatalf("admin overview: %v", err)
 	}
 	funnel := overview.Onboarding
-	if funnel.Started != 6 {
-		t.Fatalf("started=%d want 6", funnel.Started)
+	if funnel.Started != 9 {
+		t.Fatalf("started=%d want 9", funnel.Started)
 	}
 	if funnel.AuthClicked != 1 {
 		t.Fatalf("auth_clicked=%d want 1", funnel.AuthClicked)
 	}
-	if funnel.Completed != 2 {
-		t.Fatalf("completed=%d want 2", funnel.Completed)
+	if funnel.Completed != 5 {
+		t.Fatalf("completed=%d want 5", funnel.Completed)
 	}
 	if funnel.KeyClaimed != 1 {
 		t.Fatalf("key_claimed=%d want 1", funnel.KeyClaimed)

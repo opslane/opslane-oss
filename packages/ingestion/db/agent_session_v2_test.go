@@ -91,7 +91,7 @@ func TestAgentSessionV2FailureAndClickAreIdempotent(t *testing.T) {
 	}
 }
 
-func TestAgentSessionV2DeliveryStampAndPurge(t *testing.T) {
+func TestAgentSessionV2DeliveryStamp(t *testing.T) {
 	pool := testPool(t)
 	q := db.New(pool)
 	ctx := context.Background()
@@ -103,7 +103,7 @@ func TestAgentSessionV2DeliveryStampAndPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE agent_sessions SET status = 'completed', api_key_sealed = $2 WHERE id = $1`,
+		`UPDATE agent_sessions SET status = 'provisioned', api_key_sealed = $2 WHERE id = $1`,
 		session.ID, sealed); err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +115,8 @@ func TestAgentSessionV2DeliveryStampAndPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, _ := q.GetAgentSession(ctx, session.ID)
-	if first.KeyClaimedAt == nil {
-		t.Fatal("missing key_claimed_at")
+	if first.KeyClaimedAt == nil || first.Status != "key_ok" {
+		t.Fatalf("first delivery = status %q claimed %v, want key_ok with timestamp", first.Status, first.KeyClaimedAt)
 	}
 	if err := q.MarkAgentKeyDelivered(ctx, session.ID); err != nil {
 		t.Fatal(err)
@@ -126,15 +126,52 @@ func TestAgentSessionV2DeliveryStampAndPurge(t *testing.T) {
 		t.Fatalf("delivery timestamp changed: first=%v second=%v", first.KeyClaimedAt, second.KeyClaimedAt)
 	}
 
-	if _, err := pool.Exec(ctx,
-		`UPDATE agent_sessions SET expires_at = now() - interval '1 minute' WHERE id = $1`, session.ID); err != nil {
-		t.Fatal(err)
+}
+
+func TestAgentSessionLifecycleCiphertextPurgePreservesStatus(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+
+	for _, status := range []string{"provisioned", "key_ok", "app_reporting"} {
+		t.Run(status, func(t *testing.T) {
+			session, _ := newV2AgentSession(t, q, "v2-owner/purge-"+status+"-"+uuid.NewString())
+			t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id = $1`, session.ID) })
+			if _, err := pool.Exec(ctx,
+				`UPDATE agent_sessions
+				 SET status = $2, api_key_sealed = 'sealed-test', expires_at = now() - interval '1 minute'
+				 WHERE id = $1`, session.ID, status); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := q.ExpireAgentSessions(ctx); err != nil {
+				t.Fatal(err)
+			}
+			after, err := q.GetAgentSession(ctx, session.ID)
+			if err != nil || after == nil {
+				t.Fatalf("read purged session: session=%v err=%v", after, err)
+			}
+			if after.Status != status || after.APIKeySealed != nil {
+				t.Fatalf("purged session = status %q sealed %v err=%v, want %s with no ciphertext", after.Status, after.APIKeySealed, err, status)
+			}
+		})
 	}
-	if _, err := q.ExpireAgentSessions(ctx); err != nil {
-		t.Fatal(err)
-	}
-	after, _ := q.GetAgentSession(ctx, session.ID)
-	if after.APIKeySealed != nil {
-		t.Fatal("expired completed-session ciphertext was not purged")
+}
+
+func TestAgentSessionLifecycleStatuses(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	session, _ := newV2AgentSession(t, q, "v2-owner/lifecycle-"+uuid.NewString())
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id = $1`, session.ID) })
+
+	for _, status := range []string{"provisioned", "app_reporting"} {
+		if _, err := pool.Exec(ctx, `UPDATE agent_sessions SET status = $2 WHERE id = $1`, session.ID, status); err != nil {
+			t.Fatalf("set lifecycle status %q: %v", status, err)
+		}
+		got, err := q.GetAgentSession(ctx, session.ID)
+		if err != nil || got.Status != status {
+			t.Fatalf("lifecycle status = %q err=%v, want %q", got.Status, err, status)
+		}
 	}
 }

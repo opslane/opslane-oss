@@ -177,13 +177,13 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 		}
 		after, err := q.GetAgentSession(context.Background(), session.ID)
 		if err != nil || after == nil || after.OrgID == nil {
-			t.Fatalf("completed session=%+v err=%v", after, err)
+			t.Fatalf("provisioned session=%+v err=%v", after, err)
 		}
 		orgID := *after.OrgID
 		t.Cleanup(func() { cleanupCallbackTenant(t, pool, session.ID, installationID, orgID) })
 
 		code, first := pollAgentSession(t, deps, session.ID, raw)
-		if code != http.StatusOK || first["status"] != "completed" {
+		if code != http.StatusOK || first["status"] != "provisioned" {
 			t.Fatalf("first poll code=%d body=%v", code, first)
 		}
 		key, _ := first["api_key"].(string)
@@ -191,7 +191,7 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 			t.Fatalf("api_key=%q", key)
 		}
 		_, second := pollAgentSession(t, deps, session.ID, raw)
-		if second["api_key"] != key {
+		if second["status"] != "key_ok" || second["api_key"] != key {
 			t.Fatalf("second poll key=%v, want %q", second["api_key"], key)
 		}
 

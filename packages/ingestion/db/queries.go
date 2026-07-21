@@ -3150,7 +3150,7 @@ type AgentSession struct {
 	ID             string
 	RepoURL        string
 	AgentName      *string
-	Status         string // pending | completed | expired | failed
+	Status         string // pending | provisioned | key_ok | app_reporting | completed | expired | failed
 	OrgID          *string
 	ProjectID      *string
 	InstallationID *int64
@@ -3229,7 +3229,8 @@ func (q *Queries) ExpireAgentSessions(ctx context.Context) (int64, error) {
 	}
 	if _, err := q.pool.Exec(ctx,
 		`UPDATE agent_sessions SET api_key_sealed = NULL
-		 WHERE status = 'completed' AND expires_at <= now() AND api_key_sealed IS NOT NULL`,
+		 WHERE status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')
+		   AND expires_at <= now() AND api_key_sealed IS NOT NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("purge sealed agent keys: %w", err)
 	}
@@ -3240,12 +3241,28 @@ func (q *Queries) ExpireAgentSessions(ctx context.Context) (int64, error) {
 // idempotent while retaining the first-delivery funnel timestamp.
 func (q *Queries) MarkAgentKeyDelivered(ctx context.Context, sessionID string) error {
 	_, err := q.pool.Exec(ctx,
-		`UPDATE agent_sessions SET key_claimed_at = COALESCE(key_claimed_at, now())
-		 WHERE id = $1 AND status = 'completed'`, sessionID)
+		`UPDATE agent_sessions
+		 SET key_claimed_at = COALESCE(key_claimed_at, now()),
+		     status = CASE WHEN status = 'provisioned' THEN 'key_ok' ELSE status END
+		 WHERE id = $1 AND status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')`, sessionID)
 	if err != nil {
 		return fmt.Errorf("mark agent key delivered: %w", err)
 	}
 	return nil
+}
+
+// MarkAgentSessionsAppReporting advances active onboarding sessions for a
+// project when its SDK first registers. The compare-and-set tolerates the
+// reporting signal arriving before or after the CLI key probe.
+func (q *Queries) MarkAgentSessionsAppReporting(ctx context.Context, projectID string) (int64, error) {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		 SET status = 'app_reporting', completed_at = COALESCE(completed_at, now())
+		 WHERE project_id = $1 AND status IN ('provisioned', 'key_ok')`, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("mark agent sessions app reporting: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // MarkAgentSessionFailed records a definitive business failure. Transient

@@ -177,9 +177,9 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch session.Status {
-	case "completed":
+	case "completed", "provisioned", "key_ok", "app_reporting":
 		resp := map[string]any{
-			"status": "completed",
+			"status": session.Status,
 			"repo":   session.RepoURL,
 		}
 		if session.OrgID != nil {
@@ -441,7 +441,7 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 	})
 	switch {
 	case err == nil:
-		slog.Info("agent session completed", "session_id", sessionID,
+		slog.Info("agent session provisioned", "session_id", sessionID,
 			"org_id", res.OrgID, "project_id", res.ProjectID, "repo", canonical)
 		agentResultPage(w, http.StatusOK, "Done!",
 			fmt.Sprintf("Opslane is set up for <strong>%s</strong>. Your agent is finishing the integration — you can close this tab.",
@@ -453,7 +453,7 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 		agentResultPage(w, http.StatusForbidden, "Setup could not finish", agentFailureMessage(reason))
 	case errors.Is(err, db.ErrAgentSessionNotPending):
 		agentResultPage(w, http.StatusGone, "Session already handled",
-			"This setup session was already completed or expired. Check back with your agent.")
+			"This setup session was already provisioned or expired. Check back with your agent.")
 	default:
 		slog.Error("agent callback: provision failed", "error", err)
 		agentResultPage(w, http.StatusInternalServerError, "Something went wrong", "Reopen the authorization link to retry.")

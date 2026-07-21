@@ -28,6 +28,12 @@ type SessionRegistration struct {
 	Diverged      bool
 }
 
+type SessionSDKIdentity struct {
+	Name    string
+	Version string
+	Release string
+}
+
 // SessionEnvironment returns the environment for a same-project live session.
 // A globally-colliding session id owned by another project is intentionally
 // indistinguishable from an absent session on event ingest.
@@ -68,19 +74,29 @@ func isUniqueViolation(err error) bool {
 
 // InsertSession registers a client-generated session. It is idempotent so a
 // retried init request neither errors nor resets session progress.
-func (q *Queries) RegisterSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string) (*SessionRegistration, error) {
+func (q *Queries) RegisterSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string, sdk *SessionSDKIdentity) (*SessionRegistration, error) {
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("register session: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	var sdkName, sdkVersion, sdkRelease *string
+	if sdk != nil {
+		sdkName = &sdk.Name
+		sdkVersion = &sdk.Version
+		sdkRelease = &sdk.Release
+	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO sessions (id, project_id, environment_id, end_user_id, started_at, page_url)
-		 SELECT $1, $2, $3, $4, $5, $6
+		`INSERT INTO sessions (
+		   id, project_id, environment_id, end_user_id, started_at, page_url,
+		   sdk_name, sdk_version, sdk_release
+		 )
+		 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
 		 WHERE NOT EXISTS (SELECT 1 FROM session_tombstones WHERE session_id = $1)
 		 ON CONFLICT (id) DO NOTHING`,
 		sessionID, projectID, environmentID, endUserID, startedAt, pageURL,
+		sdkName, sdkVersion, sdkRelease,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert session: %w", err)
@@ -132,7 +148,7 @@ func (q *Queries) RegisterSession(ctx context.Context, sessionID, projectID, env
 
 // InsertSession preserves the existing idempotent API for internal callers.
 func (q *Queries) InsertSession(ctx context.Context, sessionID, projectID, environmentID string, endUserID *string, startedAt time.Time, pageURL string) error {
-	_, err := q.RegisterSession(ctx, sessionID, projectID, environmentID, endUserID, startedAt, pageURL)
+	_, err := q.RegisterSession(ctx, sessionID, projectID, environmentID, endUserID, startedAt, pageURL, nil)
 	return err
 }
 
