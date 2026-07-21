@@ -76,6 +76,29 @@ describe('agent setup protocol', () => {
     await expect(loadPendingSession(pollId, pendingDir)).resolves.toBeNull();
   });
 
+  it('stores the development key, keeps polling through key_ok, and completes on app_reporting', async () => {
+    await savePendingSession({
+      poll_id: pollId, poll_token: 'poll-secret', api_url: apiUrl,
+      repo: 'acme/app', created_at: new Date().toISOString(),
+    }, pendingDir);
+    const tenant = { org_id: 'org-1', project_id: 'project-1', repo: 'acme/app' };
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'provisioned', api_key: 'dev-key', ...tenant })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'key_ok', api_key: 'dev-key', ...tenant })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'app_reporting', ...tenant })));
+
+    await setup({
+      poll: pollId, credentialsPath, pendingDir, fetchFn,
+      pollIntervalMs: 0, sleepFn: async () => undefined,
+    });
+
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    await expect(loadAgentCredentials({ filePath: credentialsPath, apiUrl, repo: 'acme/app' }))
+      .resolves.toMatchObject({ api_key: 'dev-key', project_id: 'project-1' });
+    await expect(loadPendingSession(pollId, pendingDir)).resolves.toBeNull();
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({ status: 'completed' });
+  });
+
   it('maps completed without a key to key_unavailable and deletes pending state', async () => {
     await savePendingSession({ poll_id: pollId, poll_token: 'x', api_url: apiUrl, repo: 'acme/app', created_at: new Date().toISOString() }, pendingDir);
     await setup({
@@ -84,6 +107,21 @@ describe('agent setup protocol', () => {
     });
     expect(process.exit).toHaveBeenCalledWith(1);
     expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({ status: 'key_unavailable', project_id: 'project-1' });
+    await expect(loadPendingSession(pollId, pendingDir)).resolves.toBeNull();
+  });
+
+  it('does not complete app_reporting without a delivered or previously saved key', async () => {
+    await savePendingSession({ poll_id: pollId, poll_token: 'x', api_url: apiUrl, repo: 'acme/app', created_at: new Date().toISOString() }, pendingDir);
+    await setup({
+      poll: pollId, credentialsPath, pendingDir,
+      fetchFn: async () => new Response(JSON.stringify({
+        status: 'app_reporting', org_id: 'org-1', project_id: 'project-1', repo: 'acme/app',
+      })),
+    });
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+      status: 'key_unavailable', project_id: 'project-1',
+    });
     await expect(loadPendingSession(pollId, pendingDir)).resolves.toBeNull();
   });
 
@@ -175,6 +213,7 @@ describe('agent setup protocol', () => {
       const url = String(input);
       if (url.endsWith('/api/v1/projects')) return new Response(JSON.stringify([{ id: 'project-1', github_repo: 'Acme/App' }]));
       if (url.endsWith('/environments')) return new Response(JSON.stringify([{ id: 'env-dev', name: 'development' }, { id: 'env-prod', name: 'production' }]));
+      expect(url).toContain('/environments/env-dev/api-keys');
       return new Response(JSON.stringify({ raw_key: 'fresh-key' }), { status: 201 });
     });
     await setup({ relink: true, repo: 'acme/app', apiUrl, credentialsPath, tokenPath, fetchFn });
