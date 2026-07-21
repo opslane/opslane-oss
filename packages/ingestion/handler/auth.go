@@ -119,11 +119,14 @@ type Dependencies struct {
 
 // NewDependencies validates production-only invariants that direct, narrow
 // handler tests intentionally bypass when constructing Dependencies literals.
-func NewDependencies(deps Dependencies) (*Dependencies, error) {
+func NewDependencies(deps *Dependencies) (*Dependencies, error) {
+	if deps == nil {
+		return nil, fmt.Errorf("handler dependencies are required")
+	}
 	if deps.PendingCipher == nil {
 		return nil, fmt.Errorf("pending OAuth verification cipher is required")
 	}
-	return &deps, nil
+	return deps, nil
 }
 
 func (d *Dependencies) provider() auth.AuthProvider {

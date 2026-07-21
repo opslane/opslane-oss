@@ -164,10 +164,13 @@ func findResponseCookie(response *http.Response, name string) *http.Cookie {
 }
 
 func TestNewDependenciesRejectsMissingPendingCipher(t *testing.T) {
-	if _, err := NewDependencies(Dependencies{}); err == nil {
+	if _, err := NewDependencies(nil); err == nil {
+		t.Fatal("NewDependencies accepted nil dependencies")
+	}
+	if _, err := NewDependencies(&Dependencies{}); err == nil {
 		t.Fatal("NewDependencies accepted a nil pending cipher")
 	}
-	if _, err := NewDependencies(Dependencies{PendingCipher: testPendingCipher(t)}); err != nil {
+	if _, err := NewDependencies(&Dependencies{PendingCipher: testPendingCipher(t)}); err != nil {
 		t.Fatalf("NewDependencies rejected configured cipher: %v", err)
 	}
 }

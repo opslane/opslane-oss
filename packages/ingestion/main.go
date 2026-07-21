@@ -151,7 +151,7 @@ func main() {
 		}
 	}()
 	notifySender := notify.NewSender(0, notifyExtraHosts)
-	deps, err := handler.NewDependencies(handler.Dependencies{
+	deps, err := handler.NewDependencies(&handler.Dependencies{
 		Queries:               queries,
 		MinIO:                 minioClient,
 		JWTSecret:             []byte(jwtSecret),
