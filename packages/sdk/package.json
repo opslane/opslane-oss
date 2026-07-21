@@ -37,10 +37,10 @@
     "prepublishOnly": "vite build && node scripts/check-package.mjs"
   },
   "dependencies": {
-    "rrweb": "2.1.0"
+    "rrweb": "2.1.1"
   },
   "devDependencies": {
-    "@rrweb/types": "2.1.0",
+    "@rrweb/types": "2.1.1",
     "@opslane/shared": "workspace:*",
     "@playwright/test": "^1.61.1",
     "@testing-library/react": "^16.0.0",
