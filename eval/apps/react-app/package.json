@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@testing-library/react": "^16.0.0",
-    "@testing-library/jest-dom": "^6.0.0",
+    "@testing-library/jest-dom": "^7.0.0",
     "@vitejs/plugin-react": "^4.0.0",
     "happy-dom": "^14.0.0",
     "typescript": "^5.4.0",
