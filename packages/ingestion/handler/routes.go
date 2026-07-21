@@ -44,6 +44,7 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 	r.Post("/auth/password", deps.PasswordLogin)
 	r.Post("/auth/signup", deps.Signup)
 	r.Post("/auth/verify-email", deps.VerifyEmail)
+	r.Post("/auth/oauth/verify-email", deps.OAuthVerifyEmail)
 	r.Post("/auth/password/forgot", deps.ForgotPassword)
 	r.Post("/auth/password/reset", deps.ResetPassword)
 	r.With(deps.AuthenticateUserSession).Post("/auth/switch-org", deps.SwitchOrg)

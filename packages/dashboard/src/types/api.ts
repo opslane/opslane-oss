@@ -30,6 +30,10 @@ export type PasswordAuthResult =
   | { status: 'email_verification_required'; pending_authentication_token: string }
   | { status: 'error'; code: number; message: string };
 
+export type OAuthEmailVerificationResult =
+  | { status: 'verified'; redirect_to: string }
+  | { status: 'error'; code: number; message: string };
+
 export type ResetPasswordResult =
   | { status: 'reset' }
   | { status: 'error'; code: number; message: string };

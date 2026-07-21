@@ -2470,6 +2470,93 @@ type CLIPKCERequest struct {
 	CodeChallengeMethod string
 }
 
+const MaxOAuthVerificationAttempts = 5
+
+// OAuthVerificationContinuation is the self-contained server-side snapshot
+// needed to resume either a browser or CLI OAuth flow after email verification.
+type OAuthVerificationContinuation struct {
+	PendingTokenSealed     []byte
+	FlowKind               string
+	TargetOrgID            string
+	CLIClientID            string
+	CLIRedirectURI         string
+	CLIOAuthState          string
+	CLICodeChallenge       string
+	CLICodeChallengeMethod string
+	Attempts               int
+}
+
+func (q *Queries) StoreOAuthVerificationContinuation(ctx context.Context, flowHash string, continuation OAuthVerificationContinuation, expiresAt time.Time) error {
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO oauth_verification_continuations
+		 (flow_hash, pending_token_sealed, flow_kind, target_org_id,
+		  cli_client_id, cli_redirect_uri, cli_oauth_state,
+		  cli_code_challenge, cli_code_challenge_method, expires_at)
+		 VALUES ($1, $2, $3, NULLIF($4, '')::uuid,
+		         NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''),
+		         NULLIF($8, ''), NULLIF($9, ''), $10)`,
+		flowHash, continuation.PendingTokenSealed, continuation.FlowKind,
+		continuation.TargetOrgID, continuation.CLIClientID,
+		continuation.CLIRedirectURI, continuation.CLIOAuthState,
+		continuation.CLICodeChallenge, continuation.CLICodeChallengeMethod,
+		expiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("store OAuth verification continuation: %w", err)
+	}
+	return nil
+}
+
+// ReserveOAuthVerificationAttempt atomically claims the next bounded attempt
+// and returns its payload. Nil means the flow is missing, expired, consumed, or
+// has exhausted its attempt budget.
+func (q *Queries) ReserveOAuthVerificationAttempt(ctx context.Context, flowHash string) (*OAuthVerificationContinuation, error) {
+	var continuation OAuthVerificationContinuation
+	err := q.pool.QueryRow(ctx,
+		`UPDATE oauth_verification_continuations
+		    SET attempts = attempts + 1
+		  WHERE flow_hash = $1
+		    AND consumed_at IS NULL
+		    AND expires_at > now()
+		    AND attempts < $2
+		RETURNING pending_token_sealed, flow_kind,
+		          COALESCE(target_org_id::text, ''),
+		          COALESCE(cli_client_id, ''), COALESCE(cli_redirect_uri, ''),
+		          COALESCE(cli_oauth_state, ''), COALESCE(cli_code_challenge, ''),
+		          COALESCE(cli_code_challenge_method, ''), attempts`,
+		flowHash, MaxOAuthVerificationAttempts,
+	).Scan(&continuation.PendingTokenSealed, &continuation.FlowKind,
+		&continuation.TargetOrgID, &continuation.CLIClientID,
+		&continuation.CLIRedirectURI, &continuation.CLIOAuthState,
+		&continuation.CLICodeChallenge, &continuation.CLICodeChallengeMethod,
+		&continuation.Attempts)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reserve OAuth verification attempt: %w", err)
+	}
+	return &continuation, nil
+}
+
+// ConsumeOAuthVerificationContinuation is a compare-and-set completion gate.
+// Exactly one concurrent caller can win; false means the flow was already used.
+func (q *Queries) ConsumeOAuthVerificationContinuation(ctx context.Context, flowHash string) (bool, error) {
+	var id string
+	err := q.pool.QueryRow(ctx,
+		`UPDATE oauth_verification_continuations SET consumed_at = now()
+		 WHERE flow_hash = $1 AND consumed_at IS NULL
+		 RETURNING id`, flowHash,
+	).Scan(&id)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("consume OAuth verification continuation: %w", err)
+	}
+	return true, nil
+}
+
 func (q *Queries) StoreOAuthLoginState(ctx context.Context, stateHash string, expiresAt time.Time) error {
 	return q.StoreOAuthLoginStateForOrg(ctx, stateHash, "", expiresAt)
 }
@@ -2644,6 +2731,12 @@ func (q *Queries) CleanupExpiredTokens(ctx context.Context) (int64, int64, error
 		 WHERE expires_at < now() - INTERVAL '1 day'
 		    OR consumed_at < now() - INTERVAL '1 day'`); err != nil {
 		return ct1.RowsAffected(), ct2.RowsAffected(), fmt.Errorf("cleanup OAuth login states: %w", err)
+	}
+	if _, err := q.pool.Exec(ctx,
+		`DELETE FROM oauth_verification_continuations
+		 WHERE expires_at < now() - INTERVAL '1 day'
+		    OR consumed_at < now() - INTERVAL '1 day'`); err != nil {
+		return ct1.RowsAffected(), ct2.RowsAffected(), fmt.Errorf("cleanup OAuth verification continuations: %w", err)
 	}
 	return ct1.RowsAffected(), ct2.RowsAffected(), nil
 }

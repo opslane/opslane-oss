@@ -6,11 +6,11 @@ import type {
   AdminOverview, AdminJobsResponse, HealthResponse,
   AuthConfig, AuthUser, ForgotPasswordResult, OrgInvitation,
   NotificationDestination, NotificationDestinationList, NotificationTestResult,
-  PasswordAuthResult, ResetPasswordResult,
+  OAuthEmailVerificationResult, PasswordAuthResult, ResetPasswordResult,
 } from './types/api';
 export type {
   AuthConfig, AuthMembership, AuthUser, ForgotPasswordResult, OrgInvitation,
-  PasswordAuthResult, ResetPasswordResult,
+  OAuthEmailVerificationResult, PasswordAuthResult, ResetPasswordResult,
 } from './types/api';
 import type { ChunkEnvelope } from './components/session-replay';
 
@@ -290,6 +290,27 @@ export function verifyEmail(pendingToken: string, code: string): Promise<Passwor
     pending_authentication_token: pendingToken,
     code,
   });
+}
+
+export async function verifyOAuthEmail(code: string): Promise<OAuthEmailVerificationResult> {
+  try {
+    const response = await fetch('/auth/oauth/verify-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ code }),
+    });
+    const data = await readResponseBody(response);
+    const record = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+
+    if (response.ok && typeof record.redirect_to === 'string' && record.redirect_to) {
+      return { status: 'verified', redirect_to: record.redirect_to };
+    }
+    if (!response.ok) return authErrorResult(response.status, data);
+    return { status: 'error', code: response.status, message: 'Something went wrong' };
+  } catch {
+    return { status: 'error', code: 0, message: AUTH_NETWORK_ERROR };
+  }
 }
 
 export async function forgotPassword(email: string): Promise<ForgotPasswordResult> {
