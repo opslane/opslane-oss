@@ -1,5 +1,7 @@
 ---
 covers:
+  - packages/sdk/src/config.ts
+  - packages/sdk/src/index.ts
   - packages/sdk/src/replay.ts
   - packages/sdk/src/session.ts
   - packages/sdk/src/chunk-upload.ts
@@ -7,15 +9,15 @@ covers:
 ---
 # Replay privacy and masking
 
-Session replay shows what a user saw and did around an error. It is the most privacy-sensitive feature in the SDK, and session recording is **on by default since SDK 1.0.0**. This guide explains when recording actually starts, what leaves the browser, how masking works, and how to turn recording off.
+Session replay shows what a user saw and did around an error. It is the most privacy-sensitive feature in the SDK, and session recording is **on by default since SDK 1.0.0**. This guide explains the separate session-reporting and replay controls, when recording actually starts, what leaves the browser, how masking works, and how to turn either one off.
 
-Default-on does not mean every page load produces a stored recording. The browser must support `CompressionStream`, ingestion must have object storage configured, and `/api/v1/sessions/init` must approve recording for the project. If any of those checks fail, the SDK does not create a usable recording.
+By default, every `init()` attempts to report lightweight session metadata to `/api/v1/sessions/init`, even when replay is disabled or the browser cannot record. That request contains no serialized DOM. A stored recording still requires `CompressionStream`, configured object storage, and server approval for the project. If any of those checks fail, the SDK does not create a usable recording.
 
 ## How capture and storage work
 
 The current SDK records a continuous rrweb session stream rather than creating a separate replay only when an error occurs:
 
-1. The SDK registers the browser session with `/api/v1/sessions/init`. The server returns whether recording is allowed. If the SDK supplies an `environment`, ingestion resolves it within the API key's project only when that project's payload override is enabled; otherwise the key environment is used. A session keeps its first accepted environment for its lifetime.
+1. The SDK reports the browser session to `/api/v1/sessions/init`. The request includes the SDK name and version, release, environment, session id, start time, scrubbed page URL, and any user identity supplied through `setUser()`. The server returns whether recording is allowed. If the SDK supplies an `environment`, ingestion resolves it within the API key's project only when that project's payload override is enabled; otherwise the key environment is used. A session keeps its first accepted environment for its lifetime.
 2. The SDK cuts the stream into independently playable chunks roughly every 30 seconds. When an error is accepted, it also flushes the current chunk so the incident can point into that same session.
 3. The browser gzips each chunk and uploads it directly to private object storage through a size-capped presigned POST policy, then commits the chunk to ingestion.
 4. A server-side scrubber inflates the chunk under a hard size ceiling, redacts it, rewrites the stored object, and sets `scrubbed_at`.
@@ -41,6 +43,28 @@ Masking is not anonymization. A recording may include page URLs and titles, visi
 
 Separately from the DOM recording: if your application calls `setUser()`, the SDK sends that user's id, email, account id, and account name **unmasked** when it registers the session with `/api/v1/sessions/init`, and ingestion persists them to associate recordings with the person who hit an error. Masking never applies to these fields — if you identify users, say so in your privacy notice.
 
+## Session reporting without replay
+
+Turning replay off does not suppress the lightweight session report. This lets Opslane verify that an SDK installation is running without collecting a DOM recording:
+
+```ts
+init({
+  apiKey: '...',
+  replay: { enabled: false },
+});
+```
+
+To suppress the session-init request itself, use the separate reporting opt-out:
+
+```ts
+init({
+  apiKey: '...',
+  reporting: { enabled: false },
+});
+```
+
+Replay cannot start without the session-init handshake, so disabling reporting also prevents replay capture. This option controls only the session-init signal; it does not disable error-event delivery.
+
 ## Turn recording off
 
 Opt out in one integration:
@@ -51,6 +75,8 @@ init({
   replay: { enabled: false },
 });
 ```
+
+The SDK still sends the lightweight session report described above. Use `reporting: { enabled: false }` only if you also want to suppress that request.
 
 To stop recording for a whole project without redeploying the application, set `projects.recording_enabled` to `false` through your database or admin tooling. The server then declines new sessions and rejects the next chunk upload for an active session, which tells the SDK to stop its recorder.
 

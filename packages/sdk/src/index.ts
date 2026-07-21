@@ -5,7 +5,7 @@ import { patchConsole, unpatchConsole } from './console';
 import { patchFetch, unpatchFetch, patchXHR, unpatchXHR } from './network';
 import { startTransport, stopTransport } from './transport';
 import { clearBreadcrumbs } from './breadcrumbs';
-import { startReplayCapture, stopReplayCapture } from './replay';
+import { registerSession, resetSessionRegistrations, startReplayCapture, stopReplayCapture } from './replay';
 import { ensureSessionID } from './session.js';
 import { installInteractionTelemetry, uninstallInteractionTelemetry } from './telemetry';
 
@@ -41,6 +41,7 @@ export function init(options: SdkInitOptions): void {
   safeCall(installInteractionTelemetry);
   safeCall(startTransport);
   safeCall(ensureSessionID);
+  safeCall(() => { void registerSession().catch(() => {}); });
   safeCall(() => { void startReplayCapture().catch(() => {}); });
 }
 
@@ -55,6 +56,7 @@ export function destroy(): void {
   safeCall(uninstallInteractionTelemetry);
   safeCall(stopTransport);
   safeCall(stopReplayCapture);
+  safeCall(resetSessionRegistrations);
   safeCall(clearBreadcrumbs);
   safeCall(() => onIdentityChange(null));
   safeCall(clearUser);

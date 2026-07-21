@@ -12,6 +12,7 @@ export interface SdkConfig {
   flushInterval: number;
   maxBatchSize: number;
   debug: boolean;
+  reportingEnabled: boolean;
   replayEnabled: boolean;
   sampleRate: number;
   errorThrottleMs: number;
@@ -19,6 +20,10 @@ export interface SdkConfig {
 }
 
 export interface ReplayInitOptions {
+  enabled?: boolean;
+}
+
+export interface ReportingInitOptions {
   enabled?: boolean;
 }
 
@@ -32,6 +37,7 @@ export interface SdkInitOptions {
   flushInterval?: number;
   maxBatchSize?: number;
   debug?: boolean;
+  reporting?: ReportingInitOptions;
   replay?: ReplayInitOptions;
   sampleRate?: number;
   errorThrottleMs?: number;
@@ -47,6 +53,7 @@ const DEFAULTS: Omit<SdkConfig, 'endpoint' | 'apiKey' | 'release'> = {
   flushInterval: 5_000,
   maxBatchSize: 10,
   debug: false,
+  reportingEnabled: true,
   // BREAKING in 1.0: recording is always-on unless explicitly opted out.
   replayEnabled: true,
   sampleRate: 1,
@@ -85,6 +92,7 @@ export function loadConfig(options: SdkInitOptions): void {
     flushInterval: options.flushInterval ?? DEFAULTS.flushInterval,
     maxBatchSize: options.maxBatchSize ?? DEFAULTS.maxBatchSize,
     debug: options.debug ?? DEFAULTS.debug,
+    reportingEnabled: options.reporting?.enabled ?? DEFAULTS.reportingEnabled,
     replayEnabled: options.replay?.enabled ?? DEFAULTS.replayEnabled,
     sampleRate: Math.min(1, Math.max(0, options.sampleRate ?? DEFAULTS.sampleRate)),
     errorThrottleMs: options.errorThrottleMs ?? DEFAULTS.errorThrottleMs,

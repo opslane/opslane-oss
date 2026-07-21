@@ -28,6 +28,7 @@ describe('SDK Config', () => {
       flushInterval: 5_000,
       maxBatchSize: 10,
       debug: false,
+      reportingEnabled: true,
       replayEnabled: true,
       sampleRate: 1,
       errorThrottleMs: 1000,
@@ -104,6 +105,26 @@ describe('SDK Config', () => {
       expect(getConfig().replayEnabled).toBe(false);
       resetConfig();
       loadConfig({ apiKey: 'k', replay: { enabled: true } });
+      expect(getConfig().replayEnabled).toBe(true);
+    });
+  });
+
+  describe('session reporting', () => {
+    it('defaults to enabled when absent or empty', () => {
+      loadConfig({ apiKey: 'k' });
+      expect(getConfig().reportingEnabled).toBe(true);
+      resetConfig();
+      loadConfig({ apiKey: 'k', reporting: {} });
+      expect(getConfig().reportingEnabled).toBe(true);
+    });
+
+    it('honours an explicit opt-out independently of replay', () => {
+      loadConfig({
+        apiKey: 'k',
+        reporting: { enabled: false },
+        replay: { enabled: true },
+      });
+      expect(getConfig().reportingEnabled).toBe(false);
       expect(getConfig().replayEnabled).toBe(true);
     });
   });

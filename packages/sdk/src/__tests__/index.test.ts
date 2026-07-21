@@ -30,6 +30,8 @@ vi.mock('../transport', () => ({
 }));
 
 vi.mock('../replay', () => ({
+  registerSession: vi.fn().mockResolvedValue(false),
+  resetSessionRegistrations: vi.fn(),
   startReplayCapture: vi.fn(),
   stopReplayCapture: vi.fn(),
 }));
@@ -67,6 +69,7 @@ describe('SDK Public API', () => {
     expect(network.patchXHR).toHaveBeenCalledTimes(1);
     expect(telemetry.installInteractionTelemetry).toHaveBeenCalledTimes(1);
     expect(transport.startTransport).toHaveBeenCalledTimes(1);
+    expect(replay.registerSession).toHaveBeenCalledTimes(1);
     expect(replay.startReplayCapture).toHaveBeenCalledTimes(1);
   });
 
@@ -85,6 +88,7 @@ describe('SDK Public API', () => {
     expect(telemetry.uninstallInteractionTelemetry).toHaveBeenCalledTimes(1);
     expect(transport.stopTransport).toHaveBeenCalledTimes(1);
     expect(replay.stopReplayCapture).toHaveBeenCalledTimes(1);
+    expect(replay.resetSessionRegistrations).toHaveBeenCalledTimes(1);
   });
 
   it('should not double-initialize', () => {

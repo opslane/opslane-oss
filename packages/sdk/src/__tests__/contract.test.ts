@@ -78,7 +78,9 @@ describe('SDK contract', () => {
     await new Promise(r => setTimeout(r, 500));
 
     expect(receivedRequests.length).toBeGreaterThanOrEqual(1);
-    const req = receivedRequests[0];
+    const req = receivedRequests.find((request) => request.url === '/api/v1/events');
+    expect(req).toBeDefined();
+    if (!req) throw new Error('event request not received');
     expect(req.method).toBe('POST');
     expect(req.url).toBe('/api/v1/events');
     expect(req.headers['x-api-key']).toBe('sk-test-contract');
