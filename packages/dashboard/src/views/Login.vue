@@ -156,7 +156,9 @@ onMounted(() => {
         <div v-else-if="mode === 'verify-code'">
           <h1 class="text-xl font-semibold text-text text-center mb-1">Verify your email</h1>
           <p class="text-sm text-muted text-center mb-6">
-            Enter the 6-digit code sent to your email address.
+            Enter the 6-digit code sent to
+            <span v-if="email" class="text-text" v-text="email"></span>
+            <template v-else>your email address</template>.
           </p>
           <form class="space-y-4" @submit.prevent="submitVerification">
             <div>
