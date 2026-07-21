@@ -1275,7 +1275,7 @@ describeDb('db.ts integration tests', () => {
       const fixResult = await updateGroupAndCreateFixJob(
         errorGroupId,
         testProjectId,
-        { rootCause: 'current result', confidence: 'high' },
+        { rootCause: 'current result', confidence: 'high', platform: 'python' },
         currentLease,
       );
       expect(fixResult).toEqual({ created: true, fixJobId: expect.any(String) });
@@ -1290,6 +1290,11 @@ describeDb('db.ts integration tests', () => {
         status: 'fixing',
         root_cause: 'current result',
       });
+      const fixJob = await testPool.query<{ platform: string | null }>(
+        `SELECT platform FROM error_group_jobs WHERE id = $1`,
+        [fixResult.created ? fixResult.fixJobId : ''],
+      );
+      expect(fixJob.rows[0]?.platform).toBe('python');
     });
 
     it('does not authorize another tenant with a valid current lease', async () => {

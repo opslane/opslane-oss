@@ -75,6 +75,7 @@ export async function runAgentSetup(input: AgentSetupInput): Promise<AgentSetupR
       repoUrl: input.repoUrl,
       defaultBranch: input.defaultBranch,
       githubToken: input.githubToken,
+      platform: 'javascript',
     });
   } catch (err: unknown) {
     return {

@@ -292,6 +292,18 @@ describe('GitHub client configuration', () => {
 });
 
 describe('buildPRBody', () => {
+  it('discloses customer and sandbox runtimes with explicit unknowns', () => {
+    const known = buildPRBody(makeInput({
+      customerRuntime: { name: 'CPython', version: '3.11.8' },
+      sandboxRuntime: { name: 'CPython', version: '3.12.4' },
+    }));
+    expect(known).toContain('Customer: CPython 3.11.8');
+    expect(known).toContain('Sandbox: CPython 3.12.4');
+
+    const unknown = buildPRBody(makeInput());
+    expect(unknown).toContain('Customer: unknown');
+    expect(unknown).toContain('Sandbox: unknown');
+  });
   it('lists affected environments without allowing legacy names to forge markdown structure', () => {
     const body = buildPRBody(makeInput({
       environmentNames: [

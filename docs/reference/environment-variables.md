@@ -58,6 +58,8 @@ Ingestion reads **only** the `REPLAY_STORE_*` names; `MINIO_*` names appear in i
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` / `LANGFUSE_PROJECT_ID` | no | Optional LLM tracing |
 | `ANTHROPIC_BASE_URL` | no (Anthropic default) | Alternate Claude API endpoint; used by the hermetic test harness's fake model server |
 | `OPSLANE_SANDBOX_BACKEND` | no (`e2b`) | Fix-verification sandbox backend; `local` is only for trusted reliability fixtures and also requires `OPSLANE_RELIABILITY_HARNESS=1` |
+| `OPSLANE_PYTHON_PIPELINE` | no (off) | Enables durable Python incident routing for `1` or `true`; the effective platform is persisted on the fix job. |
+| `OPSLANE_E2B_PYTHON_TEMPLATE` | no (`opslane-python`) | Overrides the E2B template name used by Python fix jobs. |
 | `OPSLANE_RELIABILITY_HARNESS` | no | Explicit guard required before the non-isolating local sandbox test transport can run |
 | `OPSLANE_GITHUB_URL` | no (`https://github.com`) | Alternate git host for clones; used by tests and self-hosted git |
 | `OPSLANE_GITHUB_API_URL` | no (GitHub default) | Alternate GitHub REST API base URL for PR creation |

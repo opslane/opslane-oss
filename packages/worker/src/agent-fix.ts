@@ -5,12 +5,15 @@ import { runAgentLoop } from './harness/agent-loop.js';
 import { createToolBridge } from './harness/tool-bridge.js';
 import { createDefaultMiddleware } from './harness/tool-middleware.js';
 import { extractStackTraceFiles } from './harness/stack-trace-utils.js';
+import { parsePythonFrames, resolveFrames } from './harness/python-frames.js';
 import { judgeDiff } from './harness/diff-judge.js';
 import { investigateError } from './investigate.js';
 import { logger } from './logger.js';
 import { traceSpan } from './tracing.js';
 import type { CheckOutcome, ConfidenceLevel, EvidenceRecord, NeedsHumanReason, ReasonCode } from '@opslane/shared';
-import { buildReason } from './reason-codes.js';
+import type { Platform } from './platform.js';
+import type { RuntimeInfo } from './runtime-info.js';
+import { buildReason, triageReasonCodes } from './reason-codes.js';
 import type { AgentCompletionResult, VisualAnalysisOutput, SourceFile, AgentState } from './harness/types.js';
 import { scrubSecrets } from './harness/redact.js';
 import { createEvidenceRecorder, type EvidenceRecorder } from './harness/evidence.js';
@@ -31,6 +34,8 @@ import {
 } from './narrative.js';
 
 export interface AgentFixInput {
+  platform?: Platform;
+  customerRuntime?: RuntimeInfo | null;
   errorGroupId: string;
   projectId: string;
   title: string;
@@ -68,6 +73,7 @@ export interface AgentFixInput {
 }
 
 export interface AgentFixResult {
+  sandboxRuntime?: RuntimeInfo | null;
   status: 'fix_ready' | 'needs_human';
   diff?: string;
   confidence?: ConfidenceLevel;
@@ -151,14 +157,6 @@ const FIX_NARRATIVE_TOOL: Anthropic.Tool = {
   },
 };
 
-const TRIAGE_REASON_CODES = [
-  'unfixable_no_app_frames',
-  'unfixable_test_error',
-  'unfixable_third_party',
-  'unfixable_infra',
-  'unfixable_no_sourcemap',
-] as const satisfies readonly ReasonCode[];
-
 export interface TriageResult {
   fixable: boolean;
   confidence: 'high' | 'medium' | 'low';
@@ -167,7 +165,8 @@ export interface TriageResult {
   remediation?: string;
 }
 
-const TRIAGE_TOOL: Anthropic.Tool = {
+function triageTool(platform: Platform): Anthropic.Tool {
+  return {
   name: 'classify_error',
   description: 'Submit your triage classification of the error.',
   input_schema: {
@@ -188,7 +187,7 @@ const TRIAGE_TOOL: Anthropic.Tool = {
       },
       reason_code: {
         type: 'string',
-        enum: [...TRIAGE_REASON_CODES],
+        enum: [...triageReasonCodes(platform)],
         description: 'Machine-readable reason code when fixable is false',
       },
       remediation: {
@@ -198,7 +197,8 @@ const TRIAGE_TOOL: Anthropic.Tool = {
     },
     required: ['fixable', 'confidence', 'reason'],
   },
-};
+  };
+}
 
 /**
  * Cheap pre-agent triage: classify whether the error is likely fixable with code changes.
@@ -207,9 +207,11 @@ const TRIAGE_TOOL: Anthropic.Tool = {
  */
 export async function triageError(
   apiKey: string,
-  input: Pick<AgentFixInput, 'errorType' | 'title' | 'errorMessage' | 'stackTrace' | 'resolvedStackTrace' | 'breadcrumbs'>,
+  input: Pick<AgentFixInput, 'errorType' | 'title' | 'errorMessage' | 'stackTrace' | 'resolvedStackTrace' | 'breadcrumbs' | 'platform' | 'customerRuntime'>,
 ): Promise<TriageResult> {
   const client = createAnthropicClient(apiKey);
+  const platform = input.platform ?? 'javascript';
+  const python = platform === 'python';
 
   // If source maps resolved the stack trace, include it so triage can see real file paths
   // even when the raw trace is all <anonymous> or minified.
@@ -217,21 +219,21 @@ export async function triageError(
     ? `\n\nResolved Stack Trace (source-mapped):\n<untrusted_data>\n${truncate(JSON.stringify(input.resolvedStackTrace), MAX_STACK_TRACE)}\n</untrusted_data>`
     : '';
 
-  const prompt = `You are triaging a production error to decide if it can be fixed with code changes to the application's source code.
+  const prompt = `You are triaging a production ${python ? 'Python error and CPython traceback' : 'JavaScript/browser error'} to decide if it can be fixed with code changes to the application's source code.
 
 Analyze the error and classify it using the classify_error tool.
 
 Set fixable to FALSE if ANY of these apply:
-- Stack trace only contains <anonymous>, eval, or browser-internal frames AND no resolved/source-mapped stack trace is available with application file references
+- ${python ? 'The traceback has no application .py frames' : 'Stack trace only contains <anonymous>, eval, or browser-internal frames AND no resolved/source-mapped stack trace is available with application file references'}
 - Error message indicates a deliberate test throw (e.g., "test error", "testing 123", "Opslane test")
 - Error originates entirely from third-party code with no application source file frames
 - Error is an infrastructure/network issue (CORS, DNS, timeout, 502, 503)
-- Stack trace is completely minified with no resolvable file paths (only webpack:///chunk hashes, no original filenames) AND no resolved stack trace is provided
+${python ? '- The traceback originates entirely from site-packages or a virtual environment' : '- Stack trace is completely minified with no resolvable file paths (only webpack:///chunk hashes, no original filenames) AND no resolved stack trace is provided'}
 
-IMPORTANT: If a "Resolved Stack Trace" section is present below, use it to determine fixability — it contains source-mapped file paths that may reveal application frames not visible in the raw stack trace.
+${python ? 'IMPORTANT: Use the final traceback segment and exact application file paths.' : 'IMPORTANT: If a "Resolved Stack Trace" section is present below, use it to determine fixability — it contains source-mapped file paths that may reveal application frames not visible in the raw stack trace.'}
 
 Set fixable to TRUE if:
-- Stack trace (raw or resolved) contains references to application source files (e.g., src/components/Foo.vue:42, app/utils.ts:10)
+- Stack trace (raw or resolved) contains references to application source files (${python ? 'e.g., app/routes.py or services/cart.py' : 'e.g., src/components/Foo.vue:42, app/utils.ts:10'})
 - The error type and message suggest a code bug (null reference, type error, undefined property) AND there are application frames to investigate
 
 When in doubt (mixed signals), set fixable to true with medium/low confidence — we'd rather investigate than miss a real bug.
@@ -253,13 +255,20 @@ ${truncate(input.stackTrace, MAX_STACK_TRACE)}
 Breadcrumbs:
 <untrusted_data>
 ${truncate(input.breadcrumbs ?? '[]', 1000)}
+</untrusted_data>
+
+Customer runtime:
+<untrusted_data>
+${input.customerRuntime ? `${escapeUntrustedLabel(input.customerRuntime.name)} ${escapeUntrustedLabel(input.customerRuntime.version)}` : 'unknown'}
 </untrusted_data>`;
+
+  const allowedReasonCodes = triageReasonCodes(platform);
 
   const response = await client.messages.create({
     model: TRIAGE_MODEL,
     max_tokens: 512,
     messages: [{ role: 'user', content: prompt }],
-    tools: [TRIAGE_TOOL],
+    tools: [triageTool(platform)],
     tool_choice: { type: 'tool', name: 'classify_error' },
   });
 
@@ -279,7 +288,7 @@ ${truncate(input.breadcrumbs ?? '[]', 1000)}
     fixable: raw.fixable === true,
     confidence: validConfidences.includes(rawConfidence as typeof validConfidences[number]) ? rawConfidence as TriageResult['confidence'] : 'low',
     reason: typeof raw.reason === 'string' ? raw.reason : undefined,
-    reason_code: typeof rawReasonCode === 'string' && (TRIAGE_REASON_CODES as readonly string[]).includes(rawReasonCode)
+    reason_code: typeof rawReasonCode === 'string' && allowedReasonCodes.includes(rawReasonCode as ReasonCode)
       ? rawReasonCode as ReasonCode
       : undefined,
     remediation: typeof raw.remediation === 'string' ? raw.remediation : undefined,
@@ -360,8 +369,9 @@ function buildSystemPrompt(
   preloadedFiles?: Array<{ path: string; content: string }>,
 ): string {
   const sections: string[] = [];
+  const python = (input.platform ?? 'javascript') === 'python';
 
-  sections.push(`You are a senior software engineer debugging a production error.
+  sections.push(`You are a senior software engineer debugging a production ${python ? 'Python error from a CPython traceback' : 'JavaScript/browser error'}.
 You have access to the repository in the current working directory (/home/user/repo).
 
 ## Your Task
@@ -369,7 +379,7 @@ You have access to the repository in the current working directory (/home/user/r
 2. Investigate the codebase to understand the root cause
 3. Make the minimal code change to fix the error
 4. Run tests to verify your fix works
-5. If you cannot fix this with code changes (infrastructure issue, third-party library bug, minified stack with no sourcemap), call the give_up tool with an explanation.
+5. If you cannot fix this with code changes (${python ? 'infrastructure issue, third-party site-packages bug, incomplete traceback, or a required schema migration' : 'infrastructure issue, third-party library bug, minified stack with no sourcemap'}), call the give_up tool with an explanation.${python ? ' Use insufficient_context when a safe fix requires a schema migration.' : ''}
 
 ## Rules
 - Keep changes minimal — only modify what's necessary
@@ -383,12 +393,21 @@ You have access to the repository in the current working directory (/home/user/r
 
 ## When to Give Up Early
 After your initial investigation (first 3-5 tool calls), give up immediately if:
-- The error message cannot be found anywhere in the codebase (it was thrown externally, e.g., from the browser console or a test harness)
-- The stack trace only contains <anonymous>, eval(), or browser-internal frames with no application file references
-- The error originates entirely from a third-party library and the fix would require modifying node_modules
+- The error message cannot be found anywhere in the codebase (it was thrown externally or by a test harness)
+- ${python ? 'The traceback has no application .py file references' : 'The stack trace only contains <anonymous>, eval(), or browser-internal frames with no application file references'}
+- The error originates entirely from a third-party library and the fix would require modifying ${python ? 'site-packages or virtualenv files' : 'node_modules'}
 - You've searched for the error pattern in 3+ different ways and found no matching source code
 
-Do NOT spend turns reading SDK source code, package internals, or minified bundles trying to trace an error that doesn't originate from application code. If you can't find the source within 5 tool calls, call give_up.`);
+Do NOT spend turns reading SDK source code, package internals, or ${python ? 'virtualenv contents' : 'minified bundles'} trying to trace an error that doesn't originate from application code. If you can't find the source within 5 tool calls, call give_up.
+${python ? 'Use python -m pytest for verification. Preserve compatibility with the customer runtime shown below.' : ''}`);
+
+  if (python) {
+    sections.push(`## Runtime compatibility
+Customer runtime (untrusted):
+<untrusted_user_data>
+${input.customerRuntime ? `${escapeUntrustedLabel(input.customerRuntime.name)} ${escapeUntrustedLabel(input.customerRuntime.version)}` : 'unknown'}
+</untrusted_user_data>`);
+  }
 
   sections.push(`## Error Details
 Type: ${input.errorType}
@@ -476,6 +495,10 @@ ${truncate(input.stackTrace, MAX_STACK_TRACE)}
 }
 
 export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult> {
+  const platform = input.platform ?? 'javascript';
+  const pythonCleanup = platform === 'python'
+    ? ` && git clean -fdX -- ':(glob)**/__pycache__/**' ':(glob)**/.pytest_cache/**' ':(glob)**/htmlcov/**' ':(glob)**/*.egg-info/**' ':(glob)**/*.pyc' ':(glob)**/.coverage' ':(glob)**/build/**' ':(glob)**/dist/**'`
+    : '';
   const apiKey = process.env['ANTHROPIC_API_KEY'];
   if (!apiKey) {
     return {
@@ -492,6 +515,8 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
   if (!input.investigation) {
     try {
       const triageInput = {
+        platform,
+        customerRuntime: input.customerRuntime,
         errorType: input.errorType,
         title: input.title,
         errorMessage: input.errorMessage,
@@ -588,6 +613,8 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           defaultBranch: input.defaultBranch,
           githubToken: input.githubToken,
           setupCommands: input.setupCommands,
+          platform: input.platform,
+          customerRuntime: input.customerRuntime,
         }),
       );
     } catch (setupError: unknown) {
@@ -605,7 +632,8 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       throw setupError;
     }
     sandbox = repoSandbox.sandbox;
-    const installSucceeded = repoSandbox.installSucceeded;
+    const installOutcome = repoSandbox.installOutcome;
+    const installFailed = installOutcome === 'failed';
     evidence = createEvidenceRecorder();
 
     let verificationInfraError = false;
@@ -617,14 +645,14 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
     // E1 baseline: establish the pre-patch suite state before the agent edits.
     let testPlan: TestPlan = { kind: 'none', command: null };
     let baselineRun: SuiteRun | null = null;
-    if (!installSucceeded) {
+    if (installFailed) {
       evidence.addCheck('suite_baseline', 'infra_error', {
         command: 'dependency install',
-        output: 'npm install failed — the suite cannot run, so no verification claim is possible',
+        output: 'Dependency installation failed — the suite cannot run, so no verification claim is possible',
       });
       verificationInfraError = true;
     } else {
-      testPlan = await planTests(sandbox);
+      testPlan = await planTests(sandbox, platform);
       if (testPlan.kind !== 'none') {
         baselineRun = await traceSpan(
           'suite-baseline',
@@ -640,14 +668,29 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         // Baseline execution may write snapshots, coverage, or fixtures. Restore
         // HEAD before the agent so those artifacts can never enter its patch.
         await sandbox.commands.run(
-          `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
+          `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd${pythonCleanup}`,
           { timeoutMs: 30_000 },
         );
       }
     }
 
     // Extract stack trace files early — used for both preloading and agent state
-    const stackTraceFiles = extractStackTraceFiles(input.stackTrace);
+    let stackTraceFiles: string[];
+    if (platform === 'python') {
+      const tracked = await sandbox.commands.run(
+        `cd ${SANDBOX_REPO_PATH} && git ls-files`,
+        { timeoutMs: 10_000 },
+      );
+      // Parse deeper than the 5 we ultimately preload: frames are dropped by
+      // the tracked-file filter below, so capping before resolution would let
+      // unresolvable top-of-stack frames crowd out the real application file.
+      stackTraceFiles = resolveFrames(
+        parsePythonFrames(input.stackTrace, 25),
+        new Set(tracked.stdout.split('\n').filter(Boolean)),
+      );
+    } else {
+      stackTraceFiles = extractStackTraceFiles(input.stackTrace);
+    }
 
     // Pre-load stack trace files to eliminate exploration turns
     const preloadedFiles: Array<{ path: string; content: string }> = [];
@@ -694,7 +737,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           budgetUsd: input.budgetUsd ?? t.budgetUsd,
         }));
 
-    const tools = createToolBridge(sandbox, agentState);
+        const tools = createToolBridge(sandbox, agentState, platform);
     const middleware = createDefaultMiddleware(sandbox);
     const systemPrompt = buildSystemPrompt(input, preloadedFiles);
 
@@ -720,7 +763,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       // Reset sandbox for non-first model attempts
       if (tierIdx > 0) {
         await sandbox.commands.run(
-          'cd /home/user/repo && git reset HEAD && git checkout -- . && git clean -fd',
+          `cd /home/user/repo && git reset HEAD && git checkout -- . && git clean -fd${pythonCleanup}`,
           { timeoutMs: 30_000 },
         );
         // Reset agent state (keep cumulative token usage in totalTokenUsage)
@@ -824,14 +867,14 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
 
         // Capture the candidate before any gate can write snapshots, coverage,
         // generated files, or fixtures. This is the only diff used downstream.
-        candidateDiff = await extractDiff(sandbox);
+        candidateDiff = await extractDiff(sandbox, platform);
 
         let testResult: { passed: boolean; skipped: boolean; output: string };
-        if (!installSucceeded) {
+        if (installFailed) {
           testResult = { passed: true, skipped: true, output: 'dependency install failed' };
           evidence.addCheck('suite_post_patch', 'infra_error', {
             command: 'dependency install',
-            output: 'npm install failed — post-patch suite cannot run',
+            output: 'Dependency installation failed — post-patch suite cannot run',
           });
         } else if (testPlan.kind === 'none') {
           testResult = { passed: true, skipped: true, output: 'No test runner detected' };
@@ -870,7 +913,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
             });
           } else {
             const passed = post.tests
-              ? newFailures.length === 0
+              ? newFailures.length === 0 && (platform !== 'python' || post.outcome === 'passed')
               : comparison.comparable;
             evidence.addCheck('suite_post_patch', passed ? 'passed' : 'failed', {
               command: post.command,
@@ -885,25 +928,27 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           lastTestOutput = scrubSecrets(testResult.output);
           logger.warn('Test gate failed', { attempt, model: tier.model, output: testResult.output.slice(0, 500) });
           await sandbox.commands.run(
-            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
+            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd${pythonCleanup}`,
             { timeoutMs: 30_000 },
           );
           attempt++;
           continue;
         }
 
-        const buildResult = installSucceeded
+        const buildResult = !installFailed
           ? await traceSpan(
               'build-gate',
               { 'build_gate.attempt': attempt, 'build_gate.tier': tierIdx },
-              () => withInfraRetry(() => runBuildGate(sandbox!)),
+              () => withInfraRetry(() => runBuildGate(sandbox!, platform)),
             )
           : {
               outcome: 'infra_error' as const,
               output: 'dependency install failed — build cannot run',
             };
         evidence.addCheck('build', buildResult.outcome, {
-          command: 'build gate (build script or tsc --noEmit)',
+          command: platform === 'python'
+            ? 'build gate (python -m compileall)'
+            : 'build gate (build script or tsc --noEmit)',
           exitCode: buildResult.exitCode,
           output: buildResult.output,
         });
@@ -912,7 +957,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           lastTestOutput = `The build/typecheck failed after your change:\n${scrubSecrets(buildResult.output)}`;
           logger.warn('Build gate failed', { attempt, model: tier.model });
           await sandbox.commands.run(
-            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd`,
+            `cd ${SANDBOX_REPO_PATH} && git checkout -- . && git clean -fd${pythonCleanup}`,
             { timeoutMs: 30_000 },
           );
           attempt++;
@@ -989,6 +1034,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
           status: 'needs_human',
           diff,
           affectedFiles,
+          sandboxRuntime: repoSandbox.sandboxRuntime,
           confidence: 'low',
           rootCause: result?.summary,
           reason: buildReason(
@@ -1104,6 +1150,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
             ? `${narrative.whatHappened} ${narrative.fixApproach}`
             : undefined,
           affectedFiles,
+          sandboxRuntime: repoSandbox.sandboxRuntime,
           evidence: evidence.record(),
           tokenUsage: totalTokenUsage,
         };
@@ -1126,6 +1173,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         reason: buildReason('low_confidence_fix', reasonMessage),
         evidence: evidence.record(),
         draftEligible: qualityConfirmed && buildGatePassed && !verified,
+        sandboxRuntime: repoSandbox.sandboxRuntime,
         tokenUsage: totalTokenUsage,
       };
     }

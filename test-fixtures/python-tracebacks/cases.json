@@ -1,0 +1,56 @@
+[
+  {
+    "name": "simple_two_frames",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/api/routes.py\", line 10, in view\n    service()\n  File \"/app/services/cart.py\", line 20, in total\n    return 1 + None\nTypeError: unsupported operand",
+    "expectedFrames": [
+      { "path": "services/cart.py", "function": "total" },
+      { "path": "api/routes.py", "function": "view" }
+    ]
+  },
+  {
+    "name": "deployment_prefix_app",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/pkg/main.py\", line 1, in run\n    boom()\nValueError: boom",
+    "expectedFrames": [{ "path": "pkg/main.py", "function": "run" }]
+  },
+  {
+    "name": "deployment_prefix_home_user",
+    "traceback": "Traceback (most recent call last):\n  File \"/home/deploy/pkg/main.py\", line 1, in run\n    boom()\nValueError: boom",
+    "expectedFrames": [{ "path": "pkg/main.py", "function": "run" }]
+  },
+  {
+    "name": "site_packages_filtered",
+    "traceback": "Traceback (most recent call last):\n  File \"/usr/local/lib/python3.12/site-packages/flask/app.py\", line 1, in dispatch\n    view()\n  File \"/app/views.py\", line 2, in view\n    boom()\nValueError: boom",
+    "expectedFrames": [{ "path": "views.py", "function": "view" }]
+  },
+  {
+    "name": "dot_venv_filtered",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/.venv/project_pkg/module.py\", line 1, in helper\n    boom()\n  File \"/app/main.py\", line 2, in run\n    helper()\nValueError: boom",
+    "expectedFrames": [{ "path": "main.py", "function": "run" }]
+  },
+  {
+    "name": "chained_exception",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/inner.py\", line 1, in inner\n    boom()\nKeyError: x\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/app/outer.py\", line 2, in outer\n    handle()\nRuntimeError: failed",
+    "expectedFrames": [{ "path": "outer.py", "function": "outer" }]
+  },
+  {
+    "name": "recursion_dedup",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/recurse.py\", line 1, in spin\n    spin()\n  File \"/app/recurse.py\", line 1, in spin\n    spin()\nRecursionError: depth",
+    "expectedFrames": [{ "path": "recurse.py", "function": "spin" }]
+  },
+  {
+    "name": "more_than_five_frames",
+    "traceback": "Traceback (most recent call last):\n  File \"/app/a.py\", line 1, in a\n    b()\n  File \"/app/b.py\", line 1, in b\n    c()\n  File \"/app/c.py\", line 1, in c\n    d()\n  File \"/app/d.py\", line 1, in d\n    e()\n  File \"/app/e.py\", line 1, in e\n    f()\n  File \"/app/f.py\", line 1, in f\n    g()\n  File \"/app/g.py\", line 1, in g\n    boom()\nValueError: boom",
+    "expectedFrames": [
+      { "path": "g.py", "function": "g" },
+      { "path": "f.py", "function": "f" },
+      { "path": "e.py", "function": "e" },
+      { "path": "d.py", "function": "d" },
+      { "path": "c.py", "function": "c" }
+    ]
+  },
+  {
+    "name": "malformed_no_frames",
+    "traceback": "Traceback (most recent call last):\ngarbage",
+    "expectedFrames": []
+  }
+]

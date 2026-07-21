@@ -1,16 +1,19 @@
 import type { CheckOutcome } from '@opslane/shared';
 import type { SandboxRuntime } from './sandbox-runtime.js';
 import { scrubSecrets } from './redact.js';
+import type { Platform } from '../platform.js';
+import { parseJUnitXml } from './junit.js';
 
 const SANDBOX_REPO = '/home/user/repo';
 export const SUITE_RESULTS_PATH = '/tmp/opslane-suite-results.json';
+export const PYTEST_RESULTS_PATH = '/tmp/opslane-junit.xml';
 const SUITE_TIMEOUT_MS = 240_000;
 const MAX_SUITE_OUTPUT = 4000;
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn';
 
 export interface TestPlan {
-  kind: 'vitest' | 'npm-script' | 'none';
+  kind: 'vitest' | 'pytest' | 'npm-script' | 'none';
   command: string | null;
 }
 
@@ -105,7 +108,7 @@ export function compareSuiteRuns(
       .filter(([id, status]) => status === 'failed' && baseline.tests?.get(id) !== 'failed')
       .map(([id]) => id);
     const missingFromPost = [...baseline.tests]
-      .filter(([id, status]) => status === 'passed' && !post.tests?.has(id))
+      .filter(([id]) => !post.tests?.has(id))
       .map(([id]) => id);
     return { baselineFailed, newFailures, missingFromPost, comparable: true };
   }
@@ -129,7 +132,13 @@ async function fileExists(sandbox: SandboxRuntime, path: string): Promise<boolea
   }
 }
 
-export async function planTests(sandbox: SandboxRuntime): Promise<TestPlan> {
+export async function planTests(
+  sandbox: SandboxRuntime,
+  platform: Platform = 'javascript',
+): Promise<TestPlan> {
+  if (platform === 'python') {
+    return { kind: 'pytest', command: `python -m pytest --junit-xml=${PYTEST_RESULTS_PATH}` };
+  }
   let pkg: PackageJsonLike = {};
   try {
     pkg = JSON.parse(await sandbox.files.read(`${SANDBOX_REPO}/package.json`)) as PackageJsonLike;
@@ -192,7 +201,7 @@ export async function runSuite(
     };
   }
 
-  await sandbox.commands.run(`rm -f ${SUITE_RESULTS_PATH}`, { timeoutMs: 10_000 });
+  await sandbox.commands.run(`rm -f ${plan.kind === 'pytest' ? PYTEST_RESULTS_PATH : SUITE_RESULTS_PATH}`, { timeoutMs: 10_000 });
   let rawOutput = '';
   let exitCode = 0;
   try {
@@ -219,6 +228,26 @@ export async function runSuite(
   }
   const output = bound(rawOutput);
   const exitedNonZero = exitCode !== 0;
+
+  if (plan.kind === 'pytest') {
+    if (exitCode > 1) {
+      return { outcome: 'infra_error', command: plan.command, tests: null, total: null, exitCode, output };
+    }
+    const parsed = await sandbox.files.read(PYTEST_RESULTS_PATH)
+      .then(parseJUnitXml)
+      .catch(() => ({ outcome: 'infra_error' as const, tests: new Map<string, TestStatus>(), total: 0 }));
+    const outcome = exitCode === 1 && parsed.outcome === 'passed'
+      ? 'infra_error'
+      : parsed.outcome;
+    return {
+      outcome,
+      command: plan.command,
+      tests: parsed.tests,
+      total: parsed.total,
+      exitCode,
+      output,
+    };
+  }
 
   if (plan.kind === 'vitest') {
     let parsed: ParsedSuite | null = null;

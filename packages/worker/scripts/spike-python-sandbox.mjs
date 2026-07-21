@@ -36,7 +36,9 @@ try {
     'python -c "import flask, sqlalchemy, psycopg2; print(\'imports ok\')"',
     'cd /home/user/fixture && python -c "import app; print(\'app ok\')"',
     'python -m pytest --version',
-    'cd /home/user/fixture && python -m pytest -v',
+    'xz --version',
+    'cd /home/user/fixture && python -m pytest -v --junit-xml=/tmp/opslane-junit.xml',
+    'python -c "from pathlib import Path; p=Path(\'/tmp/opslane-junit.xml\'); assert p.read_text().startswith(\'<?xml\'); print(\'junit xml readable\')"',
   ]) {
     const result = await sbx.commands.run(command, { timeoutMs: 120_000 });
     const stderr = result.stderr ? `\n${result.stderr.trim()}` : '';

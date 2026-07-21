@@ -4,9 +4,13 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Sandbox } from 'e2b';
+import type { Platform } from '../platform.js';
 
 const execFile = promisify(execFileCallback);
 const VIRTUAL_HOME = '/home/user';
+/** Must match the template name in packages/worker/e2b-python/e2b.toml. */
+const DEFAULT_PYTHON_TEMPLATE = 'opslane-python';
+const PYTHON_SANDBOX_LIFETIME_MS = 1_800_000;
 const VIRTUAL_TMP = '/tmp';
 
 export interface SandboxCommandResult {
@@ -33,9 +37,17 @@ export interface SandboxRuntime {
  * The local backend is a transport test double, not a security boundary, and
  * must only execute trusted fixture repositories and scripted model commands.
  */
-export async function createSandboxRuntime(): Promise<SandboxRuntime> {
+export async function createSandboxRuntime(platform: Platform = 'javascript'): Promise<SandboxRuntime> {
   const backend = process.env['OPSLANE_SANDBOX_BACKEND']?.trim().toLowerCase() || 'e2b';
-  if (backend === 'e2b') return Sandbox.create();
+  if (backend === 'e2b') {
+    // Python installs (pip build backends, compiled wheels) run far longer than
+    // npm, so the Python path gets an extended lifetime. The JavaScript path
+    // keeps the E2B default: raising it there would multiply billed sandbox
+    // time and leak duration on a worker crash for no benefit.
+    if (platform !== 'python') return Sandbox.create();
+    const template = process.env['OPSLANE_E2B_PYTHON_TEMPLATE']?.trim() || DEFAULT_PYTHON_TEMPLATE;
+    return Sandbox.create(template, { timeoutMs: PYTHON_SANDBOX_LIFETIME_MS });
+  }
   if (backend === 'local') {
     if (process.env['OPSLANE_RELIABILITY_HARNESS'] !== '1') {
       throw new Error('Local sandbox backend requires OPSLANE_RELIABILITY_HARNESS=1');

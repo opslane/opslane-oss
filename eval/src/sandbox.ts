@@ -35,6 +35,7 @@ function execWithStdin(
 export async function createSandbox(
   appDir: string,
   bugPatchPath?: string | null,
+  platform: 'javascript' | 'python' = 'javascript',
 ): Promise<string> {
   const sandboxDir = await mkdtemp(path.join(tmpdir(), 'opslane-eval-'));
   await cp(appDir, sandboxDir, {
@@ -43,10 +44,15 @@ export async function createSandbox(
   });
 
   // Write .gitignore BEFORE git init to avoid staging node_modules
-  await writeFile(path.join(sandboxDir, '.gitignore'), 'node_modules/\ndist/\n');
+  await writeFile(path.join(sandboxDir, '.gitignore'), 'node_modules/\ndist/\n.venv/\n__pycache__/\n*.pyc\n.pytest_cache/\n*.egg-info/\n');
 
   // Install dependencies so grading sandbox has node_modules for test runners
-  await execFile('npm', ['install'], { cwd: sandboxDir, timeout: 120_000 });
+  if (platform === 'python') {
+    await execFile('python', ['-m', 'venv', '.venv'], { cwd: sandboxDir, timeout: 60_000 });
+    await execFile(path.join(sandboxDir, '.venv', 'bin', 'python'), ['-m', 'pip', 'install', '-r', 'requirements.txt'], { cwd: sandboxDir, timeout: 120_000 });
+  } else {
+    await execFile('npm', ['install'], { cwd: sandboxDir, timeout: 120_000 });
+  }
 
   await execFile('git', ['init'], { cwd: sandboxDir });
   await execFile('git', ['-c', 'user.name=eval', '-c', 'user.email=eval@test', 'add', '-A'], { cwd: sandboxDir });

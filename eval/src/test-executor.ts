@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import path from 'node:path';
 
 const exec = promisify(execFile);
 
@@ -18,6 +19,7 @@ export async function runTests(
   appDir: string,
   testNames: string[],
   timeoutMs = 60_000,
+  platform: 'javascript' | 'python' = 'javascript',
 ): Promise<TestResult[]> {
   const results: TestResult[] = [];
 
@@ -26,8 +28,12 @@ export async function runTests(
     const fullTestName = testName.substring(filePath.length + 3);
 
     try {
+      const command = platform === 'python' ? path.join(appDir, '.venv', 'bin', 'python') : 'npx';
+      const args = platform === 'python'
+        ? ['-m', 'pytest', testName, '-q']
+        : ['vitest', 'run', filePath, '-t', escapeRegex(fullTestName), '--reporter=verbose'];
       const { stdout } = await exec(
-        'npx', ['vitest', 'run', filePath, '-t', escapeRegex(fullTestName), '--reporter=verbose'],
+        command, args,
         { cwd: appDir, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }
       );
       results.push({ test: testName, passed: true, output: stdout });

@@ -104,12 +104,12 @@ describe('compareSuiteRuns', () => {
     expect(comparison.missingFromPost).toEqual(['t2']);
   });
 
-  it('does not treat a disappearing baseline failure as a collection drop', () => {
+  it('treats a disappearing baseline failure as a collection drop', () => {
     const comparison = compareSuiteRuns(
       run('failed', [['t1', 'passed'], ['t2', 'failed']]),
       run('passed', [['t1', 'passed']]),
     );
-    expect(comparison.missingFromPost).toEqual([]);
+    expect(comparison.missingFromPost).toEqual(['t2']);
   });
 
   it('only supports a coarse comparison when the post run passed cleanly', () => {

@@ -33,6 +33,8 @@ import { processFrictionOutcomes } from './friction/promotion.js';
 import { createAnthropicAdjudicator, type Adjudicator } from './friction/adjudicator.js';
 import { VerificationInfraError } from './harness/errors.js';
 import { processCIWatchJob } from './ci-watch.js';
+import { effectivePlatform, pythonPipelineEnabled } from './platform.js';
+import { parseRuntimeInfo } from './runtime-info.js';
 
 /** Injectable seam: unit tests and the e2e gate substitute a deterministic
  * adjudicator; production uses the real Anthropic-backed one. */
@@ -245,6 +247,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
 
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+  const platform = effectivePlatform(group.platform, pythonPipelineEnabled());
 
   // A reclaimed investigate job may have committed its durable outcome before
   // losing the lease at the final queue-completion boundary. Adopt that outcome
@@ -269,21 +272,23 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
   const event = group.sample_event_id
     ? await db.getErrorEvent(group.sample_event_id, job.projectId)
     : null;
+  const customerRuntime = parseRuntimeInfo(event?.context ?? '');
 
   // Pre-clone guard: errors with no application stack frames (cross-origin
   // "Script error.", non-Error promise rejections) are inherently unfixable by
   // the agent. Short-circuit to needs_human BEFORE cloning the repo or spending
   // an LLM/sandbox. The reason code is non-retriable, so the single collapsed
   // stackless group won't reopen on every recurrence.
-  if (hasNoAppFrames(event?.stack_trace_raw ?? '')) {
+  if (hasNoAppFrames(event?.stack_trace_raw ?? '', platform)) {
     await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
-      reason: {
-        reason_code: 'unfixable_no_app_frames',
-        reason_message:
-          'Error has no application stack frames (cross-origin "Script error." or a non-Error promise rejection), so there is nothing to investigate.',
-        remediation:
-          'Add the `crossorigin` attribute to your <script> tags (with CORS headers on the script host) so the browser exposes real stack traces, and throw/reject Error objects rather than strings so the SDK can capture a stack.',
-      },
+      reason: buildReason(
+        'unfixable_no_app_frames',
+        platform === 'python'
+          ? 'The Python traceback has no application frames, so there is nothing safe to investigate.'
+          : 'Error has no application stack frames (cross-origin "Script error." or a non-Error promise rejection), so there is nothing to investigate.',
+        undefined,
+        platform,
+      ),
     }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
@@ -366,7 +371,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
     // Source map resolution
     const [replay, sourceMaps] = await Promise.all([
       db.getReplayForGroup(job.errorGroupId, job.projectId),
-      event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
+      platform === 'javascript' && event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
     ]);
 
     const minioConfig = getMinIOConfig();
@@ -394,6 +399,8 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
 
     // Run codebase-aware investigation
     const triage = await investigateError(apiKey, {
+      platform,
+      customerRuntime,
       errorType: event?.error_type ?? 'Unknown',
       title: group.title,
       errorMessage: event?.error_message ?? '',
@@ -434,6 +441,7 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
         rootCause: triage.reason,
         suggestedMitigation: triage.remediation,
         confidence: triage.confidence,
+        platform,
       }, job);
       if (fixResult.created) {
         jobsProcessed++;
@@ -659,6 +667,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   // Fetch real data
   const group = await db.getErrorGroup(job.errorGroupId, job.projectId);
   if (!group) throw new Error(`Error group ${job.errorGroupId} not found`);
+  const platform = job.platform ?? effectivePlatform(group.platform, pythonPipelineEnabled());
 
   if (group.status === 'pr_created' || group.status === 'pr_draft') {
     logger.info('Fix delivery already committed; adopting existing state', {
@@ -686,6 +695,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   const event = group.sample_event_id
     ? await db.getErrorEvent(group.sample_event_id, job.projectId)
     : null;
+  const customerRuntime = parseRuntimeInfo(event?.context ?? '');
 
   const project = await db.getProject(job.projectId);
   if (!project) throw new Error(`Project ${job.projectId} not found`);
@@ -696,7 +706,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
   // Parallel fetch for independent data
   const [replay, sourceMaps, sessionPointer, environmentContext] = await Promise.all([
     db.getReplayForGroup(job.errorGroupId, job.projectId),
-    event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
+    platform === 'javascript' && event?.release ? db.getSourceMaps(job.projectId, event.release) : Promise.resolve([]),
     db.getSessionPointerForGroup(job.errorGroupId, job.projectId),
     db.getEnvironmentNamesForGroup(job.errorGroupId, job.projectId, group.kind),
   ]);
@@ -850,6 +860,8 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       : null;
 
     const result = await runPipeline({
+      platform,
+      customerRuntime,
       jobId: job.id,
       errorGroupId: job.errorGroupId,
       projectId: job.projectId,

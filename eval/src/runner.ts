@@ -99,7 +99,8 @@ async function runCase(evalCase: EvalCase): Promise<EvalCaseResult> {
       const patchPath = evalCase.bug_patch
         ? path.join(CASES_DIR, evalCase.id, evalCase.bug_patch)
         : null;
-      sandboxPath = await createSandbox(appDir, patchPath);
+      const platform = evalCase.error_event.platform ?? 'javascript';
+      sandboxPath = await createSandbox(appDir, patchPath, platform);
 
       if (process.env['EVAL_DEBUG']) {
         console.log(`  DEBUG diff (${result.diff.length} chars):\n${result.diff}`);
@@ -122,8 +123,8 @@ async function runCase(evalCase: EvalCase): Promise<EvalCaseResult> {
       }
 
       if (patchApplied) {
-        f2pResults = await runTests(sandboxPath, evalCase.grading.fail_to_pass);
-        p2pResults = await runTests(sandboxPath, evalCase.grading.pass_to_pass);
+        f2pResults = await runTests(sandboxPath, evalCase.grading.fail_to_pass, 60_000, platform);
+        p2pResults = await runTests(sandboxPath, evalCase.grading.pass_to_pass, 60_000, platform);
       }
     }
 
@@ -132,7 +133,10 @@ async function runCase(evalCase: EvalCase): Promise<EvalCaseResult> {
     let judgeSkipped = false;
     if (result.status === 'fix_ready' && result.diff && evalCase.expected.outcome === 'fix_pr') {
       const goldPatch = await loadGoldPatch(path.join(CASES_DIR, evalCase.id));
-      const stackTraceFiles = extractStackTraceFiles(evalCase.error_event.error.stack);
+      const stackTraceFiles = extractStackTraceFiles(
+        evalCase.error_event.error.stack,
+        evalCase.error_event.platform,
+      );
       try {
         judgeResult = await judgeCase(evalCase, result.diff, goldPatch, stackTraceFiles);
       } catch (err: unknown) {

@@ -45,6 +45,8 @@ export async function callPipeline(
   }
 
   return runAgentFix({
+    platform: evalCase.error_event.platform,
+    customerRuntime: evalCase.error_event.runtime ?? null,
     errorGroupId: evalCase.id,
     projectId: `eval-${evalCase.app}`,
     title: `${evalCase.error_event.error.type}: ${evalCase.error_event.error.message}`,

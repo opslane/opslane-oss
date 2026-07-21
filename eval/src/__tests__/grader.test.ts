@@ -93,6 +93,17 @@ describe('gradeCase', () => {
     expect(result.reason_code_correct).toBe(true);
   });
 
+  it('fails needs_human case when the expected reason_code does not match', () => {
+    const pipelineResult: AgentFixResult = {
+      status: 'needs_human',
+      reason: { reason_code: 'triage_unfixable', reason_message: 'not actionable', remediation: 'review manually' },
+    };
+    const result = gradeCase(needsHumanCase, pipelineResult, false, [], [], 500);
+    expect(result.passed).toBe(false);
+    expect(result.outcome_correct).toBe(true);
+    expect(result.reason_code_correct).toBe(false);
+  });
+
   it('fails needs_human case when pipeline returns fix_ready (false positive)', () => {
     const pipelineResult: AgentFixResult = {
       status: 'fix_ready',

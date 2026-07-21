@@ -151,6 +151,29 @@ describe('processInvestigateJob — pre-clone guard for stackless errors', () =>
     mockGetSessionPointerForGroup.mockResolvedValue(null);
   });
 
+  afterEach(() => {
+    delete process.env['OPSLANE_PYTHON_PIPELINE'];
+  });
+
+  const pythonTraceback = 'Traceback (most recent call last):\n  File "/app/cart.py", line 11, in total\n    boom()\nTypeError: boom';
+
+  it('opens the Python guard only when the feature flag is enabled', async () => {
+    mockGetErrorGroup.mockResolvedValue(makeGroup({ platform: 'python' }));
+    mockGetErrorEvent.mockResolvedValue(makeEvent(pythonTraceback));
+
+    await processInvestigateJob(makeJob(), new AbortController().signal);
+    expect(unfixableCall()).toBeDefined();
+
+    vi.clearAllMocks();
+    process.env['OPSLANE_PYTHON_PIPELINE'] = '1';
+    mockGetErrorGroup.mockResolvedValue(makeGroup({ platform: 'python' }));
+    mockGetErrorEvent.mockResolvedValue(makeEvent(pythonTraceback));
+    mockGetProject.mockResolvedValue(null);
+
+    await expect(processInvestigateJob(makeJob(), new AbortController().signal)).rejects.toThrow(/not found/i);
+    expect(unfixableCall()).toBeUndefined();
+  });
+
   it('short-circuits a stackless event to needs_human WITHOUT cloning the repo', async () => {
     mockGetErrorGroup.mockResolvedValue(makeGroup());
     mockGetErrorEvent.mockResolvedValue(makeEvent('')); // empty stack = cross-origin "Script error."
@@ -251,6 +274,7 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     vi.unstubAllGlobals();
     delete process.env['INGESTION_BASE_URL'];
     delete process.env['INTERNAL_READ_TOKEN'];
+    delete process.env['OPSLANE_PYTHON_PIPELINE'];
   });
 
   it('terminates as needs_human with all reason fields + confidence when the fix is below floor', async () => {
@@ -291,6 +315,29 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
       headSha: 'head-7',
       fixJobId: 'j1',
     }));
+  });
+
+  it('keeps persisted Python routing after the feature flag is disabled', async () => {
+    process.env['OPSLANE_PYTHON_PIPELINE'] = '0';
+    mockGetErrorGroup.mockResolvedValue({
+      ...makeGroup({ id: 'g1', sample_event_id: 'e1', status: 'fixing', platform: 'python' }),
+    });
+    mockGetErrorEvent.mockResolvedValue({
+      ...makeEvent('Traceback (most recent call last):\n  File "/app/cart.py", line 1, in total\n    boom()\nTypeError: boom'),
+      id: 'e1', context: '{"runtime":{"name":"CPython","version":"3.11.8"}}', release: 'r1',
+    });
+    mockRunPipeline.mockResolvedValue({
+      status: 'needs_human',
+      reason: { reason_code: 'tests_failed', reason_message: 'failed', remediation: 'review' },
+    });
+
+    await processFixJob({ ...fixJob(), platform: 'python' }, new AbortController().signal);
+
+    expect(mockRunPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      platform: 'python',
+      customerRuntime: { name: 'CPython', version: '3.11.8' },
+    }));
+    expect(db.getSourceMaps).not.toHaveBeenCalled();
   });
 
   it('rethrows verification infrastructure errors while the job has retries remaining', async () => {

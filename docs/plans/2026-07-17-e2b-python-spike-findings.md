@@ -1,7 +1,7 @@
 # E2B Python Template Spike Findings
 
-**Status:** Complete — authenticated template build and three live benchmark
-runs passed on 2026-07-17.
+**Status:** Complete — authenticated template builds and live benchmark runs
+passed on 2026-07-17 and 2026-07-20.
 
 This document records the evidence required to decide whether Batch 3 can use a
 300-second `pip install` budget. The template was built and exercised with the
@@ -12,7 +12,8 @@ use.
 
 - Template name: `opslane-python`
 - Template ID: `84c1j5abpjvqq2g5n5va`
-- Build ID: `73c60796-1e6d-4cd2-9371-3bc689162e81`
+- Current build ID: `c598ecc8-8d68-4b4c-a610-d776729c9235`
+- Original 2026-07-17 build ID: `73c60796-1e6d-4cd2-9371-3bc689162e81`
 - Owning E2B team: **Opslane**
   (`824cf00b-6c58-49e6-ae5f-a8419069a091`)
 - Ownership proof: the selected Opslane team built the template, and its team
@@ -41,6 +42,20 @@ Evidence from every run:
 - the template reports pytest 8.2.2;
 - the fixture test passes; and
 - the script exits successfully after printing `SPIKE PASSED`.
+
+## Batch 3 republish verification
+
+The template was rebuilt and published on 2026-07-20 after adding `xz-utils`.
+A fresh live sandbox created from `opslane-python` produced this evidence:
+
+- sandbox boot: 794 ms;
+- `pip install`: 18,646 ms;
+- runtime: Python 3.12.13;
+- pytest 8.2.2 collected and passed the fixture test;
+- xz 5.8.1 was present; and
+- pytest wrote `/tmp/opslane-junit.xml`, which was read back successfully.
+
+The live script ended with `SPIKE PASSED`.
 
 ## Failures and fixes
 
