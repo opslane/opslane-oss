@@ -335,6 +335,11 @@ jobs:
           # The notifications contract test runs a webhook sink on the runner;
           # the container reaches it via the extra_hosts host-gateway mapping.
           NOTIFY_UNSAFE_EXTRA_WEBHOOK_HOSTS: host.docker.internal:9999
+          # The friction suites wait on the chunk scrubber 13 times. A 1s tick
+          # removes up to 15s from each wait. The 30s eligibility grace is
+          # deliberately left at its production value; the tests fast-forward
+          # their own fixtures instead (see makeChunksScrubbable).
+          SCRUB_INTERVAL_SECONDS: "1"
         run: |
           docker compose up -d postgres minio minio-setup
           docker compose run --rm migrate
@@ -391,6 +396,11 @@ jobs:
           # suite prefix: they carry the #104 security contract, and a suite
           # prefix would let the rejection cases be deleted while the accepted
           # case alone keeps the pattern matching.
+          # The friction-incidents cases are pinned individually too: that suite
+          # is the lane's only end-to-end proof of the 5-user promotion
+          # threshold, environment isolation, and the ±30s error-fold window,
+          # and it is the suite the scrub fast-forward makes cheap. Pinning stops
+          # a future edit dropping one while E2E_MIN_TESTS still passes.
           E2E_REQUIRED_PATTERNS: |
             ^browser smoke: Vue error to needs_human >
             ^browser smoke: React error to needs_human >
@@ -411,6 +421,11 @@ jobs:
             ^origin allowlist with a server-side SDK > keeps browser-only routes strict for header-less callers$
             ^real Chromium always sends Origin to /events > rejects a page whose origin is not on the allowlist$
             ^real Chromium always sends Origin to /events > accepts the same page once its origin is allowlisted$
+            ^friction incidents — synthetic live-service gate > four users stay invisible
+            ^friction incidents — synthetic live-service gate > environments never combine
+            ^friction incidents — synthetic live-service gate > a signal inside ±30s
+            ^friction incidents — synthetic live-service gate > an error outside the ±30s window
+            ^friction incidents — synthetic live-service gate > the stepper fixture produces no signal
         run: node scripts/check-e2e-results.mjs "${{ runner.temp }}/e2e-results.json"
       - name: Token-leak scan over logs and public HTTP surfaces
         run: |
