@@ -37,7 +37,12 @@ type sessionInitRequest struct {
 	StartedAt   string `json:"started_at"`
 	PageURL     string `json:"page_url"`
 	Environment string `json:"environment"`
-	User        *struct {
+	Release     string `json:"release"`
+	SDK         *struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	} `json:"sdk"`
+	User *struct {
 		ID          string `json:"id"`
 		Email       string `json:"email"`
 		AccountID   string `json:"account_id"`
@@ -59,7 +64,7 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusUnauthorized, "missing project context")
 		return
 	}
-	if d.MinIO == nil {
+	if d.MinIO == nil && d.Queries == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "object storage not configured")
 		return
 	}
@@ -88,6 +93,13 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid session_id")
 		return
 	}
+	hasSDKIdentity := req.SDK != nil && req.SDK.Name != "" && req.SDK.Version != ""
+	// Preserve the cheap replay-only failure path used by deployments without
+	// storage. Reporting requests continue so SDK identity can be registered.
+	if d.MinIO == nil && !hasSDKIdentity {
+		writeJSONError(w, http.StatusServiceUnavailable, "object storage not configured")
+		return
+	}
 
 	tombstoned, err := d.Queries.SessionIsTombstoned(r.Context(), req.SessionID)
 	if err != nil {
@@ -110,14 +122,13 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusConflict, "session_id belongs to another project")
 		return
 	}
-
 	enabled, err := d.Queries.ProjectRecordingEnabled(r.Context(), projectID)
 	if err != nil {
 		slog.Error("recording flag lookup failed", "error", err, "project_id", projectID)
 		writeJSONError(w, http.StatusInternalServerError, "failed to register session")
 		return
 	}
-	if !enabled {
+	if !enabled && !hasSDKIdentity {
 		writeJSON(w, http.StatusOK, sessionInitResponse{Recording: false})
 		return
 	}
@@ -156,8 +167,14 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var sdkIdentity *db.SessionSDKIdentity
+	if hasSDKIdentity {
+		sdkIdentity = &db.SessionSDKIdentity{
+			Name: req.SDK.Name, Version: req.SDK.Version, Release: req.Release,
+		}
+	}
 	registration, err := d.Queries.RegisterSession(r.Context(), req.SessionID, projectID, environmentID,
-		endUserID, startedAt, masking.RedactURL(req.PageURL))
+		endUserID, startedAt, masking.RedactURL(req.PageURL), sdkIdentity)
 	if err != nil {
 		if errors.Is(err, db.ErrSessionTombstoned) {
 			writeJSONError(w, http.StatusGone, "session has been deleted")
@@ -174,6 +191,22 @@ func (d *Dependencies) SessionInit(w http.ResponseWriter, r *http.Request) {
 	}
 	if registration.Diverged {
 		RecordEnvironmentSessionDivergence()
+	}
+	if sdkIdentity != nil {
+		if _, err := d.Queries.MarkAgentSessionsAppReporting(r.Context(), projectID); err != nil {
+			slog.Error("advance onboarding reporting status failed", "error", err, "project_id", projectID)
+			writeJSONError(w, http.StatusInternalServerError, "failed to register session")
+			return
+		}
+	}
+
+	if d.MinIO == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "object storage not configured")
+		return
+	}
+	if !enabled {
+		writeJSON(w, http.StatusOK, sessionInitResponse{Recording: false})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, sessionInitResponse{

@@ -59,6 +59,7 @@ func cleanupCallbackTenant(t *testing.T, pool *pgxpool.Pool, sessionID string, i
 		_, _ = pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id = $1`, sessionID)
 	}
 	if installationID != 0 {
+		_, _ = pool.Exec(ctx, `DELETE FROM installation_landed WHERE installation_id = $1`, installationID)
 		_, _ = pool.Exec(ctx, `DELETE FROM github_app_installations WHERE installation_id = $1`, installationID)
 	}
 	if orgID == "" {
@@ -101,7 +102,8 @@ func pollAgentSession(t *testing.T, deps *Dependencies, sessionID, rawToken stri
 	return w.Code, body
 }
 
-func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
+func TestWorkosAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
+	t.Setenv("AUTH_PROVIDER", "workos")
 	pool := githubOAuthTestPool(t)
 	q := db.New(pool)
 	privateKey := callbackTestKey(t)
@@ -154,9 +156,11 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 	})})
 	defer restore()
 
+	provider := &recordingProvider{}
 	deps := &Dependencies{
 		Queries: q, GitHubAppID: "1", GitHubAppClientID: "cid",
 		GitHubAppClientSecret: "sec", GitHubAppPrivateKey: privateKey,
+		AuthProvider: provider,
 	}
 	callback := func(sessionID string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf(
@@ -177,13 +181,19 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 		}
 		after, err := q.GetAgentSession(context.Background(), session.ID)
 		if err != nil || after == nil || after.OrgID == nil {
-			t.Fatalf("completed session=%+v err=%v", after, err)
+			t.Fatalf("provisioned session=%+v err=%v", after, err)
 		}
 		orgID := *after.OrgID
 		t.Cleanup(func() { cleanupCallbackTenant(t, pool, session.ID, installationID, orgID) })
+		var auditCount int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM installation_landed WHERE installation_id = $1 AND $2 = ANY(repos)`,
+			installationID, repoFullName).Scan(&auditCount); err != nil || auditCount != 1 {
+			t.Fatalf("landed audit count=%d err=%v", auditCount, err)
+		}
 
 		code, first := pollAgentSession(t, deps, session.ID, raw)
-		if code != http.StatusOK || first["status"] != "completed" {
+		if code != http.StatusOK || first["status"] != "provisioned" {
 			t.Fatalf("first poll code=%d body=%v", code, first)
 		}
 		key, _ := first["api_key"].(string)
@@ -191,7 +201,7 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 			t.Fatalf("api_key=%q", key)
 		}
 		_, second := pollAgentSession(t, deps, session.ID, raw)
-		if second["api_key"] != key {
+		if second["status"] != "key_ok" || second["api_key"] != key {
 			t.Fatalf("second poll key=%v, want %q", second["api_key"], key)
 		}
 
@@ -268,6 +278,9 @@ func TestAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 			t.Fatalf("poll body=%v", body)
 		}
 	})
+	if len(provider.exchangeCodes) != 0 {
+		t.Fatalf("WorkOS exchanged GitHub codes: %v", provider.exchangeCodes)
+	}
 }
 
 func TestAgentPollExpiredSessionContract(t *testing.T) {

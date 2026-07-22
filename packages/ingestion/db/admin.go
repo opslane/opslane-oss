@@ -52,7 +52,7 @@ type AdminOutcomeOverview struct {
 // columns are nullable, so a time filter alone cannot exclude pre-v2 rows.
 //
 // AuthClicked and KeyClaimed are best-effort stamps. FirstEventReceived is
-// project activation for a completed session, not a strictly ordered funnel
+// project activation for a successfully provisioned session, not a strictly ordered funnel
 // stage, and can therefore exceed KeyClaimed.
 type AdminOnboardingOverview struct {
 	Started            int64            `json:"started"`
@@ -112,10 +112,10 @@ func (q *Queries) AdminOverviewData(ctx context.Context) (*AdminOverview, error)
 			NULL::text AS reason,
 			count(*),
 			count(auth_clicked_at),
-			count(*) FILTER (WHERE status = 'completed'),
+			count(*) FILTER (WHERE status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')),
 			count(key_claimed_at),
 			count(*) FILTER (
-				WHERE status = 'completed'
+				WHERE status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')
 				  AND project_id IS NOT NULL
 				  AND EXISTS (
 					SELECT 1 FROM error_events e WHERE e.project_id = funnel.project_id

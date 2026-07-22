@@ -46,4 +46,9 @@ regexes = [
   # in the notifications implementation plan. An obvious hex counter, not a
   # secret.
   '''0123456789abcdef0123456789abcdef''',
+  # Deterministic poll token from the onboarding-reporting seed
+  # (scripts/seed-onboarding.sql, quoted in the onboarding implementation
+  # plan). The database stores only its hash; the raw value is published on
+  # purpose so the smoke can authenticate against the seeded session.
+  '''opt_9001e986d7d75a0051a2e832119dc17b3aec0390e8d1b986b0c2212fbc23cb5c''',
 ]

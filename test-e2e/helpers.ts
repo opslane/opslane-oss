@@ -480,6 +480,13 @@ export async function cleanupTenant(orgId: string): Promise<void> {
   // Delete in dependency order (or rely on CASCADE if configured)
   // Since we don't have CASCADE, delete manually in reverse order
 
+  // oauth_login_states.initiating_user_id references users with no ON DELETE
+  // (migration 024), so clear login states before the users they point at.
+  await db.query(
+    `DELETE FROM oauth_login_states WHERE initiating_user_id IN (SELECT id FROM users WHERE org_id = $1)`,
+    [orgId]
+  );
+
   // Users
   await db.query(
     `DELETE FROM users WHERE org_id = $1`,

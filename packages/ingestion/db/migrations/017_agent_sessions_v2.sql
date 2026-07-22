@@ -24,6 +24,30 @@ ALTER TABLE oauth_login_states ADD COLUMN IF NOT EXISTS target_org_id UUID;
 
 -- 'failed' is a new terminal status; old binaries never write it, so widening
 -- the CHECK is expand-safe.
-ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
-ALTER TABLE agent_sessions ADD CONSTRAINT agent_sessions_status_check
-  CHECK (status IN ('pending', 'completed', 'expired', 'failed'));
+--
+-- REPLAY-SAFE: the migration runner replays every file on every boot (no
+-- ledger), so this must not re-narrow a constraint a LATER migration widened.
+-- Migration 021 adds 'provisioned'/'key_ok'/'app_reporting'; once those rows
+-- exist, an unconditional re-add of the 4-value set aborts the whole boot.
+-- Only (re)define when the constraint is missing or still the pre-017 shape
+-- (i.e. does not yet include 'failed'). See migration 021.
+DO $$
+DECLARE def text; has_wider boolean;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO def
+    FROM pg_constraint WHERE conname = 'agent_sessions_status_check';
+  -- Does any row already use a status wider than this migration's 4-value set?
+  -- (Migration 021 introduces such statuses; a half-applied prior boot can also
+  -- leave the constraint dropped with wider rows present.)
+  SELECT EXISTS (
+    SELECT 1 FROM agent_sessions
+    WHERE status NOT IN ('pending', 'completed', 'expired', 'failed')
+  ) INTO has_wider;
+  -- Re-narrow only when the constraint still needs it AND no data has moved on.
+  -- Otherwise leave it for migration 021 to (re)add the widened constraint.
+  IF (def IS NULL OR def NOT LIKE '%failed%') AND NOT has_wider THEN
+    ALTER TABLE agent_sessions DROP CONSTRAINT IF EXISTS agent_sessions_status_check;
+    ALTER TABLE agent_sessions ADD CONSTRAINT agent_sessions_status_check
+      CHECK (status IN ('pending', 'completed', 'expired', 'failed'));
+  END IF;
+END $$;

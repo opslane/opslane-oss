@@ -7,6 +7,7 @@ import { sdkFetch } from './network';
 import { ensureSessionID, nextChunkSeq, resetSessionId, rotateSessionIfIdle, touchSession, type SessionProgress } from './session.js';
 import { scrubUrl } from './scrub';
 import { setTelemetrySink } from './telemetry';
+import { SDK_VERSION } from './version';
 
 export type ReplayTriggerType = 'uncaught_error' | 'capture_exception';
 
@@ -26,6 +27,7 @@ let streamReady = false;
 let awaitingRotationSnapshot = false;
 let pendingMeta: eventWithTime | null = null;
 let errorFlushInFlight = false;
+const sessionRegistrations = new Map<string, Promise<boolean>>();
 
 function approxEventBytes(event: eventWithTime): number {
   try {
@@ -137,9 +139,10 @@ async function shipChunk(sessionID: string, seq: number, events: eventWithTime[]
   if (result === 'stop') stopReplayCapture();
 }
 
-async function registerSession(sessionID = ensureSessionID()): Promise<boolean> {
+async function sendSessionRegistration(sessionID: string): Promise<boolean> {
   try {
     const config = getConfig();
+    if (!config.reportingEnabled) return false;
     const user = getCurrentUser();
     const response = await sdkFetch(`${config.endpoint}/api/v1/sessions/init`, {
       method: 'POST',
@@ -148,6 +151,8 @@ async function registerSession(sessionID = ensureSessionID()): Promise<boolean> 
         session_id: sessionID,
         started_at: new Date().toISOString(),
         page_url: currentPageUrl(),
+        sdk: { name: '@opslane/sdk', version: SDK_VERSION },
+        release: config.release || undefined,
         environment: config.environment || undefined,
         user: user ? {
           id: user.id,
@@ -164,6 +169,24 @@ async function registerSession(sessionID = ensureSessionID()): Promise<boolean> 
   } catch {
     return false;
   }
+}
+
+export function registerSession(sessionID = ensureSessionID()): Promise<boolean> {
+  const pending = sessionRegistrations.get(sessionID);
+  if (pending) return pending;
+
+  const registration = sendSessionRegistration(sessionID);
+  sessionRegistrations.set(sessionID, registration);
+  void registration.then(() => {
+    if (sessionRegistrations.get(sessionID) === registration) {
+      sessionRegistrations.delete(sessionID);
+    }
+  });
+  return registration;
+}
+
+export function resetSessionRegistrations(): void {
+  sessionRegistrations.clear();
 }
 
 // Identity can change while the init request is in flight. Register the latest
@@ -354,6 +377,7 @@ function utf8ByteLength(value: string): number {
 
 export function _resetReplayState(): void {
   stopReplayCapture();
+  resetSessionRegistrations();
   startGeneration = 0;
   resetSessionId();
 }

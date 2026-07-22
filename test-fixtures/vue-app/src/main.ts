@@ -9,6 +9,8 @@ init({
   endpoint: import.meta.env['VITE_OPSLANE_ENDPOINT'] ?? 'http://localhost:8082',
   apiKey: import.meta.env['VITE_OPSLANE_API_KEY'] ?? 'e2e-test-key-plaintext',
   release: 'e2e-fixture-v1',
+  environment: import.meta.env['VITE_OPSLANE_ENVIRONMENT'] ?? 'development',
+  reporting: { enabled: import.meta.env['VITE_OPSLANE_REPORTING'] !== 'false' },
   replay: { enabled: true },
 });
 

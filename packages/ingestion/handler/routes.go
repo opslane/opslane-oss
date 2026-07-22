@@ -153,8 +153,8 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateUserSession).Get("/projects/{projectID}/accounts/{accountID}/incidents", deps.ListAccountIncidents)
 
 		// GitHub App integration
-		r.With(deps.AuthenticateUserSession).Get("/github/setup", deps.GitHubSetupCallback)
-		r.With(deps.AuthenticateUserSession).Get("/github/status", deps.GetGitHubAppStatus)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Get("/github/setup", deps.GitHubSetupCallback)
+		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Get("/github/status", deps.GetGitHubAppStatus)
 		r.With(deps.AuthenticateUserSession).Get("/github/repos", deps.ListGitHubRepos)
 
 		// Per-project GitHub config

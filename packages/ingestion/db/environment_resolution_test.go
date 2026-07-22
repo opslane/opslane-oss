@@ -72,15 +72,15 @@ func TestRegisterSessionClassifiesTenantConflictAndDivergence(t *testing.T) {
 	p2env, _ := q.CreateEnvironment(ctx, p2.ID, "production")
 	sessionID := "sess_" + uuid.NewString()
 
-	first, err := q.RegisterSession(ctx, sessionID, p1.ID, prod.ID, nil, time.Now(), "")
+	first, err := q.RegisterSession(ctx, sessionID, p1.ID, prod.ID, nil, time.Now(), "", nil)
 	if err != nil || first.Diverged || first.EnvironmentID != prod.ID {
 		t.Fatalf("first = %#v, err=%v", first, err)
 	}
-	retry, err := q.RegisterSession(ctx, sessionID, p1.ID, staging.ID, nil, time.Now(), "")
+	retry, err := q.RegisterSession(ctx, sessionID, p1.ID, staging.ID, nil, time.Now(), "", nil)
 	if err != nil || !retry.Diverged || retry.EnvironmentID != prod.ID {
 		t.Fatalf("retry = %#v, err=%v", retry, err)
 	}
-	if _, err := q.RegisterSession(ctx, sessionID, p2.ID, p2env.ID, nil, time.Now(), ""); !errors.Is(err, db.ErrSessionProjectConflict) {
+	if _, err := q.RegisterSession(ctx, sessionID, p2.ID, p2env.ID, nil, time.Now(), "", nil); !errors.Is(err, db.ErrSessionProjectConflict) {
 		t.Fatalf("cross-project err = %v", err)
 	}
 }
@@ -108,7 +108,7 @@ func TestRegisterSessionDetectsOutOfOrderEventDivergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration, err := q.RegisterSession(ctx, sessionID, project.ID, prod.ID, nil, time.Now(), "")
+	registration, err := q.RegisterSession(ctx, sessionID, project.ID, prod.ID, nil, time.Now(), "", nil)
 	if err != nil || !registration.Diverged {
 		t.Fatalf("registration = %#v, err=%v", registration, err)
 	}

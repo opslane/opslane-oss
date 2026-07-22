@@ -79,10 +79,10 @@ docs/          Documentation
 
 | Code | License |
 | --- | --- |
-| Server, worker, dashboard, eval, and tests | [AGPL-3.0-only](LICENSE) |
-| Browser SDK ([`packages/sdk`](packages/sdk/LICENSE)), CLI ([`cli`](cli/LICENSE)), shared types ([`shared`](shared/LICENSE)) | MIT |
+| Server, worker, agent core ([`packages/agent-core`](packages/agent-core)), dashboard, CLI ([`cli`](cli/LICENSE)), eval, and tests | [AGPL-3.0-only](LICENSE) |
+| Browser SDK ([`packages/sdk`](packages/sdk/LICENSE)), Python SDK ([`packages/sdk-python`](packages/sdk-python/LICENSE)), and shared types ([`shared`](shared/LICENSE)) | MIT |
 
-In short: the code that runs in *your* application and toolchain is MIT; the code that runs the Opslane service is AGPL.
+In short: the SDKs and shared types that run in *your* application are MIT; the rest of Opslane, including the agent core and CLI, is AGPL.
 
 ## Contributing
 

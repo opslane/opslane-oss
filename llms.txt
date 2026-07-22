@@ -1,6 +1,6 @@
 # Opslane
 
-> AI-powered production error-resolution engine for browser JavaScript apps: errors in, verified fix PRs (or explicit needs_human incidents) out. Self-hostable via Docker Compose. Server code AGPL-3.0-only; SDK/CLI/shared types MIT.
+> AI-powered production error-resolution engine for browser JavaScript apps: errors in, verified fix PRs (or explicit needs_human incidents) out. Self-hostable via Docker Compose. Server, agent-core, and CLI code AGPL-3.0-only; SDKs/shared types MIT.
 
 This file indexes the agent-relevant documentation. All canonical content is plain Markdown in this repository. (Location decision: repo root, so it ships with every clone; recorded in issue #18.)
 

@@ -89,6 +89,9 @@ func (c *provisionCleanup) run() {
 		}
 	}
 	for _, id := range uniqueInt64s(c.installationIDs) {
+		if _, err := c.pool.Exec(ctx, `DELETE FROM installation_landed WHERE installation_id = $1`, id); err != nil {
+			c.t.Logf("cleanup landed installation %d: %v", id, err)
+		}
 		if _, err := c.pool.Exec(ctx, `DELETE FROM github_app_installations WHERE installation_id = $1`, id); err != nil {
 			c.t.Logf("cleanup GitHub installation %d: %v", id, err)
 		}
@@ -181,19 +184,19 @@ func TestProvisionAgentSession_NewOrgUserProjectKey(t *testing.T) {
 
 	after, err := q.GetAgentSession(ctx, session.ID)
 	if err != nil {
-		t.Fatalf("get completed session: %v", err)
+		t.Fatalf("get provisioned session: %v", err)
 	}
-	if after == nil || after.Status != "completed" || after.APIKeySealed == nil {
-		t.Fatalf("session not completed with sealed key: %+v", after)
+	if after == nil || after.Status != "provisioned" || after.APIKeySealed == nil {
+		t.Fatalf("session not provisioned with sealed key: %+v", after)
 	}
 	if !strings.HasPrefix(*after.APIKeySealed, "sealed:def_") {
 		t.Errorf("sealed API key = %q, want sealed raw Opslane key", *after.APIKeySealed)
 	}
 	if after.OrgID == nil || *after.OrgID != result.OrgID || after.ProjectID == nil || *after.ProjectID != result.ProjectID {
-		t.Errorf("completed session tenant = (%v, %v), want (%s, %s)", after.OrgID, after.ProjectID, result.OrgID, result.ProjectID)
+		t.Errorf("provisioned session tenant = (%v, %v), want (%s, %s)", after.OrgID, after.ProjectID, result.OrgID, result.ProjectID)
 	}
 	if after.InstallationID == nil || *after.InstallationID != input.InstallationID {
-		t.Errorf("completed session installation = %v, want %d", after.InstallationID, input.InstallationID)
+		t.Errorf("provisioned session installation = %v, want %d", after.InstallationID, input.InstallationID)
 	}
 
 	var storedRepo string
@@ -225,12 +228,23 @@ func TestProvisionAgentSession_NewOrgUserProjectKey(t *testing.T) {
 		`SELECT count(DISTINCT e.id), count(k.id)
 		 FROM environments e
 		 LEFT JOIN environment_api_keys k ON k.environment_id = e.id
-		 WHERE e.project_id = $1 AND e.name = 'production'`, result.ProjectID).Scan(&environmentCount, &keyCount)
+		 WHERE e.project_id = $1`, result.ProjectID).Scan(&environmentCount, &keyCount)
 	if err != nil {
 		t.Fatalf("count environment and key: %v", err)
 	}
-	if environmentCount != 1 || keyCount != 1 {
-		t.Errorf("production environments/keys = %d/%d, want 1/1", environmentCount, keyCount)
+	if environmentCount != 2 || keyCount != 1 {
+		t.Errorf("environments/keys = %d/%d, want 2/1", environmentCount, keyCount)
+	}
+	lookup, err := q.LookupAPIKey(ctx, strings.TrimPrefix(*after.APIKeySealed, "sealed:"))
+	if err != nil {
+		t.Fatalf("lookup sealed development key: %v", err)
+	}
+	var sealedEnvironmentName string
+	if err := pool.QueryRow(ctx, `SELECT name FROM environments WHERE id = $1`, lookup.EnvironmentID).Scan(&sealedEnvironmentName); err != nil {
+		t.Fatalf("read sealed key environment: %v", err)
+	}
+	if sealedEnvironmentName != "development" {
+		t.Errorf("sealed key environment = %q, want development", sealedEnvironmentName)
 	}
 
 	var installationOrg string
@@ -447,7 +461,7 @@ func TestProvisionAgentSession_RepoAlreadyConfiguredCaseInsensitive(t *testing.T
 	requireProvisionFailure(t, q, session.ID, err, db.ErrAgentRepoAlreadyConfigured, "repo_already_configured")
 }
 
-func TestProvisionAgentSession_NotPendingLeavesCompletedSessionUntouched(t *testing.T) {
+func TestProvisionAgentSession_NotPendingLeavesProvisionedSessionUntouched(t *testing.T) {
 	pool := testPool(t)
 	q := db.New(pool)
 	ctx := context.Background()
@@ -464,7 +478,7 @@ func TestProvisionAgentSession_NotPendingLeavesCompletedSessionUntouched(t *test
 	cleanup.org(result.OrgID)
 	before, err := q.GetAgentSession(ctx, session.ID)
 	if err != nil {
-		t.Fatalf("read completed session: %v", err)
+		t.Fatalf("read provisioned session: %v", err)
 	}
 
 	secondResult, err := q.ProvisionAgentSession(ctx, input)
@@ -479,7 +493,7 @@ func TestProvisionAgentSession_NotPendingLeavesCompletedSessionUntouched(t *test
 		t.Fatalf("read session after replay: %v", err)
 	}
 	if after.Status != before.Status || after.FailureReason != nil || after.ProjectID == nil || before.ProjectID == nil || *after.ProjectID != *before.ProjectID {
-		t.Fatalf("completed session changed: before=%+v after=%+v", before, after)
+		t.Fatalf("provisioned session changed: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -642,15 +656,15 @@ func TestProvisionAgentSession_ConcurrentSameRepoSessionsOneProject(t *testing.T
 	if projects != 1 {
 		t.Errorf("same-repo project count = %d, want 1", projects)
 	}
-	completed, failed := 0, 0
+	provisioned, failed := 0, 0
 	for _, id := range []string{session1.ID, session2.ID} {
 		session, err := q.GetAgentSession(ctx, id)
 		if err != nil {
 			t.Fatalf("read same-repo session: %v", err)
 		}
 		switch session.Status {
-		case "completed":
-			completed++
+		case "provisioned":
+			provisioned++
 		case "failed":
 			if session.FailureReason == nil || *session.FailureReason != "repo_already_configured" {
 				t.Errorf("failed session reason = %v, want repo_already_configured", session.FailureReason)
@@ -660,8 +674,8 @@ func TestProvisionAgentSession_ConcurrentSameRepoSessionsOneProject(t *testing.T
 			t.Errorf("same-repo session status = %q", session.Status)
 		}
 	}
-	if completed != 1 || failed != 1 {
-		t.Errorf("completed/failed session counts = %d/%d, want 1/1", completed, failed)
+	if provisioned != 1 || failed != 1 {
+		t.Errorf("provisioned/failed session counts = %d/%d, want 1/1", provisioned, failed)
 	}
 }
 
@@ -718,8 +732,8 @@ func TestProvisionAgentSession_ConcurrentSameIdentityDifferentRepos(t *testing.T
 		if err != nil {
 			t.Fatalf("read same-identity session: %v", err)
 		}
-		if session.Status != "completed" {
-			t.Errorf("session %s status = %q, want completed", id, session.Status)
+		if session.Status != "provisioned" {
+			t.Errorf("session %s status = %q, want provisioned", id, session.Status)
 		}
 	}
 }

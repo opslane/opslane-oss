@@ -130,6 +130,7 @@ async function pollLoop(
   const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS;
   const deadline = Date.now() + timeout * 1_000;
   let reachedServer = false;
+  let waitingForApp = false;
 
   while (Date.now() < deadline) {
     let response: Response;
@@ -165,34 +166,52 @@ async function pollLoop(
       continue;
     }
 
-    if (status === 'completed') {
+    if (status === 'provisioned' || status === 'key_ok' || status === 'app_reporting' || status === 'completed') {
       const apiKey = typeof body['api_key'] === 'string' ? body['api_key'] : null;
-      if (!apiKey) {
+      if (!apiKey && status !== 'app_reporting') {
         await deletePendingSession(pending.poll_id, pendingDir);
         return exitWithStatus('key_unavailable', {
           project_id: body['project_id'],
           remediation: 'run "opslane login" then "opslane setup --relink"',
         }, 1);
       }
-
       const orgId = typeof body['org_id'] === 'string' ? body['org_id'] : null;
       const projectId = typeof body['project_id'] === 'string' ? body['project_id'] : null;
       const repo = typeof body['repo'] === 'string' ? body['repo'] : pending.repo;
       if (!orgId || !projectId) {
-        return exitWithStatus('internal_error', { message: 'completed response omitted project credentials' }, 1);
+        return exitWithStatus('internal_error', { message: 'provisioned response omitted project credentials' }, 1);
       }
-      try {
-        await saveAgentCredentials({
-          org_id: orgId,
-          project_id: projectId,
-          api_key: apiKey,
-          repo,
-          api_url: pending.api_url,
-        }, credentialsPath);
-      } catch {
-        return exitWithStatus('internal_error', {
-          message: 'could not save completed credentials; retry this poll while the key is available',
-        }, 1);
+      if (!apiKey) {
+        const saved = await resolveCredentials({ apiUrl: pending.api_url, repo, filePath: credentialsPath });
+        if (!saved || saved.project_id !== projectId || saved.org_id !== orgId) {
+          await deletePendingSession(pending.poll_id, pendingDir);
+          return exitWithStatus('key_unavailable', {
+            project_id: body['project_id'],
+            remediation: 'run "opslane login" then "opslane setup --relink"',
+          }, 1);
+        }
+      }
+      if (apiKey) {
+        try {
+          await saveAgentCredentials({
+            org_id: orgId,
+            project_id: projectId,
+            api_key: apiKey,
+            repo,
+            api_url: pending.api_url,
+          }, credentialsPath);
+        } catch {
+          return exitWithStatus('internal_error', {
+            message: 'could not save provisioned credentials; retry this poll while the key is available',
+          }, 1);
+        }
+      }
+
+      if (status !== 'app_reporting' && status !== 'completed') {
+        waitingForApp = true;
+        const remaining = deadline - Date.now();
+        if (remaining > 0) await sleepFn(Math.min(interval, remaining));
+        continue;
       }
       await deletePendingSession(pending.poll_id, pendingDir);
       jsonOutput({ ...body, status: 'completed' });
@@ -233,7 +252,9 @@ async function pollLoop(
   jsonOutput({
     status: 'pending',
     poll_id: pending.poll_id,
-    message: 'Authorization is still pending. Run setup --poll again.',
+    message: waitingForApp
+      ? 'Waiting for your app to report. Start it locally, then run setup --poll again.'
+      : 'Authorization is still pending. Run setup --poll again.',
   });
 }
 
@@ -301,7 +322,9 @@ async function relink(options: SetupOptions, repo: string, apiUrl: string): Prom
     return exitWithStatus('internal_error', { message: 'project has no environments' }, 1);
   }
   const candidates = environments as EnvironmentResponse[];
-  const environment = candidates.find((candidate) => candidate.name === 'production') ?? candidates[0];
+  const environment = candidates.find((candidate) => candidate.name === 'development')
+    ?? candidates.find((candidate) => candidate.name === 'production')
+    ?? candidates[0];
   if (!environment?.id) return exitWithStatus('internal_error', { message: 'invalid environment response' }, 1);
 
   const keyResponse = await fetchFn(

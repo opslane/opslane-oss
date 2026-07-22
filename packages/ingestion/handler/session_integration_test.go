@@ -337,7 +337,7 @@ func TestChunkInline_RejectsNonGzipBody(t *testing.T) {
 	}
 }
 
-func TestSessionInit_RecordingDisabledDoesNotCreateSession(t *testing.T) {
+func TestSessionInit_RecordingDisabledWithoutSDKDoesNotCreateSession(t *testing.T) {
 	deps, pool := testDepsWithStorage(t)
 	projectID, _, apiKey := seedTenantWithKey(t, pool)
 	if _, err := pool.Exec(context.Background(),
@@ -360,8 +360,104 @@ func TestSessionInit_RecordingDisabledDoesNotCreateSession(t *testing.T) {
 		t.Fatalf("count sessions: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("disabled init created %d sessions, want 0", count)
+		t.Fatalf("disabled legacy init created %d sessions, want 0", count)
 	}
+}
+
+func TestSessionInit_PersistsSDKIdentityBeforeReplayGates(t *testing.T) {
+	deps, pool := testDepsWithStorage(t)
+	projectID, _, apiKey := seedTenantWithKey(t, pool)
+	q := db.New(pool)
+	ctx := context.Background()
+
+	for _, status := range []string{"provisioned", "key_ok"} {
+		agentSession, err := q.CreateAgentSession(ctx, db.CreateAgentSessionParams{
+			RepoURL:       "sdk-identity/" + status + fmt.Sprint(time.Now().UnixNano()),
+			PollTokenHash: "poll-" + status, AgentKeyPub: "pub-" + status,
+		})
+		if err != nil {
+			t.Fatalf("create %s agent session: %v", status, err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE agent_sessions SET project_id = $2, status = $3 WHERE id = $1`,
+			agentSession.ID, projectID, status); err != nil {
+			t.Fatalf("seed %s agent session: %v", status, err)
+		}
+		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id = $1`, agentSession.ID) })
+	}
+
+	post := func(router http.Handler, sessionID, version, release string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(
+			`{"session_id":%q,"started_at":%q,"environment":"development","release":%q,"sdk":{"name":"@opslane/sdk","version":%q}}`,
+			sessionID, time.Now().UTC().Format(time.RFC3339), release, version,
+		)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/init", strings.NewReader(body))
+		req.Header.Set("X-API-Key", apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	assertIdentity := func(sessionID, version, release string) {
+		t.Helper()
+		var name, gotVersion, gotRelease *string
+		if err := pool.QueryRow(ctx,
+			`SELECT sdk_name, sdk_version, sdk_release FROM sessions WHERE id = $1`, sessionID,
+		).Scan(&name, &gotVersion, &gotRelease); err != nil {
+			t.Fatalf("read SDK identity for %s: %v", sessionID, err)
+		}
+		if name == nil || *name != "@opslane/sdk" || gotVersion == nil || *gotVersion != version || gotRelease == nil || *gotRelease != release {
+			t.Fatalf("SDK identity = (%v, %v, %v), want (@opslane/sdk, %s, %s)", name, gotVersion, gotRelease, version, release)
+		}
+	}
+
+	router := newTestRouter(t, deps, pool)
+	normalID := fmt.Sprintf("sess_sdk_normal_%d", time.Now().UnixNano())
+	if w := post(router, normalID, "1.2.3", "abc123"); w.Code != http.StatusOK {
+		t.Fatalf("normal SDK init returned %d: %s", w.Code, w.Body.String())
+	}
+	assertIdentity(normalID, "1.2.3", "abc123")
+	// RegisterSession remains first-write-wins on retry.
+	if w := post(router, normalID, "9.9.9", "changed"); w.Code != http.StatusOK {
+		t.Fatalf("retried SDK init returned %d: %s", w.Code, w.Body.String())
+	}
+	assertIdentity(normalID, "1.2.3", "abc123")
+
+	rows, err := pool.Query(ctx,
+		`SELECT status FROM agent_sessions WHERE project_id = $1 ORDER BY status`, projectID)
+	if err != nil {
+		t.Fatalf("read reporting lifecycle: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "app_reporting" {
+			t.Fatalf("agent session status = %q, want app_reporting", status)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE projects SET recording_enabled = FALSE WHERE id = $1`, projectID); err != nil {
+		t.Fatalf("disable recording: %v", err)
+	}
+	disabledID := fmt.Sprintf("sess_sdk_disabled_%d", time.Now().UnixNano())
+	if w := post(router, disabledID, "1.2.4", "disabled"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"recording":false`) {
+		t.Fatalf("recording-disabled SDK init returned %d: %s", w.Code, w.Body.String())
+	}
+	assertIdentity(disabledID, "1.2.4", "disabled")
+
+	if _, err := pool.Exec(ctx, `UPDATE projects SET recording_enabled = TRUE WHERE id = $1`, projectID); err != nil {
+		t.Fatalf("enable recording: %v", err)
+	}
+	deps.MinIO = nil
+	noStorageID := fmt.Sprintf("sess_sdk_no_storage_%d", time.Now().UnixNano())
+	if w := post(router, noStorageID, "1.2.5", "no-storage"); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-storage SDK init returned %d: %s", w.Code, w.Body.String())
+	}
+	assertIdentity(noStorageID, "1.2.5", "no-storage")
 }
 
 func TestSessionInit_TombstoneReturns410(t *testing.T) {

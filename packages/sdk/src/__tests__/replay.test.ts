@@ -3,6 +3,7 @@ import { EventType, type eventWithTime } from '@rrweb/types';
 import { clearBreadcrumbs } from '../breadcrumbs';
 import { loadConfig, resetConfig } from '../config';
 import { clearUser, setUser } from '../core';
+import { destroy, init } from '../index';
 import { emitTelemetry } from '../telemetry';
 import { _rehydrateFromStorage, peekChunkSeq, resetSessionId } from '../session';
 import {
@@ -119,6 +120,7 @@ describe('continuous chunked recording', () => {
   });
 
   afterEach(() => {
+    destroy();
     stopReplayCapture();
     resetConfig();
     sessionStorage.clear();
@@ -144,6 +146,88 @@ describe('continuous chunked recording', () => {
       started_at: expect.any(String),
     });
     expect(fetchMock.mock.invocationCallOrder[0]).toBeLessThan(rrwebState.record.mock.invocationCallOrder[0]);
+  });
+
+  it('sends sdk identity on session init', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
+
+    init({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      release: 'abc123',
+      environment: 'development',
+    });
+
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) =>
+        String(url).includes('/api/v1/sessions/init'))).toBe(true);
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) =>
+      String(url).includes('/api/v1/sessions/init'))!;
+    expect(fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/api/v1/sessions/init'))).toHaveLength(1);
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.sdk).toEqual({ name: '@opslane/sdk', version: expect.any(String) });
+    expect(body.release).toBe('abc123');
+    expect(body.environment).toBe('development');
+  });
+
+  it('registers the session when replay is disabled', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ recording: false }) });
+
+    init({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      replay: { enabled: false },
+    });
+
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) =>
+        String(url).includes('/api/v1/sessions/init'))).toBe(true);
+    });
+    expect(rrwebState.record).not.toHaveBeenCalled();
+  });
+
+  it('starts a fresh registration after destroy while the previous request is pending', async () => {
+    let resolveFirst!: (value: { ok: boolean; json: () => Promise<{ recording: boolean }> }) => void;
+    fetchMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValue({ ok: true, json: async () => ({ recording: false }) });
+
+    init({
+      apiKey: 'old-key',
+      endpoint: 'https://old.example.com',
+      replay: { enabled: false },
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    destroy();
+    init({
+      apiKey: 'new-key',
+      endpoint: 'https://new.example.com',
+      replay: { enabled: false },
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('https://old.example.com');
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain('https://new.example.com');
+    resolveFirst({ ok: true, json: async () => ({ recording: false }) });
+  });
+
+  it('keeps session reporting silent when reporting is disabled', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ recording: true }) });
+
+    init({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      reporting: { enabled: false },
+    });
+    await drainMicrotasks();
+
+    expect(fetchMock.mock.calls.some(([url]) =>
+      String(url).includes('/api/v1/sessions/init'))).toBe(false);
+    expect(rrwebState.record).not.toHaveBeenCalled();
   });
 
   it('sends the configured environment when registering a replay session', async () => {

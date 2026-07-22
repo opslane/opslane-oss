@@ -2,10 +2,10 @@
 /**
  * License-boundary check for the MIT-published packages.
  *
- * @opslane/sdk and @opslane/cli ship under MIT, so every production
+ * The JavaScript SDK and shared contracts ship under MIT, so every production
  * dependency in their tarballs must carry an MIT-compatible permissive
  * license. Copyleft (GPL/AGPL/LGPL) or unlicensed dependencies fail the
- * build. The AGPL server packages can consume anything permissive plus
+ * build. The AGPL packages can consume anything permissive plus
  * AGPL itself, so they are not checked here.
  *
  * Usage: node scripts/check-licenses.mjs
@@ -15,7 +15,61 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const MIT_PACKAGES = ['@opslane/sdk', '@opslane/cli'];
+const MIT_PACKAGES = ['@opslane/sdk', '@opslane/shared'];
+const EXPECTED_MIT_INVENTORY = ['@opslane/sdk', '@opslane/sdk-python', '@opslane/shared'];
+const EXPECTED_MIT_PNPM_PACKAGES = ['@opslane/sdk', '@opslane/shared'];
+
+const cliPackage = JSON.parse(
+  readFileSync(new URL('../cli/package.json', import.meta.url), 'utf8')
+);
+if (cliPackage.license !== 'AGPL-3.0-only') {
+  throw new Error(
+    `cli/package.json must declare AGPL-3.0-only, found ${JSON.stringify(cliPackage.license)}`
+  );
+}
+if (MIT_PACKAGES.includes('@opslane/cli')) {
+  throw new Error('@opslane/cli must not be included in the MIT package boundary');
+}
+const agentCorePackage = JSON.parse(
+  readFileSync(new URL('../packages/agent-core/package.json', import.meta.url), 'utf8')
+);
+if (agentCorePackage.license !== 'AGPL-3.0-only') {
+  throw new Error(
+    `packages/agent-core/package.json must declare AGPL-3.0-only, found ${JSON.stringify(agentCorePackage.license)}`
+  );
+}
+
+const workspaceProjects = JSON.parse(execFileSync(
+  'pnpm',
+  ['list', '--recursive', '--depth', '-1', '--json'],
+  { encoding: 'utf8' }
+));
+const actualMitInventory = workspaceProjects
+  .map((project) => JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf8')))
+  .filter((manifest) => manifest.license === 'MIT')
+  .map((manifest) => manifest.name);
+const pythonManifest = readFileSync(
+  new URL('../packages/sdk-python/pyproject.toml', import.meta.url),
+  'utf8'
+);
+if (/^license\s*=\s*"([^"]+)"/m.exec(pythonManifest)?.[1] === 'MIT') {
+  actualMitInventory.push('@opslane/sdk-python');
+}
+actualMitInventory.sort();
+const expectedMitInventory = [...EXPECTED_MIT_INVENTORY].sort();
+if (JSON.stringify(actualMitInventory) !== JSON.stringify(expectedMitInventory)) {
+  throw new Error(
+    `MIT package inventory must be exactly ${expectedMitInventory.join(', ')}; found ${actualMitInventory.join(', ')}`
+  );
+}
+if (
+  MIT_PACKAGES.length !== EXPECTED_MIT_PNPM_PACKAGES.length
+  || MIT_PACKAGES.some((name, index) => name !== EXPECTED_MIT_PNPM_PACKAGES[index])
+) {
+  throw new Error(
+    `MIT dependency checks must be exactly ${EXPECTED_MIT_PNPM_PACKAGES.join(', ')}`
+  );
+}
 
 const ALLOWED = new Set([
   'MIT',

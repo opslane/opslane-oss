@@ -92,6 +92,7 @@ All `init` options, from the SDK's `SdkInitOptions` type:
 | `flushInterval` | `number` | `5000` | Milliseconds between batched event flushes. |
 | `maxBatchSize` | `number` | `10` | Maximum events per flush batch. |
 | `debug` | `boolean` | `false` | Log SDK-internal problems to the console. |
+| `reporting.enabled` | `boolean` | `true` | Send lightweight SDK/session metadata on initialization. Disable to suppress session reporting; this also prevents replay startup but does not disable error events. |
 | `replay.enabled` | `boolean` | `true` | Capture session replays around errors. **On by default.** |
 | `sampleRate` | `number` | `1` | Fraction of events sent, clamped to `[0, 1]`. |
 | `errorThrottleMs` | `number` | `1000` | Minimum milliseconds between reports of the same error. |
@@ -110,6 +111,7 @@ clearUser();
 ## Privacy defaults
 
 - **Session recording is on by default since 1.0.0** (`replay.enabled` defaults to `true`); opt out with `replay: { enabled: false }`.
+- Session initialization metadata is reported independently of replay; opt out with `reporting: { enabled: false }`. This also prevents replay startup but does not disable error-event delivery.
 - Replay masks **all input values** (`maskAllInputs: true`) and any element matching the `.opslane-mask` selector; `.opslane-block` excludes a subtree entirely.
 - Captured URLs are scrubbed of query strings, userinfo, and token-bearing hashes; captured text is scrubbed of JWTs, `Bearer` tokens, and `password`/`secret`/`api_key`-style key-value pairs before leaving the browser.
 - Use `beforeSend` to drop or redact anything scrubbing doesn't cover.

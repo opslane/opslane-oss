@@ -30,6 +30,14 @@ var ErrNoGithubRepo = errors.New("project has no github_repo")
 // different local user. Callers must fail closed rather than issue a session.
 var ErrIdentityConflict = errors.New("auth identity belongs to a different user")
 
+// ErrOAuthLoginStateInFlight means another callback currently owns the state
+// lease. The caller may retry after the two-minute reservation window.
+var ErrOAuthLoginStateInFlight = errors.New("OAuth login state is already in flight")
+
+// ErrOAuthLoginStateReservation means the reservation token is stale, expired,
+// or does not own the state.
+var ErrOAuthLoginStateReservation = errors.New("OAuth login state reservation is no longer valid")
+
 // ErrInvalidInvitation is returned for missing, expired, revoked, consumed, or
 // email-mismatched invitations. It intentionally does not reveal which check failed.
 var ErrInvalidInvitation = errors.New("invalid invitation")
@@ -2558,15 +2566,16 @@ func (q *Queries) ConsumeOAuthVerificationContinuation(ctx context.Context, flow
 }
 
 func (q *Queries) StoreOAuthLoginState(ctx context.Context, stateHash string, expiresAt time.Time) error {
-	return q.StoreOAuthLoginStateForOrg(ctx, stateHash, "", expiresAt)
+	return q.StoreOAuthLoginStateForOrg(ctx, stateHash, "", "", expiresAt)
 }
 
 // StoreOAuthLoginStateForOrg binds an optional active organization to the
 // single-use state. The callback revalidates membership before using it.
-func (q *Queries) StoreOAuthLoginStateForOrg(ctx context.Context, stateHash, targetOrgID string, expiresAt time.Time) error {
+func (q *Queries) StoreOAuthLoginStateForOrg(ctx context.Context, stateHash, targetOrgID, initiatingUserID string, expiresAt time.Time) error {
 	_, err := q.pool.Exec(ctx,
-		`INSERT INTO oauth_login_states (state_hash, target_org_id, expires_at)
-		 VALUES ($1, NULLIF($2, '')::uuid, $3)`, stateHash, targetOrgID, expiresAt)
+		`INSERT INTO oauth_login_states (state_hash, target_org_id, initiating_user_id, expires_at)
+		 VALUES ($1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, $4)`,
+		stateHash, targetOrgID, initiatingUserID, expiresAt)
 	if err != nil {
 		return fmt.Errorf("store OAuth login state: %w", err)
 	}
@@ -2579,7 +2588,97 @@ func (q *Queries) ConsumeOAuthLoginState(ctx context.Context, stateHash string) 
 }
 
 type OAuthLoginState struct {
-	TargetOrgID *string
+	TargetOrgID      *string
+	InitiatingUserID *string
+	ReservationToken string
+}
+
+// GetOAuthLoginStateDetails reads callback context without reserving or
+// consuming it. The actor and organization bindings are immutable.
+func (q *Queries) GetOAuthLoginStateDetails(ctx context.Context, stateHash string) (*OAuthLoginState, error) {
+	var state OAuthLoginState
+	err := q.pool.QueryRow(ctx,
+		`SELECT target_org_id, initiating_user_id
+		 FROM oauth_login_states
+		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()`,
+		stateHash).Scan(&state.TargetOrgID, &state.InitiatingUserID)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get OAuth login state: %w", err)
+	}
+	return &state, nil
+}
+
+// ReserveOAuthLoginState leases a valid state for two minutes. A new UUID
+// token prevents a stale callback from finalizing or releasing a newer lease.
+func (q *Queries) ReserveOAuthLoginState(ctx context.Context, stateHash string) (*OAuthLoginState, error) {
+	var state OAuthLoginState
+	err := q.pool.QueryRow(ctx,
+		`UPDATE oauth_login_states
+		 SET reserved_at = now(), reservation_token = gen_random_uuid()
+		 WHERE state_hash = $1
+		   AND consumed_at IS NULL
+		   AND expires_at > now()
+		   AND (reserved_at IS NULL OR reserved_at <= now() - interval '2 minutes')
+		 RETURNING target_org_id, initiating_user_id, reservation_token::text`,
+		stateHash).Scan(&state.TargetOrgID, &state.InitiatingUserID, &state.ReservationToken)
+	if err == nil {
+		return &state, nil
+	}
+	if err != pgx.ErrNoRows {
+		return nil, fmt.Errorf("reserve OAuth login state: %w", err)
+	}
+	var inFlight bool
+	err = q.pool.QueryRow(ctx,
+		`SELECT reserved_at IS NOT NULL AND reserved_at > now() - interval '2 minutes'
+		 FROM oauth_login_states
+		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()`,
+		stateHash).Scan(&inFlight)
+	if err == nil && inFlight {
+		return nil, ErrOAuthLoginStateInFlight
+	}
+	if err != nil && err != pgx.ErrNoRows {
+		return nil, fmt.Errorf("inspect OAuth login state reservation: %w", err)
+	}
+	return nil, nil
+}
+
+// FinalizeOAuthLoginState consumes a state only when the caller still owns an
+// unexpired reservation. It accepts the transaction that persists the install.
+func (q *Queries) FinalizeOAuthLoginState(ctx context.Context, tx pgx.Tx, stateHash, reservationToken string) error {
+	tag, err := tx.Exec(ctx,
+		`UPDATE oauth_login_states
+		 SET consumed_at = now(), reserved_at = NULL, reservation_token = NULL
+		 WHERE state_hash = $1
+		   AND reservation_token = $2::uuid
+		   AND reserved_at > now() - interval '2 minutes'
+		   AND consumed_at IS NULL
+		   AND expires_at > now()`, stateHash, reservationToken)
+	if err != nil {
+		return fmt.Errorf("finalize OAuth login state: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrOAuthLoginStateReservation
+	}
+	return nil
+}
+
+// ReleaseOAuthLoginState releases only the lease owned by reservationToken.
+func (q *Queries) ReleaseOAuthLoginState(ctx context.Context, stateHash, reservationToken string) error {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE oauth_login_states
+		 SET reserved_at = NULL, reservation_token = NULL
+		 WHERE state_hash = $1 AND reservation_token = $2::uuid AND consumed_at IS NULL`,
+		stateHash, reservationToken)
+	if err != nil {
+		return fmt.Errorf("release OAuth login state: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrOAuthLoginStateReservation
+	}
+	return nil
 }
 
 // ConsumeOAuthLoginStateDetails atomically consumes a state and returns its
@@ -2589,7 +2688,8 @@ func (q *Queries) ConsumeOAuthLoginStateDetails(ctx context.Context, stateHash s
 	err := q.pool.QueryRow(ctx,
 		`UPDATE oauth_login_states SET consumed_at = now()
 		 WHERE state_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-		 RETURNING target_org_id`, stateHash).Scan(&state.TargetOrgID)
+		 RETURNING target_org_id, initiating_user_id`, stateHash).
+		Scan(&state.TargetOrgID, &state.InitiatingUserID)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -3150,7 +3250,7 @@ type AgentSession struct {
 	ID             string
 	RepoURL        string
 	AgentName      *string
-	Status         string // pending | completed | expired | failed
+	Status         string // pending | provisioned | key_ok | app_reporting | completed | expired | failed
 	OrgID          *string
 	ProjectID      *string
 	InstallationID *int64
@@ -3229,7 +3329,8 @@ func (q *Queries) ExpireAgentSessions(ctx context.Context) (int64, error) {
 	}
 	if _, err := q.pool.Exec(ctx,
 		`UPDATE agent_sessions SET api_key_sealed = NULL
-		 WHERE status = 'completed' AND expires_at <= now() AND api_key_sealed IS NOT NULL`,
+		 WHERE status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')
+		   AND expires_at <= now() AND api_key_sealed IS NOT NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("purge sealed agent keys: %w", err)
 	}
@@ -3240,12 +3341,28 @@ func (q *Queries) ExpireAgentSessions(ctx context.Context) (int64, error) {
 // idempotent while retaining the first-delivery funnel timestamp.
 func (q *Queries) MarkAgentKeyDelivered(ctx context.Context, sessionID string) error {
 	_, err := q.pool.Exec(ctx,
-		`UPDATE agent_sessions SET key_claimed_at = COALESCE(key_claimed_at, now())
-		 WHERE id = $1 AND status = 'completed'`, sessionID)
+		`UPDATE agent_sessions
+		 SET key_claimed_at = COALESCE(key_claimed_at, now()),
+		     status = CASE WHEN status = 'provisioned' THEN 'key_ok' ELSE status END
+		 WHERE id = $1 AND status IN ('completed', 'provisioned', 'key_ok', 'app_reporting')`, sessionID)
 	if err != nil {
 		return fmt.Errorf("mark agent key delivered: %w", err)
 	}
 	return nil
+}
+
+// MarkAgentSessionsAppReporting advances active onboarding sessions for a
+// project when its SDK first registers. The compare-and-set tolerates the
+// reporting signal arriving before or after the CLI key probe.
+func (q *Queries) MarkAgentSessionsAppReporting(ctx context.Context, projectID string) (int64, error) {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		 SET status = 'app_reporting', completed_at = COALESCE(completed_at, now())
+		 WHERE project_id = $1 AND status IN ('provisioned', 'key_ok')`, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("mark agent sessions app reporting: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // MarkAgentSessionFailed records a definitive business failure. Transient
