@@ -159,6 +159,9 @@ jobs:
           docker compose run --rm minio-setup
       - name: Apply migrations
         run: MIGRATION_DIR=db/migrations ../../scripts/run-migrations.sh
+      - name: Migrations replay cleanly with data (reapply check)
+        working-directory: .
+        run: MIGRATION_DIR=packages/ingestion/db/migrations ./scripts/check-migration-reapply.sh
       - run: go build ./...
       - run: go vet ./...
       - name: Test (fails on unexpected skips)
