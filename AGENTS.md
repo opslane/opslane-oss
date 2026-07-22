@@ -8,13 +8,14 @@ Opslane is an AI-powered production error-resolution engine. It ingests browser 
 | --- | --- |
 | `packages/ingestion` | Go 1.24, chi, pgx; API, grouping, migrations, and storage |
 | `packages/worker` | Node 22, TypeScript; investigation, fix verification, and PR creation |
+| `packages/agent-core` | Node 22, TypeScript; provider-neutral agent loop and shell-free local tools |
 | `packages/dashboard` | Vue 3, Vite, Tailwind CSS; ingestion-served UI |
 | `packages/sdk` | Browser TypeScript SDK, React/Vue integrations, Vite source maps |
 | `shared` | Runtime-free shared TypeScript contracts |
 | `cli` | Node 22, Commander, Inquirer, Chalk |
 | `eval`, `test-e2e`, `test-fixtures` | Evaluations, end-to-end contracts, and browser fixtures |
 
-Server, worker, dashboard, eval, and test code is AGPL-3.0-only. SDK, CLI, and shared types are MIT licensed.
+Server, worker, agent-core, dashboard, CLI, eval, and test code is AGPL-3.0-only. The browser and Python SDKs and shared types are MIT licensed.
 
 ## Verification
 
@@ -41,7 +42,7 @@ docker compose config --quiet
 - Keep Vitest tests colocated in `__tests__`.
 - Use the `@opslane/` package scope and the `opslane` CLI name.
 - Local Postgres user/database names are `opslane`; Compose services are `ingestion`, `worker`, `postgres`, and `minio`.
-- New server-side packages default to `AGPL-3.0-only`. Put code in the MIT SDK/CLI/shared boundary only when that distribution choice is intentional.
+- New server-side packages default to `AGPL-3.0-only`. Put code in the MIT SDKs/shared boundary only when that distribution choice is intentional.
 
 ## Guardrails
 
