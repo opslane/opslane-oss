@@ -25,7 +25,7 @@
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.14",
-    "@anthropic-ai/sdk": "0.112.4",
+    "@anthropic-ai/sdk": "0.112.5",
     "ai": "7.0.34"
   },
   "devDependencies": {
