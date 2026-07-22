@@ -44,6 +44,9 @@ func cleanupTenant(t *testing.T, pool *pgxpool.Pool, orgID string) {
 
 	// Delete in dependency order
 	queries := []string{
+		`DELETE FROM oauth_login_states WHERE target_org_id = $1 OR initiating_user_id IN (SELECT id FROM users WHERE org_id = $1)`,
+		`DELETE FROM installation_landed WHERE org_id = $1`,
+		`DELETE FROM github_app_installations WHERE org_id = $1`,
 		`DELETE FROM outbound_deliveries WHERE destination_id IN (SELECT id FROM notification_destinations WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1))`,
 		`DELETE FROM outbound_events WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,
 		`DELETE FROM notification_destinations WHERE project_id IN (SELECT id FROM projects WHERE org_id = $1)`,

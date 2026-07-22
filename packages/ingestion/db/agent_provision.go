@@ -22,6 +22,7 @@ type AgentProvisionInput struct {
 	SessionID      string
 	InstallationID int64
 	CanonicalRepo  string
+	Repos          []string
 	GitHubOrgName  string
 	GitHubOrgID    int64
 	GitHubUserID   int64
@@ -209,17 +210,18 @@ func (q *Queries) ProvisionAgentSession(ctx context.Context, in AgentProvisionIn
 		}
 	}
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO github_app_installations (installation_id, github_org_name, github_org_id, org_id, repos)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (installation_id) DO UPDATE SET updated_at = now()`,
-		in.InstallationID, in.GitHubOrgName, in.GitHubOrgID, orgID,
-		[]byte(`["`+in.CanonicalRepo+`"]`)); err != nil {
-		return nil, fmt.Errorf("upsert installation: %w", err)
+	installationRepos := in.Repos
+	if len(installationRepos) == 0 {
+		installationRepos = []string{in.CanonicalRepo}
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE orgs SET github_installation_id = $2 WHERE id = $1`, orgID, in.InstallationID); err != nil {
-		return nil, fmt.Errorf("set org installation: %w", err)
+	if err := q.PersistInstallation(ctx, tx, PersistInstallationParams{
+		InstallationID: in.InstallationID,
+		GitHubOrgName:  in.GitHubOrgName,
+		GitHubOrgID:    in.GitHubOrgID,
+		OrgID:          orgID,
+		Repos:          installationRepos,
+	}); err != nil {
+		return nil, fmt.Errorf("persist installation: %w", err)
 	}
 
 	projectName := in.CanonicalRepo

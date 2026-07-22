@@ -232,7 +232,13 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		agentJSON(w, http.StatusOK, map[string]any{"status": "pending"})
+		resp := map[string]any{"status": "pending"}
+		if installationID, _, lookupErr := d.Queries.FindRecentInstallationLandedByRepo(r.Context(), session.RepoURL); lookupErr != nil {
+			slog.Warn("agent poll: landed installation diagnosis failed", "error", lookupErr)
+		} else if installationID != 0 {
+			resp["diagnosis"] = "A GitHub App installation for this repository completed outside this setup session. Reopen this session's authorization link to verify ownership and continue."
+		}
+		agentJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -301,6 +307,8 @@ func agentFailureMessage(reason string) string {
 		return "This GitHub org already has an Opslane organization. Ask an Opslane admin of that org to invite you, then use the dashboard for a key."
 	case "repo_already_configured":
 		return "This repo already has an Opslane project. Run 'opslane login' then 'opslane setup --relink'."
+	case "authorization_denied":
+		return "GitHub authorization was denied. Re-run setup when you are ready to approve access."
 	default:
 		return "Setup failed. Re-run setup to try again."
 	}
@@ -311,19 +319,12 @@ func agentFailureMessage(reason string) string {
 // only definitive business outcomes mark it failed.
 func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("state")
-	installationIDStr := r.URL.Query().Get("installation_id")
-	if sessionID == "" || installationIDStr == "" {
-		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+	if sessionID == "" {
+		http.Error(w, "Missing session ID", http.StatusBadRequest)
 		return
 	}
 	if _, err := uuid.Parse(sessionID); err != nil {
 		http.Error(w, "Invalid session ID", http.StatusBadRequest)
-		return
-	}
-	installationID, parseErr := strconv.ParseInt(installationIDStr, 10, 64)
-	if parseErr != nil || installationID <= 0 {
-		agentResultPage(w, http.StatusBadRequest, "Invalid installation",
-			"GitHub sent an invalid installation reference. Reopen the authorization link to retry.")
 		return
 	}
 
@@ -338,7 +339,29 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 			"This setup session is no longer active. Ask your agent to run setup again.")
 		return
 	}
+	if providerError := r.URL.Query().Get("error"); providerError != "" {
+		if providerError == "access_denied" {
+			d.failAgentSession(r.Context(), sessionID, "authorization_denied")
+			agentResultPage(w, http.StatusOK, "Authorization denied", agentFailureMessage("authorization_denied"))
+			return
+		}
+		agentResultPage(w, http.StatusBadRequest, "Authorization incomplete",
+			"GitHub did not complete authorization. Reopen the authorization link to retry.")
+		return
+	}
 
+	installationIDStr := r.URL.Query().Get("installation_id")
+	if installationIDStr == "" {
+		agentResultPage(w, http.StatusBadRequest, "Authorization incomplete",
+			"GitHub did not return an installation reference. Reopen the authorization link to retry.")
+		return
+	}
+	installationID, parseErr := strconv.ParseInt(installationIDStr, 10, 64)
+	if parseErr != nil || installationID <= 0 {
+		agentResultPage(w, http.StatusBadRequest, "Invalid installation",
+			"GitHub sent an invalid installation reference. Reopen the authorization link to retry.")
+		return
+	}
 	if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 || d.GitHubAppClientID == "" {
 		writeJSONError(w, http.StatusServiceUnavailable, "GitHub App not configured")
 		return
@@ -423,10 +446,15 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 	if session.AgentKeyPub != nil {
 		agentKeyPub = *session.AgentKeyPub
 	}
+	repoNames := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		repoNames = append(repoNames, repo.FullName)
+	}
 	res, err := d.Queries.ProvisionAgentSession(r.Context(), db.AgentProvisionInput{
 		SessionID:      sessionID,
 		InstallationID: installationID,
 		CanonicalRepo:  canonical,
+		Repos:          repoNames,
 		GitHubOrgName:  installInfo.Account.Login,
 		GitHubOrgID:    installInfo.Account.ID,
 		GitHubUserID:   ghUser.ID,

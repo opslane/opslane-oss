@@ -22,6 +22,7 @@ import (
 type recordingProvider struct {
 	authorizeCalls int
 	lastReq        auth.AuthRequest
+	exchangeCodes  []string
 }
 
 func (*recordingProvider) Name() string { return "workos" }
@@ -30,7 +31,8 @@ func (provider *recordingProvider) AuthorizeURL(req auth.AuthRequest) (string, e
 	provider.lastReq = req
 	return "https://auth.example/authorize?provider=" + string(req.SocialProvider), nil
 }
-func (*recordingProvider) ExchangeCode(context.Context, string) (auth.Identity, error) {
+func (provider *recordingProvider) ExchangeCode(_ context.Context, code string) (auth.Identity, error) {
+	provider.exchangeCodes = append(provider.exchangeCodes, code)
 	return auth.Identity{}, nil
 }
 func (*recordingProvider) SupportsLocalPasswordForm() bool { return false }
@@ -167,6 +169,11 @@ func TestApplyCombinedGitHubInstallationBindsAuthenticatedUser(t *testing.T) {
 		switch r.URL.Path {
 		case fmt.Sprintf("/app/installations/%d", installationID):
 			fmt.Fprintf(w, `{"id":%d,"account":{"login":"web-owner","id":1}}`, installationID)
+		case fmt.Sprintf("/app/installations/%d/access_tokens", installationID):
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"token":"web-installation-token","expires_at":"2099-01-01T00:00:00Z"}`)
+		case "/installation/repositories":
+			fmt.Fprint(w, `{"repositories":[{"full_name":"web-owner/repo"}]}`)
 		case "/user/installations":
 			if visible {
 				fmt.Fprintf(w, `{"installations":[{"id":%d}]}`, installationID)
@@ -210,6 +217,12 @@ func TestGetGitHubAppStatusUsesSharedOAuthState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	user, err := q.CreateUserGitHub(context.Background(), org.ID,
+		"wizard-state-"+fmt.Sprint(time.Now().UnixNano())+"@example.com", "Wizard State",
+		time.Now().UnixNano(), "wizard-state", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM oauth_login_states WHERE target_org_id = $1`, org.ID)
 		cleanupGitHubOAuthOrg(t, pool, org.ID)
@@ -217,7 +230,9 @@ func TestGetGitHubAppStatusUsesSharedOAuthState(t *testing.T) {
 
 	deps := &Dependencies{Queries: q, GitHubAppSlug: "opslane", JWTSecret: []byte("secret")}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/github/status", nil)
-	req = req.WithContext(context.WithValue(req.Context(), ctxOrgID, org.ID))
+	reqCtx := context.WithValue(req.Context(), ctxOrgID, org.ID)
+	reqCtx = context.WithValue(reqCtx, ctxUserID, user.ID)
+	req = req.WithContext(reqCtx)
 	w := httptest.NewRecorder()
 	deps.GetGitHubAppStatus(w, req)
 	if w.Code != http.StatusOK {
@@ -247,9 +262,19 @@ func TestGetGitHubAppStatusUsesSharedOAuthState(t *testing.T) {
 	if !found {
 		t.Fatal("missing __auth_state cookie")
 	}
+	var initiatingUserID string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT initiating_user_id FROM oauth_login_states WHERE target_org_id = $1`, org.ID).
+		Scan(&initiatingUserID); err != nil {
+		t.Fatal(err)
+	}
+	if initiatingUserID != user.ID {
+		t.Fatalf("initiating user=%s, want %s", initiatingUserID, user.ID)
+	}
 }
 
-func TestSetupWizardSharedCallbackPreservesActiveOrg(t *testing.T) {
+func TestWorkosInstallCallbackPreservesActiveOrgAndBypassesProvider(t *testing.T) {
+	t.Setenv("AUTH_PROVIDER", "workos")
 	pool := githubOAuthTestPool(t)
 	q := db.New(pool)
 	ctx := context.Background()
@@ -294,6 +319,11 @@ func TestSetupWizardSharedCallbackPreservesActiveOrg(t *testing.T) {
 			fmt.Fprintf(w, `{"installations":[{"id":%d}]}`, installationID)
 		case fmt.Sprintf("/app/installations/%d", installationID):
 			fmt.Fprintf(w, `{"id":%d,"account":{"login":"wizard-org","id":1}}`, installationID)
+		case fmt.Sprintf("/app/installations/%d/access_tokens", installationID):
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"token":"wizard-installation-token","expires_at":"2099-01-01T00:00:00Z"}`)
+		case "/installation/repositories":
+			fmt.Fprint(w, `{"repositories":[{"full_name":"wizard-org/repo"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -306,13 +336,17 @@ func TestSetupWizardSharedCallbackPreservesActiveOrg(t *testing.T) {
 	})})
 	defer restore()
 
+	provider := &recordingProvider{}
 	deps := &Dependencies{
 		Queries: q, JWTSecret: []byte("wizard-secret"), GitHubAppSlug: "opslane",
 		GitHubAppID: "1", GitHubAppClientID: "cid", GitHubAppClientSecret: "sec",
 		GitHubAppPrivateKey: callbackTestKey(t), DashboardOrigin: "https://app.example",
+		AuthProvider: provider,
 	}
 	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/github/status", nil)
-	statusReq = statusReq.WithContext(context.WithValue(statusReq.Context(), ctxOrgID, activeOrg.ID))
+	statusCtx := context.WithValue(statusReq.Context(), ctxOrgID, activeOrg.ID)
+	statusCtx = context.WithValue(statusCtx, ctxUserID, user.ID)
+	statusReq = statusReq.WithContext(statusCtx)
 	statusW := httptest.NewRecorder()
 	deps.GetGitHubAppStatus(statusW, statusReq)
 	if statusW.Code != http.StatusOK {
@@ -342,34 +376,23 @@ func TestSetupWizardSharedCallbackPreservesActiveOrg(t *testing.T) {
 	callbackReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf(
 		"/auth/callback?code=x&state=%s&setup_action=install&installation_id=%d", state, installationID), nil)
 	callbackReq.AddCookie(stateCookie)
+	accessToken, err := auth.SignAccessToken(deps.JWTSecret, user.ID, activeOrg.ID, user.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackReq.AddCookie(&http.Cookie{Name: AccessCookieName, Value: accessToken})
 	callbackW := httptest.NewRecorder()
 	deps.OAuthLoginCallback(callbackW, callbackReq)
 	if callbackW.Code != http.StatusFound {
 		t.Fatalf("callback code=%d body=%q", callbackW.Code, callbackW.Body.String())
 	}
-	var accessCookie, refreshCookie *http.Cookie
+	if len(provider.exchangeCodes) != 0 {
+		t.Fatalf("WorkOS exchanged GitHub codes: %v", provider.exchangeCodes)
+	}
 	for _, cookie := range callbackW.Result().Cookies() {
-		switch cookie.Name {
-		case AccessCookieName:
-			accessCookie = cookie
-		case RefreshCookieName:
-			refreshCookie = cookie
+		if cookie.Name == AccessCookieName || cookie.Name == RefreshCookieName {
+			t.Fatalf("install callback minted identity cookies: %v", callbackW.Result().Cookies())
 		}
-	}
-	if accessCookie == nil || refreshCookie == nil {
-		t.Fatalf("missing auth cookies: %v", callbackW.Result().Cookies())
-	}
-	claims, err := auth.ValidateToken(deps.JWTSecret, accessCookie.Value)
-	if err != nil || claims.OrgID != activeOrg.ID {
-		t.Fatalf("access claims=%+v err=%v, want active org %s", claims, err, activeOrg.ID)
-	}
-	var refreshOrgID string
-	if err := pool.QueryRow(ctx,
-		`SELECT org_id FROM refresh_tokens WHERE token_hash = $1`, auth.HashToken(refreshCookie.Value)).Scan(&refreshOrgID); err != nil {
-		t.Fatal(err)
-	}
-	if refreshOrgID != activeOrg.ID {
-		t.Fatalf("refresh org=%s, want active org %s", refreshOrgID, activeOrg.ID)
 	}
 	activeInstallation, err := q.GetOrgGitHubInstallation(ctx, activeOrg.ID)
 	if err != nil {
@@ -381,6 +404,15 @@ func TestSetupWizardSharedCallbackPreservesActiveOrg(t *testing.T) {
 	}
 	if activeInstallation != installationID || homeInstallation != 0 {
 		t.Fatalf("active/home installations=%d/%d, want %d/0", activeInstallation, homeInstallation, installationID)
+	}
+	var auditRepos []string
+	if err := pool.QueryRow(ctx,
+		`SELECT repos FROM installation_landed WHERE installation_id = $1 ORDER BY landed_at DESC LIMIT 1`,
+		installationID).Scan(&auditRepos); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditRepos) != 1 || auditRepos[0] != "wizard-org/repo" {
+		t.Fatalf("audit repos=%v", auditRepos)
 	}
 }
 
@@ -406,6 +438,9 @@ func cleanupGitHubOAuthOrg(t *testing.T, pool *pgxpool.Pool, orgID string) {
 	t.Helper()
 	ctx := context.Background()
 	for _, query := range []string{
+		`DELETE FROM oauth_login_states WHERE target_org_id = $1 OR initiating_user_id IN (SELECT id FROM users WHERE org_id = $1)`,
+		`DELETE FROM installation_landed WHERE org_id = $1`,
+		`DELETE FROM github_app_installations WHERE org_id = $1`,
 		`DELETE FROM org_invitations WHERE org_id = $1 OR invited_by IN (SELECT id FROM users WHERE org_id = $1)`,
 		`DELETE FROM users WHERE org_id = $1`,
 		`DELETE FROM orgs WHERE id = $1`,

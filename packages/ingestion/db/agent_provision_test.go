@@ -89,6 +89,9 @@ func (c *provisionCleanup) run() {
 		}
 	}
 	for _, id := range uniqueInt64s(c.installationIDs) {
+		if _, err := c.pool.Exec(ctx, `DELETE FROM installation_landed WHERE installation_id = $1`, id); err != nil {
+			c.t.Logf("cleanup landed installation %d: %v", id, err)
+		}
 		if _, err := c.pool.Exec(ctx, `DELETE FROM github_app_installations WHERE installation_id = $1`, id); err != nil {
 			c.t.Logf("cleanup GitHub installation %d: %v", id, err)
 		}

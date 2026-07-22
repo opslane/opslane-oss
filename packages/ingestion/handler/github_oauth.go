@@ -132,11 +132,15 @@ func (d *Dependencies) OAuthLoginCallback(w http.ResponseWriter, r *http.Request
 	// OAuth-during-install sends all GitHub App installs to this shared
 	// callback. UUID state belongs to an agent session; browser state is HMAC
 	// hex and continues through the ordinary login path.
-	if state := r.URL.Query().Get("state"); state != "" && r.URL.Query().Get("installation_id") != "" {
+	if state := r.URL.Query().Get("state"); state != "" {
 		if _, err := uuid.Parse(state); err == nil {
 			d.AgentAuthCallback(w, r)
 			return
 		}
+	}
+	if r.URL.Query().Get("setup_action") == "install" && r.URL.Query().Get("installation_id") != "" {
+		d.gitHubInstallCallback(w, r)
+		return
 	}
 	if providerError := r.URL.Query().Get("error"); providerError != "" {
 		writeJSONError(w, http.StatusBadRequest, "authentication was denied: "+providerError)
@@ -240,6 +244,175 @@ func (d *Dependencies) OAuthLoginCallback(w http.ResponseWriter, r *http.Request
 		setAuthCookies(w, r, completion.AccessToken, completion.RefreshToken)
 	}
 	http.Redirect(w, r, completion.RedirectTo, http.StatusFound)
+}
+
+// gitHubInstallCallback completes an install for an already-authenticated
+// browser actor. GitHub's authorization code never crosses the identity
+// provider boundary.
+func (d *Dependencies) gitHubInstallCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+	stateCookie, stateCookieErr := r.Cookie("__auth_state")
+	if stateCookieErr != nil || !validOAuthState(stateCookie.Value, state) {
+		writeJSONError(w, http.StatusForbidden, "invalid OAuth state")
+		return
+	}
+	accessCookie, err := r.Cookie(AccessCookieName)
+	if err != nil || accessCookie.Value == "" {
+		writeJSONError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	claims, err := auth.ValidateToken(d.JWTSecret, accessCookie.Value)
+	if err != nil {
+		writeJSONError(w, http.StatusUnauthorized, "invalid or expired session")
+		return
+	}
+	if d.Queries == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "authentication database is not configured")
+		return
+	}
+
+	stateHash := auth.HashToken(state)
+	loginState, err := d.Queries.GetOAuthLoginStateDetails(r.Context(), stateHash)
+	if err != nil {
+		slog.Error("inspect install OAuth state failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if loginState == nil || loginState.TargetOrgID == nil || loginState.InitiatingUserID == nil {
+		writeJSONError(w, http.StatusForbidden, "OAuth state already used, expired, or not valid for installation")
+		return
+	}
+	if *loginState.InitiatingUserID != claims.Sub {
+		writeJSONError(w, http.StatusForbidden, "OAuth installation actor mismatch")
+		return
+	}
+	role, err := d.Queries.GetMembership(r.Context(), claims.Sub, *loginState.TargetOrgID)
+	if err != nil {
+		slog.Error("revalidate install callback membership failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !auth.RoleSatisfies(role, "admin") {
+		writeJSONError(w, http.StatusForbidden, "organization admin role required")
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	installationID, parseErr := strconv.ParseInt(r.URL.Query().Get("installation_id"), 10, 64)
+	if code == "" || parseErr != nil || installationID <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "missing or invalid GitHub installation callback parameters")
+		return
+	}
+	if d.GitHubAppID == "" || d.GitHubAppClientID == "" || len(d.GitHubAppPrivateKey) == 0 {
+		writeJSONError(w, http.StatusServiceUnavailable, "GitHub App not configured")
+		return
+	}
+
+	reservation, err := d.Queries.ReserveOAuthLoginState(r.Context(), stateHash)
+	if errors.Is(err, db.ErrOAuthLoginStateInFlight) {
+		writeJSONError(w, http.StatusConflict, "OAuth installation callback is already in progress")
+		return
+	}
+	if err != nil {
+		slog.Error("reserve install OAuth state failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if reservation == nil {
+		writeJSONError(w, http.StatusForbidden, "OAuth state already used or expired")
+		return
+	}
+	release := func() {
+		if releaseErr := d.Queries.ReleaseOAuthLoginState(r.Context(), stateHash, reservation.ReservationToken); releaseErr != nil {
+			slog.Warn("release install OAuth state failed", "error", releaseErr)
+		}
+	}
+
+	userToken, err := gh.ExchangeOAuthCode(d.GitHubAppClientID, d.GitHubAppClientSecret, code)
+	if err != nil {
+		release()
+		slog.Warn("GitHub install code exchange failed", "error", err)
+		writeJSONError(w, http.StatusBadGateway, "GitHub authorization failed")
+		return
+	}
+	userInstalls, err := gh.ListUserInstallations(userToken.AccessToken)
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusBadGateway, "could not verify GitHub installation ownership")
+		return
+	}
+	if !containsInstallation(userInstalls, installationID) {
+		release()
+		writeJSONError(w, http.StatusForbidden, "installation does not belong to the authenticated GitHub user")
+		return
+	}
+	appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusInternalServerError, "could not verify GitHub installation")
+		return
+	}
+	installInfo, err := gh.VerifyInstallation(appJWT, installationID)
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusBadRequest, "invalid or unauthorized installation")
+		return
+	}
+	installationToken, err := gh.GetInstallationToken(appJWT, installationID)
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusBadGateway, "could not load GitHub installation repositories")
+		return
+	}
+	repos, err := gh.ListInstallationRepos(installationToken.Token)
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusBadGateway, "could not load GitHub installation repositories")
+		return
+	}
+	repoNames := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		repoNames = append(repoNames, repo.FullName)
+	}
+
+	tx, err := d.Queries.Pool().Begin(r.Context())
+	if err != nil {
+		release()
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := d.Queries.FinalizeOAuthLoginState(r.Context(), tx, stateHash, reservation.ReservationToken); err != nil {
+		writeJSONError(w, http.StatusConflict, "OAuth installation reservation expired; retry the installation")
+		return
+	}
+	if err := d.Queries.PersistInstallation(r.Context(), tx, db.PersistInstallationParams{
+		InstallationID: installationID,
+		GitHubOrgName:  installInfo.Account.Login,
+		GitHubOrgID:    installInfo.Account.ID,
+		OrgID:          *reservation.TargetOrgID,
+		Repos:          repoNames,
+	}); err != nil {
+		if errors.Is(err, db.ErrInstallationOrgConflict) {
+			writeJSONError(w, http.StatusConflict, "installation is already mapped to another organization")
+			return
+		}
+		slog.Error("persist GitHub installation failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to store installation")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to store installation")
+		return
+	}
+	clearOAuthStateCookie(w)
+	http.Redirect(w, r, d.DashboardOrigin+"/settings?github_installed=true", http.StatusFound)
+}
+
+func clearOAuthStateCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "__auth_state", Value: "", Path: "/auth", MaxAge: -1, HttpOnly: true,
+	})
 }
 
 func (d *Dependencies) completeOAuthIdentity(ctx context.Context, identity auth.Identity, cont oauthContinuation) (*oauthCompletion, error) {
@@ -445,7 +618,8 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 	if err != nil {
 		return fmt.Errorf("generate GitHub App token: %w", err)
 	}
-	if _, err := gh.VerifyInstallation(appJWT, installationID); err != nil {
+	installInfo, err := gh.VerifyInstallation(appJWT, installationID)
+	if err != nil {
 		return fmt.Errorf("invalid or unauthorized installation")
 	}
 	if identity.AccessToken == "" {
@@ -458,6 +632,18 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 	if !containsInstallation(userInstalls, installationID) {
 		return fmt.Errorf("installation does not belong to the authenticated user")
 	}
+	installationToken, err := gh.GetInstallationToken(appJWT, installationID)
+	if err != nil {
+		return fmt.Errorf("get installation token: %w", err)
+	}
+	repos, err := gh.ListInstallationRepos(installationToken.Token)
+	if err != nil {
+		return fmt.Errorf("list installation repositories: %w", err)
+	}
+	repoNames := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		repoNames = append(repoNames, repo.FullName)
+	}
 	orgID := user.OrgID
 	if targetOrgID != "" {
 		role, err := d.Queries.GetMembership(ctx, user.ID, targetOrgID)
@@ -469,7 +655,21 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 		}
 		orgID = targetOrgID
 	}
-	return d.Queries.SetOrgGitHubInstallation(ctx, orgID, installationID)
+	tx, err := d.Queries.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin installation persistence: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := d.Queries.PersistInstallation(ctx, tx, db.PersistInstallationParams{
+		InstallationID: installationID,
+		GitHubOrgName:  installInfo.Account.Login,
+		GitHubOrgID:    installInfo.Account.ID,
+		OrgID:          orgID,
+		Repos:          repoNames,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // === helpers ===
@@ -501,51 +701,15 @@ func backendOrigin(r *http.Request) string {
 
 // === GitHub App installation + repo endpoints ===
 
-// GitHubSetupCallback handles the redirect after a user installs the GitHub App.
+// GitHubSetupCallback is the legacy Setup URL landing page. OAuth-during-install
+// callbacks use OAuthLoginCallback; this endpoint intentionally never mutates.
 // GET /api/v1/github/setup?installation_id=123&setup_action=install
 func (d *Dependencies) GitHubSetupCallback(w http.ResponseWriter, r *http.Request) {
-	orgID := OrgIDFromCtx(r.Context())
-	if orgID == "" {
+	if OrgIDFromCtx(r.Context()) == "" {
 		writeJSONError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
-	installationIDStr := r.URL.Query().Get("installation_id")
-	setupAction := r.URL.Query().Get("setup_action")
-
-	if setupAction == "install" && installationIDStr != "" {
-		installationID, err := strconv.ParseInt(installationIDStr, 10, 64)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid installation_id")
-			return
-		}
-
-		// Verify installation belongs to this GitHub App before trusting it
-		if d.GitHubAppID == "" || len(d.GitHubAppPrivateKey) == 0 {
-			writeJSONError(w, http.StatusServiceUnavailable, "GitHub App not configured")
-			return
-		}
-		appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
-		if err != nil {
-			slog.Error("failed to generate app JWT for verification", "error", err)
-			writeJSONError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		if _, err := gh.VerifyInstallation(appJWT, installationID); err != nil {
-			slog.Warn("installation verification failed", "installation_id", installationID, "org_id", orgID, "error", err)
-			writeJSONError(w, http.StatusBadRequest, "invalid or unauthorized installation")
-			return
-		}
-
-		if err := d.Queries.SetOrgGitHubInstallation(r.Context(), orgID, installationID); err != nil {
-			slog.Error("failed to store installation id", "error", err, "org_id", orgID)
-			writeJSONError(w, http.StatusInternalServerError, "failed to store installation")
-			return
-		}
-		slog.Info("GitHub App installed", "org_id", orgID, "installation_id", installationID)
-	}
-
-	http.Redirect(w, r, d.DashboardOrigin+"/settings?github_installed=true", http.StatusFound)
+	http.Redirect(w, r, d.DashboardOrigin+"/settings?github_install_requires_authorization=true", http.StatusFound)
 }
 
 // GetGitHubAppStatus returns the GitHub App installation status for the user's org.
@@ -571,7 +735,7 @@ func (d *Dependencies) GetGitHubAppStatus(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if d.Queries != nil {
-			if err := d.Queries.StoreOAuthLoginStateForOrg(r.Context(), auth.HashToken(state), orgID, time.Now().Add(5*time.Minute)); err != nil {
+			if err := d.Queries.StoreOAuthLoginStateForOrg(r.Context(), auth.HashToken(state), orgID, UserIDFromCtx(r.Context()), time.Now().Add(5*time.Minute)); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, "internal error")
 				return
 			}
