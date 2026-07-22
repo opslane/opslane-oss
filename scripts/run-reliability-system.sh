@@ -20,6 +20,10 @@ docker compose exec -T postgres dropdb --if-exists -U opslane "${RELIABILITY_DAT
 docker compose exec -T postgres createdb -U opslane "${RELIABILITY_DATABASE}"
 docker compose run --rm migrate
 
+# The worker source these suites import resolves @opslane/agent-core through
+# its package exports, which point at dist — build it first.
+pnpm --filter @opslane/agent-core build
+
 DATABASE_URL="${LOCAL_RELIABILITY_DATABASE_URL}" \
 OPSLANE_RELIABILITY_DB_TESTS=1 \
 pnpm --filter @opslane/worker exec vitest run \
