@@ -11,7 +11,7 @@ import {
 } from '../api';
 import { AGENT_ONBOARDING_ENABLED } from '../agent-onboarding';
 import type { GitHubAppStatus, SetupPrStatus } from '../types/api';
-import { safeUrl } from '../utils';
+import { GITHUB_PR_URL_OPTIONS, safeUrl } from '../utils';
 import AgentOnboardingCard from '../components/AgentOnboardingCard.vue';
 import CopyButton from '../components/CopyButton.vue';
 import CodeBlock from '../components/CodeBlock.vue';
@@ -37,6 +37,7 @@ const loadingGitHub = ref(true);
 
 // Step 4 setup PR state
 const setupPr = ref<SetupPrStatus>({ status: '', pr_url: null, pr_number: null });
+const setupPrHref = computed(() => safeUrl(setupPr.value.pr_url, GITHUB_PR_URL_OPTIONS));
 const setupError = ref('');
 const setupLoading = ref(false);
 const setupTimer = ref<ReturnType<typeof setInterval>>();
@@ -357,8 +358,8 @@ throw new Error('Hello Opslane!');`;
 
           <div v-else-if="setupPr.status === 'open'" class="space-y-4">
             <a
-              v-if="setupPr.pr_url"
-              :href="safeUrl(setupPr.pr_url)"
+              v-if="setupPrHref"
+              :href="setupPrHref"
               target="_blank"
               rel="noopener noreferrer"
               class="w-full flex items-center justify-center rounded-md bg-accent px-4 py-3 text-sm font-medium text-on-accent hover:bg-accent/90"

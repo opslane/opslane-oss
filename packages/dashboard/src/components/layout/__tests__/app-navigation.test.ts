@@ -12,7 +12,7 @@ async function mountNav(showAdmin: boolean, path = '/') {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: APP_NAVIGATION.map((item) => ({
-      path: item.routeName === 'activity' ? '/' : `/${item.routeName}`,
+      path: item.routeName === 'issues' ? '/' : `/${item.routeName}`,
       name: item.routeName,
       component: stub,
     })),
@@ -62,23 +62,23 @@ describe('AppNavigation active-route marking', () => {
   });
 
   it('marks the parent item when on a related detail route', async () => {
-    // 'incident' is a related route of 'activity'; the ledger entry stays lit.
+    // 'incident' is a related route of 'issues'; the list entry stays lit.
     const router = createRouter({
       history: createMemoryHistory(),
       routes: [
         ...APP_NAVIGATION.map((item) => ({
-          path: item.routeName === 'activity' ? '/' : `/${item.routeName}`,
+          path: item.routeName === 'issues' ? '/' : `/${item.routeName}`,
           name: item.routeName,
           component: stub,
         })),
-        { path: '/incidents/:id', name: 'incident', component: stub },
+        { path: '/issues/:id', name: 'incident', component: stub },
       ],
     });
-    await router.push('/incidents/incident-1');
+    await router.push('/issues/incident-1');
     await router.isReady();
     const wrapper = mount(AppNavigation, { props: { showAdmin: false }, global: { plugins: [router] } });
     const current = wrapper.findAll('a').filter((link) => link.attributes('aria-current') === 'page');
     expect(current).toHaveLength(1);
-    expect(current[0]?.text()).toContain('Incidents');
+    expect(current[0]?.text()).toContain('Issues');
   });
 });

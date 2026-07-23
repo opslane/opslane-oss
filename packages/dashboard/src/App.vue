@@ -137,7 +137,7 @@ watch(
 
       <header class="sticky top-0 z-20 flex min-h-14 items-center justify-between border-b border-border bg-surface px-4 md:hidden">
         <router-link
-          :to="{ name: 'activity' }"
+          :to="{ name: 'issues' }"
           class="font-mono text-sm font-semibold uppercase tracking-[0.16em] text-text"
         >
           Opslane

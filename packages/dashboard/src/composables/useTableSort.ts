@@ -11,6 +11,19 @@ export function useTableSort<K extends string, T>(
   const sortKey = ref<K>(defaultKey) as Ref<K>;
   const sortDir = ref<SortDir>(defaultDirForKey?.(defaultKey) ?? 'desc');
 
+  /*
+   * DIRECTION INVERSION — read before writing a comparator.
+   *
+   *   toggleSort(newKey) ──► sortDir = 'desc'   (default for any newly-picked key)
+   *                              │
+   *   sorted = [...items].sort((a,b) => comparators[key](a,b) * dir)
+   *                                                              │
+   *                                        dir = 'asc' ? 1 : -1 ─┘
+   *
+   * So the FIRST click on a column renders your comparator NEGATED.
+   * Write each comparator in its natural ascending sense and let the default
+   * 'desc' invert it; do not pre-invert inside the comparator.
+   */
   const sorted = computed(() => {
     const dir = sortDir.value === 'asc' ? 1 : -1;
     return [...items.value].sort((a, b) => comparators[sortKey.value](a, b) * dir);
@@ -30,5 +43,11 @@ export function useTableSort<K extends string, T>(
     return sortDir.value === 'asc' ? ' \u2191' : ' \u2193';
   }
 
-  return { sortKey, sortDir, sorted, toggleSort, sortIndicator };
+  /** For `<th aria-sort>`. Screen readers announce the active column and direction. */
+  function ariaSort(key: K): 'ascending' | 'descending' | 'none' {
+    if (sortKey.value !== key) return 'none';
+    return sortDir.value === 'asc' ? 'ascending' : 'descending';
+  }
+
+  return { sortKey, sortDir, sorted, toggleSort, sortIndicator, ariaSort };
 }

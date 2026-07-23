@@ -80,8 +80,8 @@ describe.skipIf(!browserAvailable)('dashboard deterministic Chromium smoke', () 
 
   const routes: Array<{ path: string; identity: RegExp }> = [
     { path: '/setup', identity: /Connect GitHub/i },
-    { path: '/', identity: /Incidents/i },
-    { path: '/incidents/incident-1', identity: /Mock incident title/i },
+    { path: '/', identity: /^Issues$/i },
+    { path: '/issues/incident-1', identity: /Mock incident title/i },
     { path: '/accounts', identity: /Accounts/i },
     { path: '/accounts/account-1', identity: /Mock Account/i },
     { path: '/sessions', identity: /Sessions/i },

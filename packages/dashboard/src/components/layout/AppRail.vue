@@ -21,14 +21,11 @@ const emit = defineEmits<{
   >
     <div class="border-b border-border px-5 py-5">
       <router-link
-        :to="{ name: 'activity' }"
+        :to="{ name: 'issues' }"
         class="inline-flex min-h-10 items-center text-text transition-colors duration-150 hover:text-accent motion-reduce:transition-none"
       >
         <span class="font-mono text-sm font-semibold uppercase tracking-[0.18em]">Opslane</span>
       </router-link>
-      <p class="mt-1 font-mono text-[0.6875rem] uppercase tracking-[0.12em] text-faint">
-        Incident ledger
-      </p>
     </div>
 
     <div class="border-b border-border px-4 py-4">

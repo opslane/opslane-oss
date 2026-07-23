@@ -56,7 +56,7 @@ async function handleSwitch(): Promise<void> {
       id="project-switcher"
       v-model="selected"
       :disabled="switching"
-      class="rounded-md border border-border bg-surface-subtle px-2 py-1 text-sm text-text"
+      class="rounded-md border border-border bg-surface-subtle pl-2 pr-8 py-1 text-sm text-text"
       @change="handleSwitch"
     >
       <option

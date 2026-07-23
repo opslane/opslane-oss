@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { Incident } from '../../types/api';
-import { safeUrl } from '../../utils';
+import { GITHUB_PR_URL_OPTIONS, safeUrl } from '../../utils';
 
 const props = defineProps<{ incident: Incident }>();
 
@@ -17,7 +17,7 @@ const title = computed(() => {
   }
 });
 
-const prUrl = computed(() => safeUrl(props.incident.pr_url));
+const prUrl = computed(() => safeUrl(props.incident.pr_url, GITHUB_PR_URL_OPTIONS));
 </script>
 
 <template>

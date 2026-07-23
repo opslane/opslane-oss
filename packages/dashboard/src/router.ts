@@ -1,6 +1,6 @@
-import { createRouter, createWebHistory } from 'vue-router';
+import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 import { isAuthenticated } from './api';
-import ActivityFeed from './views/ActivityFeed.vue';
+import IssuesList from './views/IssuesList.vue';
 import AuthCallback from './views/AuthCallback.vue';
 import IncidentDetail from './views/IncidentDetail.vue';
 import Login from './views/Login.vue';
@@ -12,24 +12,29 @@ import AccountDetail from './views/AccountDetail.vue';
 import AcceptInvitation from './views/AcceptInvitation.vue';
 import { routeNeedsProject } from './route-project';
 
+export const routes: RouteRecordRaw[] = [
+  { path: '/login', name: 'login', component: Login, meta: { public: true } },
+  { path: '/reset-password', name: 'reset-password', component: ResetPassword, meta: { public: true } },
+  { path: '/auth/complete', name: 'auth-complete', component: AuthCallback, meta: { public: true } },
+  { path: '/invite/accept', name: 'invite-accept', component: AcceptInvitation },
+  { path: '/setup', name: 'setup', component: SetupWizard },
+  { path: '/', name: 'issues', component: IssuesList },
+  { path: '/issues/:id', name: 'incident', component: IncidentDetail },
+  // Preserve pre-rename bookmarks. Vue Router carries the query forward when
+  // this function redirect only replaces the route name and params.
+  { path: '/incidents/:id', redirect: (to) => ({ name: 'incident', params: to.params }) },
+  { path: '/accounts', name: 'accounts', component: AccountsList },
+  { path: '/accounts/:accountId', name: 'account-detail', component: AccountDetail },
+  { path: '/sessions', name: 'sessions', component: () => import('./views/SessionsList.vue') },
+  { path: '/sessions/:sessionId', name: 'session-detail', component: () => import('./views/SessionDetail.vue') },
+  { path: '/settings', name: 'settings', component: Settings },
+  { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue') },
+  { path: '/:pathMatch(.*)*', redirect: '/' },
+];
+
 export const router = createRouter({
   history: createWebHistory(),
-  routes: [
-    { path: '/login', name: 'login', component: Login, meta: { public: true } },
-    { path: '/reset-password', name: 'reset-password', component: ResetPassword, meta: { public: true } },
-    { path: '/auth/complete', name: 'auth-complete', component: AuthCallback, meta: { public: true } },
-    { path: '/invite/accept', name: 'invite-accept', component: AcceptInvitation },
-    { path: '/setup', name: 'setup', component: SetupWizard },
-    { path: '/', name: 'activity', component: ActivityFeed },
-    { path: '/incidents/:id', name: 'incident', component: IncidentDetail },
-    { path: '/accounts', name: 'accounts', component: AccountsList },
-    { path: '/accounts/:accountId', name: 'account-detail', component: AccountDetail },
-    { path: '/sessions', name: 'sessions', component: () => import('./views/SessionsList.vue') },
-    { path: '/sessions/:sessionId', name: 'session-detail', component: () => import('./views/SessionDetail.vue') },
-    { path: '/settings', name: 'settings', component: Settings },
-    { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue') },
-    { path: '/:pathMatch(.*)*', redirect: '/' },
-  ],
+  routes,
 });
 
 router.beforeEach((to) => {
@@ -46,7 +51,7 @@ router.beforeEach((to) => {
   if (publicRoutes.includes(to.name as string) && authed) {
     // Don't redirect auth-complete — it needs to process cookies first
     if (to.name === 'auth-complete') return;
-    return { name: 'activity' };
+    return { name: 'issues' };
   }
 
   // Redirect to setup if authenticated but no project configured

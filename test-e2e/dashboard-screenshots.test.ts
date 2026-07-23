@@ -58,8 +58,8 @@ describe.skipIf(!browserAvailable || !captureEnabled)('dashboard approved-fixtur
     { path: '/auth/complete', fixture: 'auth-callback-loading-mock', identity: /Completing sign in/i, harness: 'callback' },
     { path: '/invite/accept?token=mock-token', fixture: 'invitation-accepted-mock', identity: /Organization invitation/i, harness: 'success' },
     { path: '/setup', fixture: 'setup-github-mock', identity: /Connect GitHub/i, harness: 'success' },
-    { path: '/', fixture: 'activity-success-mock', identity: /Production incidents/i, harness: 'success' },
-    { path: '/incidents/incident-1', fixture: 'incident-pr-created-mock', identity: /Mock incident title/i, harness: 'success' },
+    { path: '/', fixture: 'activity-success-mock', identity: /^Issues$/i, harness: 'success' },
+    { path: '/issues/incident-1', fixture: 'incident-pr-created-mock', identity: /Mock incident title/i, harness: 'success' },
     { path: '/accounts', fixture: 'accounts-success-mock', identity: /^Accounts$/i, harness: 'success' },
     { path: '/accounts/account-1', fixture: 'account-detail-success-mock', identity: /Mock Account/i, harness: 'success' },
     { path: '/sessions', fixture: 'sessions-success-mock', identity: /^Sessions$/i, harness: 'success' },
@@ -68,8 +68,8 @@ describe.skipIf(!browserAvailable || !captureEnabled)('dashboard approved-fixtur
     { path: '/admin', fixture: 'admin-success-mock', identity: /System observability/i, harness: 'success' },
     // Zero-incident and failed-load ledgers: the two branches a success-only
     // fixture set can never reach, and where the slot/prop regressions hid.
-    { path: '/', fixture: 'activity-empty-mock', identity: /No incidents yet/i, harness: 'empty' },
-    { path: '/', fixture: 'activity-error-mock', identity: /Unable to load incidents/i, harness: 'error' },
+    { path: '/', fixture: 'activity-empty-mock', identity: /No issues yet/i, harness: 'empty' },
+    { path: '/', fixture: 'activity-error-mock', identity: /Unable to load issues/i, harness: 'error' },
   ];
   const viewports = [
     { width: 1440, height: 1000 },
