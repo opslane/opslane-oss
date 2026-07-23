@@ -133,6 +133,36 @@ describe('SessionsList ledger', () => {
     expect(row.get('button[aria-label="Copy session ID"]').attributes('type')).toBe('button');
   });
 
+  // Regression: ISSUE-001 — the anonymous short id sliced the TAIL of the
+  // session id, so structured ids rendered a meaningless fragment:
+  // `sess_sdk_normal_1784676521012577000` showed `12577000` (a nanosecond
+  // fragment, near-identical between sessions started in the same millisecond)
+  // and `session-unavailable` showed `vailable`.
+  // Found by /qa on 2026-07-23
+  // Report: .gstack/qa-reports/qa-report-sessions-2026-07-23.md
+  it('shows the distinguishing head of an anonymous session id, not the tail', async () => {
+    vi.mocked(listSessions).mockResolvedValue(response([
+      session({ id: 'sess_sdk_normal_1784676521012577000', end_user: null }),
+      session({ id: 'ec7a5e89-a2c5-4e7c-a282-00298b7efaed', end_user: null }),
+      session({ id: 'sess_a1b2c3d4e5f60718293a4b5c6d7e8f90', end_user: null }),
+    ]));
+    const wrapper = await mountView();
+
+    expect(wrapper.text()).toContain('sdk_norm');
+    expect(wrapper.text()).not.toContain('12577000');
+
+    // A UUID keeps its recognisable first block rather than its last.
+    expect(wrapper.text()).toContain('ec7a5e89');
+    expect(wrapper.text()).not.toContain('8b7efaed');
+
+    // The shared `sess_` prefix is stripped so the 8 shown characters carry signal.
+    expect(wrapper.text()).toContain('a1b2c3d4');
+
+    // The full id stays available to assistive tech and to the copy control.
+    const rows = wrapper.findAll('tbody tr');
+    expect(rows[0]!.html()).toContain('sess_sdk_normal_1784676521012577000');
+  });
+
   it('copies the full session id from the sibling copy control', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
@@ -290,7 +320,8 @@ describe('SessionsList ledger', () => {
     expect(wrapper.get('a[href="https://docs.opslane.com/guides/replay-privacy/"]').attributes('rel'))
       .toBe('noopener noreferrer');
     expect(wrapper.text()).toContain('Anonymous');
-    expect(wrapper.text()).toContain('23456789');
+    // Head of the id, not the tail — see the ISSUE-001 regression test above.
+    expect(wrapper.text()).toContain('session-');
 
     await wrapper.get('button[aria-label="Dismiss anonymous recordings notice"]').trigger('click');
     expect(wrapper.text()).not.toContain('These sessions have no user attached');

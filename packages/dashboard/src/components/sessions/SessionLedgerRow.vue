@@ -38,11 +38,25 @@ const releaseLabel = computed(() => {
   if (!release) return null;
   return release.startsWith('v') ? release : `v${release}`;
 });
+/**
+ * Short id for anonymous rows. Takes the HEAD of the id, not the tail: session
+ * ids are client-generated and only *sometimes* random. `crypto.randomUUID()`
+ * and the `sess_`+hex fallback (sdk/src/session.ts:37-46) both survive a tail
+ * slice, but structured ids do not — `sess_sdk_normal_1784676521012577000`
+ * tails to `12577000`, a nanosecond fragment that is near-identical between
+ * sessions started in the same millisecond, and `session-unavailable` tails to
+ * `vailable`. The `sess_` prefix is stripped first so the 8 characters shown
+ * are the distinguishing ones rather than the shared prefix.
+ */
+function shortSessionID(id: string): string {
+  return id.replace(/^sess_/, '').slice(0, 8);
+}
+
 const metadataSegments = computed(() => {
   const result: Array<{ text: string; mono?: boolean; accessibleLabel?: string }> = [];
   if (isAnonymous.value) {
     result.push({
-      text: props.session.id.slice(-8),
+      text: shortSessionID(props.session.id),
       mono: true,
       accessibleLabel: `Session ID ${props.session.id}`,
     });
