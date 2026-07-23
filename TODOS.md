@@ -111,3 +111,22 @@ It was deliberately left alone by the issue-list polish plan, which is scoped da
 **Context:** Surfaced in `/plan-design-review` Pass 7 on 2026-07-22 and deliberately left unresolved. The relevant code is the row's `<router-link>` title in `IncidentLedgerRow.vue`. Note the tension: clamping at 2 lines is good for rhythm, bad for a `TypeError: Cannot destructure property 'name' of 'props.user.profile' as it is null.` where the useful part is the tail.
 
 **Depends on / blocked by:** The stacked mobile layout (Design decision D6), which should use the same clamp.
+
+---
+
+## Bring Settings and Admin selects up to the 44px touch minimum
+
+**What:** Selects on `/settings` and `/admin` measure 30px tall. The sanctioned `ui/SelectField.vue:42` uses `min-h-10 max-md:min-h-11` (40px desktop, 44px touch), and the issue-list filters were brought to that in the polish work. These were not.
+
+**Why:** 30px is below the 44px minimum touch target. On a phone these are hard to hit accurately, and the inconsistency means the same control renders two different sizes depending on which page you are on.
+
+**Pros:**
+- Consistent control sizing across the app.
+- Removes a real accessibility gap on two pages.
+
+**Cons:**
+- Taller controls change the vertical rhythm of both pages, so the surrounding spacing may need a look.
+
+**Context:** Measured during `/qa` on 2026-07-23 against a live build: `/settings` has one 30px select, `/admin` has 30px and 40px selects. These pages were in scope for the chevron padding fix (Task 1 of the issue-list plan) but not for the touch-target fix, which design decision D8 scoped to the issue-list filters only. Pre-existing, not a regression. The cleanest fix is probably migrating them to `SelectField` rather than hand-adding classes.
+
+**Depends on / blocked by:** Nothing.
