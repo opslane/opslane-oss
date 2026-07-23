@@ -118,7 +118,7 @@ describe.skipIf(!configured || !playwrightAvailable)('dashboard environment filt
     try {
       await db.query(`UPDATE rollup_backfill_state SET status = 'running', updated_at = now() WHERE id`);
       await page.goto(`${ingestionUrl}/`);
-      await page.getByRole('heading', { name: 'Incidents' }).waitFor();
+      await page.getByRole('heading', { name: 'Issues' }).waitFor();
       expect(await page.getByLabel('Environment').count()).toBe(0);
 
       await db.query(`UPDATE rollup_backfill_state SET status = 'complete', updated_at = now() WHERE id`);

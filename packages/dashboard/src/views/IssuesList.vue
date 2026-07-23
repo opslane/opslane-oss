@@ -150,7 +150,7 @@ onUnmounted(() => stopPolling());
       <FilterBar
         ref="filterBar"
         :project-id="projectId"
-        class="min-w-0 flex-1"
+        class="w-full sm:min-w-0 sm:flex-1"
         @filter-change="onFilterChange"
       />
       <label class="flex items-center gap-2 text-sm text-muted sm:hidden">

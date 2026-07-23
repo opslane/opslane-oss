@@ -7,13 +7,13 @@ new owned primitive or domain component is added.
 | Owned component | Production consumers | Boundary |
 |---|---|---|
 | `Button.vue` | `views/IncidentDetail.vue` | semantic actions |
-| `EmptyState.vue` | `views/ActivityFeed.vue` | empty incident ledger |
+| `EmptyState.vue` | `views/IssuesList.vue` | empty issue list |
 | `IconButton.vue` | `components/ui/ModalSurface.vue` | icon-only action |
-| `InlineAlert.vue` | `views/ActivityFeed.vue` | route feedback |
+| `InlineAlert.vue` | `views/IssuesList.vue` | route feedback |
 | `ModalSurface.vue` | `views/Settings.vue`, `components/layout/NavDrawer.vue` | accessible modal foundation |
 | `SelectField.vue` | `views/SessionsList.vue` | labelled select |
-| `SkeletonBlock.vue` | `views/ActivityFeed.vue` | loading placeholder |
-| `StatusLabel.vue` | `views/IncidentDetail.vue`, `components/incidents/IncidentLedgerRow.vue`, `components/incidents/IncidentLifecycle.vue` | typed status signal |
+| `SkeletonBlock.vue` | `views/IssuesList.vue` | loading placeholder |
+| `StatusLabel.vue` | `views/IncidentDetail.vue`, `components/incidents/IssueRow.vue`, `components/incidents/IncidentLifecycle.vue` | typed status signal |
 | `TabList.vue` | `views/Settings.vue` | tab semantics |
 | `TextInput.vue` | `views/SessionsList.vue` | labelled text input |
 | `TextareaField.vue` | `views/IncidentDetail.vue` | labelled textarea |
@@ -23,7 +23,7 @@ new owned primitive or domain component is added.
 | `EvidenceCheck.vue` | `components/evidence/EvidenceWell.vue` | verification check row |
 | `EvidenceWell.vue` | `views/IncidentDetail.vue` | dark evidence surface |
 | `ProvenanceFooter.vue` | `components/evidence/EvidenceWell.vue` | evidence provenance |
-| `IncidentLedgerRow.vue` | `views/ActivityFeed.vue` | incident list row |
+| `IssueRow.vue` | `views/IssuesList.vue` | issue list row |
 | `IncidentConclusion.vue` | `views/IncidentDetail.vue` | outcome and next action |
 | `IncidentLifecycle.vue` | `views/IncidentDetail.vue` | truthful current-state summary |
 | `layout/navigation.ts` | `components/layout/AppNavigation.vue` | navigation model and active-route rule |

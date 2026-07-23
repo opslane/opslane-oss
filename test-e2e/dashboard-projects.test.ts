@@ -111,7 +111,7 @@ describe('first-class projects dashboard', () => {
 
     try {
       await page.goto(
-        `${ingestionUrl}/incidents/${firstIncidentId}?project_id=${tenant.projectId}` +
+        `${ingestionUrl}/issues/${firstIncidentId}?project_id=${tenant.projectId}` +
         `&environment_id=${tenant.environmentId}&account_id=old-account`,
       );
       await page.getByRole('heading', { name: firstTitle }).waitFor();

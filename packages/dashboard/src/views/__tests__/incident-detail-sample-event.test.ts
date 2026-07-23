@@ -87,7 +87,7 @@ function mountView() {
 describe('IncidentDetail sample event', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    window.history.replaceState({}, '', '/incidents/i1?project_id=p1');
+    window.history.replaceState({}, '', '/issues/i1?project_id=p1');
     api.getIncident.mockResolvedValue(incident);
     api.getSampleEvent.mockResolvedValue(sampleEvent);
   });

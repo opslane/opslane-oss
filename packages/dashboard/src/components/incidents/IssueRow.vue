@@ -36,7 +36,8 @@ const showMarkers = computed(() => kind.value || (props.showPlatform && platform
   >
     <router-link
       :to="{ name: 'incident', params: { id: incident.id }, query: { project_id: projectId } }"
-      class="block text-sm font-semibold leading-5 text-text decoration-accent underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      :title="incident.title"
+      class="line-clamp-2 block text-sm font-semibold leading-5 text-text decoration-accent underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       v-text="incident.title"
     />
     <div
@@ -77,7 +78,8 @@ const showMarkers = computed(() => kind.value || (props.showPlatform && platform
     <td class="min-w-0 px-4 py-4 sm:px-5">
       <router-link
         :to="{ name: 'incident', params: { id: incident.id }, query: { project_id: projectId } }"
-        class="block min-w-0 max-w-xl text-sm font-semibold leading-5 text-text decoration-accent underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        :title="incident.title"
+        class="line-clamp-2 block min-w-0 max-w-xl text-sm font-semibold leading-5 text-text decoration-accent underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         v-text="incident.title"
       />
       <div

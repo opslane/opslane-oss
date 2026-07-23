@@ -115,5 +115,7 @@ describe('IssueRow', () => {
     expect(row.findAll('td')).toHaveLength(0);
     expect(row.text()).toContain('312 users');
     expect(row.get('[data-testid="age"]').text()).not.toBe('');
+    expect(row.get('a').classes()).toContain('line-clamp-2');
+    expect(row.get('a').attributes('title')).toBe(incident().title);
   });
 });
