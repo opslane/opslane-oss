@@ -19,9 +19,9 @@ export interface OnboardingFunnelStage {
 export function formatDuration(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return '\u2014';
   if (seconds < 1) return '<1s';
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  return `${Math.floor(seconds / 3_600)}h ${Math.round((seconds % 3_600) / 60)}m`;
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+  return `${Math.floor(seconds / 3_600)}h ${Math.floor((seconds % 3_600) / 60)}m`;
 }
 
 export function onboardingFunnelStages(onboarding: AdminOnboardingOverview): OnboardingFunnelStage[] {

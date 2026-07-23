@@ -33,6 +33,17 @@ describe.skipIf(!configured || !playwrightAvailable)('dashboard environment filt
   const stagingOnlyTitle = `phase2 staging ${crypto.randomUUID()}`;
   const productionPage = `https://app.example.test/production-${crypto.randomUUID()}`;
   const stagingPage = `https://app.example.test/staging-${crypto.randomUUID()}`;
+  // The session ledger renders the page *path* as text on the row's metadata
+  // line, not the full URL as a link: the whole row is a single link to the
+  // replay, so a second anchor would give one row two competing destinations.
+  // Identify rows by the path the UI actually paints.
+  // Mirrors SessionLedgerRow's pagePath: pathname + search, host dropped.
+  const pageRowPath = (url: string): string => {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`;
+  };
+  const productionPagePath = pageRowPath(productionPage);
+  const stagingPagePath = pageRowPath(stagingPage);
 
   async function ingest(apiKey: string, message: string): Promise<string> {
     const response = await postEvent(apiKey, {
@@ -100,7 +111,10 @@ describe.skipIf(!configured || !playwrightAvailable)('dashboard environment filt
   it('gates readiness and filters incidents, detail chips, and sessions in real Chromium', async () => {
     const { ingestionUrl } = getConfig();
     const db = getPool();
-    const context = await browser.newContext();
+    // Pinned, not left to Playwright's default: the session row only paints the
+    // page path at >=1024px (`hidden ... lg:inline`), so the assertions below
+    // are width-dependent in a way the old full-URL link assertion was not.
+    const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     await context.addCookies([{
       name: '__opslane_at',
       value: jwt,
@@ -149,18 +163,18 @@ describe.skipIf(!configured || !playwrightAvailable)('dashboard environment filt
       await page.goto(`${ingestionUrl}/sessions`);
       const sessionEnvironment = page.getByLabel('Environment');
       await sessionEnvironment.waitFor();
-      await page.getByRole('link', { name: stagingPage }).waitFor();
+      await page.getByText(stagingPagePath, { exact: true }).waitFor();
       await expect.poll(
-        () => page.getByRole('link', { name: productionPage }).count(),
+        () => page.getByText(productionPagePath, { exact: true }).count(),
       ).toBe(0);
 
       await Promise.all([
         page.waitForResponse((response) => response.url().includes(`environment_id=${tenant.environmentId}`)),
         sessionEnvironment.selectOption(tenant.environmentId),
       ]);
-      await page.getByRole('link', { name: productionPage }).waitFor();
+      await page.getByText(productionPagePath, { exact: true }).waitFor();
       await expect.poll(
-        () => page.getByRole('link', { name: stagingPage }).count(),
+        () => page.getByText(stagingPagePath, { exact: true }).count(),
       ).toBe(0);
     } finally {
       await page.close();

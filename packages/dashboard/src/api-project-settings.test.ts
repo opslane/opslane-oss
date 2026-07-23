@@ -104,7 +104,7 @@ describe('project settings API', () => {
 });
 
 describe('environment-filtered API reads', () => {
-  it('threads environment_id through incident and session list queries only when set', async () => {
+  it('threads supported filters through incident and session list queries only when set', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -114,13 +114,17 @@ describe('environment-filtered API reads', () => {
 
     await listIncidents('project-1', { environment_id: 'env-production' });
     await listIncidents('project-1', {});
-    await listSessions('project-1', { environment_id: 'env-staging' });
+    await listSessions('project-1', {
+      environment_id: 'env-staging',
+      search: 'jane@acme.com',
+      has_signals: true,
+    });
     await listSessions('project-1', {});
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       '/api/v1/projects/project-1/incidents?environment_id=env-production',
       '/api/v1/projects/project-1/incidents',
-      '/api/v1/projects/project-1/sessions?environment_id=env-staging',
+      '/api/v1/projects/project-1/sessions?search=jane%40acme.com&has_signals=true&environment_id=env-staging',
       '/api/v1/projects/project-1/sessions',
     ]);
   });
