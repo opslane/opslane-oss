@@ -610,8 +610,8 @@ export function listSessions(
   cursor?: string,
 ): Promise<SessionListResponse> {
   const params = new URLSearchParams();
-  if (filters?.end_user_id) params.set('end_user_id', filters.end_user_id);
-  if (filters?.account_id) params.set('account_id', filters.account_id);
+  if (filters?.search) params.set('search', filters.search);
+  if (filters?.has_signals) params.set('has_signals', 'true');
   if (filters?.environment_id) params.set('environment_id', filters.environment_id);
   if (filters?.from) params.set('from', filters.from);
   if (filters?.to) params.set('to', filters.to);

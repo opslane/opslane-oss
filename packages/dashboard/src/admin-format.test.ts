@@ -9,6 +9,12 @@ describe('admin formatting', () => {
     expect(formatDuration(3_720)).toBe('1h 2m');
   });
 
+  it('does not carry rounded remainders into impossible duration units', () => {
+    expect(formatDuration(59.5)).toBe('59s');
+    expect(formatDuration(3_599.5)).toBe('59m 59s');
+    expect(formatDuration(7_199)).toBe('1h 59m');
+  });
+
   it('highlights dead letters as failures', () => {
     expect(adminStatusBadgeClass('dead_letter')).toContain('text-danger');
   });

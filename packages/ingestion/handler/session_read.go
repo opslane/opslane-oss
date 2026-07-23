@@ -37,6 +37,11 @@ type sessionJSON struct {
 	PlayableChunkCount int                 `json:"playable_chunk_count"`
 	BytesStored        int64               `json:"bytes_stored"`
 	PageURL            *string             `json:"page_url,omitempty"`
+	SDKRelease         *string             `json:"sdk_release,omitempty"`
+	ErrorCount         int                 `json:"error_count"`
+	RageClickCount     int                 `json:"rage_click_count"`
+	DeadClickCount     int                 `json:"dead_click_count"`
+	FormAbandonCount   int                 `json:"form_abandon_count"`
 	EndUser            *sessionEndUserJSON `json:"end_user,omitempty"`
 }
 
@@ -50,8 +55,9 @@ type sessionChunkJSON struct {
 }
 
 type sessionListJSON struct {
-	Sessions   []sessionJSON `json:"sessions"`
-	NextCursor *string       `json:"next_cursor,omitempty"`
+	Sessions              []sessionJSON `json:"sessions"`
+	NextCursor            *string       `json:"next_cursor,omitempty"`
+	HasIdentifiedSessions bool          `json:"has_identified_sessions"`
 }
 
 type sessionDetailJSON struct {
@@ -68,6 +74,11 @@ func toSessionJSON(session db.SessionSummary) sessionJSON {
 		PlayableChunkCount: session.PlayableChunkCount,
 		BytesStored:        session.BytesStored,
 		PageURL:            session.PageURL,
+		SDKRelease:         session.SDKRelease,
+		ErrorCount:         session.ErrorCount,
+		RageClickCount:     session.RageClickCount,
+		DeadClickCount:     session.DeadClickCount,
+		FormAbandonCount:   session.FormAbandonCount,
 	}
 	if session.LastChunkAt != nil {
 		formatted := session.LastChunkAt.Format(time.RFC3339Nano)
@@ -175,13 +186,33 @@ func (d *Dependencies) ListSessionsEndpoint(w http.ResponseWriter, r *http.Reque
 		}
 		limit = max(1, min(200, parsed))
 	}
+	hasSignals := false
+	if rawHasSignals := query.Get("has_signals"); rawHasSignals != "" {
+		parsed, parseErr := strconv.ParseBool(rawHasSignals)
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid has_signals")
+			return
+		}
+		hasSignals = parsed
+	}
 
+	queryStartedAt := time.Now()
 	sessions, next, err := d.Queries.ListSessions(r.Context(), projectID, db.SessionFilters{
 		EndUserID: query.Get("end_user_id"), AccountID: query.Get("account_id"), EnvironmentID: environmentID,
-		From: from, To: to,
+		Search: strings.TrimSpace(query.Get("search")), HasSignals: hasSignals, From: from, To: to,
 	}, cursor, limit)
+	queryDuration := time.Since(queryStartedAt)
 	if err != nil {
-		slog.Error("list sessions failed", "error", err, "project_id", projectID)
+		slog.Error("list sessions failed", "error", err, "project_id", projectID,
+			"duration_ms", queryDuration.Milliseconds(), "has_signals", hasSignals)
+		writeJSONError(w, http.StatusInternalServerError, "failed to list sessions")
+		return
+	}
+	slog.Info("session list query completed", "project_id", projectID,
+		"duration_ms", queryDuration.Milliseconds(), "has_signals", hasSignals, "result_count", len(sessions))
+	hasIdentifiedSessions, err := d.Queries.HasIdentifiedSessions(r.Context(), projectID)
+	if err != nil {
+		slog.Error("check identified sessions failed", "error", err, "project_id", projectID)
 		writeJSONError(w, http.StatusInternalServerError, "failed to list sessions")
 		return
 	}
@@ -189,7 +220,9 @@ func (d *Dependencies) ListSessionsEndpoint(w http.ResponseWriter, r *http.Reque
 	for _, session := range sessions {
 		result = append(result, toSessionJSON(session))
 	}
-	writeJSON(w, http.StatusOK, sessionListJSON{Sessions: result, NextCursor: formatSessionCursor(next)})
+	writeJSON(w, http.StatusOK, sessionListJSON{
+		Sessions: result, NextCursor: formatSessionCursor(next), HasIdentifiedSessions: hasIdentifiedSessions,
+	})
 }
 
 // GetSessionEndpoint returns session metadata plus its scrubbed-only manifest.

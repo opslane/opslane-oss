@@ -20,17 +20,24 @@ type SessionSummary struct {
 	PlayableChunkCount int
 	BytesStored        int64
 	PageURL            *string
+	SDKRelease         *string
 	EndUserID          *string
 	ExternalUserID     *string
 	EndUserEmail       *string
 	ExternalAccountID  *string
 	AccountName        *string
+	ErrorCount         int
+	RageClickCount     int
+	DeadClickCount     int
+	FormAbandonCount   int
 }
 
 type SessionFilters struct {
 	EndUserID     string
 	AccountID     string
 	EnvironmentID string
+	Search        string
+	HasSignals    bool
 	From          *time.Time
 	To            *time.Time
 }
@@ -48,20 +55,40 @@ func scanSessionSummary(row sessionScanner) (SessionSummary, error) {
 	var session SessionSummary
 	err := row.Scan(
 		&session.ID, &session.StartedAt, &session.LastChunkAt, &session.Status,
-		&session.ChunkCount, &session.BytesStored, &session.PageURL,
+		&session.ChunkCount, &session.BytesStored, &session.PageURL, &session.SDKRelease,
 		&session.EndUserID, &session.ExternalUserID, &session.EndUserEmail,
 		&session.ExternalAccountID, &session.AccountName, &session.PlayableChunkCount,
+		&session.ErrorCount, &session.RageClickCount, &session.DeadClickCount,
+		&session.FormAbandonCount,
 	)
 	return session, err
 }
 
 const sessionSummarySelect = `SELECT s.id, s.started_at, s.last_chunk_at, s.status,
-       s.chunk_count, s.bytes_stored, s.page_url,
+       s.chunk_count, s.bytes_stored, s.page_url, s.sdk_release,
        eu.id, eu.external_user_id, eu.email, eu.external_account_id, eu.account_name,
        (SELECT count(*) FROM session_chunks c
-         WHERE c.session_id = s.id AND c.scrubbed_at IS NOT NULL)
+         WHERE c.session_id = s.id AND c.scrubbed_at IS NOT NULL),
+       e.errors, f.rage, f.dead, f.abandon
   FROM sessions s
-  LEFT JOIN end_users eu ON eu.id = s.end_user_id`
+  LEFT JOIN end_users eu ON eu.id = s.end_user_id AND eu.project_id = $1
+  LEFT JOIN LATERAL (
+    SELECT COALESCE(sum(fs.occurrence_count) FILTER (WHERE fs.signal_type = 'rage_click'), 0) AS rage,
+           COALESCE(sum(fs.occurrence_count) FILTER (WHERE fs.signal_type = 'dead_click'), 0) AS dead,
+           COALESCE(sum(fs.occurrence_count) FILTER (WHERE fs.signal_type = 'form_abandon'), 0) AS abandon
+      FROM friction_signals fs
+     WHERE fs.session_id = s.id
+       AND fs.project_id = $1
+       AND fs.retracted_at IS NULL
+       AND fs.superseded_by IS NULL
+       AND fs.adjudication_status = 'accepted'
+  ) f ON true
+  LEFT JOIN LATERAL (
+    SELECT count(*) AS errors
+      FROM error_events ee
+     WHERE ee.session_id = s.id
+       AND ee.project_id = $1
+  ) e ON true`
 
 // ListSessions returns non-deleting project sessions newest-first. It fetches
 // one row beyond the requested limit so exactly-full terminal pages do not
@@ -90,9 +117,15 @@ func (q *Queries) ListSessions(ctx context.Context, projectID string, filters Se
    AND ($5::timestamptz IS NULL OR s.started_at <= $5)
    AND ($6 = '' OR s.environment_id = NULLIF($6, '')::uuid)
    AND ($7::timestamptz IS NULL OR (s.started_at, s.id) < ($7, $8))
+   AND ($9 = '' OR eu.email ILIKE '%' || $9 || '%'
+                 OR eu.external_user_id ILIKE '%' || $9 || '%'
+                 OR eu.account_name ILIKE '%' || $9 || '%'
+                 OR eu.external_account_id ILIKE '%' || $9 || '%'
+                 OR s.id = $9)
+   AND ($10 = false OR (f.rage + f.dead + f.abandon + e.errors) > 0)
  ORDER BY s.started_at DESC, s.id DESC
- LIMIT $9`, projectID, filters.EndUserID, filters.AccountID, filters.From, filters.To,
-		filters.EnvironmentID, cursorStartedAt, cursorID, limit+1)
+ LIMIT $11`, projectID, filters.EndUserID, filters.AccountID, filters.From, filters.To,
+		filters.EnvironmentID, cursorStartedAt, cursorID, filters.Search, filters.HasSignals, limit+1)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -117,6 +150,23 @@ func (q *Queries) ListSessions(ctx context.Context, projectID string, filters Se
 		next = &SessionCursor{StartedAt: last.StartedAt, ID: last.ID}
 	}
 	return sessions, next, nil
+}
+
+// HasIdentifiedSessions reports whether the project has any non-deleting
+// session attached to an end user, independently of the current list page.
+func (q *Queries) HasIdentifiedSessions(ctx context.Context, projectID string) (bool, error) {
+	var exists bool
+	err := q.pool.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1
+		  FROM sessions
+		 WHERE project_id = $1
+		   AND end_user_id IS NOT NULL
+		   AND status <> 'deleting'
+	)`, projectID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check identified sessions: %w", err)
+	}
+	return exists, nil
 }
 
 // GetSessionSummary returns nil when the session is absent, belongs to another

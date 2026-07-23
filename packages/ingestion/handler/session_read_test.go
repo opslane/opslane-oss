@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -93,16 +94,45 @@ func TestSessionRead_ListAndDetailRoutes(t *testing.T) {
 			t.Fatalf("insert session: %v", err)
 		}
 	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE sessions SET sdk_release = '@opslane/sdk@1.4.2' WHERE id = $1`, listIDs[0]); err != nil {
+		t.Fatalf("seed sdk release: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO friction_signals (
+			session_id, project_id, environment_id, rule_version, signal_type,
+			fingerprint, page_url_normalized, occurred_at, occurrence_count,
+			adjudication_status
+		) VALUES ($1, $2, $3, 1, 'rage_click', 'handler-rage', '/', now(), 4, 'accepted')`,
+		listIDs[0], projectID, envID,
+	); err != nil {
+		t.Fatalf("seed friction signal: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO error_events (
+			project_id, environment_id, timestamp, error_type, error_message,
+			stack_trace_raw, session_id
+		) VALUES ($2, $3, now(), 'TypeError', 'boom', 'at handler test', $1)`,
+		listIDs[0], projectID, envID,
+	); err != nil {
+		t.Fatalf("seed error event: %v", err)
+	}
 	seedHandlerChunk(t, deps.Queries, listIDs[0], projectID, 0, true, 2048)
 	seedHandlerChunk(t, deps.Queries, listIDs[0], projectID, 1, false, 0)
 
-	first := dashboardRequest(t, router, token, "/api/v1/projects/"+projectID+"/sessions?account_id=acme&limit=1")
+	var logOutput bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+
+	first := dashboardRequest(t, router, token, "/api/v1/projects/"+projectID+"/sessions?search=user%40acme.test&has_signals=true&limit=1")
 	if first.Code != http.StatusOK {
 		t.Fatalf("list returned %d: %s", first.Code, first.Body.String())
 	}
 	var list struct {
-		Sessions []map[string]any `json:"sessions"`
-		Next     *string          `json:"next_cursor"`
+		Sessions              []map[string]any `json:"sessions"`
+		Next                  *string          `json:"next_cursor"`
+		HasIdentifiedSessions bool             `json:"has_identified_sessions"`
 	}
 	if err := json.Unmarshal(first.Body.Bytes(), &list); err != nil {
 		t.Fatalf("decode list: %v", err)
@@ -110,11 +140,25 @@ func TestSessionRead_ListAndDetailRoutes(t *testing.T) {
 	if len(list.Sessions) != 1 || list.Sessions[0]["id"] != listIDs[0] {
 		t.Fatalf("filtered sessions = %+v", list.Sessions)
 	}
+	if !list.HasIdentifiedSessions {
+		t.Fatal("has_identified_sessions = false, want project-level true")
+	}
 	if list.Sessions[0]["playable_chunk_count"] != float64(1) || list.Sessions[0]["chunk_count"] != float64(2) {
 		t.Fatalf("chunk counts = %+v", list.Sessions[0])
 	}
+	if list.Sessions[0]["sdk_release"] != "@opslane/sdk@1.4.2" ||
+		list.Sessions[0]["error_count"] != float64(1) ||
+		list.Sessions[0]["rage_click_count"] != float64(4) ||
+		list.Sessions[0]["dead_click_count"] != float64(0) ||
+		list.Sessions[0]["form_abandon_count"] != float64(0) {
+		t.Fatalf("summary fields = %+v", list.Sessions[0])
+	}
 	if _, ok := list.Sessions[0]["end_user"].(map[string]any); !ok {
 		t.Fatalf("end_user shape = %#v", list.Sessions[0]["end_user"])
+	}
+	if logs := logOutput.String(); !strings.Contains(logs, "session list query completed") ||
+		!strings.Contains(logs, "duration_ms=") || !strings.Contains(logs, "project_id="+projectID) {
+		t.Fatalf("list query duration log = %q", logs)
 	}
 	filterValues := url.Values{
 		"end_user_id": {userID},
@@ -142,6 +186,10 @@ func TestSessionRead_ListAndDetailRoutes(t *testing.T) {
 	if malformed.Code != http.StatusBadRequest {
 		t.Fatalf("malformed cursor returned %d", malformed.Code)
 	}
+	badHasSignals := dashboardRequest(t, router, token, "/api/v1/projects/"+projectID+"/sessions?has_signals=maybe")
+	if badHasSignals.Code != http.StatusBadRequest {
+		t.Fatalf("invalid has_signals returned %d", badHasSignals.Code)
+	}
 	wrongProject := dashboardRequest(t, router, token, "/api/v1/projects/"+otherProjectID+"/sessions")
 	if wrongProject.Code != http.StatusForbidden {
 		t.Fatalf("wrong project returned %d", wrongProject.Code)
@@ -154,6 +202,11 @@ func TestSessionRead_ListAndDetailRoutes(t *testing.T) {
 	var detailJSON map[string]any
 	if err := json.Unmarshal(detail.Body.Bytes(), &detailJSON); err != nil {
 		t.Fatalf("decode detail: %v", err)
+	}
+	if detailJSON["sdk_release"] != "@opslane/sdk@1.4.2" ||
+		detailJSON["error_count"] != float64(1) ||
+		detailJSON["rage_click_count"] != float64(4) {
+		t.Fatalf("detail summary fields = %+v", detailJSON)
 	}
 	chunks, ok := detailJSON["chunks"].([]any)
 	if !ok || len(chunks) != 1 {

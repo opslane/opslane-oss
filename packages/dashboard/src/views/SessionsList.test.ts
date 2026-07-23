@@ -1,41 +1,92 @@
 // @vitest-environment jsdom
 
-import { flushPromises, mount } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryHistory, createRouter } from 'vue-router';
 
 import SessionsList from './SessionsList.vue';
 import { listEnvironments, listSessions } from '../api';
-import type { SessionListResponse, SessionSummary } from '../types/api';
+import type { SessionListResponse, SessionStatus, SessionSummary } from '../types/api';
 
 vi.mock('../api', () => ({
   listEnvironments: vi.fn(),
   listSessions: vi.fn(),
 }));
 
-function session(pageUrl: string): SessionSummary {
+function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
-    id: `session-${pageUrl.replace(/[^a-z]/g, '').slice(-24)}`,
-    started_at: '2026-07-19T00:00:00Z',
-    status: 'recording',
-    chunk_count: 1,
-    playable_chunk_count: 1,
-    bytes_stored: 100,
-    page_url: pageUrl,
+    id: 'session-full-identifier-123456789',
+    started_at: '2026-07-22T20:00:00Z',
+    last_chunk_at: '2026-07-22T20:07:21Z',
+    status: 'analyzed',
+    chunk_count: 2,
+    playable_chunk_count: 2,
+    bytes_stored: 2_048,
+    page_url: 'https://example.test/checkout?step=payment',
+    end_user: {
+      id: 'end-user-1',
+      external_user_id: 'user-123',
+      email: 'jane@acme.com',
+      external_account_id: 'account-1',
+      account_name: 'Acme Corp',
+    },
+    error_count: 3,
+    rage_click_count: 2,
+    dead_click_count: 1,
+    form_abandon_count: 1,
+    sdk_release: '1.4.2',
+    ...overrides,
+  };
+}
+
+function response(
+  sessions: SessionSummary[],
+  overrides: Partial<SessionListResponse> = {},
+): SessionListResponse {
+  return {
+    sessions,
+    next_cursor: null,
+    has_identified_sessions: true,
+    ...overrides,
   };
 }
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
-describe('SessionsList environment pagination', () => {
+async function mountView(settle = true): Promise<VueWrapper> {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/sessions', name: 'sessions', component: SessionsList },
+      { path: '/sessions/:sessionId', name: 'session-detail', component: { template: '<div />' } },
+      { path: '/setup', component: { template: '<div />' } },
+    ],
+  });
+  await router.push('/sessions');
+  await router.isReady();
+  const wrapper = mount(SessionsList, { global: { plugins: [router] } });
+  if (settle) await flushPromises();
+  return wrapper;
+}
+
+function visibilityClasses(element: { classes(): string[] }): string[] {
+  return element.classes().filter((value) => value === 'hidden' || /^(sm|md|lg|xl):table-cell$/.test(value));
+}
+
+describe('SessionsList ledger', () => {
   beforeEach(() => {
+    vi.mocked(listSessions).mockReset();
+    vi.mocked(listEnvironments).mockReset();
     localStorage.clear();
     localStorage.setItem('opslane_project_id', 'project-1');
-    localStorage.setItem('opslane_environment_id', 'env-production');
     vi.mocked(listEnvironments).mockResolvedValue({
       environments: [
         { id: 'env-production', project_id: 'project-1', name: 'production', created_at: '' },
@@ -47,59 +98,201 @@ describe('SessionsList environment pagination', () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
     localStorage.clear();
   });
 
-  it('drops an in-flight old cursor page when the environment changes', async () => {
-    const initialUnfiltered = deferred<SessionListResponse>();
-    const oldPage = deferred<SessionListResponse>();
-    vi.mocked(listSessions).mockImplementation(async (_projectId, filters, cursor) => {
-      if (cursor === 'cursor-production') return oldPage.promise;
-      if (filters?.environment_id === 'env-production') {
-        return { sessions: [session('https://production.example.test')], next_cursor: 'cursor-production' };
-      }
-      if (filters?.environment_id === 'env-staging') {
-        return { sessions: [session('https://staging.example.test')], next_cursor: null };
-      }
-      return initialUnfiltered.promise;
-    });
+  it('renders identity, accepted signal counts, metadata, and the responsive three-column matrix', async () => {
+    vi.mocked(listSessions).mockResolvedValue(response([session()]));
+    const wrapper = await mountView();
 
-    const router = createRouter({
-      history: createMemoryHistory(),
-      routes: [
-        { path: '/sessions', component: SessionsList },
-        { path: '/sessions/:sessionId', name: 'session-detail', component: { template: '<div />' } },
-      ],
+    expect(wrapper.get('h1').text()).toBe('Recorded sessions');
+    expect(wrapper.text()).toContain('1 loaded');
+    expect(wrapper.text()).toContain('jane@acme.com');
+    expect(wrapper.text()).toContain('Acme Corp');
+    expect(wrapper.text()).toContain('v1.4.2');
+    expect(wrapper.text()).toContain('/checkout?step=payment');
+    expect(wrapper.text()).toContain('3 errors');
+    expect(wrapper.text()).toContain('2 rage clicks');
+    expect(wrapper.text()).toContain('1 dead click');
+    expect(wrapper.text()).toContain('1 form abandon');
+    expect(wrapper.get('table').attributes('aria-label')).toBe('Recorded sessions');
+    expect(wrapper.get('time').attributes('datetime')).toBe('2026-07-22T20:00:00Z');
+
+    const headers = wrapper.findAll('th');
+    const cells = wrapper.findAll('tbody tr')[0]!.findAll('td');
+    expect(headers.map(visibilityClasses)).toEqual([[], ['hidden', 'sm:table-cell'], []]);
+    expect(cells.map(visibilityClasses)).toEqual([[], ['hidden', 'sm:table-cell'], []]);
+    expect(headers.map((header) => header.attributes('scope'))).toEqual(['col', 'col', 'col']);
+
+    const row = wrapper.get('tbody tr');
+    expect(row.findAll('a')).toHaveLength(1);
+    expect(row.get('a').attributes('aria-label')).toContain('Play session for jane@acme.com');
+    expect(row.find('a button').exists()).toBe(false);
+    expect(row.get('button[aria-label="Copy session ID"]').attributes('type')).toBe('button');
+  });
+
+  it('copies the full session id from the sibling copy control', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
     });
-    await router.push('/sessions');
-    await router.isReady();
-    const wrapper = mount(SessionsList, { global: { plugins: [router] } });
+    vi.mocked(listSessions).mockResolvedValue(response([session()]));
+    const wrapper = await mountView();
+
+    await wrapper.get('button[aria-label="Copy session ID"]').trigger('click');
     await flushPromises();
 
-    expect(wrapper.text()).toContain('https://production.example.test');
-    const loadMore = wrapper.findAll('button').find((button) => button.text().includes('Load more'));
-    expect(loadMore).toBeDefined();
-    await loadMore!.trigger('click');
-    const environmentSelect = wrapper.get('select');
-    await environmentSelect.setValue('env-staging');
-    await environmentSelect.trigger('change');
-    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith('session-full-identifier-123456789');
+  });
 
-    expect(wrapper.text()).toContain('https://staging.example.test');
-    expect(wrapper.text()).not.toContain('https://production.example.test');
+  it.each<[SessionStatus, number, string]>([
+    ['recording', 1, 'Processing'],
+    ['closed', 1, 'Processing'],
+    ['analyzing', 1, 'Processing'],
+    ['analysis_failed', 1, 'Unavailable'],
+    ['analyzed', 0, 'No recording'],
+  ])('does not link an unplayable %s session and explains %s', async (status, chunkCount, label) => {
+    vi.mocked(listSessions).mockResolvedValue(response([session({
+      status,
+      chunk_count: chunkCount,
+      playable_chunk_count: 0,
+      error_count: 0,
+      rage_click_count: 0,
+      dead_click_count: 0,
+      form_abandon_count: 0,
+    })]));
+    const wrapper = await mountView();
+
+    expect(wrapper.find('tbody a').exists()).toBe(false);
+    expect(wrapper.get('[aria-disabled="true"]').attributes('title')).toBe(label);
+  });
+
+  it('sends search, date, environment, and has-signals filters and clears them', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-22T20:00:00Z'));
+    vi.mocked(listSessions).mockResolvedValue(response([session()]));
+    const wrapper = await mountView();
+
+    await wrapper.get('input[type="search"]').setValue('Acme');
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
     expect(vi.mocked(listSessions)).toHaveBeenLastCalledWith(
       'project-1',
-      expect.objectContaining({ environment_id: 'env-staging' }),
+      expect.objectContaining({
+        search: 'Acme',
+        from: '2026-07-21T20:00:00.000Z',
+      }),
       undefined,
     );
 
-    oldPage.resolve({ sessions: [session('https://stale-page.example.test')], next_cursor: null });
-    initialUnfiltered.resolve({ sessions: [session('https://stale-initial.example.test')], next_cursor: null });
+    await wrapper.findAll('select')[0].setValue('7d');
+    await wrapper.findAll('select')[1].setValue('env-staging');
+    await wrapper.findAll('button').find((button) => button.text() === 'With signals')!.trigger('click');
+    await flushPromises();
+    expect(vi.mocked(listSessions)).toHaveBeenLastCalledWith(
+      'project-1',
+      expect.objectContaining({
+        search: 'Acme',
+        from: '2026-07-15T20:00:00.000Z',
+        environment_id: 'env-staging',
+        has_signals: true,
+      }),
+      undefined,
+    );
+
+    await wrapper.findAll('button').find((button) => button.text() === 'Clear filters')!.trigger('click');
+    await flushPromises();
+    expect(vi.mocked(listSessions)).toHaveBeenLastCalledWith(
+      'project-1',
+      expect.not.objectContaining({
+        search: expect.anything(),
+        environment_id: expect.anything(),
+        has_signals: expect.anything(),
+      }),
+      undefined,
+    );
+  });
+
+  it('keeps existing rows when a filtered request or pagination request fails', async () => {
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce(response([session()], { next_cursor: 'cursor-1' }))
+      .mockRejectedValueOnce(new Error('filter unavailable'));
+    const wrapper = await mountView();
+
+    await wrapper.get('input[type="search"]').setValue('missing');
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
+    expect(wrapper.text()).toContain('jane@acme.com');
+    expect(wrapper.text()).toContain('Unable to load sessions');
+
+    vi.mocked(listSessions).mockResolvedValueOnce(response([session()], { next_cursor: 'cursor-1' }));
+    await wrapper.findAll('button').find((button) => button.text() === 'Retry')!.trigger('click');
+    await flushPromises();
+    vi.mocked(listSessions).mockRejectedValueOnce(new Error('page unavailable'));
+    await wrapper.findAll('button').find((button) => button.text() === 'Load more')!.trigger('click');
     await flushPromises();
 
-    expect(wrapper.text()).toContain('https://staging.example.test');
-    expect(wrapper.text()).not.toContain('https://stale-page.example.test');
-    expect(wrapper.text()).not.toContain('https://stale-initial.example.test');
-    wrapper.unmount();
+    expect(wrapper.text()).toContain('jane@acme.com');
+    expect(wrapper.text()).toContain('Unable to load more sessions');
+  });
+
+  it('shows loading, retry, and the distinct empty states', async () => {
+    const initial = deferred<SessionListResponse>();
+    vi.mocked(listSessions).mockReturnValueOnce(initial.promise);
+    const wrapper = await mountView(false);
+    expect(wrapper.get('[role="status"]').attributes('aria-busy')).toBe('true');
+    expect(wrapper.findAllComponents({ name: 'SkeletonBlock' })).toHaveLength(3);
+    initial.reject(new Error('network down'));
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('Unable to load sessions');
+    expect(wrapper.text()).toContain('Retry');
+
+    vi.mocked(listSessions).mockResolvedValueOnce(response([]));
+    await wrapper.findAll('button').find((button) => button.text() === 'Retry')!.trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).toContain('No sessions recorded yet');
+    expect(wrapper.text()).toContain('Setup guide');
+    expect(wrapper.text()).not.toContain('These sessions have no user attached');
+
+    vi.mocked(listSessions).mockResolvedValueOnce(response([]));
+    await wrapper.findAll('button').find((button) => button.text() === 'With signals')!.trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).toContain('No sessions with signals');
+    expect(wrapper.text()).toContain('Show all sessions');
+
+    vi.mocked(listSessions).mockResolvedValueOnce(response([]));
+    await wrapper.findAll('button').find((button) => button.text() === 'Show all sessions')!.trigger('click');
+    vi.mocked(listSessions).mockResolvedValueOnce(response([]));
+    await wrapper.get('input[type="search"]').setValue('nobody@example.com');
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
+    expect(wrapper.text()).toContain('No sessions match these filters');
+  });
+
+  it('gates the privacy-aware anonymous hint on project identity coverage and allows dismissal', async () => {
+    vi.mocked(listSessions).mockResolvedValue(response([
+      session({
+        end_user: null,
+        error_count: 0,
+        rage_click_count: 0,
+        dead_click_count: 0,
+        form_abandon_count: 0,
+      }),
+    ], { has_identified_sessions: false }));
+    const wrapper = await mountView();
+
+    expect(wrapper.text()).toContain('These sessions have no user attached');
+    expect(wrapper.text()).toContain('Identifying fields are sent unmasked');
+    expect(wrapper.get('a[href="https://docs.opslane.com/guides/replay-privacy/"]').attributes('rel'))
+      .toBe('noopener noreferrer');
+    expect(wrapper.text()).toContain('Anonymous');
+    expect(wrapper.text()).toContain('23456789');
+
+    await wrapper.get('button[aria-label="Dismiss anonymous recordings notice"]').trigger('click');
+    expect(wrapper.text()).not.toContain('These sessions have no user attached');
   });
 });

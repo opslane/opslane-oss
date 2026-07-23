@@ -78,6 +78,38 @@ export function sessionStatusRecipe(status: SessionStatus): StatusRecipe {
   return unknownStatusRecipe(status);
 }
 
+export type FrictionSignalKind =
+  | 'error'
+  | 'rage_click'
+  | 'dead_click'
+  | 'form_abandon'
+  | 'recording'
+  | 'queued'
+  | 'analyzing'
+  | 'analysis_failed';
+
+export function frictionSignalRecipe(kind: FrictionSignalKind, count = 1): StatusRecipe {
+  switch (kind) {
+    case 'error':
+      return recipe(`${count} ${count === 1 ? 'error' : 'errors'}`, 'danger');
+    case 'rage_click':
+      return recipe(`${count} rage ${count === 1 ? 'click' : 'clicks'}`, 'warning');
+    case 'dead_click':
+      return recipe(`${count} dead ${count === 1 ? 'click' : 'clicks'}`, 'warning');
+    case 'form_abandon':
+      return recipe(`${count} form ${count === 1 ? 'abandon' : 'abandons'}`, 'neutral');
+    case 'recording':
+      return recipe('Recording', 'progress');
+    case 'queued':
+      return recipe('Queued', 'progress');
+    case 'analyzing':
+      return recipe('Analyzing', 'progress');
+    case 'analysis_failed':
+      return recipe('Analysis failed', 'warning');
+  }
+  return unknownStatusRecipe(kind);
+}
+
 export type IncidentKind = 'error' | 'friction';
 
 export function incidentKindRecipe(kind: IncidentKind): StatusRecipe {

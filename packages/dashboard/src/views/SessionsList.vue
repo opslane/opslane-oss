@@ -1,45 +1,65 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import { listSessions } from '../api';
-import type { SessionFilters, SessionStatus, SessionSummary } from '../types/api';
-import { formatDate, getProjectId, safeUrl } from '../utils';
-import { sessionStatusRecipe } from '../status-recipes';
+import type { SessionFilters, SessionSummary } from '../types/api';
+import { getProjectId } from '../utils';
 import { applySessionFilters, sessionPageRequest } from '../components/session-list-query';
 import { useEnvironmentFilter } from '../composables/useEnvironmentFilter';
-import SelectField from '../components/ui/SelectField.vue';
-import TextInput from '../components/ui/TextInput.vue';
+import SessionLedgerRow from '../components/sessions/SessionLedgerRow.vue';
 import Button from '../components/ui/Button.vue';
+import EmptyState from '../components/ui/EmptyState.vue';
+import InlineAlert from '../components/ui/InlineAlert.vue';
+import SelectField from '../components/ui/SelectField.vue';
+import SkeletonBlock from '../components/ui/SkeletonBlock.vue';
+import TextInput from '../components/ui/TextInput.vue';
+
+type DatePreset = '24h' | '7d' | '30d' | 'custom';
 
 const sessions = ref<SessionSummary[]>([]);
 const projectId = ref('');
 const loading = ref(true);
+const hasLoaded = ref(false);
 const loadingMore = ref(false);
 const error = ref<string | null>(null);
+const paginationError = ref<string | null>(null);
 const nextCursor = ref<string | null>(null);
-const endUserId = ref('');
-const accountId = ref('');
-const from = ref('');
-const to = ref('');
+const hasIdentifiedSessions = ref(true);
+const anonymousHintDismissed = ref(false);
+const search = ref('');
+const datePreset = ref<DatePreset>('24h');
+const customFrom = ref('');
+const customTo = ref('');
+const withSignals = ref(false);
 const appliedFilters = ref<SessionFilters>({});
 let fetchGeneration = 0;
+
 const {
   environments,
   rollupReady,
   selectedEnvironmentId,
 } = useEnvironmentFilter(projectId);
+
 const environmentOptions = computed(() => [
   { value: '', label: 'All environments' },
   ...environments.value.map((environment) => ({ value: environment.id, label: environment.name })),
 ]);
-
-function selectEnvironment(value: string): void {
-  selectedEnvironmentId.value = value;
-  applyFilters();
-}
-
-watch(rollupReady, (ready) => {
-  if (ready) applyFilters();
-});
+const dateOptions = [
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+  { value: 'custom', label: 'Custom range' },
+];
+const filtersActive = computed(() =>
+  search.value.trim().length > 0
+  || datePreset.value !== '24h'
+  || selectedEnvironmentId.value.length > 0
+  || withSignals.value);
+const showAnonymousHint = computed(() =>
+  hasLoaded.value
+  && sessions.value.length > 0
+  && !hasIdentifiedSessions.value
+  && !anonymousHintDismissed.value);
+const initialLoading = computed(() => loading.value && !hasLoaded.value);
 
 function isoDate(value: string): string | undefined {
   if (!value) return undefined;
@@ -47,34 +67,56 @@ function isoDate(value: string): string | undefined {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
 }
 
+function presetStart(preset: Exclude<DatePreset, 'custom'>): string {
+  const days = preset === '24h' ? 1 : preset === '7d' ? 7 : 30;
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1_000).toISOString();
+}
+
 function filters(): SessionFilters {
+  if (datePreset.value === 'custom') {
+    return {
+      search: search.value.trim() || undefined,
+      has_signals: withSignals.value || undefined,
+      environment_id: rollupReady.value ? selectedEnvironmentId.value || undefined : undefined,
+      from: isoDate(customFrom.value),
+      to: isoDate(customTo.value),
+    };
+  }
   return {
-    end_user_id: endUserId.value.trim() || undefined,
-    account_id: accountId.value.trim() || undefined,
+    search: search.value.trim() || undefined,
+    has_signals: withSignals.value || undefined,
     environment_id: rollupReady.value ? selectedEnvironmentId.value || undefined : undefined,
-    from: isoDate(from.value),
-    to: isoDate(to.value),
+    from: presetStart(datePreset.value),
+    to: undefined,
   };
 }
 
 async function fetchSessions(cursor?: string): Promise<void> {
   const generation = ++fetchGeneration;
-  if (cursor) loadingMore.value = true;
-  else {
+  if (cursor) {
+    loadingMore.value = true;
+    paginationError.value = null;
+  } else {
     loading.value = true;
-    loadingMore.value = false;
+    error.value = null;
   }
-  error.value = null;
+
   try {
     const request = sessionPageRequest(appliedFilters.value, cursor);
     const response = await listSessions(projectId.value, request.filters, request.cursor);
     if (generation !== fetchGeneration) return;
     sessions.value = cursor ? [...sessions.value, ...response.sessions] : response.sessions;
     nextCursor.value = response.next_cursor ?? null;
+    hasIdentifiedSessions.value = response.has_identified_sessions;
+    hasLoaded.value = true;
   } catch (caught: unknown) {
     if (generation !== fetchGeneration) return;
     const message = caught instanceof Error ? caught.message : String(caught);
-    error.value = `Failed to load sessions: ${message}`;
+    if (cursor) paginationError.value = message;
+    else {
+      error.value = message;
+      hasLoaded.value = true;
+    }
   } finally {
     if (generation === fetchGeneration) {
       loading.value = false;
@@ -84,128 +126,258 @@ async function fetchSessions(cursor?: string): Promise<void> {
 }
 
 function applyFilters(): void {
-  // Invalidate any in-flight page before it can append rows produced by the
-  // previous filter snapshot.
   fetchGeneration++;
   const applied = applySessionFilters(filters());
   appliedFilters.value = applied.filters;
   nextCursor.value = applied.cursor;
+  paginationError.value = null;
   void fetchSessions();
 }
 
-function duration(session: SessionSummary): string {
-  if (!session.last_chunk_at) return '\u2014';
-  const ms = new Date(session.last_chunk_at).getTime() - new Date(session.started_at).getTime();
-  if (!Number.isFinite(ms) || ms < 0) return '\u2014';
-  const seconds = Math.floor(ms / 1_000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  if (minutes < 60) return `${minutes}m ${remainder}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+function selectEnvironment(value: string): void {
+  selectedEnvironmentId.value = value;
+  applyFilters();
 }
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / (1024 ** index);
-  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+function selectDatePreset(value: string): void {
+  datePreset.value = value as DatePreset;
+  if (datePreset.value !== 'custom') applyFilters();
 }
 
-function sessionBadge(status: SessionStatus): string {
-  return sessionStatusRecipe(status).class;
+function setSignalsFilter(enabled: boolean): void {
+  withSignals.value = enabled;
+  applyFilters();
 }
+
+function clearFilters(): void {
+  search.value = '';
+  datePreset.value = '24h';
+  customFrom.value = '';
+  customTo.value = '';
+  selectedEnvironmentId.value = '';
+  withSignals.value = false;
+  applyFilters();
+}
+
+watch(rollupReady, (ready) => {
+  if (ready && selectedEnvironmentId.value) applyFilters();
+});
 
 onMounted(() => {
   projectId.value = getProjectId();
   if (!projectId.value) {
     error.value = 'No project configured.';
     loading.value = false;
+    hasLoaded.value = true;
     return;
   }
+  appliedFilters.value = filters();
   void fetchSessions();
 });
 </script>
 
 <template>
-  <div>
-    <div class="flex items-center justify-between gap-4 mb-4">
-      <div>
-        <h2 class="text-lg font-medium text-text">Sessions</h2>
-        <p class="mt-1 text-sm text-muted">Browse scrubbed recordings by user, account, and time.</p>
+  <div class="mx-auto w-full max-w-[1120px]">
+    <header class="mb-7 border-b border-border pb-5">
+      <p class="text-xs font-semibold uppercase tracking-[0.18em] text-accent">Session ledger</p>
+      <div class="mt-2 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 class="text-2xl font-semibold tracking-tight text-text">Recorded sessions</h1>
+          <p class="mt-1 max-w-2xl text-sm text-muted">Browse scrubbed recordings by user, account, and time.</p>
+        </div>
+        <p v-if="hasLoaded && (!error || sessions.length)" class="font-mono text-xs text-muted">
+          {{ sessions.length }} loaded
+        </p>
       </div>
-    </div>
+    </header>
 
-    <form class="grid gap-3 mb-5 md:grid-cols-2 xl:grid-cols-6" @submit.prevent="applyFilters">
-      <TextInput v-model="endUserId" label="End-user ID" placeholder="End-user ID" />
-      <TextInput v-model="accountId" label="Account ID" placeholder="Account ID" />
+    <form class="mb-5 flex flex-wrap items-end gap-3" @submit.prevent="applyFilters">
+      <TextInput
+        v-model="search"
+        type="search"
+        label="Search"
+        placeholder="Search by user, email, or session ID"
+        :disabled="loading"
+        class="w-full sm:min-w-72 sm:flex-1"
+      />
+      <SelectField
+        :model-value="datePreset"
+        label="Date range"
+        :options="dateOptions"
+        :disabled="loading"
+        class="min-w-40 flex-1 sm:max-w-52"
+        @update:model-value="selectDatePreset"
+      />
       <SelectField
         v-if="rollupReady"
         :model-value="selectedEnvironmentId"
         label="Environment"
         :options="environmentOptions"
+        :disabled="loading"
+        class="min-w-40 flex-1 sm:max-w-56"
         @update:model-value="selectEnvironment"
       />
-      <TextInput v-model="from" label="From" type="datetime-local" />
-      <TextInput v-model="to" label="To" type="datetime-local" />
-      <Button variant="primary" class="self-end" type="submit" :disabled="loading">Apply filters</Button>
+      <fieldset class="grid gap-1.5">
+        <legend class="text-sm font-medium text-text">Signals</legend>
+        <div class="inline-flex min-h-10 max-md:min-h-11 rounded-md border border-border-strong bg-surface p-0.5">
+          <button
+            type="button"
+            class="px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            :class="!withSignals ? 'bg-text text-surface' : 'text-muted hover:text-text'"
+            :aria-pressed="!withSignals"
+            :disabled="loading"
+            @click="setSignalsFilter(false)"
+          >All</button>
+          <button
+            type="button"
+            class="px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            :class="withSignals ? 'bg-text text-surface' : 'text-muted hover:text-text'"
+            :aria-pressed="withSignals"
+            :disabled="loading"
+            @click="setSignalsFilter(true)"
+          >With signals</button>
+        </div>
+      </fieldset>
+      <button
+        v-if="filtersActive"
+        type="button"
+        class="min-h-10 self-end px-2 text-sm font-medium text-accent underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        :disabled="loading"
+        @click="clearFilters"
+      >Clear filters</button>
+      <button type="submit" class="sr-only" :disabled="loading">Search sessions</button>
+
+      <div v-if="datePreset === 'custom'" class="flex w-full flex-wrap gap-3">
+        <TextInput
+          v-model="customFrom"
+          type="datetime-local"
+          label="From"
+          :disabled="loading"
+          class="min-w-56 flex-1"
+          @change="applyFilters"
+        />
+        <TextInput
+          v-model="customTo"
+          type="datetime-local"
+          label="To"
+          :disabled="loading"
+          class="min-w-56 flex-1"
+          @change="applyFilters"
+        />
+      </div>
     </form>
 
-    <div v-if="loading" class="text-muted">Loading sessions...</div>
-    <div v-else-if="error" class="rounded-md bg-danger/10 border border-danger/20 p-4 text-sm text-danger">
-      <p v-text="error"></p>
-    </div>
-    <div v-else-if="sessions.length === 0" class="py-16 text-center">
-      <h3 class="text-sm font-medium text-text">No sessions found</h3>
-      <p class="mt-1 text-sm text-muted">Recordings appear after their first chunk has been accepted.</p>
-    </div>
-    <div v-else class="border border-border rounded-lg overflow-x-auto">
-      <table class="min-w-full text-sm">
-        <thead>
-          <tr class="border-b border-border bg-surface text-left text-xs font-medium uppercase tracking-wider text-muted">
-            <th class="py-2.5 px-4">Started</th>
-            <th class="py-2.5 px-4">User</th>
-            <th class="py-2.5 px-4">Duration</th>
-            <th class="py-2.5 px-4">Chunks</th>
-            <th class="py-2.5 px-4">Size</th>
-            <th class="py-2.5 px-4">Status</th>
-            <th class="py-2.5 px-4">Page</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="item in sessions" :key="item.id" class="border-b border-border hover:bg-surface transition-colors">
-            <td class="py-2.5 px-4 whitespace-nowrap">
-              <router-link
-                v-if="item.playable_chunk_count > 0"
-                :to="{ name: 'session-detail', params: { sessionId: item.id } }"
-                class="text-accent hover:underline font-medium"
-              >{{ formatDate(item.started_at) }}</router-link>
-              <span v-else>{{ formatDate(item.started_at) }}</span>
-            </td>
-            <td class="py-2.5 px-4 text-muted" v-text="item.end_user?.email || item.end_user?.external_user_id || '\u2014'"></td>
-            <td class="py-2.5 px-4 text-muted whitespace-nowrap">{{ duration(item) }}</td>
-            <td class="py-2.5 px-4 text-muted whitespace-nowrap">
-              {{ item.playable_chunk_count }}/{{ item.chunk_count }}
-              <span v-if="item.playable_chunk_count === 0" class="ml-1 text-warning">processing</span>
-            </td>
-            <td class="py-2.5 px-4 text-muted whitespace-nowrap">{{ formatBytes(item.bytes_stored) }}</td>
-            <td class="py-2.5 px-4">
-              <span class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium" :class="sessionBadge(item.status)" v-text="item.status.replace('_', ' ')"></span>
-            </td>
-            <td class="py-2.5 px-4 max-w-72 truncate">
-              <a v-if="safeUrl(item.page_url ?? undefined)" :href="safeUrl(item.page_url ?? undefined)" target="_blank" rel="noopener noreferrer" class="text-accent hover:underline" v-text="item.page_url"></a>
-              <span v-else class="text-faint">\u2014</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+    <InlineAlert v-if="showAnonymousHint" title="Anonymous recordings" tone="info" class="mb-5">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <p>
+          These sessions have no user attached. Call <code class="font-mono">setUser()</code> to see who they are.
+          Identifying fields are sent unmasked.
+          <a
+            href="https://docs.opslane.com/guides/replay-privacy/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="font-semibold underline underline-offset-2"
+          >Review replay privacy</a>.
+        </p>
+        <button
+          type="button"
+          class="shrink-0 font-semibold underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          aria-label="Dismiss anonymous recordings notice"
+          @click="anonymousHintDismissed = true"
+        >Dismiss</button>
+      </div>
+    </InlineAlert>
+
+    <div
+      v-if="initialLoading"
+      role="status"
+      aria-busy="true"
+      aria-label="Loading recorded sessions"
+      class="grid gap-3 border-y border-border py-5"
+    >
+      <SkeletonBlock class="h-14" />
+      <SkeletonBlock class="h-14" />
+      <SkeletonBlock class="h-14" />
     </div>
 
-    <div v-if="nextCursor" class="mt-4 text-center">
-      <Button variant="secondary" :disabled="loadingMore" @click="fetchSessions(nextCursor)">
-        {{ loadingMore ? 'Loading...' : 'Load more' }}
-      </Button>
-    </div>
+    <template v-else>
+      <InlineAlert v-if="error" tone="danger" title="Unable to load sessions" class="mb-4">
+        <p v-text="error"></p>
+        <Button class="mt-3" variant="secondary" :disabled="loading" @click="fetchSessions()">Retry</Button>
+      </InlineAlert>
+
+      <EmptyState
+        v-if="!error && sessions.length === 0 && withSignals"
+        title="No sessions with signals"
+        description="No analyzed sessions in this range have accepted errors or friction signals."
+      >
+        <Button variant="secondary" @click="setSignalsFilter(false)">Show all sessions</Button>
+      </EmptyState>
+
+      <EmptyState
+        v-else-if="!error && sessions.length === 0 && filtersActive"
+        title="No sessions match these filters"
+        description="Try widening the date range or clearing the search."
+      >
+        <Button variant="secondary" @click="clearFilters">Clear filters</Button>
+      </EmptyState>
+
+      <EmptyState
+        v-else-if="!error && sessions.length === 0"
+        title="No sessions recorded yet"
+        description="Recordings appear after the SDK sends its first chunk."
+      >
+        <router-link
+          to="/setup"
+          class="inline-flex min-h-10 items-center bg-accent px-4 py-2 text-sm font-semibold text-on-accent hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+        >Setup guide</router-link>
+      </EmptyState>
+
+      <div
+        v-if="sessions.length"
+        class="overflow-x-auto border-y border-border"
+        :aria-busy="loading || loadingMore || undefined"
+      >
+        <table class="min-w-full table-fixed text-sm" aria-label="Recorded sessions">
+          <thead>
+            <tr class="border-b border-border bg-surface-subtle">
+              <th scope="col" class="w-[60%] px-2 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:w-[45%] sm:px-4">
+                Session
+              </th>
+              <th scope="col" class="hidden w-[30%] px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:table-cell">
+                Signals
+              </th>
+              <th scope="col" class="w-[40%] px-2 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:w-[25%] sm:px-4">
+                Started
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <SessionLedgerRow
+              v-for="session in sessions"
+              :key="session.id"
+              :session="session"
+            />
+          </tbody>
+        </table>
+      </div>
+
+      <InlineAlert v-if="paginationError" tone="danger" title="Unable to load more sessions" class="mt-4">
+        <p v-text="paginationError"></p>
+        <Button
+          v-if="nextCursor"
+          class="mt-3"
+          variant="secondary"
+          :disabled="loadingMore"
+          @click="fetchSessions(nextCursor)"
+        >Retry</Button>
+      </InlineAlert>
+
+      <div v-if="nextCursor && !paginationError" class="mt-5 text-center">
+        <Button variant="secondary" :disabled="loadingMore" @click="fetchSessions(nextCursor)">
+          {{ loadingMore ? 'Loading...' : 'Load more' }}
+        </Button>
+      </div>
+    </template>
   </div>
 </template>

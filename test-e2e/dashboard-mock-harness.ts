@@ -60,7 +60,9 @@ export const dashboardMockFixtures = {
     responses: {
       'GET /api/v1/projects/project-1/incidents': { body: [] },
       'GET /api/v1/projects/project-1/accounts': { body: [] },
-      'GET /api/v1/projects/project-1/sessions': { body: { sessions: [], next_cursor: null } },
+      'GET /api/v1/projects/project-1/sessions': {
+        body: { sessions: [], next_cursor: null, has_identified_sessions: false },
+      },
     },
   },
   // The incident list fails while everything else succeeds, so the ledger's
@@ -120,7 +122,9 @@ function defaultBody(method: string, pathname: string): unknown {
   if (/\/accounts$/.test(pathname) && method === 'GET') return [mockAccount()];
   if (/\/accounts\/[^/]+\/incidents$/.test(pathname)) return [mockIncident()];
   if (/\/accounts\/[^/]+$/.test(pathname)) return mockAccount();
-  if (/\/sessions$/.test(pathname)) return { sessions: [mockSession()], next_cursor: null };
+  if (/\/sessions$/.test(pathname)) {
+    return { sessions: mockSessions(), next_cursor: null, has_identified_sessions: true };
+  }
   if (/\/sessions\/[^/]+\/chunks\/[0-9]+$/.test(pathname)) return { events: [] };
   if (/\/sessions\/[^/]+$/.test(pathname)) return { ...mockSession(), chunks: [] };
   if (/\/replays\/[^/]+$/.test(pathname)) return { events: [], meta: {} };
@@ -158,7 +162,85 @@ function mockAccount(): Record<string, unknown> {
 }
 
 function mockSession(): Record<string, unknown> {
-  return { id: 'session-1', started_at: '2026-01-01T00:00:00Z', last_chunk_at: '2026-01-01T00:00:05Z', status: 'closed', chunk_count: 0, playable_chunk_count: 0, bytes_stored: 0, page_url: 'https://example.test/mock' };
+  return mockSessions()[0]!;
+}
+
+function mockSessions(): Array<Record<string, unknown>> {
+  const base = {
+    bytes_stored: 2_048,
+    page_url: 'https://example.test/checkout?step=payment',
+    sdk_release: '1.4.2',
+  };
+  return [
+    {
+      ...base,
+      id: 'session-1',
+      started_at: '2026-07-22T20:02:00Z',
+      last_chunk_at: '2026-07-22T20:09:21Z',
+      status: 'analyzed',
+      chunk_count: 2,
+      playable_chunk_count: 2,
+      error_count: 3,
+      rage_click_count: 2,
+      dead_click_count: 0,
+      form_abandon_count: 0,
+      end_user: {
+        id: 'end-user-1',
+        external_user_id: 'user-123',
+        email: 'jane@acme.com',
+        external_account_id: 'account-1',
+        account_name: 'Acme Corp',
+      },
+    },
+    {
+      ...base,
+      id: 'session-anonymous-clean-8f3a2c1b',
+      started_at: '2026-07-22T19:31:00Z',
+      last_chunk_at: '2026-07-22T19:33:48Z',
+      status: 'analyzed',
+      chunk_count: 1,
+      playable_chunk_count: 1,
+      error_count: 0,
+      rage_click_count: 0,
+      dead_click_count: 0,
+      form_abandon_count: 0,
+      end_user: null,
+    },
+    {
+      ...base,
+      id: 'session-queued',
+      started_at: '2026-07-22T19:18:00Z',
+      last_chunk_at: '2026-07-22T19:19:05Z',
+      status: 'closed',
+      chunk_count: 1,
+      playable_chunk_count: 1,
+      error_count: 0,
+      rage_click_count: 0,
+      dead_click_count: 0,
+      form_abandon_count: 0,
+      end_user: {
+        id: 'end-user-2',
+        external_user_id: 'user-queued',
+        email: null,
+        external_account_id: 'account-1',
+        account_name: 'Acme Corp',
+      },
+    },
+    {
+      ...base,
+      id: 'session-unavailable',
+      started_at: '2026-07-22T18:59:00Z',
+      last_chunk_at: null,
+      status: 'analysis_failed',
+      chunk_count: 2,
+      playable_chunk_count: 0,
+      error_count: 1,
+      rage_click_count: 0,
+      dead_click_count: 1,
+      form_abandon_count: 0,
+      end_user: null,
+    },
+  ];
 }
 
 function mockAdminOverview(): Record<string, unknown> {

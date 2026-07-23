@@ -42,6 +42,10 @@ const detail = (chunks: SessionChunkMeta[]): SessionDetail => ({
   chunk_count: chunks.length,
   playable_chunk_count: chunks.length,
   bytes_stored: 100,
+  error_count: 0,
+  rage_click_count: 0,
+  dead_click_count: 0,
+  form_abandon_count: 0,
   chunks,
 });
 

@@ -58,7 +58,7 @@ const descriptionId = computed(() => props.error || props.hint ? `${inputId.valu
       :autocomplete="autocomplete"
       :aria-invalid="error ? 'true' : undefined"
       :aria-describedby="descriptionId"
-      class="min-h-10 max-md:min-h-11 rounded-md border bg-surface px-3 py-2 text-text placeholder:text-faint disabled:cursor-not-allowed disabled:opacity-60"
+      class="min-h-10 max-md:min-h-11 rounded-md border bg-surface px-3 py-2 text-text placeholder:text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-60"
       :class="error ? 'border-danger' : 'border-border-strong'"
       @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />

@@ -26,6 +26,7 @@ new owned primitive or domain component is added.
 | `IncidentLedgerRow.vue` | `views/ActivityFeed.vue` | incident list row |
 | `IncidentConclusion.vue` | `views/IncidentDetail.vue` | outcome and next action |
 | `IncidentLifecycle.vue` | `views/IncidentDetail.vue` | truthful current-state summary |
+| `SessionLedgerRow.vue` | `views/SessionsList.vue` | session list row |
 | `layout/navigation.ts` | `components/layout/AppNavigation.vue` | navigation model and active-route rule |
 | `session.ts` | `App.vue` | tenant-scoped client state teardown on sign-out |
 

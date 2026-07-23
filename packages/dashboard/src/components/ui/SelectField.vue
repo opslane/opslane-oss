@@ -39,7 +39,7 @@ const descriptionId = computed(() => props.error || props.hint ? `${inputId.valu
       v-bind="controlAttrs"
       :id="inputId" :value="modelValue" :disabled="disabled" :required="required"
       :aria-invalid="error ? 'true' : undefined" :aria-describedby="descriptionId"
-      class="min-h-10 max-md:min-h-11 rounded-md border bg-surface px-3 py-2 pr-9 text-text disabled:cursor-not-allowed disabled:opacity-60"
+      class="min-h-10 max-md:min-h-11 rounded-md border bg-surface px-3 py-2 pr-9 text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-60"
       :class="error ? 'border-danger' : 'border-border-strong'"
       @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)"
     >

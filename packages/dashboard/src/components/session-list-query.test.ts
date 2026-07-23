@@ -4,30 +4,32 @@ import { applySessionFilters, sessionPageRequest, snapshotSessionFilters } from 
 
 describe('session list pagination query', () => {
   it('keeps a cursor paired with the filters that produced it', () => {
-    const draft: SessionFilters = { account_id: 'account-a', from: '2026-07-15T00:00:00Z' };
+    const draft: SessionFilters = { search: 'account-a', from: '2026-07-15T00:00:00Z' };
     const applied = snapshotSessionFilters(draft);
-    draft.account_id = 'account-b';
+    draft.search = 'account-b';
 
     expect(sessionPageRequest(applied, 'cursor-a')).toEqual({
-      filters: { account_id: 'account-a', from: '2026-07-15T00:00:00Z' },
+      filters: { search: 'account-a', from: '2026-07-15T00:00:00Z' },
       cursor: 'cursor-a',
     });
   });
 
   it('returns defensive filter copies for page requests', () => {
-    const applied: SessionFilters = { end_user_id: 'user-a' };
+    const applied: SessionFilters = { search: 'user-a' };
     const first = sessionPageRequest(applied, 'cursor-a');
-    first.filters.end_user_id = 'mutated';
-    expect(sessionPageRequest(applied, 'cursor-b').filters.end_user_id).toBe('user-a');
+    first.filters.search = 'mutated';
+    expect(sessionPageRequest(applied, 'cursor-b').filters.search).toBe('user-a');
   });
 
   it('includes environment_id and resets the cursor when filters are applied', () => {
     expect(applySessionFilters({
-      account_id: 'account-a',
+      search: 'account-a',
+      has_signals: true,
       environment_id: 'env-staging',
     })).toEqual({
       filters: {
-        account_id: 'account-a',
+        search: 'account-a',
+        has_signals: true,
         environment_id: 'env-staging',
       },
       cursor: null,

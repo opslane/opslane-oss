@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AdminJobStatus, ErrorGroupStatus, SessionStatus } from './types/api';
-import { adminJobStatusRecipe, incidentStatusRecipe, sessionStatusRecipe } from './status-recipes';
+import { adminJobStatusRecipe, frictionSignalRecipe, incidentStatusRecipe, sessionStatusRecipe } from './status-recipes';
 
 describe('typed status recipes', () => {
   it('covers every incident status without motion styling', () => {
@@ -28,6 +28,14 @@ describe('typed status recipes', () => {
     expect(statuses.map(sessionStatusRecipe).map((item) => item.label)).toEqual([
       'Recording', 'Closed', 'Analyzing', 'Analyzed', 'Analysis failed', 'Deleting',
     ]);
+  });
+
+  it('maps session signals to truthful labels and tones', () => {
+    expect(frictionSignalRecipe('error', 3)).toMatchObject({ label: '3 errors', tone: 'danger' });
+    expect(frictionSignalRecipe('rage_click', 1)).toMatchObject({ label: '1 rage click', tone: 'warning' });
+    expect(frictionSignalRecipe('dead_click', 2)).toMatchObject({ label: '2 dead clicks', tone: 'warning' });
+    expect(frictionSignalRecipe('form_abandon', 1)).toMatchObject({ label: '1 form abandon', tone: 'neutral' });
+    expect(frictionSignalRecipe('analysis_failed')).toMatchObject({ label: 'Analysis failed', tone: 'warning' });
   });
 
   it('falls back to a neutral badge instead of throwing on an unknown wire value', () => {

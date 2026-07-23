@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { useRoute } from 'vue-router';
+import { formatDuration } from '../admin-format';
 import ReplayPlayer from '../components/ReplayPlayer.vue';
 import { useSessionPlayback } from '../composables/useSessionPlayback';
 import { formatAbsolute, getProjectId, safeUrl } from '../utils';
@@ -35,10 +36,9 @@ const activeChunksLabel = computed(() => {
 });
 
 function duration(): string {
-  if (!session.value?.last_chunk_at) return '\u2014';
+  if (!session.value?.last_chunk_at) return formatDuration(null);
   const ms = new Date(session.value.last_chunk_at).getTime() - new Date(session.value.started_at).getTime();
-  if (!Number.isFinite(ms) || ms < 0) return '\u2014';
-  return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1_000)}s`;
+  return formatDuration(ms / 1_000);
 }
 </script>
 

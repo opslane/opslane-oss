@@ -40,6 +40,45 @@ func addReadChunk(t *testing.T, q *db.Queries, sessionID, projectID string, seq 
 	}
 }
 
+func addReadSignal(t *testing.T, pool *pgxpool.Pool, sessionID, projectID, envID, signalType, fingerprint, status string, ruleVersion, occurrenceCount int) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO friction_signals (
+			session_id, project_id, environment_id, rule_version, signal_type,
+			fingerprint, page_url_normalized, occurred_at, occurrence_count,
+			adjudication_status
+		) VALUES ($1, $2, $3, $4, $5, $6, '/checkout', now(), $7, $8)
+		RETURNING id`,
+		sessionID, projectID, envID, ruleVersion, signalType, fingerprint,
+		occurrenceCount, status,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert %s signal: %v", signalType, err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM friction_signals WHERE id = $1`, id)
+	})
+	return id
+}
+
+func addReadError(t *testing.T, pool *pgxpool.Pool, sessionID, projectID, envID string) {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO error_events (
+			project_id, environment_id, timestamp, error_type, error_message,
+			stack_trace_raw, session_id
+		) VALUES ($1, $2, now(), 'TypeError', 'boom', 'at test', $3)
+		RETURNING id`,
+		projectID, envID, sessionID,
+	).Scan(&id); err != nil {
+		t.Fatalf("insert error event: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM error_events WHERE id = $1`, id)
+	})
+}
+
 func TestListSessions_FiltersPaginationAndTenantScope(t *testing.T) {
 	q, pool := sessionTestQueries(t)
 	ctx := context.Background()
@@ -109,6 +148,123 @@ func TestListSessions_FiltersPaginationAndTenantScope(t *testing.T) {
 	otherRows, _, err := q.ListSessions(ctx, otherProjectID, db.SessionFilters{}, nil, 50)
 	if err != nil || len(otherRows) != 1 || otherRows[0].ID != "sess_read_other_project" {
 		t.Fatalf("other project rows = %+v err=%v", otherRows, err)
+	}
+}
+
+func TestListSessions_CountsAcceptedActiveSignalsAndSearchesIdentity(t *testing.T) {
+	q, pool := sessionTestQueries(t)
+	ctx := context.Background()
+	projectID, envID := seedSessionProject(t, pool)
+	otherProjectID, otherEnvID := seedSessionProject(t, pool)
+
+	userID, err := q.UpsertEndUser(ctx, projectID, "Customer-123", "acct-789", "Jane@Acme.test", "Acme Corporation")
+	if err != nil {
+		t.Fatalf("upsert end user: %v", err)
+	}
+	base := time.Now().UTC().Truncate(time.Microsecond).Add(-time.Hour)
+	signalSessionID := "sess_signal_search_exact"
+	cleanSessionID := "sess_clean_search_exact"
+	pendingSessionID := "sess_pending_only"
+	insertReadSession(t, q, pool, projectID, envID, &userID, signalSessionID, base.Add(2*time.Minute))
+	insertReadSession(t, q, pool, projectID, envID, nil, cleanSessionID, base.Add(time.Minute))
+	insertReadSession(t, q, pool, projectID, envID, nil, pendingSessionID, base)
+	if _, err := pool.Exec(ctx, `UPDATE sessions SET sdk_release = '@opslane/sdk@1.4.2' WHERE id = $1`, signalSessionID); err != nil {
+		t.Fatalf("set sdk release: %v", err)
+	}
+
+	newRageID := addReadSignal(t, pool, signalSessionID, projectID, envID, "rage_click", "rage-versioned", "accepted", 2, 3)
+	oldRageID := addReadSignal(t, pool, signalSessionID, projectID, envID, "rage_click", "rage-versioned", "accepted", 1, 9)
+	if _, err := pool.Exec(ctx, `UPDATE friction_signals SET superseded_by = $2 WHERE id = $1`, oldRageID, newRageID); err != nil {
+		t.Fatalf("supersede old signal: %v", err)
+	}
+	retractedID := addReadSignal(t, pool, signalSessionID, projectID, envID, "rage_click", "rage-retracted", "accepted", 1, 8)
+	if _, err := pool.Exec(ctx, `UPDATE friction_signals SET retracted_at = now() WHERE id = $1`, retractedID); err != nil {
+		t.Fatalf("retract signal: %v", err)
+	}
+	addReadSignal(t, pool, signalSessionID, projectID, envID, "dead_click", "dead-accepted", "accepted", 1, 2)
+	addReadSignal(t, pool, signalSessionID, projectID, envID, "dead_click", "dead-pending", "pending", 1, 7)
+	addReadSignal(t, pool, signalSessionID, projectID, envID, "form_abandon", "abandon-accepted", "accepted", 1, 5)
+	addReadSignal(t, pool, signalSessionID, projectID, envID, "form_abandon", "abandon-rejected", "rejected", 1, 6)
+	addReadSignal(t, pool, pendingSessionID, projectID, envID, "rage_click", "pending-only", "pending", 1, 12)
+	addReadError(t, pool, signalSessionID, projectID, envID)
+	addReadError(t, pool, signalSessionID, projectID, envID)
+
+	// Deliberately inconsistent tenant columns prove that each LATERAL enforces
+	// project scope instead of relying on the outer sessions predicate.
+	addReadSignal(t, pool, signalSessionID, otherProjectID, otherEnvID, "form_abandon", "cross-project", "accepted", 1, 11)
+	addReadError(t, pool, signalSessionID, otherProjectID, otherEnvID)
+
+	all, _, err := q.ListSessions(ctx, projectID, db.SessionFilters{}, nil, 50)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("sessions len = %d, want 3", len(all))
+	}
+	got := all[0]
+	if got.ID != signalSessionID {
+		t.Fatalf("first session = %q, want %q", got.ID, signalSessionID)
+	}
+	if got.SDKRelease == nil || *got.SDKRelease != "@opslane/sdk@1.4.2" {
+		t.Fatalf("sdk release = %v", got.SDKRelease)
+	}
+	if got.ErrorCount != 2 || got.RageClickCount != 3 || got.DeadClickCount != 2 || got.FormAbandonCount != 5 {
+		t.Fatalf("signal counts = errors:%d rage:%d dead:%d abandon:%d, want 2/3/2/5",
+			got.ErrorCount, got.RageClickCount, got.DeadClickCount, got.FormAbandonCount)
+	}
+	if pendingOnly := all[2]; pendingOnly.ID != pendingSessionID || pendingOnly.RageClickCount != 0 {
+		t.Fatalf("pending-only counts = %+v, want zero visible signals", pendingOnly)
+	}
+
+	detail, err := q.GetSessionSummary(ctx, projectID, signalSessionID)
+	if err != nil || detail == nil || detail.RageClickCount != 3 || detail.ErrorCount != 2 {
+		t.Fatalf("detail counts = %+v err=%v", detail, err)
+	}
+
+	searches := []string{"jane@acme", "CUSTOMER-123", "acme corporation", "ACCT-789", signalSessionID}
+	for _, search := range searches {
+		found, _, searchErr := q.ListSessions(ctx, projectID, db.SessionFilters{Search: search}, nil, 50)
+		if searchErr != nil || len(found) != 1 || found[0].ID != signalSessionID {
+			t.Errorf("search %q = %+v err=%v", search, found, searchErr)
+		}
+	}
+	partialID, _, err := q.ListSessions(ctx, projectID, db.SessionFilters{Search: "sess_signal_search"}, nil, 50)
+	if err != nil || len(partialID) != 0 {
+		t.Fatalf("partial session id search = %+v err=%v, want no exact-id match", partialID, err)
+	}
+
+	withSignals, _, err := q.ListSessions(ctx, projectID, db.SessionFilters{HasSignals: true}, nil, 50)
+	if err != nil || len(withSignals) != 1 || withSignals[0].ID != signalSessionID {
+		t.Fatalf("with-signals filter = %+v err=%v", withSignals, err)
+	}
+}
+
+func TestHasIdentifiedSessions_IsProjectScopedAndIgnoresDeleting(t *testing.T) {
+	q, pool := sessionTestQueries(t)
+	ctx := context.Background()
+	projectID, envID := seedSessionProject(t, pool)
+	otherProjectID, otherEnvID := seedSessionProject(t, pool)
+	userID, err := q.UpsertEndUser(ctx, projectID, "identified", "", "", "")
+	if err != nil {
+		t.Fatalf("upsert end user: %v", err)
+	}
+	insertReadSession(t, q, pool, projectID, envID, &userID, "sess_identified", time.Now())
+	insertReadSession(t, q, pool, otherProjectID, otherEnvID, nil, "sess_other_anonymous", time.Now())
+
+	hasIdentified, err := q.HasIdentifiedSessions(ctx, projectID)
+	if err != nil || !hasIdentified {
+		t.Fatalf("identified project = %v err=%v, want true", hasIdentified, err)
+	}
+	otherHasIdentified, err := q.HasIdentifiedSessions(ctx, otherProjectID)
+	if err != nil || otherHasIdentified {
+		t.Fatalf("anonymous project = %v err=%v, want false", otherHasIdentified, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE sessions SET status = 'deleting' WHERE id = 'sess_identified'`); err != nil {
+		t.Fatalf("mark identified session deleting: %v", err)
+	}
+	hasIdentified, err = q.HasIdentifiedSessions(ctx, projectID)
+	if err != nil || hasIdentified {
+		t.Fatalf("deleting-only project = %v err=%v, want false", hasIdentified, err)
 	}
 }
 

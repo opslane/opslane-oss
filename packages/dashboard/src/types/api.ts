@@ -212,6 +212,11 @@ export interface SessionSummary {
   bytes_stored: number;
   page_url?: string | null;
   end_user?: SessionEndUser | null;
+  error_count: number;
+  rage_click_count: number;
+  dead_click_count: number;
+  form_abandon_count: number;
+  sdk_release?: string | null;
 }
 
 export interface SessionChunkMeta {
@@ -230,11 +235,12 @@ export interface SessionDetail extends SessionSummary {
 export interface SessionListResponse {
   sessions: SessionSummary[];
   next_cursor?: string | null;
+  has_identified_sessions: boolean;
 }
 
 export interface SessionFilters {
-  end_user_id?: string;
-  account_id?: string;
+  search?: string;
+  has_signals?: boolean;
   environment_id?: string;
   from?: string;
   to?: string;

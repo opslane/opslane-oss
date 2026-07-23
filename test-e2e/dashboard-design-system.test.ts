@@ -38,7 +38,7 @@ function sourceFiles(directory: string): string[] {
 describe('dashboard V1 safeguards', () => {
   it('requires a documented production consumer for every owned component', () => {
     const matrix = read('docs/design/dashboard-v1/consumer-matrix.md');
-    const ownedRoots = ['ui', 'layout', 'evidence', 'incidents'];
+    const ownedRoots = ['ui', 'layout', 'evidence', 'incidents', 'sessions'];
     const production = sourceFiles(resolve(DASHBOARD, 'src')).filter((path) =>
       !/\.(?:test|spec)\.ts$/.test(path) &&
       !path.includes('/__tests__/') &&
@@ -119,6 +119,33 @@ describe.skipIf(!browserAvailable)('dashboard deterministic Chromium smoke', () 
       harness.assertClean();
     });
   }
+
+  it('renders the session ledger fixture with decision signals and mobile-preserved chips', async () => {
+    await harness.page.setViewportSize({ width: 1440, height: 1000 });
+    await harness.page.goto(`${harness.url}/sessions`);
+    await expect.poll(async () => harness.page.getByRole('heading', { name: 'Recorded sessions' }).count())
+      .toBe(1);
+
+    const table = harness.page.getByRole('table', { name: 'Recorded sessions' });
+    expect(await table.locator('tbody tr').count()).toBe(4);
+    expect(await table.getByText('3 errors', { exact: true }).count()).toBeGreaterThan(0);
+    expect(await table.getByText('2 rage clicks', { exact: true }).count()).toBeGreaterThan(0);
+    expect(await table.getByText('Queued', { exact: true }).count()).toBeGreaterThan(0);
+    expect(await table.getByText('Analysis failed', { exact: true }).count()).toBeGreaterThan(0);
+    expect(await table.locator('tbody tr').nth(3).locator('a').count()).toBe(0);
+    expect(await table.locator('tbody tr').nth(3).locator('[aria-disabled="true"]').count()).toBe(1);
+
+    await harness.page.setViewportSize({ width: 390, height: 844 });
+    expect(await table.locator('th').filter({ hasText: 'Signals' }).evaluate((element) =>
+      getComputedStyle(element).display)).toBe('none');
+    const mobileSignals = table.locator('tbody tr').first().locator('td').first();
+    expect(await mobileSignals.getByText('3 errors', { exact: true }).count()).toBe(1);
+    expect(await harness.page.evaluate(() =>
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+
+    await harness.page.setViewportSize({ width: 1440, height: 1000 });
+    harness.assertClean();
+  });
 
   it('wires Settings tabs to real tabpanels', async () => {
     await harness.page.goto(`${harness.url}/settings`);
