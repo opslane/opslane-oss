@@ -2,322 +2,392 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Build every deterministic piece of the `opslane onboard` agent engine — the two MCP tools, the secret-aware survey tools, the deterministic survey pre-pass, the goal-based spec, the event reducer, and the two-layer permission policy — all unit-tested, no live model, no TTY.
+**Goal:** Build every deterministic piece of the `opslane onboard` agent engine — the MCP tools, a secret-aware `search`, the goal-based spec, the event reducer + ordered edit lifecycle, and the two-layer permission policy — all unit-tested, no live model, no TTY.
 
-**Architecture:** The engine is `@anthropic-ai/claude-agent-sdk` `query()`, which spawns the bundled Claude Code subprocess (authenticated by `ANTHROPIC_API_KEY` from the environment — the CLI constructs no Anthropic client). Our code is: (a) an in-process MCP server exposing `ask_user`, `finish_onboarding`, and secret-aware survey tools (`read_file`, `search`, `list_dir`); (b) a deterministic `survey` pre-pass the CLI runs and injects into the prompt; (c) `renderSpec` (goal + constraints + SDK contract); (d) an event reducer + edit tracker; (e) the permission policy — a **PreToolUse hook** for un-shadowable hard denials plus a `canUseTool` callback for human approval, run under `permissionMode: 'default'` with `settingSources: []` so no user/project settings can shadow the gate.
+**Architecture:** The engine is `@anthropic-ai/claude-agent-sdk` `query()`, which spawns the bundled Claude Code subprocess (authenticated by `ANTHROPIC_API_KEY` from the environment; the CLI constructs no Anthropic client). Our code:
+- The agent uses **built-in `Read`/`Glob`/`Edit`/`Write`** (keeping built-in `Read` preserves Claude Code's read-cache so `Edit` doesn't fail "file not read yet"). Built-in **`Grep` is disabled** (it returns `.env` content and can't be scoped) and replaced by a secret-aware **`search`** MCP tool.
+- An in-process MCP server exposes `ask_user`, `finish_onboarding`, and `search`.
+- `renderSpec` (goal + constraints + SDK contract) — it instructs the agent to **investigate the repository itself** (framework, env convention, entry point, package manager, existing SDK). There is no separate deterministic survey (see the design note below).
+- An event reducer + an **ordered `EditTracker`**.
+- The permission policy: a **PreToolUse hook** (un-shadowable hard denials, applied to *every* path-bearing tool) + a `canUseTool` approval callback, under `permissionMode: 'default'`, `settingSources: []`, `strictMcpConfig: true`.
+- **One shared path/secret module** (`paths.ts`) used by the finish tool, search, hook, and tracker — so containment and the `.env*` definition can't drift.
 
-**Verified SDK facts (0.3.217, from `sdk.d.ts` + the 2026-07-22 spikes):**
-- `permissionMode: 'default'` consults `canUseTool` for any tool NOT in `allowedTools`; `bypassPermissions` and bare `allowedTools` entries shadow it (spike-confirmed).
-- Hooks: `hooks: { PreToolUse: [{ hooks: [cb] }] }`. `cb(input: PreToolUseHookInput, toolUseID, {signal}) => Promise<HookJSONOutput>`; deny via `{ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason } }`. `HookPermissionDecision = 'allow'|'deny'|'ask'|'defer'`. `PreToolUseHookInput = { tool_name, tool_input, tool_use_id }`.
-- `canUseTool(toolName, input, {signal,...}) => Promise<PermissionResult>`; `{behavior:'allow', updatedInput?} | {behavior:'deny', message}`.
-- `settingSources?: ('user'|'project'|'local')[]`; `settingSources: []` loads none.
-- `createSdkMcpServer({name, version, tools})`; `tool(name, description, zodShape, handler)`; handler returns `{content:[{type:'text', text}]}`.
+**Design note — why no static survey (decided 2026-07-22, from a live eval):** an earlier draft ran a deterministic `surveyRepo()` pre-pass to detect framework/prefix/entry and injected it into the prompt. A live eval removed that pre-pass and let the agent read the repo itself. Result: correctness was identical — the agent chose the right convention on 5 fixture repos and both real repos (`asset-management-jira/vue3/client` → `VITE_APP_`, `verify-cloud/dashboard` → plain `VITE_`), with survey **off**. The survey only saved latency (~40% fewer turns), was framework-biased (reported `unknown` on a Create-React-App repo the agent handled correctly), and risked being *confidently wrong* on configs its regex missed — a wrong fact is worse than a blank one because the agent trusts it. So the static survey is dropped. If a later phase needs the package manager for an install step, that step reads the lock file inline where it's needed — no separate survey module. The one real defect the eval surfaced (the agent named a var `VITE_APP_DEFENDER_API_KEY`, picking up the repo's existing "Defender" wording instead of "Opslane") is fixed in the spec with an explicit naming guard (Task 1.4).
 
-**Tech Stack:** TypeScript (ESM, strict), Node 22, `@anthropic-ai/claude-agent-sdk@0.3.217`, `zod@^3`, `ink@7.1.1` + `@inkjs/ui@2.0.0` + `react@19.2.8` (exact — `docs/decisions/tui-renderer.md`), Vitest colocated in `__tests__`. All new code in `cli/src/onboard/` (create it).
+**Verified SDK facts (0.3.217, `sdk.d.ts` + spikes + codex review):**
+- `permissionMode: 'default'` consults `canUseTool` for any tool NOT in `allowedTools`; `bypassPermissions` and bare `allowedTools` entries shadow it.
+- Hooks: `hooks: { PreToolUse: [{ hooks: [cb] }] }`; `cb(input, toolUseID, {signal}) => Promise<HookJSONOutput>`; deny via `{ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason } }`; returning `{}` is "no opinion" and falls through to `canUseTool` (hook runs *before* permission resolution). `PreToolUseHookInput = { tool_name, tool_input, tool_use_id }`.
+- `canUseTool(toolName, input, {signal}) => Promise<{behavior:'allow'} | {behavior:'deny', message}>`.
+- `settingSources: []` loads no user/project/local settings; `strictMcpConfig: true` loads no external MCP.
+- `createSdkMcpServer({name, version, tools})`; `tool(name, description, zodShape, handler)` (the SDK wraps the raw zod shape in a default Zod object, so unknown keys are stripped before the handler); `.handler` is callable for unit tests.
+- Cancellation is via `options.abortController` (an `AbortController`), not a raw signal. The `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` warning is emitted by `process.emitWarning` in the parent — not in the generator stream or child stderr.
 
-**Out of scope for Phase 1:** the Ink TUI, the controller, provisioning, the CLI command — those are Phase 3 (run-and-observe) and Phase 2 (plumbing). Phase 1 is only the CI-testable engine seams. The prototype at `prototype/onboard-tui` (in the clone `/Users/abhishekray/Projects/opslane/opslane-oss`) is a UX/spec donor: `git show prototype/onboard-tui:prototype/onboard/src/<file>`.
+**Tech Stack:** TypeScript (ESM, strict), Node 22, `@anthropic-ai/claude-agent-sdk@0.3.217`, `zod@^4.0.0`, Vitest colocated in `__tests__`. All new code in `cli/src/onboard/`.
+**Deps deferred to Phase 3 (the TUI):** `ink`, `react`, `@inkjs/ui`, `@types/react`. Phase 1 excludes the TUI, so it does not add them — no extra dependency/license surface for code that proves no engine seam.
+
+**Out of scope for Phase 1:** the Ink TUI, controller, provisioning, CLI command (Phase 2/3). Prototype (UX/spec donor) in the clone `/Users/abhishekray/Projects/opslane/opslane-oss`: `git show prototype/onboard-tui:prototype/onboard/src/<file>`.
 
 ---
 
-## Task 1.1: Dependencies
+## Task 1.0: Shared path + secret-file policy (TDD)
 
-**Files:** Modify `cli/package.json`.
+One module so containment and the `.env*` rule can't drift across the finish tool, search, hook, and tracker (review #7).
 
-**Step 1:** Add to `dependencies` (exact versions, no ranges for the renderer stack):
+**Files:** Create `cli/src/onboard/paths.ts`; test `cli/src/onboard/__tests__/paths.test.ts`.
+
+**Step 1: Failing test** (real `mkdtemp` fixtures + a symlink):
+```ts
+import { describe, expect, it } from 'vitest';
+import { isSecretFile, containedRepoRelative } from '../paths.js';
+
+it('isSecretFile catches every dotenv shape', () => {
+  for (const f of ['.env', '.env.production', '.env.local', '.env-example', '.envrc'])
+    expect(isSecretFile(`/x/${f}`)).toBe(true);
+  expect(isSecretFile('/x/src/env.ts')).toBe(false);
+});
+
+// containedRepoRelative(root, p): returns canonical repo-relative path, or throws.
+it('contains real paths, rejects escapes and symlink aliases', async () => {
+  // fixture: root/, root/src/main.ts, root/link -> /etc  (symlink)
+  expect(containedRepoRelative(root, `${root}/src/main.ts`)).toBe('src/main.ts');
+  expect(containedRepoRelative(root, `${root}/pkg/../src/main.ts`)).toBe('src/main.ts');
+  expect(() => containedRepoRelative(root, '/etc/passwd')).toThrow(/contain/i);
+  expect(() => containedRepoRelative(root, `${root}/link/passwd`)).toThrow(/contain/i); // symlink escape
+  // a not-yet-created file inside root resolves via its nearest existing parent
+  expect(containedRepoRelative(root, `${root}/src/new.ts`)).toBe('src/new.ts');
+});
+```
+
+**Step 2:** FAIL. **Step 3: Implement.**
+- `isSecretFile(p)`: `path.basename(p).startsWith('.env')` — catches `.env`, `.env.*`, `.env-*`, `.envrc` (the old regex missed `.envrc`/`.env-example`).
+- `containedRepoRelative(root, p)`: normalize separators; resolve `p` against `root`; `realpath` the target if it exists, else `realpath` the **nearest existing ancestor** and append the remaining segments; realpath `root`; throw `outside repo` unless the resolved path is `realRoot` or under `realRoot + sep`; return `path.relative(realRoot, resolved)`. This is the single symlink-safe containment used everywhere.
+
+**Step 4:** green. **Step 5: Commit** — `feat(cli): shared onboard path + secret-file policy`
+
+---
+
+## Task 1.1: Dependencies + discoverable colocated tests
+
+**Files:** Modify `cli/package.json`, `cli/vitest.config.ts`.
+
+**Step 0 (blocking):** `cli/vitest.config.ts` has `include: ['src/__tests__/**/*.test.ts']`, so `cli/src/onboard/__tests__/` tests are **never discovered**. Widen to `include: ['src/**/*.test.ts']`. Verify the existing suite still runs.
+
+**Step 1:** Add to `dependencies`:
 ```json
 "@anthropic-ai/claude-agent-sdk": "0.3.217",
-"@inkjs/ui": "2.0.0",
-"ink": "7.1.1",
-"react": "19.2.8",
-"zod": "^3.23.0"
+"zod": "^4.0.0"
 ```
-Add to `devDependencies`: `"@types/react": "^19.0.0"`. Add `"engines": { "node": ">=22" }`.
-(No `@anthropic-ai/sdk` — `query()` spawns a subprocess that reads `ANTHROPIC_API_KEY`; we construct no client.)
+(zod 4 — the SDK peers `zod@^4`; its `tool()` uses zod-4 `AnyZodRawShape`/`InferShape`. Confirm no other CLI code pins zod 3.) Add `"engines": { "node": ">=22" }`. **Do not** add `ink`/`react`/`@inkjs/ui`/`@types/react` — those are Phase 3.
 
-**Step 2:** `pnpm install` (workspace root). Expected: lockfile updates, no peer errors. If `scripts/check-licenses.mjs` flags the Agent SDK's `SEE LICENSE IN README.md`, add a targeted allowlist entry citing the 2026-07-22 reversal (`docs/decisions/anthropic-agent-sdk-terms.md`).
+**Step 2:** `pnpm install`. If `scripts/check-licenses.mjs` flags the Agent SDK's `SEE LICENSE IN README.md`, add a targeted allowlist entry citing the 2026-07-22 reversal (`docs/decisions/anthropic-agent-sdk-terms.md`).
 
-**Step 3:** `pnpm --filter @opslane/cli build` — green.
-
-**Step 4: Commit** — `git commit -am "feat(cli): onboard engine dependencies"`
+**Step 3:** `pnpm --filter @opslane/cli build` — green. **Step 4: Commit.**
 
 ---
 
-## Task 1.2: `ask_user` + `finish_onboarding` MCP tools (TDD)
+## Task 1.2: `ask_user` (per-run) + `finish_onboarding` MCP tools (TDD)
 
-`ask_user` routes a question to a swappable resolver (Ink in prod, a stub in tests). `finish_onboarding` receives the agent's **structured, untrusted** report; validate everything at the tool boundary.
+No module-global resolver (review #6): `createAskUserTool(resolver)` is constructed per `runOnboardingAgent`. The finish report is untrusted; the handler validates every **value**. The SDK wraps the raw shape in a Zod object, which by default **strips** unknown keys before the handler runs — so unknown keys are dropped, not a threat, and handler-level unknown-key rejection is not the boundary. Value validation on the known fields is.
 
 **Files:** Create `cli/src/onboard/tools.ts`; test `cli/src/onboard/__tests__/tools.test.ts`.
 
-**Step 1: Write the failing test**
+**Step 1: Failing test** — uses a **real `mkdtemp` app fixture** (so realpath + the `devScript`-exists check pass):
 ```ts
-import { describe, expect, it, beforeEach } from 'vitest';
-import { askUserTool, setAskResolver, createFinishTool, type OnboardingReport } from '../tools.js';
-
+import { describe, expect, it, beforeAll } from 'vitest';
+import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os'; import { join } from 'node:path';
+import { createAskUserTool, createFinishTool, type OnboardingReport } from '../tools.js';
 const call = (t: any, input: unknown) => t.handler(input, {} as never);
 
-describe('ask_user', () => {
-  it('returns the resolver choice', async () => {
-    setAskResolver(async ({ options }) => [options[1]!]);
-    expect((await call(askUserTool, { question: 'Which?', options: ['a','b'], multi: false }))
-      .content[0]).toEqual({ type: 'text', text: 'User chose: b' });
-  });
-  it('throws when no resolver installed (piped runs must not hang)', async () => {
-    setAskResolver(null);
-    await expect(call(askUserTool, { question: 'x', options: ['a'], multi: false })).rejects.toThrow();
+describe('ask_user (per-run factory)', () => {
+  it('routes to its own resolver; throws with no resolver', async () => {
+    const t = createAskUserTool(async ({ options }) => [options[1]!]);
+    expect((await call(t, { question: 'Which?', options: ['a','b'], multi: false })).content[0])
+      .toEqual({ type: 'text', text: 'User chose: b' });
+    const bad = createAskUserTool(null);
+    await expect(call(bad, { question: 'x', options: ['a'], multi: false })).rejects.toThrow();
   });
 });
 
-describe('finish_onboarding validation (report is untrusted)', () => {
-  const root = '/repo/x';
-  let captured: OnboardingReport | null; let finish: ReturnType<typeof createFinishTool>;
-  beforeEach(() => { captured = null; finish = createFinishTool(root, (r) => { captured = r; }); });
-  const good: OnboardingReport = { apps: [{ dir: 'client/web', apiKeyVar: 'VITE_OPSLANE_API_KEY',
-    endpointVar: 'VITE_OPSLANE_ENDPOINT', packageManager: 'pnpm', devScript: 'dev' }],
-    editedFiles: ['client/web/src/main.ts', 'client/web/package.json'] };
+describe('finish_onboarding validation (untrusted report, real fixture)', () => {
+  let root: string; let report: OnboardingReport;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'fin-'));
+    mkdirSync(join(root, 'web', 'src'), { recursive: true });
+    writeFileSync(join(root, 'web', 'package.json'), JSON.stringify({ scripts: { dev: 'vite' } }));
+    writeFileSync(join(root, 'web', 'src', 'main.ts'), '');
+    report = { apps: [{ dir: 'web', apiKeyVar: 'VITE_OPSLANE_API_KEY', endpointVar: 'VITE_OPSLANE_ENDPOINT',
+      packageManager: 'pnpm', devScript: 'dev' }], editedFiles: ['web/src/main.ts', 'web/package.json'] };
+  });
+  const finish = (state = { finished: false }) => createFinishTool(root, state, () => {});
 
-  it('accepts a valid report', async () => { await call(finish, good); expect(captured).toEqual(good); });
-  it('rejects empty apps/edits', async () => {
-    await expect(call(finish, { apps: [], editedFiles: [] })).rejects.toThrow(); expect(captured).toBeNull();
+  it('accepts a valid report and sets finished on success', async () => {
+    const state = { finished: false }; await call(createFinishTool(root, state, () => {}), report);
+    expect(state.finished).toBe(true);
   });
-  it('rejects paths escaping the root', async () => {
-    await expect(call(finish, { ...good, apps: [{ ...good.apps[0]!, dir: '../../etc' }] })).rejects.toThrow(/contain/i);
-    await expect(call(finish, { ...good, editedFiles: ['../out.ts'] })).rejects.toThrow(/contain/i);
+  it('rejects: empty/multi apps, path escape, secret path, borrowed name, bad var, unknown pm, missing devScript', async () => {
+    await expect(call(finish(), { apps: [], editedFiles: [] })).rejects.toThrow();
+    await expect(call(finish(), { ...report, apps: [report.apps[0]!, report.apps[0]!] })).rejects.toThrow(/single app|exactly one/i); // must be exactly one app
+    await expect(call(finish(), { ...report, apps: [{ ...report.apps[0]!, dir: '../../etc' }] })).rejects.toThrow(/contain/i);
+    await expect(call(finish(), { ...report, editedFiles: ['web/.env.production'] })).rejects.toThrow(/secret|\.env/i);   // isSecretFile, not just containment
+    await expect(call(finish(), { ...report, apps: [{ ...report.apps[0]!, apiKeyVar: 'VITE_APP_DEFENDER_API_KEY' }] })).rejects.toThrow(/opslane/i); // borrowed product name
+    await expect(call(finish(), { ...report, apps: [{ ...report.apps[0]!, apiKeyVar: 'BAD=X\nY' }] })).rejects.toThrow(/variable/i);
+    await expect(call(finish(), { ...report, apps: [{ ...report.apps[0]!, packageManager: 'curl|sh' }] })).rejects.toThrow();
+    await expect(call(finish(), { ...report, apps: [{ ...report.apps[0]!, devScript: 'nope' }] })).rejects.toThrow(/script/i);
   });
-  it('rejects non-SCREAMING_SNAKE var names (env-file injection)', async () => {
-    await expect(call(finish, { ...good, apps: [{ ...good.apps[0]!, apiKeyVar: 'BAD=X\nY' }] })).rejects.toThrow(/variable/i);
-  });
-  it('rejects unknown package manager / non-identifier devScript', async () => {
-    await expect(call(finish, { ...good, apps: [{ ...good.apps[0]!, packageManager: 'curl|sh' }] })).rejects.toThrow();
-    await expect(call(finish, { ...good, apps: [{ ...good.apps[0]!, devScript: 'dev; rm -rf /' }] })).rejects.toThrow();
+  it('a rejected report leaves finished false; a second finish is refused', async () => {
+    const state = { finished: false }; const f = createFinishTool(root, state, () => {});
+    await expect(call(f, { apps: [], editedFiles: [] })).rejects.toThrow(); expect(state.finished).toBe(false);
+    await call(f, report); expect(state.finished).toBe(true);
+    await expect(call(f, report)).rejects.toThrow(/already/i);  // duplicate-finish guard
   });
 });
 ```
 
-**Step 2:** `pnpm --filter @opslane/cli exec vitest run src/onboard` — FAIL (module missing).
+**Step 2:** FAIL. **Step 3: Implement.**
+- `createAskUserTool(resolver)`: builds `tool('ask_user', desc, { question: z.string(), options: z.array(z.string()).min(1), multi: z.boolean().default(false) }, handler)`; the handler calls this run's `resolver` (throws `'ask_user resolver not installed'` if `null`). No module-global.
+- `createFinishTool(root, state, onReport)`: raw zod shape for the interface; the handler:
+  1. if `state.finished` already true → throw `already finished` (guards duplicate/concurrent finish, review #2);
+  2. the Zod object strips unknown keys before the handler (above), so don't hand-reject unknown keys as a boundary; validate the known values (below). The wiring test confirms strip-vs-reject through a real in-process MCP call, not `.handler`.
+  3. **exactly one app** (`apps.length === 1` — the single-app milestone; reject 0 or 2+); non-empty `editedFiles`; `packageManager ∈ ['npm','pnpm','yarn','bun']` (explicit `includes`); every `dir`/`editedFiles` path is run through **both** `containedRepoRelative(root, …)` (rejects escapes) **and** `isSecretFile` (rejects `.env*`) — containment alone does NOT reject secret files; var names match `/^[A-Z][A-Z0-9_]*$/` **and contain the `OPSLANE` token** (rejects borrowed names like `VITE_APP_DEFENDER_API_KEY`); `devScript` `/^[A-Za-z0-9:_-]+$/` **and** present in `<dir>/package.json` `scripts`;
+  4. on success `onReport(report)` then `state.finished = true`; return a confirmation.
+- Export `OnboardingReport` and `createAskServer(...tools) = createSdkMcpServer({ name:'onboard', version:'0.0.0', tools })`.
 
-**Step 3: Implement.** (Port `ask_user` wording from `prototype/onboard/src/ask.ts`.)
-- Resolver slot defaults to `null`; `askUserTool` (via `tool('ask_user', desc, { question: z.string(), options: z.array(z.string()).min(1), multi: z.boolean().default(false) }, handler)`) throws `'ask_user resolver not installed'` when unset. Export the tool object so `.handler` is testable without the SDK runtime (if `tool()` doesn't expose `.handler` in 0.3.217, export the raw handler separately — the test's `call()` indirection stays).
-- `createFinishTool(root, onReport)`: zod schema (`apps[]` with `dir`, `apiKeyVar`, `endpointVar`, `packageManager: z.enum(['npm','pnpm','yarn','bun'])`, `devScript`; `editedFiles[]`; `.strict()`), plus hand checks the schema can't do: non-empty arrays; every `dir`/`editedFiles` entry resolves inside `root` (`path.resolve(root, p)` startsWith `root` — realpath containment is enforced later in the controller when files exist, here reject `..`/absolute escapes); var names match `/^[A-Z][A-Z0-9_]*$/`; `devScript` matches `/^[A-Za-z0-9:_-]+$/`. Valid → `onReport(report)`, return a confirmation string.
-- Export `OnboardingReport` type; export `createAskServer(...tools)` = `createSdkMcpServer({ name: 'onboard', version: '0.0.0', tools })` (used in Task 1.8).
+**Wiring test:** build `createAskServer(createFinishTool(root, {finished:false}, () => {}))` and assert `finish_onboarding` is registered with an input schema (proves the zod layer is connected, not just the handler).
 
-**Step 4:** green. **Step 5: Commit** — `feat(cli): ask_user + validated finish_onboarding tools`
-
----
-
-## Task 1.3: Secret-aware survey tools (TDD)
-
-Built-in `Read`/`Grep` are disabled (Task 1.8) because a repo-wide `Grep` returns lines from a committed `.env.production`. The agent surveys through these instead: they refuse any `.env*` path and stay inside the repo root.
-
-**Files:** Create `cli/src/onboard/survey-tools.ts`; test `cli/src/onboard/__tests__/survey-tools.test.ts`.
-
-**Step 1: Failing test** — using `fs.mkdtemp` fixtures:
-- `read_file({ path })`: returns contents for an in-root file; **rejects** any path matching `/(^|\/)\.env(\..+)?$/` and any path resolving outside root; output capped (e.g. 64KB).
-- `search({ query, glob? })`: returns matching `path:line` results across in-root files, **excluding** `.env*`, `.git`, `node_modules`.
-- `list_dir({ path })`: entries with a trailing `/` on dirs; excludes `.git`/`node_modules`; refuses out-of-root.
-
-**Step 2:** FAIL. **Step 3: Implement** as `tool()`s built by `createSurveyTools(root)`. Shared `containedPath(root, p)` helper (resolve + startsWith, reject `.env*`). Use `node:fs`; for `search`, walk the tree (skip excluded dirs), simple substring/regex match, cap results. **Step 4:** green. **Step 5: Commit.**
+**Step 4:** green. **Step 5: Commit.**
 
 ---
 
-## Task 1.4: Deterministic survey pre-pass (TDD)
+## Task 1.3: Secret-aware `search` tool (TDD)
 
-Following PostHog's wizard, the CLI computes a repo map deterministically and injects it into the prompt so the model starts scoped instead of surveying blind.
+Replaces built-in `Grep`. **Literal substring only** (no model-supplied regex), bounded (review #8).
 
-**Files:** Create `cli/src/onboard/survey.ts`; test `cli/src/onboard/__tests__/survey.test.ts`.
+**Files:** Create `cli/src/onboard/search-tool.ts`; test `cli/src/onboard/__tests__/search-tool.test.ts`.
 
-**Step 1: Failing test** — `surveyRepo(cwd)` → `Survey` against three `mkdtemp` fixtures:
-- a plain Vite+React repo → `{ framework:'react-vite', entryPoints:['src/main.tsx'], envPrefix:'VITE_', configLocation:'vite.config.ts', existingSdk:null, packageManager:'npm' }`
-- a `VITE_APP_*` repo (config uses `loadEnv(mode,'.','VITE_APP_')`, `pnpm-lock.yaml` present) → `envPrefix:'VITE_APP_'`, `packageManager:'pnpm'`
-- a repo with `@defender-dev/sdk` in deps → `existingSdk:'@defender-dev/sdk'`
+**Step 1: Failing test** (`mkdtemp` fixture with a `.env.production` containing the query, a binary file, and a normal source hit):
+- `search({ query, glob? })` returns `path:line` matches from in-root text files; a string that exists **only** in `.env.production` returns nothing; `node_modules`/`.git`/binary files are skipped; a symlink to outside is not traversed; results capped and total bytes scanned capped.
 
-**Step 2:** FAIL. **Step 3: Implement** `surveyRepo(cwd)`:
-- Parse `package.json` (deps/devDeps → framework, existing error SDK `@opslane/sdk`/`@defender-dev/sdk`); lockfile presence → `packageManager` (`pnpm-lock.yaml`|`package-lock.json`|`yarn.lock`|`bun.lockb`).
-- Read `vite.config.{ts,js}`/framework config: regex for `loadEnv(mode, …, 'PREFIX_')` or `envPrefix:` to get the prefix (default `VITE_`); record `configLocation`.
-- Detect entry point by convention (`src/main.tsx`/`.ts`/`main.js`) via existence checks.
-- Scan `.env*` filenames present (do NOT read values) to corroborate the prefix.
-Pure fs + parse; return the struct. **Step 4:** green. **Step 5: Commit.**
+**Step 2:** FAIL. **Step 3: Implement** `createSearchTool(root)` as a `tool()` with `{ query: z.string().min(1), glob: z.string().optional() }`. Walk `root` with `node:fs` (skip `.git`/`node_modules`, any `isSecretFile`, and symlinks pointing outside via `containedRepoRelative`), match the query as a **literal substring** (not a regex the model controls), skip files that look binary (NUL byte in the first 8KB) and files over a per-file byte cap, stop at a total-bytes-scanned cap and a max-results cap, and emit `repoRel:line`. **Step 4:** green. **Step 5: Commit.**
 
 ---
 
-## Task 1.5: Goal-based spec (TDD)
+## Task 1.4: Goal-based spec (TDD)
 
-Spike-validated: a goal + constraints + injected survey makes the agent match the repo's convention (it chose `VITE_APP_OPSLANE_API_KEY` on the `VITE_APP_` fixture). No fixed filename, no baked-in prefix.
+Live-validated: goal + constraints, with the agent told to read the repo itself, makes it match the repo's own convention (chose `VITE_APP_OPSLANE_API_KEY` on a `VITE_APP_` repo, plain `VITE_OPSLANE_API_KEY` on a default-prefix repo). No fixed filename, no baked-in prefix, **no injected survey**. The spec also pins the product name so the agent doesn't borrow another product's wording (the `VITE_APP_DEFENDER_API_KEY` slip from the eval).
 
 **Files:** Create `cli/src/onboard/spec.ts`; test `cli/src/onboard/__tests__/spec.test.ts`.
 
 **Step 1: Failing test**
 ```ts
-import { describe, expect, it } from 'vitest';
 import { renderSpec } from '../spec.js';
-it('is goal-framed, carries the rules, injects the survey, hardcodes no convention', () => {
-  const spec = renderSpec({ cwd: '/repo/x', survey: {
-    framework: 'vue-vite', entryPoints: ['src/main.ts'], envPrefix: 'VITE_APP_',
-    configLocation: 'vite.config.ts', existingSdk: null, packageManager: 'pnpm' } });
+it('goal-framed, tells the agent to investigate, bakes in no convention, guards the product name', () => {
+  const spec = renderSpec({ cwd: '/repo/x' });
   expect(spec).toContain('/repo/x');
-  expect(spec).toContain('VITE_APP_');          // the injected finding
-  expect(spec).not.toContain('VITE_OPSLANE_');  // never bake in our own prefix
-  const lower = spec.toLowerCase();
-  for (const n of ['goal','follow','endpoint','ask_user','migrate','finish_onboarding',
-                   'never write','do not run installs']) expect(lower).toContain(n);
+  expect(spec).not.toContain('VITE_OPSLANE_');                     // no baked-in prefix
+  expect(spec.toLowerCase()).toContain('read the repository');     // investigate-first, not a survey dump
+  expect(spec).toMatch(/name the opslane variables after opslane/i); // naming guard (Defender fix)
+  expect(spec).toMatch(/never name them after another product/i);
+  for (const n of ['goal','follow','endpoint','ask_user','migrate','finish_onboarding','never write','do not run installs'])
+    expect(spec.toLowerCase()).toContain(n);
 });
 ```
+**Step 2:** FAIL. **Step 3: Implement** `renderSpec({ cwd })` — a single string with:
+- **Goal:** `init` runs once at the app's real entry point, reading key + required endpoint from THIS repo's env convention; `@opslane/sdk` added to that app's deps.
+- **Investigate first:** the agent reads the repo itself to determine framework, env naming convention, entry point, package manager, and any existing error SDK. No survey is injected.
+- **SDK contract:** `init({ apiKey, endpoint })`, endpoint required (a contract, not a code template).
+- **Constraints:** follow the repo's own prefix/config; **name the Opslane variables after Opslane (e.g. `PREFIX_OPSLANE_API_KEY`), never after another product in the repo** (the finish validator also enforces the `OPSLANE` token, but the prompt guard keeps the agent from writing the wrong name into source in the first place); env vars by name only — **never write** literal secrets or environment-variable values (this exact phrasing keeps the spec test's `never write` assertion honest); migrate an existing SDK rather than duplicate; ask before editing; do not run installs; `devScript` must be an existing script; **single app this milestone — if the repo has more than one plausible app, call `ask_user` (`multi:false`) to have the user pick exactly one before any edit**; end with exactly one `finish_onboarding`, no edits after.
 
-**Step 2:** FAIL. **Step 3: Implement** `renderSpec({ cwd, survey })` — start from `prototype/onboard/src/spec.ts`, reshaped to: a **goal** ("init runs at the entry point, reading key+endpoint from THIS repo's env convention; `@opslane/sdk` added to deps"), the **SDK contract** (`init({ apiKey, endpoint })`, endpoint required — as a contract not a template), the **constraints** (follow the detected prefix + config location; env vars by name only, never a literal value; migrate an existing SDK; multiple apps → batched `ask_user`; ask before editing; do not run installs; `devScript` must be an existing script; end with one `finish_onboarding`), and the **injected survey** as the starting map. **Step 4:** green. **Step 5: Commit.**
+Add to the test: `expect(spec).toMatch(/more than one|multiple/i)` and `expect(spec).toMatch(/pick|select/i)` to pin the multi-app→ask_user instruction.
+
+**Step 4:** green. **Step 5: Commit.**
 
 ---
 
-## Task 1.6: Event reducer + edit tracker (TDD)
+## Task 1.5: Event reducer + ordered `EditTracker` (TDD)
 
-Derives TUI task lines from the SDK message stream, and records the files actually edited (for Phase 3's report reconciliation) as **canonical repo-relative** paths so they match the report.
+The reducer drives task lines; the tracker records an **ordered** tool lifecycle so the Phase-3 controller can reject edits at-or-after the accepted finish (review #2 — sets can't).
 
 **Files:** Create `cli/src/onboard/events.ts`; test `cli/src/onboard/__tests__/events.test.ts`.
 
 **Step 1: Failing test**
 ```ts
-import { describe, expect, it } from 'vitest';
-import { labelFor, reduceTasks, collectEdit, type TaskLine } from '../events.js';
-const toolUse = (id: string, name: string, input: Record<string, unknown>) =>
-  ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
-const toolResult = (id: string) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id }] } });
+import { labelFor, reduceTasks, EditTracker, type TaskLine } from '../events.js';
+const asst = (blocks: any[]) => ({ type:'assistant', message:{ content: blocks } });
+const tu = (id: string, name: string, input: any) => ({ type:'tool_use', id, name, input });
+const usr = (blocks: any[]) => ({ type:'user', message:{ content: blocks } });
+const tr = (id: string, err = false) => ({ type:'tool_result', tool_use_id:id, is_error: err });
 
-describe('reduceTasks', () => {
-  it('runs on tool_use, done on tool_result, all done on result', () => {
-    let t: TaskLine[] = reduceTasks([], toolUse('t1','mcp__onboard__read_file',{ path:'src/main.tsx' }));
-    expect(t[0]).toMatchObject({ id:'t1', state:'run' });
-    t = reduceTasks(t, toolResult('t1')); expect(t[0]!.state).toBe('done');
-    t = reduceTasks([{ id:'x', label:'Editing', state:'run' }], { type:'result' } as never);
-    expect(t[0]!.state).toBe('done');
-  });
+it('reducer: multi-block, fail on error result, all-fail on error result msg', () => {
+  let t: TaskLine[] = reduceTasks([], asst([tu('a','Edit',{file_path:'/r/a'}), tu('b','Read',{file_path:'/r/b'})]));
+  expect(t.length).toBe(2);
+  t = reduceTasks(t, usr([tr('a'), tr('b', true)]));
+  expect(t.find(x=>x.id==='a')!.state).toBe('done'); expect(t.find(x=>x.id==='b')!.state).toBe('fail');
 });
-describe('collectEdit — canonical repo-relative', () => {
-  it('records Edit/Write targets relative to root, ignores reads', () => {
-    const e = new Set<string>(); const root = '/repo';
-    collectEdit(e, root, toolUse('a','Edit',{ file_path:'/repo/src/main.ts' }));
-    collectEdit(e, root, toolUse('b','Write',{ file_path:'/repo/pkg.json' }));
-    collectEdit(e, root, toolUse('c','mcp__onboard__read_file',{ path:'x.ts' }));
-    expect([...e]).toEqual(['src/main.ts','pkg.json']);
-  });
-});
-describe('labelFor', () => {
-  it('labels read/edit/ask/finish distinctly', () => {
-    expect(labelFor('mcp__onboard__read_file',{ path:'a/b.ts' })).toContain('b.ts');
-    expect(labelFor('Edit',{ file_path:'a/main.ts' })).toContain('main.ts');
-    expect(labelFor('mcp__onboard__ask_user',{})).toBe('Asking you');
-    expect(labelFor('mcp__onboard__finish_onboarding',{})).toBe('Wrapping up');
-  });
+
+it('EditTracker: ordered, commit on success, flags edit at/after finish', () => {
+  const t = new EditTracker('/r');   // uses containedRepoRelative
+  t.onMessage(asst([tu('e1','Edit',{file_path:'/r/src/main.ts'})])); t.onMessage(usr([tr('e1')]));
+  t.onMessage(asst([tu('f','mcp__onboard__finish_onboarding',{})])); t.onMessage(usr([tr('f')]));
+  t.onMessage(asst([tu('e2','Edit',{file_path:'/r/src/late.ts'})]));  t.onMessage(usr([tr('e2')]));
+  t.markFinished('f');                                   // controller calls this when finish is accepted
+  expect([...t.committedBeforeFinish()]).toEqual(['src/main.ts']);
+  expect(t.editsAfterFinish()).toEqual(['src/late.ts']); // e2 landed after finish → flagged
 });
 ```
-
-**Step 2:** FAIL. **Step 3: Implement** — `reduceTasks(tasks, msg)` branches: assistant/tool_use → append `{id,label:labelFor(name,input),state:'run'}`; user/tool_result → mark matching id `done` (or `fail` if `is_error`); `result` → close all running. New array (no mutation). `collectEdit(set, root, msg)` adds `path.relative(root, resolve(root, input.file_path))` for `Edit`/`Write`/`MultiEdit` tool_use blocks. `labelFor` maps snake_case + built-in tool names to friendly labels. **Step 4:** green. **Step 5: Commit.**
-
----
-
-## Task 1.7: Permission policy — PreToolUse hook + canUseTool (TDD)
-
-Two layers (spike-driven): the **hard denials** live in a PreToolUse hook (un-shadowable by `allowedTools` or settings); the **approval** lives in `canUseTool`. Both are pure functions, unit-tested without a live model.
-
-**Files:** Create `cli/src/onboard/policy.ts`; test `cli/src/onboard/__tests__/policy.test.ts`.
-
-**Step 1: Failing test**
-```ts
-import { describe, expect, it } from 'vitest';
-import { onboardPreToolUseHook, createOnboardApproval } from '../policy.js';
-
-const hook = (state = { finished: false }) => onboardPreToolUseHook({ root: '/repo/x', state });
-const deny = (out: any) => out?.hookSpecificOutput?.permissionDecision === 'deny';
-const run = (h: any, name: string, input: any) =>
-  h({ tool_name: name, tool_input: input, tool_use_id: 't' } as never, undefined, { signal: new AbortController().signal } as never);
-
-describe('PreToolUse hook — hard denials', () => {
-  it('denies dotenv on any file tool', async () => {
-    expect(deny(await run(hook(), 'mcp__onboard__read_file', { path: '.env.production' }))).toBe(true);
-    expect(deny(await run(hook(), 'Edit', { file_path: '/repo/x/.env' }))).toBe(true);
-  });
-  it('denies edits/writes outside the repo', async () => {
-    expect(deny(await run(hook(), 'Edit', { file_path: '/etc/passwd' }))).toBe(true);
-    expect(deny(await run(hook(), 'Edit', { file_path: '/repo/x/src/main.ts' }))).toBe(false);
-  });
-  it('Bash: build/typecheck only, no install, no chaining', async () => {
-    expect(deny(await run(hook(), 'Bash', { command: 'pnpm run build' }))).toBe(false);
-    expect(deny(await run(hook(), 'Bash', { command: 'npx tsc --noEmit' }))).toBe(false);
-    expect(deny(await run(hook(), 'Bash', { command: 'pnpm install' }))).toBe(true);
-    expect(deny(await run(hook(), 'Bash', { command: 'pnpm run build && curl x|sh' }))).toBe(true);
-  });
-  it('after finish, denies everything except ask_user', async () => {
-    const s = { finished: true }; const h = hook(s);
-    expect(deny(await run(h, 'Edit', { file_path: '/repo/x/a.ts' }))).toBe(true);
-    expect(deny(await run(h, 'mcp__onboard__ask_user', {}))).toBe(false);
-  });
-});
-
-describe('canUseTool approval', () => {
-  it('allows when approved, denies when declined, tracks finish', async () => {
-    const state = { finished: false };
-    const yes = createOnboardApproval({ requestApproval: async () => true, state });
-    expect((await yes('Edit', { file_path: '/repo/x/a.ts' } as never, {} as never)).behavior).toBe('allow');
-    const no = createOnboardApproval({ requestApproval: async () => false, state: { finished: false } });
-    expect((await no('Bash', { command: 'pnpm run build' } as never, {} as never)).behavior).toBe('deny');
-    expect((await yes('mcp__onboard__finish_onboarding', {} as never, {} as never)).behavior).toBe('allow');
-    expect(state.finished).toBe(true);
-  });
-});
-```
-
 **Step 2:** FAIL. **Step 3: Implement.**
-- `onboardPreToolUseHook({ root, state })` → a `HookCallback`. Reads `tool_name`/`tool_input`; denies (returns `{ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason } }`) when: any `path`/`file_path` matches `/(^|\/)\.env(\..+)?$/`; an `Edit`/`Write` `file_path` resolves outside `root`; a `Bash` command is not a single **check** (`<pm> run build`, `<pm> run <script>`, `npx tsc`, `tsc` — no `&&`/`;`/`|`/backticks/`$()`, no `install`); or `state.finished` and the tool isn't `ask_user`. Otherwise return `{}` (no decision → falls through to `canUseTool`).
-- `createOnboardApproval({ requestApproval, state })` → a `CanUseTool`: for a mutating tool (`Edit`/`Write`/`Bash`) `await requestApproval(...)` → `false` ⇒ `{behavior:'deny', message:'declined'}`; on an allowed `finish_onboarding` set `state.finished = true`; else `{behavior:'allow'}`.
-The hook and approval share one `state` object (the engine owns it, Task 1.8).
+- `reduceTasks(tasks, msg)`: iterate **every** content block; tool_use → append `run`; tool_result → mark id `done`, or `fail` when `is_error`; a `result` msg with an error subtype → all running `fail`, clean `result` → `done`. New array.
+- `EditTracker(root)`: records an **ordered log** of `{seq, id, kind:'edit'|'finish', path?, committed:boolean}`. `onMessage` assigns a monotonic seq to each `tool_use`, and on a matching non-error `tool_result` marks it committed (an errored/denied edit is never committed — review). `markFinished(id)` records the seq of the accepted finish. `committedBeforeFinish()` = committed edit paths with seq < finish seq; `editsAfterFinish()` = committed edit paths with seq ≥ finish seq (what the controller rejects). Paths via `containedRepoRelative`.
+- `labelFor` maps tool names to friendly labels.
 
 **Step 4:** green. **Step 5: Commit.**
 
 ---
 
-## Task 1.8: Engine options + assembly (TDD)
+## Task 1.6: Permission policy — hook + approval (TDD)
 
-Wires the pieces into SDK `query()` options: `permissionMode: 'default'`, `allowedTools` = only `ask_user`, built-in `Read`/`Grep`/network disabled, `settingSources: []`, the MCP server, the PreToolUse hook, and the approval `canUseTool`.
+The hook applies containment to **every path-bearing tool** (review #1 — Read/Glob/Edit/Write, not just mutators) plus the `.env` and Bash and post-finish rules. Approval is separate and does not touch finish-state.
+
+**Files:** Create `cli/src/onboard/policy.ts`; test `cli/src/onboard/__tests__/policy.test.ts`.
+
+**Step 1: Failing test** (real `mkdtemp` root + a symlink to outside):
+```ts
+import { onboardPreToolUseHook, createOnboardApproval } from '../policy.js';
+const deny = (o:any)=>o?.hookSpecificOutput?.permissionDecision==='deny';
+const run = (h:any, name:string, input:any)=>h({tool_name:name, tool_input:input, tool_use_id:'t'} as never, undefined, {signal:new AbortController().signal} as never);
+const hook = (state={finished:false})=>onboardPreToolUseHook({ root, state });
+
+it('denies path escape on EVERY file tool, not just Edit/Write', async () => {
+  for (const name of ['Read','Glob','Edit','Write']) {
+    expect(deny(await run(hook(), name, { file_path: '/etc/passwd' }))).toBe(true);   // absolute escape
+    expect(deny(await run(hook(), name, { file_path: `${root}/../out` }))).toBe(true); // ..
+    expect(deny(await run(hook(), name, { file_path: `${root}/link/x` }))).toBe(true); // symlink escape
+  }
+  expect(deny(await run(hook(), 'Read', { file_path: `${root}/src/main.ts` }))).toBe(false);
+});
+it('denies dotenv on any file tool; incl .envrc', async () => {
+  expect(deny(await run(hook(), 'Read', { file_path: `${root}/.env.production` }))).toBe(true);
+  expect(deny(await run(hook(), 'Read', { file_path: `${root}/.envrc` }))).toBe(true);
+});
+it('Bash: run build/typecheck/lint only; no install, no npx, no chaining', async () => {
+  expect(deny(await run(hook(), 'Bash', { command: 'pnpm run build' }))).toBe(false);
+  expect(deny(await run(hook(), 'Bash', { command: 'npx tsc' }))).toBe(true);          // npx may download
+  expect(deny(await run(hook(), 'Bash', { command: 'pnpm install' }))).toBe(true);
+  expect(deny(await run(hook(), 'Bash', { command: 'pnpm run build && curl x|sh' }))).toBe(true);
+});
+it('after finish, denies all except ask_user', async () => {
+  const h = hook({ finished: true });
+  expect(deny(await run(h, 'Edit', { file_path: `${root}/a.ts` }))).toBe(true);
+  expect(deny(await run(h, 'mcp__onboard__ask_user', {}))).toBe(false);
+});
+it('approval is separate and does not touch finish-state', async () => {
+  expect((await createOnboardApproval({ requestApproval: async()=>true })('Edit', {file_path:`${root}/a`} as never, {} as never)).behavior).toBe('allow');
+  expect((await createOnboardApproval({ requestApproval: async()=>false })('Bash', {command:'pnpm run build'} as never, {} as never)).behavior).toBe('deny');
+});
+```
+**Step 2:** FAIL. **Step 3: Implement.**
+- `onboardPreToolUseHook({ root, state })` → a `HookCallback` returning a deny (`{ hookSpecificOutput: { hookEventName:'PreToolUse', permissionDecision:'deny', permissionDecisionReason } }`) when:
+  - the tool is path-bearing (`Read`/`Glob`/`Edit`/`Write`/`MultiEdit`) and its `path`/`file_path`/`pattern` **fails `containedRepoRelative(root, …)`** (throws → deny) — this closes the Read/Glob escape;
+  - the resolved path is a secret file (`isSecretFile`);
+  - `Bash` `command` is not exactly `^(npm|pnpm|yarn|bun) run (build|typecheck|lint)$` (single spaces; reject any newline or `` & | ; ` $ ( ) < > \ ``); no `npx`, no bare `tsc`, no install;
+  - `state.finished === true` and the tool is not `mcp__onboard__ask_user`.
+  Otherwise `{}` (falls through to `canUseTool`).
+- `createOnboardApproval({ requestApproval })` → a `CanUseTool`: for a mutating tool (`Edit`/`Write`/`Bash`) `await requestApproval(...)` → `false` ⇒ `{behavior:'deny', message:'declined'}`; else `{behavior:'allow'}`. It does **not** read or set `finished` (that lives in the finish handler).
+
+**Step 4:** green. **Step 5: Commit.**
+
+---
+
+## Task 1.7: Engine assembly + tested `runOnboardingAgent` (TDD)
+
+`runOnboardingAgent` holds the failure-prone seams (cancellation, warning capture, terminal-result mapping), so it takes an **injectable `queryFn`** and is unit-tested with an async-generator stub — no model, no subprocess (review #5). No `survey` parameter — the spec tells the agent to investigate the repo itself.
 
 **Files:** Create `cli/src/onboard/engine.ts`; test `cli/src/onboard/__tests__/engine.test.ts`.
 
 **Step 1: Failing test**
 ```ts
-import { describe, expect, it } from 'vitest';
-import { engineOptions } from '../engine.js';
-it('locks the gate: nothing security-relevant auto-runs; settings isolated; built-in read/grep off', () => {
-  const opts = engineOptions({ cwd: '/repo/x', canUseTool: async () => ({ behavior:'allow' }),
-    hook: async () => ({}), mcpServers: {} as never });
-  expect(opts.permissionMode).toBe('default');
-  expect(opts.settingSources).toEqual([]);                 // no user/project/local settings can shadow
-  expect(opts.allowedTools).toEqual(['mcp__onboard__ask_user']);
-  for (const t of ['Read','Grep','Edit','Write','Bash','mcp__onboard__finish_onboarding'])
-    expect(opts.allowedTools).not.toContain(t);
-  expect(opts.disallowedTools).toEqual(expect.arrayContaining(['Read','Grep','WebFetch','WebSearch']));
-  expect(opts.hooks?.PreToolUse?.[0]?.hooks?.length).toBe(1); // the hard-deny hook is registered
-  expect(typeof opts.canUseTool).toBe('function');
+import { engineOptions, runOnboardingAgent } from '../engine.js';
+
+it('engineOptions locks the gate', () => {
+  const o = engineOptions({ cwd:'/r', canUseTool: async()=>({behavior:'allow'}), hook: async()=>({}),
+                            mcpServers:{} as never, abortController:new AbortController() });
+  expect(o.permissionMode).toBe('default'); expect(o.settingSources).toEqual([]); expect(o.strictMcpConfig).toBe(true);
+  expect(o.allowedTools).toEqual(['mcp__onboard__ask_user']);
+  expect(o.disallowedTools).toEqual(expect.arrayContaining(['Grep','WebFetch','WebSearch']));
+  expect(o.disallowedTools).not.toContain('Read');                 // Read stays (read-cache)
+  expect(o.hooks?.PreToolUse?.[0]?.hooks?.length).toBe(1);
+});
+
+// async-generator stub for queryFn — no SDK, no subprocess:
+const stub = (msgs: any[]) => ({ [Symbol.asyncIterator]: async function* () { for (const m of msgs) yield m; } });
+
+// lifecycle tests need a dummy key — runOnboardingAgent short-circuits to no_api_key when ANTHROPIC_API_KEY is unset,
+// so a hermetic env would otherwise fail the success/abort cases. Set it for these, restore the prior value after.
+const priorKey = process.env.ANTHROPIC_API_KEY;
+beforeAll(() => { process.env.ANTHROPIC_API_KEY = 'test-only'; });
+afterAll(() => { if (priorKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = priorKey; });
+
+it('runOnboardingAgent maps a clean result to ok:true', async () => {
+  const r = await runOnboardingAgent({ cwd:'/r', onMessage(){}, onReport(){},
+    requestApproval: async()=>true, signal: new AbortController().signal,
+    queryFn: () => stub([{ type:'result', subtype:'success' }]) as never });
+  expect(r.ok).toBe(true);
+});
+it('maps an error result / max-turns / missing result to ok:false (never throws normally)', async () => {
+  for (const msgs of [[{type:'result', subtype:'error_max_turns'}], []]) {
+    const r = await runOnboardingAgent({ cwd:'/r', onMessage(){}, onReport(){},
+      requestApproval: async()=>true, signal: new AbortController().signal, queryFn: () => stub(msgs) as never });
+    expect(r.ok).toBe(false);
+  }
+});
+it('a caller-abort aborts the run; an already-aborted signal is handled', async () => {
+  const ac = new AbortController(); ac.abort();
+  const r = await runOnboardingAgent({ cwd:'/r', onMessage(){}, onReport(){},
+    requestApproval: async()=>true, signal: ac.signal, queryFn: () => stub([]) as never });
+  expect(r.ok).toBe(false); expect(r.aborted).toBe(true);
+});
+it('returns no_api_key and never queries when the key is missing', async () => {
+  delete process.env.ANTHROPIC_API_KEY; let queried = false;
+  const r = await runOnboardingAgent({ cwd:'/r', onMessage(){}, onReport(){}, requestApproval: async()=>true,
+    signal: new AbortController().signal, queryFn: () => { queried = true; return stub([]) as never; } });
+  process.env.ANTHROPIC_API_KEY = 'test-only';
+  expect(r.reason).toBe('no_api_key'); expect(queried).toBe(false);
+});
+it('maps a thrown queryFn to ok:false without rethrowing', async () => {
+  const r = await runOnboardingAgent({ cwd:'/r', onMessage(){}, onReport(){}, requestApproval: async()=>true,
+    signal: new AbortController().signal, queryFn: () => { throw new Error('subprocess failed'); } });
+  expect(r.ok).toBe(false); expect(r.reason).toMatch(/subprocess failed/);
 });
 ```
-
 **Step 2:** FAIL. **Step 3: Implement.**
-- `engineOptions({ cwd, canUseTool, hook, mcpServers })` returns the SDK `Options`: `cwd`; `permissionMode: 'default'`; `settingSources: []`; `allowedTools: ['mcp__onboard__ask_user']`; `tools: ['Glob','Write','Edit','Bash']` plus our MCP tool names available via `mcpServers`; `disallowedTools: ['Read','Grep','WebFetch','WebSearch']`; `mcpServers`; `hooks: { PreToolUse: [{ hooks: [hook] }] }`; `canUseTool`; `maxTurns: 60`.
-- `runOnboardingAgent({ cwd, survey, onMessage, onReport, requestApproval, signal })`: build one `state = { finished: false }`; `hook = onboardPreToolUseHook({ root: cwd, state })`; `canUseTool = createOnboardApproval({ requestApproval, state })`; `mcpServers = { onboard: createAskServer(askUserTool, createFinishTool(cwd, onReport), ...createSurveyTools(cwd)) }`; then `query({ prompt: renderSpec({ cwd, survey }), options: engineOptions({ cwd, canUseTool, hook, mcpServers }) })`. Error out clearly if `process.env.ANTHROPIC_API_KEY` is unset (check before spawning). Iterate the async generator into `onMessage`; on any `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` stderr warning for a guarded tool, throw (regression tripwire — the settings-isolation + allowedTools discipline must hold). Forward `signal` to the SDK abort input.
+- `engineOptions({ cwd, canUseTool, hook, mcpServers, abortController })`: `cwd`; `permissionMode:'default'`; `settingSources:[]`; `strictMcpConfig:true`; `allowedTools:['mcp__onboard__ask_user']`; `tools:['Read','Glob','Write','Edit','Bash']`; `disallowedTools:['Grep','WebFetch','WebSearch']`; `mcpServers`; `hooks:{PreToolUse:[{hooks:[hook]}]}`; `canUseTool`; `abortController`; `maxTurns:60`.
+- `runOnboardingAgent({ cwd, onMessage, onReport, requestApproval, signal, askUser = null, queryFn = query })`:
+  - if `!process.env.ANTHROPIC_API_KEY` → return `{ ok:false, reason:'no_api_key' }` (or throw a typed error — controller-friendly; pick one and test it).
+  - `state = { finished:false }`; `hook = onboardPreToolUseHook({ root:cwd, state })`; `canUseTool = createOnboardApproval({ requestApproval })`; `mcpServers = { onboard: createAskServer(createAskUserTool(askUser), createFinishTool(cwd, state, onReport), createSearchTool(cwd)) }`.
+  - **Cancellation:** create an `AbortController ac`; if `signal.aborted` already, `ac.abort()`; else add a one-shot `signal` listener that calls `ac.abort()`. Pass `ac` as `abortController`.
+  - **Warning tripwire (safe):** register `const onWarn = (w) => { if isShadowWarning(w) and not the intentional ask_user shadow: shadowErr = new Error(...); ac.abort(); }; process.on('warning', onWarn)`. **Do not throw inside the listener** (uncaught process exception) — store it, abort, and reject after the loop. The `mcp__onboard__ask_user` shadow is intentional (it is in `allowedTools`) and must NOT trip the tripwire.
+  - **`try`:** iterate `queryFn({ prompt: renderSpec({cwd}), options: engineOptions({cwd, canUseTool, hook, mcpServers, abortController: ac}) })` into `onMessage`, capturing the terminal `result` message.
+  - **`catch`:** a thrown SDK/iterator error (subprocess spawn failure, mid-stream throw) is captured into `caughtError` and mapped to `{ ok:false, reason: err.message }` — never rethrown. (Aborting the controller mid-iteration surfaces here or via the aborted-signal check.)
+  - **`finally`:** remove `onWarn` and the `signal` listener.
+  - Return `{ ok, aborted, subtype, reason }`: `ok:false` if `shadowErr`, if `caughtError` (reason = its message), if aborted, if no terminal result was seen, or if the result subtype is an error/max-turns; `ok:true` only on a clean `result`. `runOnboardingAgent` **never decides success** beyond a clean result — the Phase-3 controller additionally requires a captured report reconciled against `EditTracker`.
 
 **Step 4:** green. **Step 5: Commit.**
 
 ---
 
-## Task 1.9: Phase 1 validation checkpoint
+## Task 1.8: Phase 1 validation checkpoint
 
 ```bash
 pnpm --filter @opslane/cli build
 pnpm --filter @opslane/cli exec vitest run src/onboard
-pnpm --filter @opslane/cli test    # the whole existing CLI suite still green
+pnpm --filter @opslane/cli test    # whole existing CLI suite still green
 ```
-All green = Phase 1 complete. Nothing here spawns the subprocess or touches a TTY; every test runs in CI. `runOnboardingAgent` is the only piece that isn't directly unit-tested (it wraps `query()` + env check) — it is exercised live in Phase 3's smoke; keep it a thin wrapper so the untested surface stays minimal.
+All green = Phase 1 unit-complete. Every seam — including `runOnboardingAgent`'s lifecycle (via the injected `queryFn` stub) — is unit-tested; nothing spawns the subprocess or touches a TTY.
+
+**Live run (required — standing preference: exercise the real running system, not just green tests):** with `ANTHROPIC_API_KEY` set, drive `runOnboardingAgent` against a throwaway copy of a real app and confirm: it reaches `ok:true`, wires `init()` at the entry point using the repo's own prefix and the `OPSLANE` product name, adds `@opslane/sdk` to deps, and the hook blocks a planted `.env` secret. Never run against a real project in place — copy to a temp dir first (the agent edits files).
 
 ---
 
-## Notes for the reviewer (call out to `/codex`)
+## SDK facts confirmed by codex review (2026-07-22)
 
-1. **`tool()` return shape in 0.3.217** — does the object expose a callable `.handler` for unit tests, or must we export the raw handler function separately? The tests assume a testable handler.
-2. **PreToolUse "no decision" fall-through** — returning `{}` (no `permissionDecision`) should let `canUseTool` run. Confirm the SDK treats an empty hook output as "no opinion," not "deny."
-3. **`tools` vs `disallowedTools` interaction** — we both omit `Read`/`Grep` from `tools`/`allowedTools` AND list them in `disallowedTools`. Confirm that reliably removes the built-ins (the spike showed `disallowedTools` is the real removal).
-4. **Survey regex brittleness** — the env-prefix detection is regex over `vite.config`. Acceptable for Phase 1 (the model re-verifies from the injected survey), or should it be stricter?
+`tool()` exposes a callable `.handler`; a PreToolUse hook returning `{}` is "no opinion" and runs before permission resolution; `disallowedTools` reliably removes built-in `Grep`; built-ins + an in-process MCP server coexist in one `query()`. Cancellation is via `options.abortController`; the shadow warning is a parent-process `process.emitWarning`.
