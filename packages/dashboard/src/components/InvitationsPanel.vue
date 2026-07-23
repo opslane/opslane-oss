@@ -75,7 +75,7 @@ onMounted(load);
         placeholder="person@example.com"
         class="min-w-64 flex-1 rounded-md border border-border bg-surface-subtle px-3 py-2 text-sm"
       />
-      <select v-model="role" class="rounded-md border border-border bg-surface-subtle px-3 py-2 text-sm">
+      <select v-model="role" class="rounded-md border border-border bg-surface-subtle pl-3 pr-9 py-2 text-sm">
         <option value="member">Member</option>
         <option value="admin">Admin</option>
         <option value="owner">Owner</option>

@@ -96,7 +96,7 @@ watch(
       <label class="text-sm text-muted whitespace-nowrap">Account:</label>
       <select
         v-model="selectedAccountId"
-        class="text-sm rounded-md px-2 py-1.5"
+        class="text-sm rounded-md pl-2 pr-8 py-1.5"
       >
         <option value="">All accounts</option>
         <option
@@ -112,7 +112,7 @@ watch(
       <label class="text-sm text-muted whitespace-nowrap">Status:</label>
       <select
         v-model="selectedStatus"
-        class="text-sm rounded-md px-2 py-1.5"
+        class="text-sm rounded-md pl-2 pr-8 py-1.5"
       >
         <option value="">All statuses</option>
         <option value="new">New</option>
@@ -132,7 +132,7 @@ watch(
       <select
         v-model="selectedPlatform"
         aria-label="Platform"
-        class="text-sm rounded-md px-2 py-1.5"
+        class="text-sm rounded-md pl-2 pr-8 py-1.5"
       >
         <option value="">All platforms</option>
         <option value="javascript">JavaScript</option>
@@ -145,7 +145,7 @@ watch(
       <select
         v-model="selectedEnvironmentId"
         aria-label="Environment"
-        class="text-sm rounded-md px-2 py-1.5"
+        class="text-sm rounded-md pl-2 pr-8 py-1.5"
       >
         <option value="">All environments</option>
         <option

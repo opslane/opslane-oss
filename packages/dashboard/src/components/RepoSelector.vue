@@ -44,7 +44,7 @@ function onSelect(event: Event): void {
       :value="modelValue"
       @change="onSelect"
       :disabled="disabled"
-      class="block w-full rounded-md px-3 py-2 text-sm disabled:opacity-50"
+      class="block w-full rounded-md pl-3 pr-9 py-2 text-sm disabled:opacity-50"
     >
       <option value="" disabled>Select a repository</option>
       <option
