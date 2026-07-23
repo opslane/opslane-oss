@@ -194,7 +194,11 @@ function mockSessions(): Array<Record<string, unknown>> {
     },
     {
       ...base,
-      id: 'session-anonymous-clean-8f3a2c1b',
+      // Real shape, not a descriptive slug: the SDK emits either
+      // crypto.randomUUID() or `sess_`+32 hex (sdk/src/session.ts:37-46). A
+      // descriptive id makes the row's short-id rendering unrepresentative of
+      // what any user sees, and two slugs sharing a prefix collide on screen.
+      id: '8f3a2c1b-4d6e-4a91-b0c7-2e5f1a9d3b84',
       started_at: '2026-07-22T19:31:00Z',
       last_chunk_at: '2026-07-22T19:33:48Z',
       status: 'analyzed',
@@ -228,7 +232,8 @@ function mockSessions(): Array<Record<string, unknown>> {
     },
     {
       ...base,
-      id: 'session-unavailable',
+      // The `sess_`+hex fallback the SDK uses outside a secure context.
+      id: 'sess_c47d90a1e6b25f38047ac1d9e83b6f52',
       started_at: '2026-07-22T18:59:00Z',
       last_chunk_at: null,
       status: 'analysis_failed',
