@@ -266,6 +266,35 @@ describe('IssuesList URL filters', () => {
     wrapper.unmount();
   });
 
+  // Regression: ISSUE-001 — sortable headers rendered sentence-case while TITLE
+  // stayed uppercase. base.css sets `font: inherit` on buttons, but the font
+  // shorthand does not carry text-transform or letter-spacing, so wrapping each
+  // label in a <button> for keyboard access silently handed those two back to
+  // the UA stylesheet. jsdom does not compute inherited text-transform either,
+  // so this asserts the classes rather than the computed style.
+  // Found by /qa on 2026-07-23
+  // Report: .gstack/qa-reports/qa-report-127-0-0-1-8099-2026-07-23.md
+  it('keeps sortable header buttons on the same type treatment as Title', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'Boom', 'javascript')]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    const headers = wrapper.findAll('thead th');
+    const titleHeader = headers[0]!;
+    expect(titleHeader.classes()).toEqual(expect.arrayContaining(['uppercase', 'tracking-[0.14em]']));
+
+    const buttons = headers.filter((th) => th.find('button').exists()).map((th) => th.get('button'));
+    expect(buttons).toHaveLength(5);
+    for (const button of buttons) {
+      expect(button.classes()).toEqual(expect.arrayContaining(['uppercase', 'tracking-[0.14em]']));
+    }
+
+    wrapper.unmount();
+  });
+
   it('renders a single-line Issues header and accessible compact filters', async () => {
     mocks.route.query = { project_id: 'p1' };
     window.history.replaceState({}, '', '/?project_id=p1');
