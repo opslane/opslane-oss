@@ -5,7 +5,7 @@ import { APIError, getAdminOverview, getHealth, listAdminJobs } from '../api';
 import { adminStatusBadgeClass, formatDuration, onboardingFunnelStages } from '../admin-format';
 import AdminHourlyChart from '../components/AdminHourlyChart.vue';
 import type { AdminJob, AdminJobStatus, AdminOverview, ErrorGroupStatus, HealthResponse } from '../types/api';
-import { formatDate, safeUrl } from '../utils';
+import { formatDate, GITHUB_PR_URL_OPTIONS, safeUrl } from '../utils';
 import Button from '../components/ui/Button.vue';
 
 const REFRESH_INTERVAL_MS = 60_000;
@@ -40,6 +40,11 @@ const onboardingFailureReasons = computed(() =>
   Object.entries(overview.value?.onboarding?.by_failure_reason ?? {}).sort((a, b) => b[1] - a[1]),
 );
 const healthChecks = computed(() => Object.entries(health.value?.checks ?? {}));
+const jobsWithLinks = computed(() => jobs.value.map((job) => ({
+  ...job,
+  traceHref: safeUrl(job.trace_url),
+  prHref: safeUrl(job.pr_url, GITHUB_PR_URL_OPTIONS),
+})));
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -294,7 +299,7 @@ onUnmounted(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="job in jobs" :key="job.id" class="border-b border-border align-top last:border-0">
+            <tr v-for="job in jobsWithLinks" :key="job.id" class="border-b border-border align-top last:border-0">
               <td class="whitespace-nowrap px-4 py-3 text-muted">{{ formatDate(job.created_at) }}</td>
               <td class="max-w-56 px-4 py-3">
                 <p class="truncate" v-text="job.project_name"></p>
@@ -313,22 +318,22 @@ onUnmounted(() => {
               </td>
               <td class="whitespace-nowrap px-4 py-3 text-right">
                 <a
-                  v-if="safeUrl(job.trace_url ?? undefined)"
-                  :href="safeUrl(job.trace_url ?? undefined)"
+                  v-if="job.traceHref"
+                  :href="job.traceHref"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="text-accent hover:underline"
                   aria-label="Open Langfuse trace"
                 >Trace ⧉</a>
                 <a
-                  v-if="safeUrl(job.pr_url ?? undefined)"
-                  :href="safeUrl(job.pr_url ?? undefined)"
+                  v-if="job.prHref"
+                  :href="job.prHref"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="ml-3 text-accent hover:underline"
                   aria-label="Open pull request"
                 >PR ⧉</a>
-                <span v-if="!safeUrl(job.trace_url ?? undefined) && !safeUrl(job.pr_url ?? undefined)" class="text-faint">—</span>
+                <span v-if="!job.traceHref && !job.prHref" class="text-faint">—</span>
               </td>
             </tr>
             <tr v-if="jobs.length === 0 && !loading">

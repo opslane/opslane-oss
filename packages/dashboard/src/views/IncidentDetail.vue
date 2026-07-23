@@ -3,7 +3,7 @@ import { computed, defineAsyncComponent, ref, onMounted, onUnmounted, watch } fr
 import { useRoute } from 'vue-router';
 import type { Incident, AffectedUser, SampleEvent } from '../types/api';
 import { APIError, getIncident, getSampleEvent, getReplay, listAffectedUsers, triggerFix, resolveIncident, archiveIncident, unarchiveIncident, type ReplayRecording } from '../api';
-import { getProjectId, safeUrl, formatDate, formatAbsolute } from '../utils';
+import { GITHUB_PR_URL_OPTIONS, getProjectId, safeUrl, formatDate, formatAbsolute } from '../utils';
 import { kindBadge, fixControlsVisible } from '../components/incident-kind';
 import EvidenceWell from '../components/evidence/EvidenceWell.vue';
 // rrweb is ~194 KB. Loading it eagerly put it in the entry chunk on every
@@ -24,6 +24,7 @@ import { incidentStatusRecipe } from '../status-recipes';
 const route = useRoute();
 const incidentId = route.params['id'] as string;
 const incident = ref<Incident | null>(null);
+const prHref = computed(() => safeUrl(incident.value?.pr_url, GITHUB_PR_URL_OPTIONS));
 const loading = ref(true);
 const error = ref<string | null>(null);
 const projectId = ref('');
@@ -403,7 +404,7 @@ onMounted(async () => {
 
         <!-- PR link -->
         <div
-          v-if="safeUrl(incident.pr_url)"
+          v-if="prHref"
           class="p-4 border border-l-2 rounded-lg"
           :class="incident.status === 'pr_draft'
             ? 'bg-warning/10 border-warning/20 border-l-warning'
@@ -419,12 +420,12 @@ onMounted(async () => {
             Opslane did not reach the ready-for-review evidence bar locally. Review the repository CI results before marking this PR ready.
           </p>
           <a
-            :href="safeUrl(incident.pr_url)"
+            :href="prHref"
             target="_blank"
             rel="noopener noreferrer"
             class="mt-1 inline-flex items-center font-medium hover:underline text-sm"
             :class="incident.status === 'pr_draft' ? 'text-warning' : 'text-success'"
-            v-text="incident.pr_url"
+            v-text="prHref"
           >
           </a>
         </div>
