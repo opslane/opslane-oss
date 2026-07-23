@@ -169,15 +169,38 @@ func (q *Queries) ProvisionProject(
 	if strings.TrimSpace(idempotencyToken) == "" {
 		return nil, fmt.Errorf("provision project: idempotency token is required")
 	}
-
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("provision project: begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
+	result, err := q.provisionProjectTx(ctx, tx, orgID, name, githubRepo, idempotencyToken)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("provision project: commit: %w", err)
+	}
+	return result, nil
+}
+
+// provisionProjectTx performs the project/environment/key mutation inside a
+// caller-owned transaction. Keeping this transaction body shared lets related
+// provisioning state changes commit under the same project row lock.
+func (q *Queries) provisionProjectTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	orgID, name string,
+	githubRepo *string,
+	idempotencyToken string,
+) (*ProjectProvisioning, error) {
+	if strings.TrimSpace(idempotencyToken) == "" {
+		return nil, fmt.Errorf("provision project: idempotency token is required")
+	}
+
 	var result ProjectProvisioning
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO projects (org_id, name, github_repo, idempotency_token)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (org_id, idempotency_token) WHERE idempotency_token IS NOT NULL
@@ -252,9 +275,6 @@ func (q *Queries) ProvisionProject(
 		return nil, fmt.Errorf("provision project: project scope changed before commit")
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("provision project: commit: %w", err)
-	}
 	return &result, nil
 }
 

@@ -2,396 +2,395 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Make GitHub App installation complete under `AUTH_PROVIDER=workos`, so agent
-onboarding can be activated without breaking web installs. The single gate on launching agent
-onboarding; the built P1 reporting flow is unreachable by a hosted user until this lands.
+**Goal:** Close the remaining gaps so agent onboarding can be activated: prove both install
+flows complete through the shared callback with a WorkOS-shaped provider, harden the
+assertions the shipped implementation is missing, produce skip-proof launch evidence, and
+make the activation runbook executable.
 
-**Architecture:** Design `docs/plans/2026-07-21-onboarding-unification-design.md` (iteration
-12), decisions D2/D3/D4/D11/D12/D19-Q3. `OAuthLoginCallback` (github_oauth.go:131) sends an
-install callback's **GitHub** code to `d.provider().ExchangeCode` (line 216); under WorkOS that
-provider cannot exchange it, so the flow dies silently. We move install handling **ahead** of
-the identity exchange with a dedicated GitHub exchange, make OAuth state reservable with an
-ownership token, bind the initiating user, share one exported install-persistence primitive,
-require admin, and — because P0's recovery was folded here — add the `installation_landed`
-audit table and its diagnosis. The App toggle flips **last**, via runbook.
+**Architecture:** The core P2 work — install callbacks exchanging their GitHub code with
+GitHub instead of the identity provider, one exported `PersistInstallation` primitive,
+token-guarded reservable OAuth state, admin-gated install routes, divergence diagnosis, and
+the inert Setup URL handler — **already shipped in commit `69e2c9a` (PR #175)**. This plan is
+now two things: (1) a verification ledger of that shipped work, and (2) the remaining
+phases: acceptance proof, assertion hardening, the launch-evidence gate, and the runbook
+rewrite. Design: `docs/plans/2026-07-21-onboarding-unification-design.md` (iteration 12),
+decisions D2/D3/D4/D11/D12/D19-Q3.
 
-**Tech Stack:** Go 1.24 + pgx, Postgres 16. All work in `packages/ingestion`.
+**Tech Stack:** Go 1.24 + pgx, Postgres 16. All code work in `packages/ingestion`.
 
-**Reviews:** two Codex rounds folded in (13 then 6 P1s; convergent).
-
----
-
-## Independence
-
-Entirely Go in `packages/ingestion`; P3 is TypeScript in `packages/agent-core`/`cli`. Zero file
-overlap — parallelizable. Only late coupling: P3's `onboard` command consumes the login-first
-provisioning this plan prepares.
+**Reviews:** four Codex rounds folded in. Rounds 1–2 shaped the original build plan; rounds
+3–4 (2026-07-22) audited HEAD `69e2c9a` task-by-task, converted the build phases into the
+ledger below, and corrected the remaining phases (skip-gate ordering, one-use authorization
+codes, tenant-safety of the diagnosis, activation mechanics).
 
 ---
 
-## Conventions
+## Status ledger at `69e2c9a` — shipped, do not rebuild
 
-- Handler tests are **`package handler`** (not `handler_test`) and use **`githubOAuthTestPool(t)`**
-  (github_oauth_test.go:387), not `testPool`. DB tests are `package db_test` with `testPool(t)`.
-  Run from `packages/ingestion`: `go build ./... && go test ./db ./handler`.
-- **Red tests must compile.** A test that names a not-yet-created method/type will not compile,
-  so it is not a valid red test. Two allowed patterns: (a) drive the fail-first with raw SQL or
-  existing public behavior; or (b) **first add a compiling stub** (method/type that returns a
-  `not implemented` error), commit nothing, write the red test against the stub (it fails at
-  runtime, compiles), then implement. Tasks A3 and C1 use pattern (b) — add the stubs in step 3's
-  file before the step 1 test.
-- Migrations append-only from the highest existing (**022**), reapplication-safe. Take the next
-  free number when writing each; the `scripts/check-migration-reapply.sh` gate now guards
-  replay-with-data.
-- Commit after every task. **Never flip the production App toggle from code or CI** (Phase G).
+Verified task-by-task against HEAD (Codex round 3, 2026-07-22). Line numbers are current.
+
+| Original task | Status | Evidence at HEAD |
+| --- | --- | --- |
+| A1 `installation_landed` table | Shipped | `db/migrations/023_installation_landed.sql`; `InsertInstallationLanded` (db/installations.go:77) |
+| A2 actor-bound install state | Shipped | `024_oauth_state_actor.sql`; wired in `GetGitHubAppStatus` (handler/github_oauth.go:738) |
+| A3 token-guarded reserve/finalize/release | Shipped | `025_oauth_state_reservations.sql`; `ReserveOAuthLoginState` (db/queries.go:2614) + lifecycle tests |
+| B1 dispatch on session state | Shipped | UUID dispatch at handler/github_oauth.go:135; denial regression in handler/github_install_callback_test.go:158 |
+| C1 exported `PersistInstallation` | Shipped | db/installations.go:26; all three mutating paths call it |
+| C2 GitHub exchange for install callbacks | Shipped | `gitHubInstallCallback` (handler/github_oauth.go:252); WorkOS spy test exists |
+| C3 reserve/finalize + actor match | Shipped | Validation → reserve → exchange → tx finalize+persist at handler/github_oauth.go:252-400 |
+| D1 org precedence | Shipped | Conflict handling inside `PersistInstallation` (db/installations.go:33) — correctly part of the primitive, not a later phase |
+| D2 admin on install routes | Shipped | `RequireRoleIfCloud("admin")` on `/github/setup` + `/github/status` (handler/routes.go:156-157) |
+| D3 divergence diagnosis | Shipped | handler/agent_setup.go:225-240; `TestAgentPollDiagnosesDivergentInstallWithoutMutation` |
+| F1 inert Setup URL handler | Shipped | Non-mutating `GitHubSetupCallback` (handler/github_oauth.go:707) |
+| G runbook file | Exists, not executable | `docs/runbooks/activate-agent-onboarding.md` — rewritten in Phase 4 |
+
+**Known-stale references from the original plan:** highest migration is now **025** (not
+022); handler callback tests live in **`github_install_callback_test.go`** (not
+`callback_test.go`); `GitHubSetupCallback` is at line ~707 (not 506). The dashboard
+"feature flag" is `AGENT_ONBOARDING_ENABLED` in `packages/dashboard/src/agent-onboarding.ts:8`
+— a **compile-time constant** flipped by a reviewed activation PR, deliberately not a
+runtime flag. Its test (`agent-onboarding.test.ts:29`) hard-asserts `false`, and the agent
+quickstart doc carries `draft: true` with its own assertion, so the activation PR touches
+all three — it is **not** a one-line diff.
 
 ---
 
-## Phase A — Audit table and reservable, actor-bound OAuth state
+## Conventions (remaining work)
 
-### Task A1: `installation_landed` audit table (P0 artifact, folded here)
+- Handler tests are **`package handler`** and use **`githubOAuthTestPool(t)`**
+  (github_oauth_test.go:419). DB tests are `package db_test` with `testPool(t)`. Run from
+  `packages/ingestion`.
+- **Skip-proof validation from the start.** Both test pools `t.Skip` when Postgres is
+  unreachable, so a bare green `go test` proves nothing. Every phase's Validate step uses
+  the existing CI recipe (ci.yml:171):
+  ```bash
+  go test ./db ./handler -v -count=1 2>&1 | tee /tmp/go-test.log
+  GO_MIN_TESTS=1 node ../../scripts/check-go-skips.mjs /tmp/go-test.log
+  ```
+  `check-go-skips.mjs` fails on any unexpected skip. Do **not** invent a new gate flag —
+  this script already exists and CI already runs it.
+- **Red tests must compile.** Where a task's test is expected to pass immediately
+  (characterization of shipped behavior), it must instead carry a **mutation check**:
+  temporarily break the code under test, confirm the test fails, revert. A test that can't
+  be made to fail proves nothing.
+- Migrations append-only from **025**; none of the remaining phases need one.
+- Commit after every task. `AGENT_ONBOARDING_ENABLED` and the GitHub App OAuth toggle are
+  flipped **only** via Phase 4's runbook — the constant through a reviewed activation PR
+  deployed by normal CI, the App toggle by a human in GitHub App settings. No ad-hoc
+  automation flips either.
 
-**Files:** new migration `0NN_installation_landed.sql`; test in `db`.
+---
 
-> It does **not** exist yet (only `github_app_installations`, 001_baseline.sql:342). D1 and the
-> diagnosis depend on it, so it comes first.
+## Phase 1 — Close the acceptance gap: agent flow through the shared callback
 
-**Step 1:** Failing test inserts a landed row and reads it back (raw SQL, so it compiles).
+> **Phase deliverable:** An acceptance test in which the **agent flow enters through
+> `OAuthLoginCallback`** — the shared handler behind `/auth/callback` and
+> `/auth/github/callback` (routes.go:57-58), which is what GitHub actually calls once
+> OAuth-during-install is enabled — not by invoking `AgentAuthCallback` directly. Today's
+> test (agent_callback_integration_test.go:165) bypasses the dispatch under test, so a
+> dispatch regression would ship green.
+> **Validate:** the new test passes under the skip-proof recipe, and the mutation check
+> (break the UUID dispatch at github_oauth.go:135) makes it fail.
 
-**Step 2:** `go test ./db -run InstallationLanded -v` → FAIL (relation missing).
+### Task 1.1: Successful agent install via `OAuthLoginCallback`
 
-**Step 3:** Migration:
-```sql
-CREATE TABLE IF NOT EXISTS installation_landed (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  installation_id BIGINT NOT NULL,
-  org_id UUID REFERENCES orgs(id),
-  repos TEXT[] NOT NULL DEFAULT '{}',
-  landed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_installation_landed_at ON installation_landed(landed_at DESC);
+**Files:** `packages/ingestion/handler/agent_callback_integration_test.go` (extend);
+dispatch under test at `packages/ingestion/handler/github_oauth.go:131-140`.
+
+**Step 1:** The existing fixture (stub GitHub server, `recordingProvider` spy,
+`createCallbackSession`) is a closure inside one test, not reusable — **extract it into a
+helper** (with tenant cleanup) or parameterize the existing `callback` closure with the
+entrypoint. Then write `TestAgentInstallCompletesThroughSharedCallback`, building the
+request as GitHub sends it and handing it to the **shared** entrypoint:
+
+```go
+req := httptest.NewRequest(http.MethodGet, fmt.Sprintf(
+    "/auth/callback?state=%s&installation_id=%d&setup_action=install&code=x",
+    session.ID, installationID), nil)
+w := httptest.NewRecorder()
+deps.OAuthLoginCallback(w, req) // NOT AgentAuthCallback
 ```
-Add an exported `InsertInstallationLanded(ctx/tx, …)` helper.
 
-**Step 4:** Apply twice for idempotency; test → PASS. **Step 5: Commit** —
-`feat(ingestion): installation_landed audit table`
+Assert the **exact** post-callback state: HTTP 200 with the "Done!" body; the session's
+exact post-callback status (read it from `GetAgentSession` — do not assume `provisioned`
+is terminal) with non-null org, project, sealed key, and installation fields; an
+`installation_landed` audit row; and **zero** `ExchangeCode` calls recorded by the spy.
+Name it precisely: this is a **WorkOS-shaped injected provider** (the spy), not
+`AUTH_PROVIDER=workos` boot-time selection — don't claim the env var is exercised.
 
-### Task A2: `initiating_user_id` on install OAuth state, wired at creation
+**Step 2:** Run under the skip-proof recipe → PASS expected (the dispatch shipped).
+**Mutation check:** invert the UUID check at github_oauth.go:135, rerun → must FAIL,
+revert. If it doesn't fail, the test isn't exercising the dispatch — fix the test.
 
-**Files:** migration `0NN_oauth_state_actor.sql`; `db/queries.go` (`StoreOAuthLoginStateForOrg`
-~2568 and the `OAuthLoginState` struct); `github_oauth.go:574` (the install-state creator);
-tests in `db` and `handler`.
-
-**Step 1:** Failing test: after `GetGitHubAppStatus` mints an install state, the row carries
-the **authenticated user's** id. (Ordinary login states — the non-install path — must stay
-actorless; assert that too.)
-
-**Step 2:** Run → FAIL (only `orgID` is stored today).
-
-**Step 3:** Add `ADD COLUMN IF NOT EXISTS initiating_user_id UUID REFERENCES users(id)`. Extend
-`StoreOAuthLoginStateForOrg` to accept and store it, and pass `UserIDFromCtx(r.Context())` at
-github_oauth.go:574. Do **not** set it on the ordinary login-state insert.
-
-**Step 4:** `go test ./db ./handler` → PASS. **Step 5: Commit** —
-`feat(ingestion): bind initiating user to install oauth state`
-
-### Task A3: Reserve / finalize / release with an ownership token
-
-**Files:** migration adding `reserved_at TIMESTAMPTZ` + `reservation_token UUID`;
-`db/queries.go` near `ConsumeOAuthLoginStateDetails` (2587); test in `db`.
-
-> A bare `reserved_at` is race-unsafe: after lease expiry, a stale request could
-> finalize/release a newer reservation. Reserve returns a **token**; finalize/release require
-> the matching token.
-
-**Step 1:** Failing tests (raw SQL to set up, public methods under test):
-- `ReserveOAuthLoginState(hash)` → returns context (`target_org_id`, `initiating_user_id`) **and
-  a `reservation_token`**; a second reserve within the lease returns "in flight".
-- `FinalizeOAuthLoginState(hash, token)` consumes only when the token matches; wrong/expired
-  token → no-op error.
-- `ReleaseOAuthLoginState(hash, token)` clears the lease only for the matching token.
-- After the lease TTL, a fresh reserve succeeds and issues a **new** token, invalidating the old.
-
-**Step 2:** Run → FAIL.
-
-**Step 3:** Implement as compare-and-set updates keyed on `(state_hash, reservation_token)`.
-Keep `ConsumeOAuthLoginStateDetails` intact — callers switch in Task C3. **Lease TTL: 2
-minutes** (long enough for a GitHub exchange, short enough to recover a crash).
-
-**Step 4:** `go test ./db` → PASS. **Step 5: Commit** —
-`feat(ingestion): token-guarded reservable oauth login state`
+**Step 3:** No production change expected. **Step 4:** Skip-proof recipe green.
+**Step 5: Commit** — `test(ingestion): agent install completes through the shared oauth callback`
 
 ---
 
-## Phase B — Dispatch on the session before requiring success params
+## Phase 2 — Harden the shipped assertions
 
-### Task B1: Recognize the agent session from `state` alone; make `authorization_denied` reachable
+> **Phase deliverable:** The coverage gaps Codex found are closed, plus three small
+> production fixes: client-secret config guards, detached reservation release, and
+> rollback-before-release ordering on persistence failure. Tasks are sequenced so 2.4
+> builds on 2.3's detached release. Each task is independently committable.
+> **Validate:** skip-proof recipe green after each task; production changes carry
+> red-first tests; characterization tests carry mutation checks.
 
-**Files:** `github_oauth.go` dispatch block (131-143); `agent_setup.go` (`AgentAuthCallback`,
-denial handling); test in `callback_test.go` (`package handler`, `githubOAuthTestPool`).
+### Task 2.1: A3 takeover invalidates the old token for finalize AND release
 
-**Step 1:** Failing test: a callback with UUID `state`, `error=access_denied`, and **no**
-`installation_id` drives the matching pending session to `authorization_denied` (today it falls
-through to the login path and hangs — the guard at :135 requires `installation_id`).
+**Files:** the reservation lifecycle tests in `packages/ingestion/db`.
 
-**Step 2:** `go test ./handler -run AuthorizationDenied -v` → FAIL.
+**Step 1:** Extend the expired-lease test: reserve, force-expire (raw SQL backdating
+`reserved_at`), reserve again (new token). Assert the **old** token fails
+`FinalizeOAuthLoginState` **and** fails `ReleaseOAuthLoginState`, and the state stays
+leased to the new token.
 
-**Step 3:** Parse `state` first: a UUID naming a pending agent session routes to the agent
-handler **regardless of** `installation_id`/`error`. The agent handler maps `error=access_denied`
-→ `authorization_denied` (definitive, terminal); a missing code with no error stays pending
-(transient — preserve the "cheap unauthenticated requests never kill a session" rule). **This
-UUID/agent path is intentionally session-authenticated only; do not add the browser actor-match
-that Task C3 adds to the web path.**
+**Step 2:** Run → PASS expected (compare-and-set on `(state_hash, reservation_token)`).
+Mutation check: drop the token predicate from the release query, confirm FAIL, revert.
+If it fails unmutated, fix `db/queries.go`.
 
-**Step 4:** `go test ./handler` → PASS. **Step 5: Commit** —
-`fix(ingestion): dispatch github callback on session state before install params`
+**Step 3–4:** Skip-proof recipe green. **Step 5: Commit** —
+`test(ingestion): stale reservation token cannot finalize or release after takeover`
 
----
+### Task 2.2: Config guards include the client secret — both branches
 
-## Phase C — The B1 fix: exchange the GitHub code with GitHub, and persist through one primitive
+**Files:** `packages/ingestion/handler/github_oauth.go` (web install branch guard) **and**
+`packages/ingestion/handler/agent_setup.go` (`AgentAuthCallback`'s guard — it has the same
+omission); tests in `github_install_callback_test.go`.
 
-Ordering note: **D-work (the shared primitive) comes before the exchange rewrite**, because C's
-new install branch must persist through it.
+**Step 1:** Red tests: deps with `GitHubAppClientSecret: ""` on (a) an install-shaped web
+callback and (b) an agent callback → expect a clear "misconfigured" 500-class error, not a
+confusing 502 from a doomed GitHub exchange.
 
-### Task C1: Exported `persistInstallation` primitive, all three paths through it (D12)
+**Step 2:** Run → FAIL (secret unchecked today). **Step 3:** Add the secret to both guards.
 
-**Files:** `db/agent_provision.go` (the tx at 45, install insert at 213); `github_oauth.go:472`
-and `:540` (the two `SetOrgGitHubInstallation` callers); test in `db`.
+**Step 4:** Skip-proof recipe green. **Step 5: Commit** —
+`fix(ingestion): fail fast when the github client secret is missing`
 
-**Step 1:** Failing test: an **exported** `PersistInstallation(ctx, tx, params)` writes the
-installation and an `installation_landed` audit row **inside one transaction**. (Exported so
-`package handler` and `db_test` can call it — a lowercase `db.persistInstallation` cannot be.)
+### Task 2.3: Reservation release survives request cancellation
 
-**Step 2:** Run → FAIL.
+**Files:** `packages/ingestion/handler/github_oauth.go:326` (release call); test in
+`github_install_callback_test.go`.
 
-**Step 3:** Define `PersistInstallationParams` covering **both** shapes: agent provisioning
-writes rich `github_app_installations` metadata (org name, repos), the web/setup paths today
-only update `orgs.github_installation_id`. The primitive writes the rich table **and** keeps the
-legacy `orgs` column in sync, plus the audit row. Agent provisioning keeps its single large
-transaction (begins at agent_provision.go:45; do not break its atomicity); the web/setup callers wrap it in their own tx.
+**Step 1:** Red test: cancel the request context before the transient-failure release path
+runs → assert the reservation is still released (a fresh reserve succeeds immediately, no
+2-minute lockout).
 
-**Step 4:** `go test ./db ./handler` → PASS. **Step 5: Commit** —
-`refactor(ingestion): one exported transaction-aware installation persistence`
+**Step 2:** Run → FAIL (release uses `r.Context()`, already canceled).
 
-### Task C2: Install branch ahead of `provider().ExchangeCode`, dedicated GitHub exchange
+**Step 3:** Release with a detached, **bounded** context — bare `WithoutCancel` can hang:
 
-**Files:** `github_oauth.go` (`OAuthLoginCallback` install detection ~133-192, exchange at 216,
-web branch `applyCombinedGitHubInstallation` ~425-472); reuse `gh.ExchangeOAuthCode`
-(agent_setup.go:353); test in `handler`.
+```go
+releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+defer cancel()
+```
 
-> **This task carries the E-gate regression test** (moved here from a separate phase, because a
-> pre-C checkout would not contain the test). Write the WorkOS test in this task and require it
-> to demonstrate a *behavioral* failure (the WorkOS provider's `ExchangeCode` invoked with the
-> GitHub code) on the code **before** step 3, captured by asserting on a spy provider — not a
-> compile error.
+**Step 4:** Skip-proof recipe green. **Step 5: Commit** —
+`fix(ingestion): release oauth reservation even when the request is canceled`
 
-**Step 1:** Failing test, `AUTH_PROVIDER=workos` with a **spy provider**: an install-shaped
-browser callback (HMAC `state` + `installation_id` + `setup_action=install` + `code`) must
-complete without the spy's `ExchangeCode` ever being called with the GitHub code. Assert the
-spy records **zero** GitHub-code exchanges.
+### Task 2.4: Transient-failure recovery and finalize/persist atomicity (builds on 2.3)
 
-**Step 2:** `go test ./handler -run WorkosInstallCallback -v` → FAIL: the spy records the GitHub
-code going into WorkOS (today's behavior).
+**Files:** `packages/ingestion/handler/github_oauth.go` (web branch failure paths),
+`github_install_callback_test.go`.
 
-**Step 3:** When the callback is install-shaped, branch **before** `d.provider().ExchangeCode`:
-exchange `code` via `gh.ExchangeOAuthCode(...)`, run the existing user↔installation ownership
-binding (`ListUserInstallations`), then persist via `PersistInstallation`. **Correction:** the
-web flow has **no requested repository**, so it does **not** get `AgentAuthCallback`'s repo-grant
-check — that check is specific to the agent flow's known repo. Web-branch verification is app
-verification + ownership binding only, matching current `applyCombinedGitHubInstallation`.
+> GitHub authorization codes are **one-use**. A "retry" is the user traversing the same
+> install link again, which produces a **fresh code** with the **same state**. Do not
+> write a test that replays the same code and call it proof — a permissive stub would
+> pass while production fails.
 
-**Step 4:** `go test ./handler ./db` → PASS. **Step 5: Commit** —
-`fix(ingestion): exchange install callbacks with github, not the identity provider`
+**Step 1:** Two tests. (a) **Exchange fails before the code is consumed** (GitHub token
+endpoint 500s): assert the reservation is released, `__auth_state` is preserved, and a
+second callback with the **same state + a fresh code** against a healthy stub completes
+and persists. (b) **Persistence failure atomicity:** seed a conflicting installation→org
+mapping so `PersistInstallation` errors inside the tx → assert the state row is **not**
+consumed (finalize rolled back with it) and the reservation is released so the flow is
+retryable.
 
-### Task C3: Web branch on reserve/finalize + actor match, retry-safe
+**Step 2:** Run → (b) likely exposes a real ordering bug: the reservation lives outside
+the tx, so on persistence failure the handler must **roll back the tx first, then release
+via 2.3's detached context** — releasing before rollback can block on the transaction's
+row lock.
 
-**Files:** `github_oauth.go` (web branch, and the `__auth_state` cookie clear at 171);
-`callback_test.go`.
+**Step 3:** Fix the ordering if (b) fails. **Step 4:** Skip-proof recipe green.
+**Step 5: Commit** — `fix(ingestion): install callback recovers cleanly from transient and persistence failures`
 
-> Three review corrections: (a) `/auth/callback` is unauthenticated middleware-wise
-> (routes.go:57), so the actor match is **branch-local**. **Two different cookies:** validate
-> the CSRF nonce `__auth_state`, but resolve the **session user** from the access cookie
-> **`AccessCookieName` (`__opslane_at`)** — `__auth_state` holds only the nonce. Require the
-> resolved user equals the reserved state's `initiating_user_id`, and do a **fresh admin
-> membership lookup** for the reserved target org. (b) The handler **deletes `__auth_state`
-> before** the exchange (line 171); on a transient failure it must be **preserved** and the
-> reservation **released**. (c) Validate both cookies **before** reserving the state.
+### Task 2.5: Tighten four weak assertions
 
-**Step 1:** Failing tests: a transient GitHub failure mid-install **releases** the reservation
-**and preserves `__auth_state`**, so the same link retries; a mismatched actor is rejected; a
-non-admin actor for the reserved org is rejected (403).
+**Files:** `packages/ingestion/handler/github_install_callback_test.go`,
+`packages/ingestion/db` tests.
 
-**Step 2:** Run → FAIL.
+One commit, four edits — assert **endpoint-exact** results, not absence of failure:
 
-**Step 3:** In the web branch, in order: **validate `__auth_state` + `__opslane_at` and the
-actor/admin first**, then `ReserveOAuthLoginState` (returns token) → `gh.ExchangeOAuthCode` and
-the ownership binding (external calls) → then in **one DB transaction**
-`FinalizeOAuthLoginState(hash, token)` **and** `PersistInstallation(tx, …)`, so a stale/expired
-reservation cannot mutate installation data (finalize rejects the token in the same tx that
-would persist), and a persistence failure rolls back the finalize. On transient GitHub failure
-`ReleaseOAuthLoginState(hash, token)` and **keep** the cookie. None of this applies to the UUID
-agent path (B1).
+- **D1 handler-level conflict:** web callback whose reserved target org conflicts with an
+  existing mapping → assert the specific 409 response.
+- **D2 admin success:** `/github/setup` returns its intentional **302** redirect;
+  `/github/status` returns **200** (today "not 401/403" lets a 500 pass).
+- **F1 zero writes:** the setup-callback test asserts no rows in
+  `github_app_installations` **and** `installation_landed` (today only
+  `orgs.github_installation_id`).
+- **A1 direct coverage:** a `db_test` exercising `InsertInstallationLanded` directly.
 
-**Step 4:** `go test ./handler ./db` → PASS. **Step 5: Commit** —
-`fix(ingestion): retry-safe, actor-bound web install callback`
+**Steps:** mutation-check each, skip-proof recipe green.
+**Commit** — `test(ingestion): tighten install-path assertions`
 
----
+### Task 2.6: D3 diagnosis proven end-to-end — and kept tenant-safe
 
-## Phase D — Org precedence, admin, and divergence diagnosis
+**Files:** `github_install_callback_test.go`; `handler/agent_setup.go:225-240` unchanged
+in content.
 
-### Task D1: Enforce Q3 org precedence
+> **Tenant-safety constraint (do the opposite of the earlier draft):** agent sessions are
+> unauthenticated and accept arbitrary `owner/repo`; a poll token proves no membership.
+> The diagnosis must **not** name the landing org or installation — that is a
+> cross-tenant information leak. Keep the message generic recovery guidance.
 
-**Files:** `agent_provision.go:139` (mapping-first); `github_oauth.go:461` (web active-org
-target); consider legacy `orgs.github_installation_id`; test in `db`.
+**Step 1:** End-to-end test with **no hand-seeded rows**: drive a real web install through
+`gitHubInstallCallback` for the session's repo, then poll the agent session → the generic
+diagnosis appears. Add a negative assertion: the poll response contains no org name or
+installation id from the other tenant.
 
-**Step 1:** Failing test: an installation already mapped to org A + a web session passing
-`target_org_id = B` → **rejected with a specific reason**, not re-homed. Agent sessions with no
-target still use the GitHub home org. Legacy `orgs.github_installation_id` mappings participate
-in precedence (assert an org that owns the install via the legacy column also wins).
+**Step 2:** Run; mutation check by disabling the `installation_landed` lookup.
 
-**Step 2:** Run → FAIL.
-
-**Step 3:** Enforce: existing installation→org mapping (rich table **or** legacy column) wins; a
-conflicting explicit target fails loudly.
-
-**Step 4:** `go test ./db` → PASS. **Step 5: Commit** —
-`feat(ingestion): enforce installation org precedence`
-
-### Task D2: Admin on the install routes; callback-time revalidation
-
-**Files:** `routes.go` — the **actual** routes are `/github/setup` (156) and `/github/status`
-(157); there is **no** "relink route" (CLI relink uses existing project/environment key APIs).
-Test in `handler`.
-
-**Step 1:** Failing test: a non-admin member on `/github/setup` and `/github/status` → 403; admin
-→ ok. Follow the admin-middleware pattern (routes.go:103), but use `RequireRoleIfCloud`.
-
-**Step 2:** Run → FAIL (routes require auth but no role).
-
-**Step 3:** Add **`RequireRoleIfCloud("admin")`** — **not** `RequireRole("admin")`, which
-returns 404 whenever cloud auth is disabled (auth.go:294-299) and would break these routes for
-OSS/GitHub-auth deployments. `RequireRoleIfCloud` enforces the role only under cloud auth. The C3
-web callback already does a fresh admin lookup for the reserved org; reference that, don't
-duplicate.
-
-**Step 4:** `go test ./handler` → PASS. **Step 5: Commit** —
-`feat(ingestion): require org admin for github install routes`
-
-### Task D3: Divergence diagnosis on the agent poll (P0, folded here)
-
-**Files:** `agent_setup.go` (`AgentPoll`); the install paths write `installation_landed` via
-`PersistInstallation` (already, from C1); test in `handler`.
-
-**Step 1:** Failing test: a pending agent session whose repo appears in a recent
-`installation_landed` row gets a `diagnosis` explaining an install landed elsewhere and naming
-recovery. **Read-only** — no session mutation (auto-attach by repo was the API-key theft vector).
-
-**Step 2:** Run → FAIL.
-
-**Step 3:** Populate `diagnosis` from a read-only `installation_landed` lookup keyed on the
-session's repo, returned only to the poll-token holder.
-
-> **Prerequisite for real diagnosis (fold into C1/C2):** web/setup installs have no requested
-> repo, so unless we fetch the installation's **granted repositories** and store them in
-> `installation_landed.repos`, that column is empty and a real divergent web install is
-> undiagnosable — the test would pass on a hand-seeded row while production stays broken. The
-> install branch must call `ListInstallationRepos` (already used by the agent flow) and pass the
-> repo list to `PersistInstallation`, **without** enforcing an agent-style repo-grant check.
-
-**Step 4:** `go test ./handler` → PASS. **Step 5: Commit** —
-`feat(ingestion): explain divergent installs on the agent poll`
+**Step 3–4:** Skip-proof recipe green. **Step 5: Commit** —
+`test(ingestion): divergence diagnosis proven end-to-end and tenant-safe`
 
 ---
 
-## Phase E — Prove it under WorkOS
+## Phase 3 — Launch evidence: the full gate, skip-proof, on a disposable DB
 
-### Task E1: Both flows complete under `AUTH_PROVIDER=workos`
+> **Phase deliverable:** A recorded transcript proving the full gate ran with **zero
+> silent skips** against a disposable Postgres, tied to a commit SHA and CI run. This is
+> the launch-gate proof; commands alone are not evidence.
+> **Validate:** the transcript below shows verbose `-count=1` output piped through
+> `scripts/check-go-skips.mjs` (the CI recipe), the migration-reapply check, and the
+> repo-wide gate, all against the named SHA.
 
-**Files:** extend `agent_callback_integration_test.go` or add `workos_install_integration_test.go`
-(`package handler`, `githubOAuthTestPool`).
+### Task 3.1: Disposable Postgres procedure (explicit — no shared 5434)
 
-**Step 1:** One integration test, `AUTH_PROVIDER=workos`, driving **both** the agent (UUID) and
-web (HMAC) installs end to end — agent to a provisioned project+key, web to a stored
-installation — asserting (via the spy provider) neither routes a GitHub code through WorkOS and
-both persist via `PersistInstallation` with an audit row.
-
-**Step 2:** Run on the completed Phases A–D → PASS. (The *behavioral* pre-fix failure is already
-locked by the C2 spy test; this is the full-flow acceptance.)
-
-**Step 3:** Full gate `go build ./... && go test ./...`; apply migrations to a disposable DB and
-run `scripts/check-migration-reapply.sh`.
-
-**Step 4:** Record the transcript here. **Step 5: Commit** —
-`test(ingestion): workos install completes for both agent and web flows`
-
----
-
-## Phase F — Convert the Setup URL handler (code)
-
-### Task F1: `GitHubSetupCallback` becomes non-mutating
-
-**Files:** `github_oauth.go:506` (`GitHubSetupCallback` — note it is defined at **506**, not
-504); test in `handler`.
-
-> Split out from the runbook per review: this is **tested code**, not documentation. After the
-> toggle is enabled (Phase G) this handler can no longer receive a usable callback, so it must
-> stop mutating.
-
-**Step 1:** Failing test: `GitHubSetupCallback` performs **no** installation write and returns a
-landing response (explain + redirect to the dashboard).
-
-**Step 2:** Run → FAIL (it still writes today).
-
-**Step 3:** Replace its mutation with a non-mutating landing response. Leave it deletable a
-release later.
-
-**Step 4:** `go test ./handler` → PASS. **Step 5: Commit** —
-`refactor(ingestion): setup-url callback becomes a non-mutating landing page`
-
----
-
-## Phase G — Activation runbook (human step, not code)
-
-Create `docs/runbooks/activate-agent-onboarding.md`. Ordered, reversible, and explicit that two
-independent toggles exist with **separate** rollbacks:
-
-1. Confirm Phase E green on the deployed build, and Task F1 shipped.
-2. **GitHub App toggle:** enable "Request user authorization (OAuth) during installation."
-   Routes every install to the shared callback and disables the Setup URL — safe now (Phase C
-   handles it under WorkOS, F1 made the old handler inert). **Rollback: disable the toggle.**
-3. **Product feature flag:** un-draft `docs/quickstart/agent.md` / flip the agent-onboarding
-   flag. **Rollback: re-draft / re-flip.**
-4. Note which toggle changes which behavior; never flip either from CI.
-
-**Commit** — `docs: activation runbook for agent onboarding`
-
----
-
-## Before merge
+**Step 1:** Stand up a throwaway instance; the migration tests create child databases, so
+the role needs `CREATEDB`:
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm -r build
-(cd packages/ingestion && go build ./... && go test ./...)
-docker compose config --quiet
+docker run -d --name p2-gate-pg -e POSTGRES_USER=opslane -e POSTGRES_PASSWORD=opslane_dev \
+  -e POSTGRES_DB=opslane -p 55440:5432 postgres:16
+trap 'docker rm -f p2-gate-pg' EXIT
+export DATABASE_URL="postgres://opslane:opslane_dev@localhost:55440/opslane?sslmode=disable"
+docker exec p2-gate-pg psql -U opslane -c 'ALTER ROLE opslane CREATEDB;'
 ```
-Apply the new migrations to a disposable DB and run `scripts/check-migration-reapply.sh`.
 
-**Acceptance criteria:**
-1. The C2 spy test shows a WorkOS-exchange **behavioral** failure on pre-fix code and passes
-   after; E1 completes both flows under WorkOS.
-2. No install path calls `d.provider().ExchangeCode` with a GitHub code.
-3. `authorization_denied` reachable (B1).
-4. All three install paths persist through exported `PersistInstallation` with the audit row.
-5. `/github/setup` and `/github/status` require admin.
-6. Reserve/finalize/release is token-guarded; transient failure preserves `__auth_state` and
-   releases the reservation.
-7. The toggle flip exists only in the runbook.
+**Step 2:** Apply all migrations, then `scripts/check-migration-reapply.sh` against this
+instance. Never point any of this at the retained 5434 dev database.
+
+### Task 3.2: Run and record the full gate
+
+**Step 1:** From `packages/ingestion`, the CI recipe — verbose, uncached, skip-checked
+(mirror ci.yml, including its `GO_ALLOWED_SKIP_PATTERN` for suites needing MinIO, or run
+MinIO too):
+
+```bash
+go build ./...
+go test ./... -v -count=1 2>&1 | tee /tmp/go-test.log
+node ../../scripts/check-go-skips.mjs /tmp/go-test.log
+```
+
+**Step 2:** Repo-wide gate: `pnpm install --frozen-lockfile && pnpm -r build && pnpm test`,
+`docker compose config --quiet`.
+
+**Step 3:** Record in this section: the commit SHA, the CI run URL for that SHA, and the
+tails of each command's output. Evidence must be attributable — a pasted tail with no SHA
+is stale the moment the branch moves.
+
+**Step 4: Commit** — `test(ingestion): record the launch-gate transcript`
+
+**Transcript:** _(recorded when Phase 3 runs; must name the SHA and CI run)_
+
+---
+
+## Phase 4 — Rewrite the activation runbook around the real mechanism
+
+> **Phase deliverable:** `docs/runbooks/activate-agent-onboarding.md` rewritten so a named
+> human can execute it. Activation is (a) the GitHub App "Request user authorization
+> (OAuth) during installation" toggle and (b) a reviewed **activation PR** — which flips
+> `AGENT_ONBOARDING_ENABLED` (agent-onboarding.ts:8), updates the hard-coded `false`
+> assertion (agent-onboarding.test.ts:29), and un-drafts the agent quickstart doc (its
+> `draft: true` flag plus that draft's assertion). Deployed by normal CI after review —
+> never ad-hoc automation.
+> **Validate:** doc review against Task 4.1's checklist — every step has an owner role, an
+> exact precondition, an exact artifact (toggle name / file+line / URL), a verification
+> probe that exists (no fictional log queries), and an honest rollback; rollbacks run in
+> reverse order (UI exposure off before docs unpublish).
+
+### Task 4.1: The rewrite
+
+**Files:** `docs/runbooks/activate-agent-onboarding.md`.
+
+Required ordered steps, each with owner, precondition, verification, rollback:
+
+0. **App prerequisites:** the GitHub App's callback URL includes
+   `/auth/github/callback` (routes.go:58) and the App has Account permission
+   **"Email addresses: Read-only"**. Verify in App settings before anything else.
+1. **Precondition gate:** Phase 3 transcript green for the deployed SHA; CLI on npm —
+   verify the **exact version** on the `latest` dist-tag and run a real
+   `npx -y @opslane/cli@latest` smoke, not just registry existence.
+2. **Publish docs:** `docs.opslane.com/agent.md` live. Verify **content** (fetch and check
+   it contains the setup command), not just HTTP 200. Rollback: unpublish — but only
+   after step 4's rollback (reverse order), since the dashboard prompt tells agents to
+   fetch this file.
+3. **GitHub App toggle:** enable "Request user authorization (OAuth) during installation"
+   (owner: App admin). Verify: a fresh production install lands on the shared callback and
+   completes; positive signal is `installation_landed` rows advancing. **Rollback honesty:
+   disabling the toggle is a degraded emergency stop, not a clean rollback** — it restores
+   the Setup URL path, whose handler is intentionally inert (F1), so new installs stop
+   persisting until the toggle is re-enabled or a compatible code rollback ships. Say so
+   in the runbook.
+4. **Activation PR:** the three-file diff above, authored and merged by a named engineer,
+   deployed through normal CI. Rollback: revert PR (this is the clean rollback lever).
+5. **Post-activation probe:** run the quickstart on a clean repo against production;
+   confirm session → provisioned and the dashboard card renders. If deeper production
+   assurance is wanted (e.g. "no GitHub codes ever reach the identity provider"), add an
+   explicit metric first — do not claim log evidence that isn't emitted.
+
+**Commit** — `docs: executable activation runbook for agent onboarding`
+
+---
+
+## Acceptance criteria (remaining)
+
+1. The agent flow completes through `OAuthLoginCallback` with a WorkOS-shaped spy
+   provider recording zero code exchanges — and the mutation check proves the test fails
+   when the UUID dispatch breaks (Phase 1).
+2. Config guards cover the client secret in both callback branches; reservation release is
+   detached and bounded; persistence failure rolls back finalize **then** releases; the
+   same-state/fresh-code retry path is proven (Phase 2).
+3. The diagnosis is proven end-to-end without seeded rows and leaks no tenant
+   information (Task 2.6).
+4. The launch transcript shows the CI skip-check recipe passing against a disposable DB,
+   tied to a SHA and CI run (Phase 3).
+5. The runbook names the real activation mechanisms with owners, existing probes, and
+   honest rollbacks in reverse order (Phase 4).
 
 ---
 
 ## What this unblocks
 
-A hosted (WorkOS) user can complete GitHub authorization, making the built P1 reporting flow
-reachable end to end. Agent onboarding can be activated; P3's `onboard` experience integrates
-against a working callback.
+A hosted user can complete GitHub authorization with recorded, attributable proof, making
+the P1 reporting flow reachable end to end. Agent onboarding can be activated by executing
+the Phase 4 runbook; P3's `onboard` experience integrates against a verified callback.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| Codex Review | `/codex review` | Independent 2nd opinion | 2 | CLEAR (all findings folded in) | R3: 9 P1 + 9 P2; R4: 14 P1 + 8 P2 — all addressed in this revision |
+
+**CODEX:** Round 3 established the plan was stale (phases A–D/F already shipped at
+`69e2c9a`) and drove the ledger restructure; round 4 corrected the remaining phases:
+reuse `check-go-skips.mjs` instead of a new gate flag, one-use authorization-code retry
+semantics, rollback-before-release ordering, endpoint-exact assertions, tenant-safe
+diagnosis, and executable activation mechanics with honest rollbacks.
+
+**VERDICT:** CODEX CLEARED — both review rounds' findings are incorporated; the plan is
+ready to execute (eng review not run in this session).
+
+NO UNRESOLVED DECISIONS

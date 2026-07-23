@@ -110,6 +110,7 @@ func NewRouterWithPool(deps *Dependencies, pool *pgxpool.Pool) *chi.Mux {
 		r.With(deps.AuthenticateUserSession, deps.RequireAdmin).Get("/admin/jobs", deps.AdminJobs)
 
 		// Onboarding
+		r.With(deps.AuthenticateUserSession).Post("/onboard/provision", deps.OnboardProvision)
 		r.With(deps.AuthenticateUserSession, deps.RequireRoleIfCloud("admin")).Post("/onboarding/setup", deps.OnboardingSetup)
 
 		// Project CRUD
