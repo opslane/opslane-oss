@@ -26,9 +26,6 @@ const emit = defineEmits<{
       >
         <span class="font-mono text-sm font-semibold uppercase tracking-[0.18em]">Opslane</span>
       </router-link>
-      <p class="mt-1 font-mono text-[0.6875rem] uppercase tracking-[0.12em] text-faint">
-        Incident ledger
-      </p>
     </div>
 
     <div class="border-b border-border px-4 py-4">

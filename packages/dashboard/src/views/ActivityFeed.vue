@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted } from 'vue';
 import type { Incident, IncidentFilters, ErrorGroupStatus } from '../types/api';
 import { listIncidents } from '../api';
 import { getProjectId } from '../utils';
@@ -17,6 +17,7 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const projectId = ref('');
 const currentFilters = ref<IncidentFilters>({});
+const filterBar = ref<InstanceType<typeof FilterBar> | null>(null);
 let fetchGeneration = 0;
 
 const statusOrder: Record<ErrorGroupStatus, number> = {
@@ -36,18 +37,32 @@ const statusOrder: Record<ErrorGroupStatus, number> = {
   archived: 10,
 };
 
-type SortKey = 'last_seen' | 'occurrences' | 'users' | 'status';
+type SortKey = 'last_seen' | 'occurrences' | 'users' | 'status' | 'age';
 
-const { sorted: sortedIncidents, toggleSort, sortIndicator } = useTableSort<SortKey, Incident>(
+const {
+  sortKey,
+  sorted: sortedIncidents,
+  toggleSort,
+  sortIndicator,
+  ariaSort,
+} = useTableSort<SortKey, Incident>(
   incidents,
-  'last_seen',
+  'users',
   {
     occurrences: (a, b) => a.occurrence_count - b.occurrence_count,
     users: (a, b) => a.affected_users_count - b.affected_users_count,
     status: (a, b) => (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99),
     last_seen: (a, b) => new Date(a.last_seen).getTime() - new Date(b.last_seen).getTime(),
+    // Natural ascending sense: newer first_seen means a smaller age. The
+    // default descending direction negates this, putting the oldest issue first.
+    age: (a, b) => new Date(b.first_seen).getTime() - new Date(a.first_seen).getTime(),
   },
 );
+
+const platformsVary = computed(
+  () => new Set(incidents.value.map((incident) => incident.platform).filter(Boolean)).size > 1,
+);
+const hasActiveFilters = computed(() => Object.keys(currentFilters.value).length > 0);
 
 const newIncidentCount = ref(0);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -64,7 +79,7 @@ async function fetchIncidents(filters?: IncidentFilters) {
   } catch (e: unknown) {
     if (generation !== fetchGeneration) return;
     const msg = e instanceof Error ? e.message : String(e);
-    error.value = `Failed to load incidents: ${msg}`;
+    error.value = `Failed to load issues: ${msg}`;
   } finally {
     if (generation === fetchGeneration) loading.value = false;
   }
@@ -102,6 +117,15 @@ function onFilterChange(filters: IncidentFilters) {
   fetchIncidents(filters);
 }
 
+function clearFilters() {
+  filterBar.value?.reset();
+}
+
+function onMobileSortChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value as SortKey;
+  if (value !== sortKey.value) toggleSort(value);
+}
+
 onMounted(async () => {
   projectId.value = getProjectId();
   if (!projectId.value) {
@@ -118,37 +142,60 @@ onUnmounted(() => stopPolling());
 
 <template>
   <div class="mx-auto w-full max-w-[1120px]">
-    <header class="mb-7 border-b border-border pb-5">
-      <p class="text-xs font-semibold uppercase tracking-[0.18em] text-accent">Incident ledger</p>
-      <div class="mt-2 flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 class="text-2xl font-semibold tracking-tight text-text">Production incidents</h1>
-          <p class="mt-1 max-w-2xl text-sm text-muted">Review current outcomes, affected users, and the evidence behind each investigation.</p>
-        </div>
-        <p v-if="!loading && !error" class="font-mono text-xs text-muted">{{ incidents.length }} record{{ incidents.length === 1 ? '' : 's' }}</p>
-      </div>
+    <header class="mb-4">
+      <h1 class="text-3xl font-semibold tracking-tight text-text">Issues</h1>
     </header>
 
-    <FilterBar
-      v-if="projectId"
-      :project-id="projectId"
-      @filter-change="onFilterChange"
-    />
+    <div v-if="projectId" class="mb-3 flex flex-wrap items-center gap-2">
+      <FilterBar
+        ref="filterBar"
+        :project-id="projectId"
+        class="min-w-0 flex-1"
+        @filter-change="onFilterChange"
+      />
+      <label class="flex items-center gap-2 text-sm text-muted sm:hidden">
+        <span>Sort:</span>
+        <span class="relative">
+          <svg
+            aria-hidden="true"
+            class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+          >
+            <path d="M8 7h10M8 12h7M8 17h4M4 6v12m0 0-2-2m2 2 2-2" />
+          </svg>
+          <select
+            aria-label="Sort issues"
+            :value="sortKey"
+            class="min-h-10 max-md:min-h-11 rounded-md border border-border bg-surface py-1.5 pl-9 pr-8 text-sm text-text"
+            @change="onMobileSortChange"
+          >
+            <option value="users">Most users</option>
+            <option value="occurrences">Most events</option>
+            <option value="last_seen">Most recent</option>
+            <option value="age">Oldest issues</option>
+            <option value="status">Status</option>
+          </select>
+        </span>
+      </label>
+    </div>
 
     <button
       v-if="newIncidentCount > 0"
       class="mb-4 w-full border border-accent bg-surface px-4 py-2 text-center text-sm font-semibold text-accent hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       @click="loadNewIncidents"
     >
-      {{ newIncidentCount }} new incident{{ newIncidentCount === 1 ? '' : 's' }} — click to refresh
+      {{ newIncidentCount }} new issue{{ newIncidentCount === 1 ? '' : 's' }} — click to refresh
     </button>
 
     <div
       v-if="loading"
       role="status"
       aria-busy="true"
-      aria-label="Loading incident ledger"
-      class="grid gap-3 border-y border-border py-5"
+      aria-label="Loading issues"
+      class="grid gap-3 rounded-lg border border-border p-5"
     >
       <SkeletonBlock class="h-14" />
       <SkeletonBlock class="h-14" />
@@ -158,57 +205,110 @@ onUnmounted(() => stopPolling());
     <InlineAlert
       v-else-if="error"
       tone="danger"
-      title="Unable to load incidents"
+      title="Unable to load issues"
     >
       <p v-text="error"></p>
     </InlineAlert>
 
-    <EmptyState v-else-if="incidents.length === 0" title="No incidents yet" description="Events will appear once your SDK starts reporting errors.">
-      <router-link
-        to="/setup"
-        class="inline-flex min-h-10 items-center bg-accent px-4 py-2 text-sm font-semibold text-on-accent hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+    <template v-else-if="incidents.length === 0">
+      <EmptyState
+        v-if="hasActiveFilters"
+        title="No issues match these filters"
+        description="Try widening or clearing them."
       >
-        Setup guide
-      </router-link>
-    </EmptyState>
+        <button
+          type="button"
+          class="inline-flex min-h-10 items-center rounded-sm border border-border-strong bg-surface px-4 py-2 text-sm font-semibold text-text hover:bg-surface-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          @click="clearFilters"
+        >
+          Clear filters
+        </button>
+      </EmptyState>
+      <EmptyState
+        v-else
+        title="No issues yet"
+        description="Events will appear once your SDK starts reporting errors."
+      >
+        <router-link
+          to="/setup"
+          class="inline-flex min-h-10 items-center bg-accent px-4 py-2 text-sm font-semibold text-on-accent hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+        >
+          Setup guide
+        </router-link>
+      </EmptyState>
+    </template>
 
-    <div v-else class="overflow-x-auto border-y border-border">
-      <table class="min-w-full text-sm" aria-label="Production incidents">
+    <template v-else>
+      <div
+        class="overflow-hidden rounded-lg border border-border sm:hidden"
+        data-testid="stacked-issues-list"
+      >
+        <IncidentLedgerRow
+          v-for="incident in sortedIncidents"
+          :key="incident.id"
+          :incident="incident"
+          :project-id="projectId"
+          :show-platform="platformsVary"
+          layout="stacked"
+        />
+      </div>
+
+      <div class="hidden overflow-x-auto rounded-lg border border-border sm:block">
+        <table class="min-w-full text-sm" aria-label="Issues">
         <thead>
           <tr class="border-b border-border bg-surface-subtle">
-            <th class="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:px-5">
+            <th scope="col" class="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:px-5">
               Title
             </th>
-            <th class="hidden px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted md:table-cell">
-              Kind
-            </th>
             <th
-              class="cursor-pointer select-none px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text"
-              @click="toggleSort('status')"
+              scope="col"
+              :aria-sort="ariaSort('status')"
+              class="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted"
             >
-              Status{{ sortIndicator('status') }}
+              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('status')">
+                Status<span aria-hidden="true">{{ sortIndicator('status') }}</span>
+              </button>
             </th>
             <th
-              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text sm:table-cell"
-              @click="toggleSort('occurrences')"
+              scope="col"
+              :aria-sort="ariaSort('occurrences')"
+              class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:table-cell"
             >
-              Events{{ sortIndicator('occurrences') }}
+              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('occurrences')">
+                Events<span aria-hidden="true">{{ sortIndicator('occurrences') }}</span>
+              </button>
             </th>
             <th
-              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text lg:table-cell"
+              scope="col"
+              :aria-sort="ariaSort('users')"
               :title="currentFilters.environment_id ? 'users across all environments' : undefined"
-              @click="toggleSort('users')"
+              class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted lg:table-cell"
             >
-              Users{{ sortIndicator('users') }}
+              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('users')">
+                Users<span aria-hidden="true">{{ sortIndicator('users') }}</span>
+              </button>
               <span v-if="currentFilters.environment_id" class="block text-[10px] normal-case tracking-normal">
                 across all environments
               </span>
             </th>
             <th
-              class="hidden cursor-pointer select-none px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted hover:text-text xl:table-cell"
-              @click="toggleSort('last_seen')"
+              scope="col"
+              :aria-sort="ariaSort('age')"
+              title="Time since this issue was first seen"
+              class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted lg:table-cell"
             >
-              Last Seen{{ sortIndicator('last_seen') }}
+              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('age')">
+                Age<span aria-hidden="true">{{ sortIndicator('age') }}</span>
+              </button>
+            </th>
+            <th
+              scope="col"
+              :aria-sort="ariaSort('last_seen')"
+              class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted xl:table-cell"
+            >
+              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('last_seen')">
+                Last Seen<span aria-hidden="true">{{ sortIndicator('last_seen') }}</span>
+              </button>
             </th>
           </tr>
         </thead>
@@ -218,9 +318,15 @@ onUnmounted(() => stopPolling());
             :key="incident.id"
             :incident="incident"
             :project-id="projectId"
+            :show-platform="platformsVary"
           />
         </tbody>
-      </table>
-    </div>
+        </table>
+      </div>
+    </template>
+
+    <p v-if="!loading && !error && incidents.length > 0" class="mt-3 text-xs text-muted">
+      {{ incidents.length }} issue{{ incidents.length === 1 ? '' : 's' }}
+    </p>
   </div>
 </template>

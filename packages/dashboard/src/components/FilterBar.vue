@@ -84,6 +84,16 @@ function onFilterChange() {
   emitFilters();
 }
 
+function reset() {
+  selectedAccountId.value = '';
+  selectedStatus.value = '';
+  selectedPlatform.value = '';
+  selectedEndUserId.value = '';
+  selectedEnvironmentId.value = '';
+}
+
+defineExpose({ reset });
+
 watch(
   [selectedAccountId, selectedStatus, selectedPlatform, selectedEnvironmentId, rollupReady],
   onFilterChange,
@@ -91,12 +101,23 @@ watch(
 </script>
 
 <template>
-  <div class="flex flex-wrap gap-3 items-center py-3">
-    <div class="flex items-center gap-2">
-      <label class="text-sm text-muted whitespace-nowrap">Account:</label>
+  <div class="flex flex-wrap items-center gap-2 py-3">
+    <div class="relative">
+      <svg
+        aria-hidden="true"
+        class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+      >
+        <circle cx="12" cy="8" r="3" />
+        <path d="M5 20c.8-4 3.1-6 7-6s6.2 2 7 6" />
+      </svg>
       <select
         v-model="selectedAccountId"
-        class="text-sm rounded-md pl-2 pr-8 py-1.5"
+        aria-label="Account"
+        class="min-h-10 max-md:min-h-11 rounded-md border border-border bg-surface py-1.5 pl-9 pr-8 text-sm"
       >
         <option value="">All accounts</option>
         <option
@@ -108,11 +129,22 @@ watch(
       </select>
     </div>
 
-    <div class="flex items-center gap-2">
-      <label class="text-sm text-muted whitespace-nowrap">Status:</label>
+    <div class="relative">
+      <svg
+        aria-hidden="true"
+        class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+      >
+        <circle cx="12" cy="12" r="8" />
+        <path d="M12 8v4l2.5 2.5" />
+      </svg>
       <select
         v-model="selectedStatus"
-        class="text-sm rounded-md pl-2 pr-8 py-1.5"
+        aria-label="Status"
+        class="min-h-10 max-md:min-h-11 rounded-md border border-border bg-surface py-1.5 pl-9 pr-8 text-sm"
       >
         <option value="">All statuses</option>
         <option value="new">New</option>
@@ -127,12 +159,22 @@ watch(
       </select>
     </div>
 
-    <div class="flex items-center gap-2">
-      <label class="text-sm text-muted whitespace-nowrap">Platform:</label>
+    <div class="relative">
+      <svg
+        aria-hidden="true"
+        class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+      >
+        <path d="M8 4h8l4 8-4 8H8l-4-8 4-8Z" />
+        <circle cx="12" cy="12" r="2" />
+      </svg>
       <select
         v-model="selectedPlatform"
         aria-label="Platform"
-        class="text-sm rounded-md pl-2 pr-8 py-1.5"
+        class="min-h-10 max-md:min-h-11 rounded-md border border-border bg-surface py-1.5 pl-9 pr-8 text-sm"
       >
         <option value="">All platforms</option>
         <option value="javascript">JavaScript</option>
@@ -140,12 +182,21 @@ watch(
       </select>
     </div>
 
-    <div v-if="rollupReady" class="flex items-center gap-2">
-      <label class="text-sm text-muted whitespace-nowrap">Environment:</label>
+    <div v-if="rollupReady" class="relative">
+      <svg
+        aria-hidden="true"
+        class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+      >
+        <path d="M5 5h14v14H5zM5 10h14M10 10v9" />
+      </svg>
       <select
         v-model="selectedEnvironmentId"
         aria-label="Environment"
-        class="text-sm rounded-md pl-2 pr-8 py-1.5"
+        class="min-h-10 max-md:min-h-11 rounded-md border border-border bg-surface py-1.5 pl-9 pr-8 text-sm"
       >
         <option value="">All environments</option>
         <option

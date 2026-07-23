@@ -6,7 +6,7 @@ export interface AppNavigationItem {
 }
 
 export const APP_NAVIGATION: readonly AppNavigationItem[] = [
-  { label: 'Incidents', routeName: 'activity', relatedRoutes: ['incident'] },
+  { label: 'Issues', routeName: 'activity', relatedRoutes: ['incident'] },
   { label: 'Accounts', routeName: 'accounts', relatedRoutes: ['account-detail'] },
   { label: 'Sessions', routeName: 'sessions', relatedRoutes: ['session-detail'] },
   { label: 'Settings', routeName: 'settings', relatedRoutes: [] },

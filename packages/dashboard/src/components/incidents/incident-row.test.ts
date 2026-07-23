@@ -1,0 +1,119 @@
+// @vitest-environment jsdom
+
+import { mount } from '@vue/test-utils';
+import { describe, expect, it } from 'vitest';
+import type { Incident } from '../../types/api';
+import IncidentLedgerRow from './IncidentLedgerRow.vue';
+
+function incident(overrides: Partial<Incident> = {}): Incident {
+  return {
+    id: 'i1',
+    project_id: 'p1',
+    kind: 'error',
+    platform: 'javascript',
+    fingerprint: 'f37814ba355f3df260ec891e3e343433',
+    title: "TypeError: Cannot destructure property 'name'",
+    status: 'new',
+    first_seen: '2026-07-15T12:00:00Z',
+    last_seen: '2026-07-17T12:00:00Z',
+    occurrence_count: 12_842,
+    affected_users_count: 312,
+    ...overrides,
+  };
+}
+
+function mountRow(
+  overrides: Partial<Incident> = {},
+  props: { showPlatform?: boolean; layout?: 'table' | 'stacked' } = {},
+) {
+  return mount(IncidentLedgerRow, {
+    props: {
+      incident: incident(overrides),
+      projectId: 'p1',
+      ...props,
+    },
+    global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+  });
+}
+
+describe('IncidentLedgerRow', () => {
+  it('does not render the fingerprint hash', () => {
+    expect(mountRow().text()).not.toContain('f37814ba355f3df260ec891e3e343433');
+  });
+
+  it('hides the kind marker when the kind is the default error', () => {
+    expect(mountRow().find('[data-testid="kind-marker"]').exists()).toBe(false);
+  });
+
+  it('shows the kind marker for friction', () => {
+    expect(mountRow({ kind: 'friction', platform: null })
+      .get('[data-testid="kind-marker"]').text()).toBe('Friction');
+  });
+
+  it('shows the unchecked adjudication marker', () => {
+    expect(mountRow({
+      kind: 'friction',
+      adjudication_status: 'unchecked',
+      platform: null,
+    }).get('[data-testid="kind-marker"]').text()).toBe('Unchecked');
+  });
+
+  it('only renders the platform marker when the parent says platforms vary', () => {
+    expect(mountRow().find('[data-testid="platform-marker"]').exists()).toBe(false);
+    expect(mountRow({}, { showPlatform: true })
+      .get('[data-testid="platform-marker"]').text()).toBe('JavaScript');
+  });
+
+  it('renders the six desktop cells with formatted counts', () => {
+    const row = mountRow();
+    expect(row.findAll('td')).toHaveLength(6);
+    expect(row.text()).toContain('12,842');
+    expect(row.text()).toContain('312');
+  });
+
+  it('renders a visibly linked status for a valid GitHub pr_url', () => {
+    const link = mountRow({
+      status: 'pr_draft',
+      pr_url: 'https://github.com/acme/web/pull/42',
+    }).get('a[data-testid="pr-link"]');
+
+    expect(link.attributes('href')).toBe('https://github.com/acme/web/pull/42');
+    expect(link.attributes('rel')).toContain('noopener');
+    expect(link.attributes('target')).toBe('_blank');
+    expect(link.attributes('aria-label')).toContain('opens pull request on GitHub');
+    expect(link.text()).toContain('↗');
+  });
+
+  it.each([
+    ['no URL', undefined],
+    ['a hostile protocol', 'javascript:alert(1)'],
+    ['a non-GitHub host', 'https://gitlab.com/a/b/-/merge_requests/1'],
+  ])('renders status as plain text with no arrow for %s', (_label, prUrl) => {
+    const row = mountRow({ status: 'pr_draft', pr_url: prUrl });
+    expect(row.find('a[data-testid="pr-link"]').exists()).toBe(false);
+    expect(row.text()).toContain('Draft PR');
+    expect(row.text()).not.toContain('↗');
+  });
+
+  it('derives the age cell from first_seen, not last_seen', () => {
+    const age = mountRow({
+      first_seen: new Date(Date.now() - 400 * 86_400_000).toISOString(),
+      last_seen: new Date(Date.now() - 86_400_000).toISOString(),
+    }).get('[data-testid="age"]').text();
+    expect(age).toBe('1y');
+  });
+
+  it('renders relative last-seen exactly once', () => {
+    const row = mountRow();
+    expect(row.findAll('[data-testid="last-seen"]')).toHaveLength(1);
+    expect(row.text()).not.toContain('Last seen');
+  });
+
+  it('renders the mobile layout as a stacked issue with status, users, and age', () => {
+    const row = mountRow({}, { layout: 'stacked' });
+    expect(row.get('[data-testid="stacked-issue"]').element.tagName).toBe('ARTICLE');
+    expect(row.findAll('td')).toHaveLength(0);
+    expect(row.text()).toContain('312 users');
+    expect(row.get('[data-testid="age"]').text()).not.toBe('');
+  });
+});

@@ -235,7 +235,7 @@ onMounted(async () => {
 <template>
   <div class="incident-case mx-auto w-full max-w-[1180px] [container-type:inline-size]">
     <router-link to="/" class="inline-flex min-h-10 items-center text-sm font-medium text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
-      &larr; Back to incidents
+      &larr; Back to issues
     </router-link>
 
     <div v-if="loading" class="mt-4 text-muted">Loading incident...</div>
@@ -253,7 +253,7 @@ onMounted(async () => {
       </svg>
       <h3 class="text-sm font-medium text-text">Incident not found</h3>
       <p class="mt-1 text-sm text-muted">This incident may have been resolved or doesn't exist.</p>
-      <router-link to="/" class="mt-4 text-accent hover:underline text-sm">Back to incidents</router-link>
+      <router-link to="/" class="mt-4 text-accent hover:underline text-sm">Back to issues</router-link>
     </div>
 
     <div v-else class="mt-4 space-y-6">

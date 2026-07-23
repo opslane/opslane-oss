@@ -79,6 +79,6 @@ describe('AppNavigation active-route marking', () => {
     const wrapper = mount(AppNavigation, { props: { showAdmin: false }, global: { plugins: [router] } });
     const current = wrapper.findAll('a').filter((link) => link.attributes('aria-current') === 'page');
     expect(current).toHaveLength(1);
-    expect(current[0]?.text()).toContain('Incidents');
+    expect(current[0]?.text()).toContain('Issues');
   });
 });

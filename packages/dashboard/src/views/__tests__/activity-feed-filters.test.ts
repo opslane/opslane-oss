@@ -6,6 +6,7 @@ import type { Incident } from '../../types/api';
 
 const mocks = vi.hoisted(() => ({
   listAccounts: vi.fn(),
+  listEnvironments: vi.fn(),
   listIncidents: vi.fn(),
   replace: vi.fn(),
   route: { query: {} as Record<string, string> },
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../api', () => ({
   listAccounts: mocks.listAccounts,
+  listEnvironments: mocks.listEnvironments,
   listIncidents: mocks.listIncidents,
 }));
 
@@ -66,6 +68,7 @@ describe('ActivityFeed URL filters', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.listAccounts.mockResolvedValue([]);
+    mocks.listEnvironments.mockResolvedValue({ environments: [], rollup_ready: false });
     mocks.route.query = {};
     window.history.replaceState({}, '', '/');
   });
@@ -94,7 +97,7 @@ describe('ActivityFeed URL filters', () => {
       end_user_id: 'user-123',
     });
     expect(wrapper.text()).toContain('Python failure');
-    expect(wrapper.text()).toContain('Python');
+    expect(wrapper.find('[data-testid="platform-marker"]').exists()).toBe(false);
 
     wrapper.unmount();
   });
@@ -158,7 +161,246 @@ describe('ActivityFeed URL filters', () => {
     expect(frictionRow?.text()).toContain('Friction');
     expect(frictionRow?.text()).not.toContain('Python');
     expect(frictionRow?.text()).not.toContain('JavaScript');
-    expect(pythonRow?.text()).toContain('Python');
+    expect(pythonRow?.find('[data-testid="platform-marker"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it('shows platform markers only when the loaded list contains multiple platforms', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([
+      incident('javascript', 'JavaScript failure', 'javascript'),
+      incident('python', 'Python failure', 'python'),
+    ]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    const desktopRows = wrapper.findAll('tbody tr');
+    expect(desktopRows[0]?.get('[data-testid="platform-marker"]').text()).toBe('JavaScript');
+    expect(desktopRows[1]?.get('[data-testid="platform-marker"]').text()).toBe('Python');
+
+    wrapper.unmount();
+  });
+
+  it('defaults to users affected descending', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    const lowImpact = incident('low', 'Low impact', 'javascript');
+    lowImpact.affected_users_count = 2;
+    const highImpact = incident('high', 'High impact', 'javascript');
+    highImpact.affected_users_count = 3_000;
+    mocks.listIncidents.mockResolvedValue([lowImpact, highImpact]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.findAll('tbody tr')[0]?.text()).toContain('High impact');
+    const usersHeader = wrapper.findAll('thead th').find((th) => th.text().includes('Users'));
+    expect(usersHeader?.attributes('aria-sort')).toBe('descending');
+
+    wrapper.unmount();
+  });
+
+  it('renders matching desktop header and row columns with no Kind column', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'Boom', 'javascript')]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    const headers = wrapper.findAll('thead th').map((th) => th.text().replace(/[↑↓]/g, '').trim());
+    expect(headers).toEqual(['Title', 'Status', 'Events', 'Users', 'Age', 'Last Seen']);
+    expect(wrapper.findAll('tbody tr')[0]?.findAll('td')).toHaveLength(headers.length);
+
+    const visibility = (el: { classes: () => string[] }) =>
+      el.classes().filter((value) =>
+        value === 'hidden' || /^(sm|md|lg|xl):table-cell$/.test(value)).sort();
+    expect(wrapper.findAll('thead th').map(visibility))
+      .toEqual(wrapper.findAll('tbody tr')[0]!.findAll('td').map(visibility));
+
+    wrapper.unmount();
+  });
+
+  it('sorts by age from a keyboard-reachable header button', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    const older = incident('old', 'Older issue', 'javascript');
+    older.first_seen = '2026-01-01T00:00:00Z';
+    const newer = incident('new', 'Newer issue', 'javascript');
+    newer.first_seen = '2026-07-01T00:00:00Z';
+    mocks.listIncidents.mockResolvedValue([newer, older]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    const ageHeader = wrapper.findAll('thead th').find((th) => th.text().includes('Age'))!;
+    expect(ageHeader.attributes('aria-sort')).toBe('none');
+    await ageHeader.get('button').trigger('click');
+
+    expect(wrapper.findAll('tbody tr')[0]?.text()).toContain('Older issue');
+    expect(ageHeader.attributes('aria-sort')).toBe('descending');
+
+    wrapper.unmount();
+  });
+
+  it('exposes every sortable desktop column as a button with aria-sort', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'Boom', 'javascript')]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    const headers = wrapper.findAll('thead th');
+    const sortable = headers.filter((th) => th.find('button').exists());
+    expect(sortable).toHaveLength(5);
+    for (const header of sortable) {
+      expect(header.attributes('aria-sort')).toBeDefined();
+      expect(header.get('button').attributes('type')).toBe('button');
+    }
+    expect(headers.filter((th) => th.attributes('aria-sort') === 'descending')).toHaveLength(1);
+
+    wrapper.unmount();
+  });
+
+  it('renders a single-line Issues header and accessible compact filters', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'Boom', 'javascript')]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.get('h1').text()).toBe('Issues');
+    expect(wrapper.get('header').text()).toBe('Issues');
+    expect(wrapper.text()).not.toContain('Account:');
+    expect(wrapper.text()).not.toContain('Status:');
+    expect(wrapper.text()).not.toContain('Platform:');
+    for (const label of ['Account', 'Status', 'Platform']) {
+      expect(wrapper.find(`select[aria-label="${label}"]`).exists()).toBe(true);
+    }
+    expect(wrapper.find('select[aria-label="Environment"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it('renders the Environment filter only when environment rollups are ready', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listEnvironments.mockResolvedValue({
+      environments: [{ id: 'env-1', name: 'Production' }],
+      rollup_ready: true,
+    });
+    mocks.listIncidents.mockResolvedValue([]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.find('select[aria-label="Environment"]').exists()).toBe(true);
+
+    wrapper.unmount();
+  });
+
+  it('renders singular and plural issue counts below the list', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'One', 'javascript')]);
+
+    let wrapper = mountFeed();
+    await flushPromises();
+    expect(wrapper.text()).toContain('1 issue');
+    expect(wrapper.text()).not.toContain('1 issues');
+    wrapper.unmount();
+
+    mocks.listIncidents.mockResolvedValue([
+      incident('a', 'One', 'javascript'),
+      incident('b', 'Two', 'javascript'),
+    ]);
+    wrapper = mountFeed();
+    await flushPromises();
+    expect(wrapper.text()).toContain('2 issues');
+    wrapper.unmount();
+  });
+
+  it('renders the unfiltered empty state with its Setup guide action', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('No issues yet');
+    expect(wrapper.text()).toContain('Setup guide');
+    expect(wrapper.find('table').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it('renders a filtered empty state and clears controls plus URL filters', async () => {
+    mocks.route.query = { project_id: 'p1', status: 'merged', platform: 'python' };
+    window.history.replaceState({}, '', '/?project_id=p1&status=merged&platform=python');
+    mocks.listIncidents.mockResolvedValue([]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('No issues match these filters');
+    expect(wrapper.text()).not.toContain('Setup guide');
+    await wrapper.get('button').trigger('click');
+    await flushPromises();
+
+    expect((wrapper.get('select[aria-label="Status"]').element as HTMLSelectElement).value).toBe('');
+    expect((wrapper.get('select[aria-label="Platform"]').element as HTMLSelectElement).value).toBe('');
+    expect(mocks.replace).toHaveBeenLastCalledWith({ query: { project_id: 'p1' } });
+    expect(mocks.listIncidents).toHaveBeenLastCalledWith('p1', {});
+
+    wrapper.unmount();
+  });
+
+  it('renders an error alert when the issue fetch fails', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockRejectedValue(new Error('boom'));
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('Unable to load issues');
+    expect(wrapper.text()).toContain('boom');
+    expect(wrapper.find('table').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it('renders skeleton rows while loading', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockImplementation(() => new Promise(() => {}));
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.get('[role="status"]').attributes('aria-busy')).toBe('true');
+    expect(wrapper.find('table').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it('renders a stacked list and mobile sort control below the sm breakpoint', async () => {
+    mocks.route.query = { project_id: 'p1' };
+    window.history.replaceState({}, '', '/?project_id=p1');
+    mocks.listIncidents.mockResolvedValue([incident('a', 'Boom', 'javascript')]);
+
+    const wrapper = mountFeed();
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="stacked-issues-list"]').classes()).toContain('sm:hidden');
+    expect(wrapper.get('[data-testid="stacked-issue"]').element.tagName).toBe('ARTICLE');
+    expect(wrapper.get('select[aria-label="Sort issues"]').classes()).toContain('max-md:min-h-11');
 
     wrapper.unmount();
   });
