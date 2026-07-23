@@ -1,6 +1,10 @@
 # Anthropic Agent SDK terms verdict
 
-- **Status:** Rejected for P3
+- **Status:** SUPERSEDED — reversed 2026-07-22 by founder decision. The SDK may be used
+  as a plain npm dependency of the CLI (npm fetches it separately; we do not bundle it).
+  Rationale for the reversal: other shipping tools depend on it the same way, and we will
+  not build and maintain our own agent harness. The analysis below is kept for the record.
+- **Prior status:** Rejected for P3
 - **Reviewed:** 2026-07-21
 - **Package reviewed:** `@anthropic-ai/claude-agent-sdk@0.3.217`
 
