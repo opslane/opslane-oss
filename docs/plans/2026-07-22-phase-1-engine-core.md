@@ -4,6 +4,8 @@
 
 **Goal:** Build the **Detect stage** of `opslane onboard` — a *read-only* agent that inspects a repo and reports a structured wiring **plan** (`report_plan`), making no edits. Validated by an eval over real OSS monorepos, plus unit tests. No live model in unit tests, no TTY.
 
+**Latency budget (eng-review Issue 3):** the whole onboarding flow — Detect, human approval, Apply — targets **under 10 minutes**. Detect's share should stay in the low minutes. `maxTurns:50` is a safety stop, not a time budget, so the eval **reports wall-clock elapsed per repo** to make regressions visible (observed on the smoke run: 41–89s, 11–31 tool calls). No hard timeout — a run that is slow but correct beats a run killed 20 seconds from the answer.
+
 **Why two stages (decided 2026-07-23, from a live eval).** The onboard agent was first built as one loop that investigates *and* edits. We split it into **Detect → Apply**:
 - **Detect** (this phase): read-only. Tools are `Read`, `Glob`, our secret-aware `search`, `ask_user`, and `report_plan`. **Edit/Write/Bash are not in the toolset at all** — the stage is physically incapable of changing a file. It outputs a plan the user (or the Apply stage) consumes.
 - **Apply** (next phase): given an approved plan, makes exactly those edits and records them.
@@ -62,6 +64,15 @@ Per-run factory, no module globals. `report_plan` is the Detect stage's single o
 
 **The plan is a typed, machine-applicable artifact — not prose (codex P1.1).** The Detect eval showed the model naturally emits a narrative `init_snippet` ("place before the existing init() call, around line 22", plus optional error-handler suggestions). That is not something Apply (or a codemod) can apply deterministically, and a single string cannot say whether an existing SDK is kept or replaced. So `report_plan` captures a structured `OnboardingPlan`:
 
+**Not every repo can be onboarded (eng-review Issue 1).** Some repos have no web app at all (a pure Go service, a CLI, a docs site). `report_plan` therefore takes a **status discriminant**, so "nothing to onboard here" is a first-class, testable outcome rather than a fabricated plan or a `maxTurns` timeout:
+
+```ts
+type ReportPlanInput =
+  | { status: 'ok'; plan: OnboardingPlan }
+  | { status: 'unsupported'; reason: string };   // e.g. "no web app: only Go services and docs"
+```
+The full-plan validation below runs **only** when `status === 'ok'`. For `'unsupported'`, validate a non-empty `reason` and nothing else. `runDetect` maps `'unsupported'` to a distinct outcome (`ok:false, reason:'unsupported'`) that the CLI can report as "this repo has no app to onboard" — never conflated with an error or a timeout.
+
 ```ts
 interface OnboardingPlan {
   app_dir: string;                 // repo-relative, canonical
@@ -99,7 +110,7 @@ This resolves the keep-vs-migrate ambiguity explicitly (current code says "migra
 - **No `dev_script` field** (codex P1.6): Apply does not run the app (it only runs allowlisted build/typecheck/lint), so a run command is not needed, and a free command string is an injection vector. If a later phase needs it, model it as `{ manifest_path, script_name }` validated against that manifest's `scripts` and executed via `spawn(pm, ['run', script], { shell:false })` — never a raw string.
 - Export `OnboardingPlan` and `createOnboardServer(...tools) = createSdkMcpServer({ name:'onboard', version:'0.0.0', tools })`.
 
-**Test** (real `mkdtemp` app fixture with a real entry file): `ask_user` routes to its resolver / throws with none; `report_plan` accepts a valid plan and calls `onPlan` once; a **second** call rejects (`/already/i`); rejects empty fields, a path escape, a secret `edit.file`, an `edit.file` outside `app_dir` or that doesn't exist, a var not starting with `env_prefix`, a borrowed name (`VITE_APP_DEFENDER_API_KEY` → `/opslane/i`), an unknown `package_manager`, a wrong `entry_hash`, and an `anchor` absent from the file. Wiring test: `createOnboardServer(createReportPlanTool(...))` registers `report_plan` with an input schema.
+**Test** (real `mkdtemp` app fixture with a real entry file): `ask_user` routes to its resolver / throws with none; `report_plan` accepts a valid `status:'ok'` plan and calls `onPlan` once; a **second** call rejects (`/already/i`); rejects empty fields, a path escape, a secret `edit.file`, an `edit.file` outside `app_dir` or that doesn't exist, a var not starting with `env_prefix`, a borrowed name (`VITE_APP_DEFENDER_API_KEY` → `/opslane/i`), an unknown `package_manager`, a wrong `entry_hash`, and an `anchor` absent from the file. **Discriminant tests (eng-review Issue 1):** `status:'unsupported'` with a non-empty `reason` is accepted **without** any plan fields; `status:'unsupported'` with an empty/missing `reason` rejects; `status:'ok'` without a full plan rejects. Wiring test: `createOnboardServer(createReportPlanTool(...))` registers `report_plan` with an input schema.
 
 **Commit.**
 
@@ -111,7 +122,7 @@ Replaces built-in `Grep` (which returns `.env` content). Literal substring, boun
 
 **Files:** Create `cli/src/onboard/search-tool.ts`; test `__tests__/search-tool.test.ts`.
 
-**Implement** `createSearchTool(root)` — `tool()` with `{ query: z.string().min(1), glob: z.string().optional() }`. Walk `root` (skip `.git`/`node_modules`, any `isSecretFile`, symlinks leaving root via `containedRepoRelative`); literal substring match; skip binary (NUL in first 8KB) and over-cap files; stop at total-bytes and max-results caps; emit `repoRel:line`. **Test:** a string only in `.env.production` returns nothing; normal source hit returns `path:line`; binary/`node_modules` skipped; caps enforced. **Commit.**
+**Implement** `createSearchTool(root)` — `tool()` with `{ query: z.string().min(1), glob: z.string().optional() }`. Walk `root` (skip `.git`/`node_modules`, any `isSecretFile`, symlinks leaving root via `containedRepoRelative`); literal substring match; skip binary (NUL in first 8KB) and over-cap files; stop at total-bytes and max-results caps; emit `repoRel:line`. **Test:** a string only in `.env.production` returns nothing; normal source hit returns `path:line`; binary/`node_modules` skipped; caps enforced; **a symlink pointing outside `root` is not traversed** (eng-review test gap — the implementation claims this, so assert it: plant `root/link -> /etc` with a match target behind it and expect zero results). **Commit.**
 
 ---
 
@@ -175,7 +186,7 @@ The engine core holds the failure-prone seams — so it takes an injectable `que
   - `try`: iterate `queryFn({ prompt: renderDetectSpec({cwd}), options: detectOptions({cwd, hook, mcpServers, abortController: ac}) })` into `onMessage`, capture terminal `result` subtype. `catch`: map a thrown error to `{ok:false, reason: err.message}`. `finally`: remove `onWarn` + the signal listener.
   - Return `{ ok, aborted, subtype, reason }`: `ok:true` only on a clean `result` **AND `plans === 1`** (a validated plan was captured — codex P1.2: a clean terminal subtype with zero or two reports is NOT success, reason `no_plan`/`multiple_plans`); `ok:false` on shadow error, caught error, abort, missing result, or an error subtype.
 
-**Test:** `detectOptions` locks the gate (`permissionMode:'default'`, `settingSources:[]`, `strictMcpConfig:true`, no `Edit`/`Write`/`Bash` in `tools`, `Read` not disallowed; `canUseTool` denies a tool other than Read/Glob); `beforeAll` sets a dummy key (restored after) so lifecycle cases run hermetically; `runDetect` maps a clean result **with one plan** → `ok:true`, a clean result with **zero** plans → `ok:false` (`no_plan`), an error/missing result → `ok:false`, a thrown `queryFn` → `ok:false` (no rethrow), an already-aborted signal → `aborted:true`, missing key → `no_api_key` without querying (assert `queryFn` not called). Stub `queryFn` yields a synthetic `report_plan` tool-use in the message stream to drive the one-plan path.
+**Test:** `detectOptions` locks the gate (`permissionMode:'default'`, `settingSources:[]`, `strictMcpConfig:true`, no `Edit`/`Write`/`Bash` in `tools`, `Read` not disallowed; `canUseTool` denies a tool other than Read/Glob); `beforeAll` sets a dummy key (restored after) so lifecycle cases run hermetically; `runDetect` maps a clean result **with one plan** → `ok:true`, a clean result with **zero** plans → `ok:false` (`no_plan`), a clean result with **two** plans → `ok:false` (`multiple_plans`, eng-review test gap — the reason is named in the impl, so assert it), a `status:'unsupported'` report → `ok:false` with reason `unsupported` and **distinct from any error path** (eng-review Issue 1), an error/missing result → `ok:false`, a thrown `queryFn` → `ok:false` (no rethrow), an already-aborted signal → `aborted:true`, missing key → `no_api_key` without querying (assert `queryFn` not called). Stub `queryFn` yields a synthetic `report_plan` tool-use in the message stream to drive the plan paths.
 
 **Commit.**
 
@@ -211,7 +222,8 @@ Result of that smoke run (hand-scored), read-only detect over five popular OSS m
 5/5 on every hand-scored dimension, entry files verified, no `ask_user` needed; it chose Next's `instrumentation-client.ts` and read twenty's `REACT_APP_` from its Vite config.
 
 **Decision-grade eval (what to build before trusting a pass rate — codex P1.7):**
-- run the **production `runDetect`**, not the inlined spike;
+- run the **production `runDetect`**, not the inlined spike. **Then DELETE the spike copies** (eng-review Issue 4): `cli/scripts/detect-eval.mjs:37` defines its own `DETECT_PROMPT` and `:60` its own `report_plan` tool. Once `renderDetectSpec` and `createReportPlanTool` exist, the script must import them and those two inlined definitions must be removed. Leaving them is a DRY violation in a *measuring instrument* — the eval would silently score a stale prompt while a different one ships, which is exactly how the current 5/5 came from the spike rather than production code;
+- **not a CI gate** (eng-review perf): 5 runs × ~8 cases × 40–90s is roughly 40–60 minutes of wall-clock plus real token spend per full pass. Run it nightly or before a release, never per-commit. The unit gate above is the per-commit gate;
 - **pinned repo SHAs** + a per-repo expected-fields fixture; **per-field** scoring (not one PASS/repo) and whole-plan scoring;
 - **5 independent runs per case**; report the distribution, not "5/5 repos";
 - assert exactly one report and a **uniquely resolvable edit** (anchor found exactly at `occurrence`);
@@ -244,3 +256,98 @@ The committed code (`587bd93`) is the single combined loop. This plan renames/re
 - **Hook signature:** keep `onboardPreToolUseHook({ root, state? })` — `root` required, `state` **optional**. Detect passes no `state` (no edits, no post-finish rule); Apply passes `state` to get post-finish denial. One hook serves both; do not fork it.
 - **Combined-loop tests + `cli/scripts/live-onboard-check.mjs`** target `runOnboardingAgent`/`finish_onboarding`. When Detect lands, either (a) keep them and repoint at `runApply` once Apply exists, or (b) delete the combined-loop path outright. Pick (b) unless we still want an end-to-end combined smoke; the plan assumes the combined loop is **replaced**, not kept in parallel.
 - **Live run:** drive Detect → (approve) → Apply against a throwaway copy of a real app; confirm the SDK is wired at the planned entry with the planned vars, dep added, `.env` untouched.
+
+---
+
+## What already exists (reused, not rebuilt)
+
+| Existing | Reused by Detect | Note |
+|---|---|---|
+| `paths.ts` — symlink-safe containment + `.env*` policy | yes, unchanged | already committed (`587bd93`) |
+| `search-tool.ts` — secret-aware search | yes, unchanged | the detect eval imported it as-is |
+| `policy.ts` — PreToolUse containment/secret hook | yes, `state` becomes optional | one hook serves Detect and Apply |
+| `tools.ts` — `createAskUserTool` | yes, unchanged | per-run factory, no globals |
+| `engine.ts` — cancellation, warning tripwire, result mapping, injectable `queryFn` | yes, wrapped as `runDetect` | the lifecycle is stage-agnostic |
+| `events.ts` — `reduceTasks` | yes | `EditTracker` waits for Apply |
+| milestone 0.5 provisioning endpoint | untouched | committed, live-tested |
+
+Only `spec.ts` genuinely changes shape (one combined prompt → `renderDetectSpec` + a later `renderApplySpec`), plus `finish_onboarding` → `report_plan` for this stage.
+
+## NOT in scope (considered and deferred)
+
+- **The Apply stage** — outlined above; it needs the typed plan to exist first.
+- **Hashing the manifest for staleness** — deliberately declined (eng-review Issue 2): the Detect→Apply gap is minutes inside a <10min flow, so drift risk is low and the extra rejection path costs more than it saves.
+- **A hard wall-clock timeout on Detect** — measure first, enforce only if the data shows it (eng-review Issue 3).
+- **Filtering `.env*` filenames out of `Glob` results** — accepted limitation; names leak, contents never do.
+- **`ask_user` with `multi:true`** — Detect selects exactly one app, so the multi path is unused.
+- **The Ink TUI, the `opslane onboard` command, provisioning wiring** — later phases.
+- **Prompt-injection hardening beyond the eval case** — the eval includes a malicious-README case; a real defense (e.g. instruction quarantining) is its own piece of work.
+
+## Failure modes (per new codepath)
+
+| Codepath | Realistic production failure | Test? | Error handling? | User sees |
+|---|---|---|---|---|
+| `report_plan` on an unsupported repo | model fabricates a plan for a repo with no app | yes (new discriminant tests) | yes — `status:'unsupported'` | clear "no app to onboard" |
+| `report_plan` validation | model names a file outside `app_dir` or a `.env` | yes | yes — handler throws, model retries | retry, then failure |
+| two `report_plan` calls | model reports twice, second overwrites | yes (new `multiple_plans` test) | yes — state guard + `plans===1` | failure, not a wrong plan |
+| `runDetect` cancellation | user ctrl-C mid-run | yes | yes — `AbortController` | clean abort |
+| `runDetect` subprocess throw | SDK/subprocess dies mid-stream | yes | yes — `catch` → `ok:false` | error with reason |
+| `search` on a symlinked dir | traverses outside the repo | yes (new symlink test) | yes — containment | no results, no leak |
+| `Glob` broad pattern | enumerates `.env*` filenames | no (accepted) | partial — contents still blocked | names visible in transcript |
+| Detect exceeds `maxTurns` on a huge repo | 50-turn exhaustion, no plan | via eval elapsed reporting | yes — `ok:false` | failure; budget regression visible in eval |
+
+**Critical gaps (no test AND no error handling AND silent): 0.** The one that qualified — silent fabrication on an unsupported repo — is closed by the status discriminant.
+
+## Worktree parallelization
+
+| Step | Modules touched | Depends on |
+|---|---|---|
+| 1.0 paths | `cli/src/onboard/` | — |
+| 1.1 deps | `cli/` root manifest | — |
+| 1.2 tools (`ask_user`, `report_plan`) | `cli/src/onboard/` | 1.0 |
+| 1.3 search | `cli/src/onboard/` | 1.0 |
+| 1.4 spec | `cli/src/onboard/` | — |
+| 1.5 events | `cli/src/onboard/` | — |
+| 1.6 policy | `cli/src/onboard/` | 1.0 |
+| 1.7 engine + `runDetect` | `cli/src/onboard/` | 1.2, 1.4, 1.6 |
+| 1.8 eval | `cli/scripts/` | 1.7 |
+
+**Sequential implementation, no meaningful parallelization opportunity** — every step but 1.1 and 1.8 lands in the single `cli/src/onboard/` module, so parallel worktrees would collide on the same directory for near-zero wall-clock gain.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each derives from a specific finding above.
+
+- [ ] **T1 (P1, human: ~1h / CC: ~10min)** — tools.ts — Add the `status: 'ok' | 'unsupported'` discriminant to `report_plan`
+  - Surfaced by: Architecture Issue 1 — the eval demands an unsupported-repo case the contract can't express
+  - Files: `cli/src/onboard/tools.ts`, `cli/src/onboard/__tests__/tools.test.ts`, `cli/src/onboard/engine.ts`
+  - Verify: `pnpm --filter @opslane/cli exec vitest run src/onboard/__tests__/tools.test.ts`
+- [ ] **T2 (P2, human: ~30min / CC: ~5min)** — plan/eval — Record the <10min budget; report elapsed wall-clock per repo in the eval
+  - Surfaced by: Architecture Issue 3 — an unmeasured target is not a target
+  - Files: `cli/scripts/detect-eval.mjs`
+  - Verify: run the eval, confirm elapsed prints per repo
+- [ ] **T3 (P1, human: ~1h / CC: ~10min)** — eval — Import `renderDetectSpec` + `createReportPlanTool`; delete the inlined spike copies
+  - Surfaced by: Code Quality Issue 4 — `detect-eval.mjs:37,60` duplicate the prompt and schema
+  - Files: `cli/scripts/detect-eval.mjs`
+  - Verify: `grep -c 'DETECT_PROMPT' cli/scripts/detect-eval.mjs` returns 0
+- [ ] **T4 (P2, human: ~45min / CC: ~10min)** — tests — Add the three coverage gaps: `unsupported` discriminant, `search` symlink non-traversal, `runDetect` two-plan → `multiple_plans`
+  - Surfaced by: Test Review — 4 gaps in the coverage diagram
+  - Files: `cli/src/onboard/__tests__/{tools,search-tool,engine}.test.ts`
+  - Verify: `pnpm --filter @opslane/cli test`
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 1 | issues_found | 7 P1 + 2 P2, all folded |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 10 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**CODEX:** ran against this plan at commit `2e59023` — typed handoff artifact, exactly-one-plan enforcement, stronger `report_plan` validation, `dev_script` removal, default-deny `canUseTool`, migration section, honest eval status. All absorbed before this review. The changes made *during* this eng review (status discriminant, latency budget, eval de-duplication, 3 test gaps) postdate that pass and have not been codex-reviewed.
+
+**CROSS-MODEL:** no tension. Codex and this review agree the two-stage Detect→Apply boundary is correct and that a third planning stage would be ceremony. They found disjoint problems — codex the handoff typing and validation strength, this review the missing negative-outcome path, the eval's self-invalidating duplication, and the unmeasured latency budget.
+
+**VERDICT:** ENG CLEARED — ready to implement. Detect stage architecture locked; 9 of 10 findings folded into the plan, 1 accepted as-is with rationale.
+
+NO UNRESOLVED DECISIONS

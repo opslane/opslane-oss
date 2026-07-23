@@ -65,6 +65,46 @@ The scope call worth naming: login-first A depends on milestone 0.5 (account pro
 
 ## 4. System overview
 
+> **Updated 2026-07-23:** the agent is no longer one loop that investigates *and* edits. It is two stages — **Detect** (read-only, emits a typed plan) and **Apply** (executes an approved plan). The pipeline below is the current shape; §5.1–5.3 still describe the original combined loop and are superseded on that point. See `docs/plans/2026-07-22-phase-1-engine-core.md`.
+
+```
+  repo ──▶ ┌──────────────── DETECT (read-only) ────────────────┐
+           │  tools: Read, Glob, search, ask_user, report_plan  │
+           │  NO Edit / Write / Bash exist in this stage        │
+           │                                                    │
+           │   Read ──┐                                         │
+           │   Glob ──┼──▶ reason ──▶ report_plan ──┐           │
+           │   search ┘         ▲                   │           │
+           │                    └── ask_user ◀──────┘ (ambiguous)│
+           └────────────────────────┬───────────────────────────┘
+                                    │
+                     status='unsupported' ──▶ "no app to onboard" (terminal, not an error)
+                                    │
+                            status='ok' + typed OnboardingPlan
+                            { app_dir, env_vars, dependency,
+                              edit{ file, entry_hash, anchor,
+                                    position, occurrence,
+                                    import_line, init_block },
+                              existing_sdk{ keep|migrate|no_op } }
+                                    │
+                                    ▼
+                        ┌──── HUMAN APPROVAL ────┐
+                        └────────────┬───────────┘
+                                     ▼
+           ┌──────────────── APPLY (edits) ─────────────────┐
+           │  re-hash edit.file                             │
+           │      ├── hash MISMATCH ──▶ stop ──▶ re-Detect ─┼──┐
+           │      └── hash OK                               │  │
+           │  find anchor at occurrence                     │  │
+           │      ├── missing / ambiguous ──▶ stop ─────────┼──┤
+           │      └── found ──▶ insert import + init block  │  │
+           │  apply dependency to manifest                  │  │
+           │  finish_onboarding(edited files)               │  │
+           └────────────────────────────────────────────────┘  │
+                                     ▲                          │
+                                     └──────────────────────────┘
+```
+
 Three programs cooperate. The **CLI** runs on the developer's machine and owns everything deterministic: login, provisioning, key material, config files, status polling. The **agent** is a Claude Code subprocess spawned through `@anthropic-ai/claude-agent-sdk`; it owns the reasoning: survey the repo, ask, edit, report. The **server** is the existing Opslane ingestion service; it authenticates the user, mints the project and key, and flips the session status through `created -> provisioned -> key_ok -> app_reporting`. `key_ok` means the key works; `app_reporting` means the installed SDK phoned home from the running app.
 
 ### Identity first, repo access later
