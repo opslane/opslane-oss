@@ -60,6 +60,7 @@ The agent callback requires `code`, `installation_id`, and UUID `state`; definit
 | POST | `/api/v1/invitations/accept` | Cloud: accept a single-use, verified-email-bound invitation |
 | GET | `/api/v1/admin/overview` | Operator-only cross-tenant observability overview incl. best-effort agent-onboarding funnel (404 unless allowlisted) |
 | GET | `/api/v1/admin/jobs` | Operator-only recent jobs (404 unless allowlisted) |
+| POST | `/api/v1/onboard/provision` | Provision an org/project for a repo and seal the API key into an agent session for poll delivery |
 | POST | `/api/v1/onboarding/setup` | First-run setup |
 | GET | `/api/v1/projects` | List projects |
 | POST | `/api/v1/projects` | Create project |
