@@ -21,7 +21,7 @@ const emit = defineEmits<{
   >
     <div class="border-b border-border px-5 py-5">
       <router-link
-        :to="{ name: 'activity' }"
+        :to="{ name: 'issues' }"
         class="inline-flex min-h-10 items-center text-text transition-colors duration-150 hover:text-accent motion-reduce:transition-none"
       >
         <span class="font-mono text-sm font-semibold uppercase tracking-[0.18em]">Opslane</span>

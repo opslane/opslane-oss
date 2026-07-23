@@ -3,7 +3,7 @@ import { APP_NAVIGATION, isNavigationItemActive } from './navigation';
 
 describe('application navigation', () => {
   it('keeps detail routes associated with their parent ledger section', () => {
-    const incidents = APP_NAVIGATION.find((item) => item.routeName === 'activity');
+    const incidents = APP_NAVIGATION.find((item) => item.routeName === 'issues');
     const accounts = APP_NAVIGATION.find((item) => item.routeName === 'accounts');
     const sessions = APP_NAVIGATION.find((item) => item.routeName === 'sessions');
 

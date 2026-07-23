@@ -5,7 +5,7 @@ import { listIncidents } from '../api';
 import { getProjectId } from '../utils';
 import { useTableSort } from '../composables/useTableSort';
 import FilterBar from '../components/FilterBar.vue';
-import IncidentLedgerRow from '../components/incidents/IncidentLedgerRow.vue';
+import IssueRow from '../components/incidents/IssueRow.vue';
 import InlineAlert from '../components/ui/InlineAlert.vue';
 import EmptyState from '../components/ui/EmptyState.vue';
 import SkeletonBlock from '../components/ui/SkeletonBlock.vue';
@@ -243,7 +243,7 @@ onUnmounted(() => stopPolling());
         class="overflow-hidden rounded-lg border border-border sm:hidden"
         data-testid="stacked-issues-list"
       >
-        <IncidentLedgerRow
+        <IssueRow
           v-for="incident in sortedIncidents"
           :key="incident.id"
           :incident="incident"
@@ -313,7 +313,7 @@ onUnmounted(() => stopPolling());
           </tr>
         </thead>
         <tbody>
-          <IncidentLedgerRow
+          <IssueRow
             v-for="incident in sortedIncidents"
             :key="incident.id"
             :incident="incident"

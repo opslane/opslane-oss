@@ -3,7 +3,7 @@
 import { mount } from '@vue/test-utils';
 import { describe, expect, it } from 'vitest';
 import type { Incident } from '../../types/api';
-import IncidentLedgerRow from './IncidentLedgerRow.vue';
+import IssueRow from './IssueRow.vue';
 
 function incident(overrides: Partial<Incident> = {}): Incident {
   return {
@@ -26,7 +26,7 @@ function mountRow(
   overrides: Partial<Incident> = {},
   props: { showPlatform?: boolean; layout?: 'table' | 'stacked' } = {},
 ) {
-  return mount(IncidentLedgerRow, {
+  return mount(IssueRow, {
     props: {
       incident: incident(overrides),
       projectId: 'p1',
@@ -36,7 +36,7 @@ function mountRow(
   });
 }
 
-describe('IncidentLedgerRow', () => {
+describe('IssueRow', () => {
   it('does not render the fingerprint hash', () => {
     expect(mountRow().text()).not.toContain('f37814ba355f3df260ec891e3e343433');
   });

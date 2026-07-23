@@ -8,7 +8,7 @@ describe('routeNeedsProject', () => {
   });
 
   it('still requires a project for tenant-scoped routes', () => {
-    expect(routeNeedsProject('activity')).toBe(true);
+    expect(routeNeedsProject('issues')).toBe(true);
     expect(routeNeedsProject('sessions')).toBe(true);
   });
 });

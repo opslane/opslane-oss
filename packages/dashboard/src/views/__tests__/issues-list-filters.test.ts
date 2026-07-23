@@ -23,7 +23,7 @@ vi.mock('vue-router', () => ({
   useRouter: () => ({ replace: mocks.replace }),
 }));
 
-import ActivityFeed from '../ActivityFeed.vue';
+import IssuesList from '../IssuesList.vue';
 
 function incident(
   id: string,
@@ -55,7 +55,7 @@ function deferred<T>() {
 }
 
 function mountFeed() {
-  return mount(ActivityFeed, {
+  return mount(IssuesList, {
     global: {
       stubs: {
         RouterLink: { template: '<a><slot /></a>' },
@@ -64,7 +64,7 @@ function mountFeed() {
   });
 }
 
-describe('ActivityFeed URL filters', () => {
+describe('IssuesList URL filters', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.listAccounts.mockResolvedValue([]);

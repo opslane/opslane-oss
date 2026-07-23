@@ -59,7 +59,7 @@ describe.skipIf(!browserAvailable || !captureEnabled)('dashboard approved-fixtur
     { path: '/invite/accept?token=mock-token', fixture: 'invitation-accepted-mock', identity: /Organization invitation/i, harness: 'success' },
     { path: '/setup', fixture: 'setup-github-mock', identity: /Connect GitHub/i, harness: 'success' },
     { path: '/', fixture: 'activity-success-mock', identity: /^Issues$/i, harness: 'success' },
-    { path: '/incidents/incident-1', fixture: 'incident-pr-created-mock', identity: /Mock incident title/i, harness: 'success' },
+    { path: '/issues/incident-1', fixture: 'incident-pr-created-mock', identity: /Mock incident title/i, harness: 'success' },
     { path: '/accounts', fixture: 'accounts-success-mock', identity: /^Accounts$/i, harness: 'success' },
     { path: '/accounts/account-1', fixture: 'account-detail-success-mock', identity: /Mock Account/i, harness: 'success' },
     { path: '/sessions', fixture: 'sessions-success-mock', identity: /^Sessions$/i, harness: 'success' },
