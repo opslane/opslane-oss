@@ -265,7 +265,7 @@ onUnmounted(() => stopPolling());
               :aria-sort="ariaSort('status')"
               class="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.14em] text-muted"
             >
-              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('status')">
+              <button type="button" class="inline-flex items-center gap-1 uppercase tracking-[0.14em] hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('status')">
                 Status<span aria-hidden="true">{{ sortIndicator('status') }}</span>
               </button>
             </th>
@@ -274,7 +274,7 @@ onUnmounted(() => stopPolling());
               :aria-sort="ariaSort('occurrences')"
               class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted sm:table-cell"
             >
-              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('occurrences')">
+              <button type="button" class="inline-flex items-center gap-1 uppercase tracking-[0.14em] hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('occurrences')">
                 Events<span aria-hidden="true">{{ sortIndicator('occurrences') }}</span>
               </button>
             </th>
@@ -284,7 +284,7 @@ onUnmounted(() => stopPolling());
               :title="currentFilters.environment_id ? 'users across all environments' : undefined"
               class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted lg:table-cell"
             >
-              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('users')">
+              <button type="button" class="inline-flex items-center gap-1 uppercase tracking-[0.14em] hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('users')">
                 Users<span aria-hidden="true">{{ sortIndicator('users') }}</span>
               </button>
               <span v-if="currentFilters.environment_id" class="block text-[10px] normal-case tracking-normal">
@@ -297,7 +297,7 @@ onUnmounted(() => stopPolling());
               title="Time since this issue was first seen"
               class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted lg:table-cell"
             >
-              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('age')">
+              <button type="button" class="inline-flex items-center gap-1 uppercase tracking-[0.14em] hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('age')">
                 Age<span aria-hidden="true">{{ sortIndicator('age') }}</span>
               </button>
             </th>
@@ -306,7 +306,7 @@ onUnmounted(() => stopPolling());
               :aria-sort="ariaSort('last_seen')"
               class="hidden px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-[0.14em] text-muted xl:table-cell"
             >
-              <button type="button" class="inline-flex items-center gap-1 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('last_seen')">
+              <button type="button" class="inline-flex items-center gap-1 uppercase tracking-[0.14em] hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" @click="toggleSort('last_seen')">
                 Last Seen<span aria-hidden="true">{{ sortIndicator('last_seen') }}</span>
               </button>
             </th>
