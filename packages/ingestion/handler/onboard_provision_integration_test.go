@@ -35,9 +35,20 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	admin, err := queries.CreateUserGitHub(ctx, org.ID,
+		fmt.Sprintf("onboard-admin-%s@example.com", uuid.NewString()),
+		"Onboard Admin", time.Now().UnixNano(), "onboard-admin", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.CreateMembership(ctx, admin.ID, org.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	// Provisioning mints and rotates a production key, so it is admin-gated
+	// like every sibling key route; a plain org member must be refused.
 	member, err := queries.CreateUserGitHub(ctx, org.ID,
 		fmt.Sprintf("onboard-member-%s@example.com", uuid.NewString()),
-		"Onboard Member", time.Now().UnixNano(), "onboard-member", "")
+		"Onboard Member", time.Now().UnixNano()+1, "onboard-member", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +57,7 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 	}
 	nonMember, err := queries.CreateUserGitHub(ctx, org.ID,
 		fmt.Sprintf("onboard-outsider-%s@example.com", uuid.NewString()),
-		"Onboard Outsider", time.Now().UnixNano()+1, "onboard-outsider", "")
+		"Onboard Outsider", time.Now().UnixNano()+2, "onboard-outsider", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +69,12 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 		cleanupTenantHandler(t, pool, org.ID)
 	})
 
+	adminToken, err := auth.SignAccessToken(
+		[]byte(authTestJWTSecret), admin.ID, org.ID, admin.Email,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	memberToken, err := auth.SignAccessToken(
 		[]byte(authTestJWTSecret), member.ID, org.ID, member.Email,
 	)
@@ -103,10 +120,13 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 	if response := postProvision(nonMemberToken); response.Code != http.StatusForbidden {
 		t.Fatalf("non-member status=%d body=%s", response.Code, response.Body.String())
 	}
+	if response := postProvision(memberToken); response.Code != http.StatusForbidden {
+		t.Fatalf("non-admin member status=%d body=%s", response.Code, response.Body.String())
+	}
 
-	provisionResponse := postProvision(memberToken)
+	provisionResponse := postProvision(adminToken)
 	if provisionResponse.Code != http.StatusCreated {
-		t.Fatalf("member status=%d body=%s", provisionResponse.Code, provisionResponse.Body.String())
+		t.Fatalf("admin status=%d body=%s", provisionResponse.Code, provisionResponse.Body.String())
 	}
 	if got := provisionResponse.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q, want no-store", got)
@@ -131,8 +151,8 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 	).Scan(&actorID, &sessionStatus, &createdAt, &expiresAt, &keyClaimedAt); err != nil {
 		t.Fatal(err)
 	}
-	if actorID != member.ID || sessionStatus != "provisioned" {
-		t.Fatalf("actor/status=%s/%s, want %s/provisioned", actorID, sessionStatus, member.ID)
+	if actorID != admin.ID || sessionStatus != "provisioned" {
+		t.Fatalf("actor/status=%s/%s, want %s/provisioned", actorID, sessionStatus, admin.ID)
 	}
 	if keyClaimedAt != nil {
 		t.Fatal("synchronous provisioning must not mark the key claimed before the CLI polls")
@@ -205,7 +225,7 @@ func TestOnboardProvisionRealRouterAuthorizationAndLifecycle(t *testing.T) {
 		t.Fatalf("reporting poll status=%d payload=%v", code, payload)
 	}
 
-	repeatResponse := postProvision(memberToken)
+	repeatResponse := postProvision(adminToken)
 	if repeatResponse.Code != http.StatusCreated {
 		t.Fatalf("repeat status=%d body=%s", repeatResponse.Code, repeatResponse.Body.String())
 	}

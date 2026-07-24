@@ -11,6 +11,11 @@ import (
 
 var onboardProvisionLimiter = newRateLimiter(10)
 
+const (
+	maxOnboardRepoURLLen   = 200
+	maxOnboardAgentNameLen = 64
+)
+
 // OnboardProvision creates or reuses a project for an authenticated user's
 // organization and returns a freshly rotated API key plus poll credentials.
 //
@@ -43,6 +48,16 @@ func (d *Dependencies) OnboardProvision(w http.ResponseWriter, r *http.Request) 
 	}
 	if !repoURLPattern.MatchString(req.RepoURL) {
 		writeJSONError(w, http.StatusBadRequest, "repo_url must be in owner/repo format")
+		return
+	}
+	// The repo becomes part of the project idempotency token, which is indexed;
+	// an unbounded value would fail deep in Postgres as a 500 instead of a 400.
+	if len(req.RepoURL) > maxOnboardRepoURLLen {
+		writeJSONError(w, http.StatusBadRequest, "repo_url must be 200 characters or less")
+		return
+	}
+	if len(req.AgentName) > maxOnboardAgentNameLen {
+		writeJSONError(w, http.StatusBadRequest, "agent_name must be 64 characters or less")
 		return
 	}
 	var agentName *string
