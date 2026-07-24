@@ -40,7 +40,7 @@ function fixture(): { root: string; report: ReportPlanInput; plan: OnboardingPla
       position: 'before',
       occurrence: 0,
     },
-    existing_sdk: { action: 'keep', name: null },
+    existing_sdk: { action: 'keep', name: '@sentry/vue' },
     rationale: 'Initialize before the application mount.',
   };
   return { root, plan, report: { status: 'ok', plan } };

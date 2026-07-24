@@ -49,6 +49,27 @@ describe('onboarding hard-denial hook', () => {
     expect(denied(await run(hook(), 'Glob', { pattern: '**/.envrc' }))).toBe(true);
   });
 
+  it('denies credential files and directories beyond dotenv', async () => {
+    for (const candidate of [
+      '.git/config',
+      '.npmrc',
+      '.netrc',
+      '.git-credentials',
+      '.ssh/id_rsa',
+      '.aws/credentials',
+      'certs/server.pem',
+      'deploy/prod.tfvars',
+    ]) {
+      expect(
+        denied(await run(hook(), 'Read', { file_path: join(root, ...candidate.split('/')) })),
+        candidate,
+      ).toBe(true);
+    }
+    expect(denied(await run(hook(), 'Read', { file_path: join(root, 'src', 'main.ts') }))).toBe(
+      false,
+    );
+  });
+
   it('allows only exact package build, typecheck, or lint scripts through Bash', async () => {
     expect(denied(await run(hook(), 'Bash', { command: 'pnpm run build' }))).toBe(false);
     for (const command of [

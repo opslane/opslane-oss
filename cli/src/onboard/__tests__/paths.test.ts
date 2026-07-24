@@ -13,6 +13,30 @@ describe('onboarding path policy', () => {
     expect(isSecretFile('/x/src/env.ts')).toBe(false);
   });
 
+  it('treats credential files and directories beyond dotenv as secret', () => {
+    for (const filename of [
+      '.git',
+      '.npmrc',
+      '.netrc',
+      '.git-credentials',
+      '.pgpass',
+      '.ssh',
+      '.aws',
+      'credentials',
+      'id_rsa',
+      'id_ed25519.pub',
+      'server.pem',
+      'signing.key',
+      'prod.tfvars',
+      'keystore.p12',
+    ]) {
+      expect(isSecretFile(`/x/${filename}`), filename).toBe(true);
+    }
+    for (const filename of ['package.json', 'vite.config.ts', 'main.ts', 'README.md']) {
+      expect(isSecretFile(`/x/${filename}`), filename).toBe(false);
+    }
+  });
+
   it('contains canonical paths and rejects escapes through paths or symlinks', () => {
     const root = mkdtempSync(join(tmpdir(), 'opslane-paths-'));
     mkdirSync(join(root, 'src'));

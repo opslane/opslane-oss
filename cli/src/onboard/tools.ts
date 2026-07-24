@@ -8,7 +8,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
-import { containedRepoRelative, isSecretFile } from './paths.js';
+import { containedRepoRelative, hasSecretSegment } from './paths.js';
 
 const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun'] as const;
 /**
@@ -106,10 +106,6 @@ function enumValue<const Values extends readonly string[]>(
     throw new Error(`Unknown ${label}: ${String(value)}`);
   }
   return value as Values[number];
-}
-
-function hasSecretSegment(repoRelativePath: string): boolean {
-  return repoRelativePath.split('/').some((segment) => isSecretFile(segment));
 }
 
 function canonicalRepoPath(root: string, value: unknown, label: string): string {
@@ -229,6 +225,15 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
     value.existing_sdk.name === null
       ? null
       : nonEmptyString(value.existing_sdk.name, 'existing_sdk.name');
+  // `keep` and `migrate` describe an action ON a named SDK, so a null name
+  // makes the plan unapplyable; `none` means no SDK was found, so a name
+  // contradicts it. Apply reads both fields, so the pairing must hold here.
+  if ((existingAction === 'keep' || existingAction === 'migrate') && existingName === null) {
+    throw new Error(`existing_sdk.name is required when action is ${existingAction}`);
+  }
+  if (existingAction === 'none' && existingName !== null) {
+    throw new Error('existing_sdk.name must be null when action is none');
+  }
 
   return {
     app_dir: appDir,

@@ -70,7 +70,7 @@ describe('secret-aware onboarding search', () => {
     expect(result).not.toContain('huge.ts');
   });
 
-  it('stops scanning after the total byte limit', async () => {
+  it('skips past the total byte limit without ending the walk', async () => {
     for (let index = 0; index < 6; index += 1) {
       writeFileSync(join(root, `a${index}.txt`), 'x'.repeat(900 * 1024));
     }
@@ -78,6 +78,18 @@ describe('secret-aware onboarding search', () => {
 
     const result = await text(root, { query: 'past-total-limit' });
 
-    expect(result).toBe('');
+    // Files that would blow the budget are skipped, but alphabetically later
+    // files are still visited — one heavy subtree must not hide the repo.
+    expect(result).toBe('z-after-limit.txt:1');
+  });
+
+  it('does not scan generated output directories', async () => {
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    writeFileSync(join(root, 'dist', 'bundle.js'), 'generated-needle');
+    writeFileSync(join(root, 'src', 'main.ts'), 'generated-needle');
+
+    const result = await text(root, { query: 'generated-needle' });
+
+    expect(result).toBe('src/main.ts:1');
   });
 });

@@ -4,7 +4,7 @@ import {
   type PreToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import { containedRepoRelative, isSecretFile } from './paths.js';
+import { containedRepoRelative, hasSecretSegment } from './paths.js';
 
 const FILE_TOOLS = new Set(['Read', 'Glob', 'Edit', 'Write', 'MultiEdit']);
 const MUTATING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'Bash']);
@@ -26,10 +26,6 @@ function pathValues(value: unknown, key?: string): string[] {
   if (Array.isArray(value)) return value.flatMap((item) => pathValues(item, key));
   if (typeof value !== 'object' || value === null) return [];
   return Object.entries(value).flatMap(([childKey, child]) => pathValues(child, childKey));
-}
-
-function hasSecretSegment(repoRelativePath: string): boolean {
-  return repoRelativePath.split('/').some((segment) => isSecretFile(segment));
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

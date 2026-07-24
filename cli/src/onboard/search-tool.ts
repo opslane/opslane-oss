@@ -9,7 +9,24 @@ const MAX_RESULTS = 100;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 5 * 1024 * 1024;
 const BINARY_PREFIX_BYTES = 8 * 1024;
-const IGNORED_DIRECTORIES = new Set(['.git', 'node_modules']);
+// Generated output is skipped as well as `.git`/`node_modules`: entries are
+// walked in name order, so a large `dist/` would otherwise consume the whole
+// byte budget before an alphabetically later `src/` is ever visited.
+const IGNORED_DIRECTORIES = new Set([
+  '.git',
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.turbo',
+  '.venv',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'out',
+  'target',
+  'vendor',
+]);
 
 function globRegex(glob: string): RegExp {
   let source = '^';
@@ -73,10 +90,9 @@ function search(root: string, query: string, glob?: string): string[] {
         continue;
       }
       if (size > MAX_FILE_BYTES) continue;
-      if (totalBytes + size > MAX_TOTAL_BYTES) {
-        exhausted = true;
-        break;
-      }
+      // Skip past a file that would blow the budget rather than ending the
+      // walk: one heavy subtree must not hide the rest of the repository.
+      if (totalBytes + size > MAX_TOTAL_BYTES) continue;
 
       let buffer: Buffer;
       try {
