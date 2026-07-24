@@ -311,10 +311,18 @@ for (const root of roots) {
     console.log('  ask_user:', request.question, '->', JSON.stringify(request.options));
   }
   console.log('  PLAN:');
-  console.log(
+  // env_vars hold variable NAMES (e.g. VITE_OPSLANE_API_KEY), never secret values —
+  // Detect never emits a key. But the clear-text-logging scanner flags any log of an
+  // `api_key` field, so redact env_vars from the dump. The naming check below still
+  // verifies the actual variable names.
+  const printablePlan =
     run.plan === null
+      ? null
+      : { ...run.plan, env_vars: '[variable names — not printed]' };
+  console.log(
+    printablePlan === null
       ? '    (none reported)'
-      : JSON.stringify(run.plan, null, 2)
+      : JSON.stringify(printablePlan, null, 2)
           .split('\n')
           .map((line) => `    ${line}`)
           .join('\n'),
