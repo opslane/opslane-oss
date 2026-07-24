@@ -522,6 +522,8 @@ hardcode `VITE_OPSLANE_*` (what the recipe would have written, wrong here), wrot
 key, added the dependency, wired `init()` at the real entry point, and flagged "couldn't run
 the app" as unverified. So the spec below is goal + constraints + SDK contract, not steps.
 
+> **SUPERSEDED (2026-07-22):** the deterministic `survey.ts` pre-pass described in this section was **removed** after a live eval showed the agent picks the right convention on its own (2/2 real repos, 5/5 fixtures) with the survey off — it only saved latency and risked being confidently wrong. `renderSpec` now takes just `{ cwd }` and tells the agent to investigate the repo itself, plus a naming guard. See the "Design note — why no static survey" section in `docs/plans/2026-07-22-phase-1-engine-core.md` for the evidence and the current signatures. The paragraph below is kept for history; ignore its `survey` parameter and `survey.ts` references.
+
 **Two parts, and one is deterministic.** Follow PostHog: the CLI does a **survey pre-pass**
 (Task-local, deterministic) that detects the framework, entry point, env prefix, config
 location, and any existing SDK, and injects those *findings* into the prompt. The model gets

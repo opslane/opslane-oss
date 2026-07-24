@@ -21,7 +21,7 @@ The deeper problem is the manual install itself. In a clean Vite app it costs te
 
 - `opslane onboard` takes a developer from an uninstrumented repo to a confirmed connection (`app_reporting`) in one command.
 - The agent edits code in the repo's own conventions (its env-var prefix, its config location), not ours.
-- Every guardrail is pinned by a test: nothing runs without permission, Bash is allowlisted, no secret reads, no edits after the agent reports done.
+- Every guardrail is pinned by a test: nothing mutates without permission, Apply has no Bash, no secret reads occur, and no edits can land after the agent reports done.
 - Every run leaves a transcript on disk. The prototype's runs didn't, and we felt the gap.
 
 ### Non-goals (milestone A)
@@ -65,6 +65,47 @@ The scope call worth naming: login-first A depends on milestone 0.5 (account pro
 
 ## 4. System overview
 
+> **Updated 2026-07-23:** the agent is no longer one loop that investigates *and* edits. It is two stages — **Detect** (read-only, emits a typed plan) and **Apply** (executes an approved plan). The pipeline below is the current shape; §5.1–5.3 still describe the original combined loop and are superseded on that point. See `docs/plans/2026-07-22-phase-1-engine-core.md`.
+
+```
+  repo ──▶ ┌──────────────── DETECT (read-only) ────────────────┐
+           │  tools: Read, Glob, search, ask_user, report_plan  │
+           │  NO Edit / Write / Bash exist in this stage        │
+           │                                                    │
+           │   Read ──┐                                         │
+           │   Glob ──┼──▶ reason ──▶ report_plan ──┐           │
+           │   search ┘         ▲                   │           │
+           │                    └── ask_user ◀──────┘ (ambiguous)│
+           └────────────────────────┬───────────────────────────┘
+                                    │
+                     status='unsupported' ──▶ "no app to onboard" (terminal, not an error)
+                                    │
+                            status='ok' + typed OnboardingPlan
+                            { app_dir, env_vars, dependency,
+                              edit{ file, entry_hash,
+                                    manifest_file, manifest_hash,
+                                    init anchor/position/occurrence,
+                                    import_line, init_block },
+                              existing_sdk{ none|keep|migrate|no_op } }
+                                    │
+                                    ▼
+                        ┌──── HUMAN APPROVAL ────┐
+                        └────────────┬───────────┘
+                                     ▼
+           ┌──────────────── APPLY (edits) ─────────────────┐
+           │  contain + re-hash entry and manifest          │
+           │      ├── mismatch/unsafe ──▶ stop ──▶ re-Detect┼──┐
+           │      └── current ──▶ snapshot both files       │  │
+           │  agent edits exactly those two approved paths  │  │
+           │  finish_apply(edited files)                    │  │
+           │  reconcile settlement order + exact verify     │  │
+           │      ├── failure ──▶ restore both snapshots ───┼──┤
+           │      └── pass ──▶ report install required      │  │
+           └────────────────────────────────────────────────┘  │
+                                     ▲                          │
+                                     └──────────────────────────┘
+```
+
 Three programs cooperate. The **CLI** runs on the developer's machine and owns everything deterministic: login, provisioning, key material, config files, status polling. The **agent** is a Claude Code subprocess spawned through `@anthropic-ai/claude-agent-sdk`; it owns the reasoning: survey the repo, ask, edit, report. The **server** is the existing Opslane ingestion service; it authenticates the user, mints the project and key, and flips the session status through `created -> provisioned -> key_ok -> app_reporting`. `key_ok` means the key works; `app_reporting` means the installed SDK phoned home from the running app.
 
 ### Identity first, repo access later
@@ -96,13 +137,17 @@ sequenceDiagram
     end
     CLI->>Srv: POST provision (authenticated, no GitHub yet)
     Srv-->>CLI: api key + endpoint + project ids + session id
-    CLI->>Agent: spawn with spec prompt
-    Agent->>Agent: survey repo (Glob/Grep/Read)
+    CLI->>Agent: Detect prompt (read-only)
+    Agent->>Agent: survey repo (Glob/search/Read)
     Agent->>Dev: ask_user("Which app?")
     Dev-->>Agent: choice
+    Agent->>CLI: report_plan(typed plan)
+    CLI->>CLI: validate + hash entry and manifest
+    CLI->>Agent: Apply prompt (approved plan)
     Agent->>Agent: edit main.ts, package.json
-    Agent->>CLI: finish_onboarding(report)
-    CLI->>CLI: validate report, write .env.local
+    Agent->>CLI: finish_apply(edited files)
+    CLI->>CLI: reconcile, exact-verify, rollback on failure
+    CLI->>CLI: write .env.local (later phase)
     CLI-->>Dev: run pnpm install, then pnpm run dev
     Dev->>App: starts dev server
     App->>Srv: /sessions/init (sdk name+version)
@@ -121,6 +166,8 @@ sequenceDiagram
 ## 5. Component design
 
 ### 5.1 The agent loop
+
+> **Historical prototype context.** The transcript below is the original combined-loop spike. Production splits it into read-only Detect (`report_plan`) and narrow Apply (`finish_apply`). Apply has no Glob, search, or Bash and can write only the two hashed plan files.
 
 `query()` spawns the bundled Claude Code binary as a child process and returns an async generator of messages. The loop runs on its own: the model emits text and tool calls, the harness runs the tools, the results go back to the model, repeat until it stops. We consume the stream; we do not drive the turns. A prototype run against `opslane-smoke` (a throwaway clean Vite + React app kept as the onboarding test target) read like this:
 
@@ -143,13 +190,15 @@ Two mechanics matter. A custom MCP tool's handler is an async function, so while
 
 The prototype's spec was ten imperative lines, and that was the wrong shape. It hardcoded the file (`src/main.tsx`), the env prefix (`VITE_OPSLANE_*`), and the Vite idiom — a codemod narrated to a model. It works on a clean single-app Vite repo and is wrong the moment the repo differs, which is the whole reason to use an agent instead of a codemod. The design's own D3 says follow the repo's convention, never impose one.
 
-So the production spec is a **goal plus constraints plus the SDK contract**, not a step list. The goal: Opslane's `init()` runs once at the app's real entry point, reading key and endpoint from *this repo's* env convention, with `@opslane/sdk` added to dependencies. The constraints: follow the detected prefix and config location; reference env vars by name, never a literal value; migrate an existing SDK rather than duplicate; ask before editing; don't run installs; end with one `finish_onboarding`. The model chooses the file and the wiring by reading the repo. PostHog's wizard is the reference here — it wraps "a deterministic fence around a chaotic process," a stable prompt tailored with the project's specific files.
+Production uses two specs. Detect is a goal-oriented, read-only investigation that chooses the app, entry, env convention, package manifest, and coexistence action, then calls `report_plan`. Host code contains both files, stamps both hashes, and pins the SDK version. Apply receives that approved typed plan: it may only weave the exact import/init/dependency into those two files, must not run installs, refuses migration, and ends with one `finish_apply`. PostHog's wizard remains the reference: a deterministic fence around a model judgment.
 
 A live spike settled it. Against a repo using `VITE_APP_*` with config in `vite.config.ts`, the goal-based spec made the agent read the config, detect the prefix, and choose `VITE_APP_OPSLANE_API_KEY` — matching the repo. The recipe would have written `VITE_OPSLANE_API_KEY`, wrong there. It wrote no literal key, added the dependency, wired `init()` at the entry point, and flagged that it couldn't run the app.
 
 One deterministic half, also from PostHog: the CLI runs a **survey pre-pass** — read `package.json`, the lockfile, the framework config, and `.env*` files to detect framework, entry point, env prefix, config location, and any existing SDK — and injects those findings into the prompt. The model gets a smaller, better-scoped job (wire it, given the map) rather than survey-and-reason-and-edit from a thin prompt. It still verifies and may correct the findings, but starts with a map. Each rule in the rendered prompt is pinned by a test, because the spec is the most-edited file in this system and a dropped line is invisible until an agent misbehaves.
 
 ### 5.3 Custom tools and the structured report
+
+> **Superseded combined-report shape.** The interface below documents the prototype. Production Detect emits `OnboardingPlan`; Apply emits only canonical `edited_files` plus a summary. Install metadata is host-derived after exact verification.
 
 The agent gets the SDK's file tools plus two custom MCP tools. `ask_user` pauses the loop and routes a question to the Ink UI; its resolver defaults to throwing, so a run with no UI attached fails fast instead of hanging. `finish_onboarding` is how the agent hands the CLI a machine-readable result:
 
@@ -171,6 +220,8 @@ The report is model output, so it is validated like input from a stranger: paths
 **When validation or reconciliation fails.** If the report is malformed, references a file the agent never edited, or the reverse (an edit with no report entry), the CLI writes no `.env.local`, does no polling, prints the run-log path and a one-line reason, and exits non-zero (`onboard_failed`). The provisioned session is *not* consumed, so the persisted pending state (R5) lets a plain re-run start a fresh agent against the same session, the same recovery path as a crash. A brand-new user's story is therefore "it stopped and told me to re-run," not a stranded project.
 
 ### 5.4 Tool policy: a gate, not a bypass
+
+> **Production split.** Detect exposes read-only `Read`, `Glob`, and secret-aware search. Apply exposes only `Read`, `Edit`, `Write`, and `finish_apply`; its hook restricts mutations to the exact entry/manifest paths, and Bash is absent. The prototype policy below explains the permission findings that led to the two-layer hook plus fail-closed approval design, but its combined tool list is not the shipping configuration.
 
 The prototype ran `permissionMode: 'bypassPermissions'` because Ink owns the TTY and the subprocess cannot prompt. Reading the actual SDK type definitions (`sdk.d.ts`, v0.3.217) surfaced two problems with carrying that into production. That mode bypasses all permission checks and is grouped with `auto` as an auto-allow mode, so `canUseTool` is never consulted, which would make the guardrails below dead code. And we do not want a bypass. Nothing should run without permission.
 
