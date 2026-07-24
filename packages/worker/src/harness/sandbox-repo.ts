@@ -1,7 +1,12 @@
 import type { CheckOutcome } from '@opslane/shared';
 import { logger } from '../logger.js';
-import { buildGitNetrc } from '../repo-clone.js';
-import { scrubSecrets } from './redact.js';
+import {
+  buildGitNetrc,
+  CloneResolutionError,
+  resolveClonedBranch,
+  type GitRunner,
+} from '../repo-clone.js';
+import { redactCloneDetail, scrubSecrets } from './redact.js';
 import { createSandboxRuntime, type SandboxRuntime } from './sandbox-runtime.js';
 import type { Platform } from '../platform.js';
 import { sanitizeRuntimeValue, type RuntimeInfo } from '../runtime-info.js';
@@ -108,7 +113,7 @@ async function ensureModernNode(sandbox: SandboxRuntime): Promise<void> {
  */
 export async function createRepoSandbox(opts: {
   repoUrl: string;
-  defaultBranch: string;
+  githubRepo?: string;
   githubToken?: string;
   /** Commands applied after the baseline commit and committed separately. */
   setupCommands?: string[];
@@ -126,18 +131,49 @@ export async function createRepoSandbox(opts: {
       await sandbox.commands.run('chmod 600 /home/user/.netrc');
     }
 
+    const runner: GitRunner = async (args) => {
+      try {
+        const result = await sandbox.commands.run(
+          `git -C ${SANDBOX_REPO} ${args.map(shellEscape).join(' ')}`,
+          { timeoutMs: 30_000 },
+        );
+        return {
+          stdout: String(result.stdout ?? ''),
+          stderr: String(result.stderr ?? ''),
+          exitCode: 0,
+        };
+      } catch (err: unknown) {
+        const detail = err as { message?: string; stdout?: string; stderr?: string };
+        return {
+          stdout: String(detail.stdout ?? ''),
+          stderr: String(detail.stderr ?? detail.message ?? err),
+          exitCode: 1,
+        };
+      }
+    };
+
     try {
       await sandbox.commands.run(
-        `git clone --depth 1 --branch ${shellEscape(opts.defaultBranch)} ${shellEscape(opts.repoUrl)} ${SANDBOX_REPO}`,
+        `git clone --depth 1 ${shellEscape(opts.repoUrl)} ${SANDBOX_REPO}`,
         { timeoutMs: 120_000 },
       );
+      // ls-remote needs the private-repo credential, so resolve before .netrc
+      // is removed. This result validates the sandbox only; the host clone is
+      // the PR-base authority.
+      await resolveClonedBranch(runner, opts.githubRepo ?? 'repo');
     } catch (err: unknown) {
-      const msg = (err instanceof Error ? err.message : String(err))
-        .replace(/https:\/\/[^@]+@/g, 'https://***@');
-      throw new Error(`clone failed: ${msg}`);
+      if (err instanceof CloneResolutionError) throw err;
+      const detail = err as { message?: string; stderr?: string };
+      const message = [
+        detail.message ?? String(err),
+        detail.stderr,
+      ].filter(Boolean).join('\n');
+      throw new Error(`clone failed: ${redactCloneDetail(message)}`);
+    } finally {
+      if (gitNetrc) {
+        await sandbox.commands.run('rm -f /home/user/.netrc').catch(() => {});
+      }
     }
-
-    if (gitNetrc) await sandbox.commands.run('rm -f /home/user/.netrc');
 
     const platform = opts.platform ?? 'javascript';
     const hasPackageJson = await fileExists(sandbox, `${SANDBOX_REPO}/package.json`);

@@ -9,7 +9,7 @@ import { fetchObject, getMinIOConfig } from './minio-client.js';
 import { investigateError } from './investigate.js';
 import { runPipeline } from './pipeline.js';
 import { createPoller } from './poller.js';
-import { buildRepoUrl, cloneRepo } from './repo-clone.js';
+import { buildRepoUrl, cloneFailureReason, cloneRepo } from './repo-clone.js';
 import { getInstallationToken } from './github-app.js';
 import { type ReplaySignals } from './pr.js';
 import { processSetupPrJob } from './setup-pr.js';
@@ -343,24 +343,15 @@ export async function processInvestigateJob(job: ClaimedJob & { errorGroupId: st
   try {
     const cloneResult = await cloneRepo({
       githubRepo: project.github_repo,
-      defaultBranch: project.default_branch,
       jobId: job.id,
       githubToken,
     });
     repoDir = cloneResult.repoDir;
     cleanup = cloneResult.cleanup;
+    await db.cacheProjectDefaultBranch(job.projectId, cloneResult.defaultBranch);
   } catch (err: unknown) {
-    const rawMessage = err instanceof Error ? err.message : String(err);
-    const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
-    const message = rawMessage.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
     await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
-      reason: {
-        reason_code: isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
-        reason_message: `Failed to clone repository: ${message}`,
-        remediation: isTokenMissing
-          ? 'Set the GITHUB_TOKEN environment variable with repo scope'
-          : 'Ensure GITHUB_TOKEN has read access to the repository',
-      },
+      reason: cloneFailureReason(err),
     }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
@@ -522,18 +513,13 @@ export async function processFrictionInvestigateJob(
   try {
     clone = await cloneRepo({
       githubRepo: project.github_repo,
-      defaultBranch: project.default_branch,
       jobId: job.id,
       githubToken,
     });
+    await db.cacheProjectDefaultBranch(job.projectId, clone.defaultBranch);
   } catch (error: unknown) {
-    const raw = error instanceof Error ? error.message : String(error);
-    const message = raw.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
     await updateGroupInvestigation(job.errorGroupId, job.projectId, 'needs_human', {
-      reason: buildReason(
-        raw.includes('GITHUB_TOKEN') ? 'missing_github_token' : 'repo_access_denied',
-        `Failed to clone repository: ${message}`,
-      ),
+      reason: cloneFailureReason(error),
     }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
@@ -732,25 +718,21 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
 
   // Clone repo
   let repoDir: string;
+  let defaultBranch: string;
   let cleanup: () => Promise<void>;
   try {
     const cloneResult = await cloneRepo({
       githubRepo: project.github_repo,
-      defaultBranch: project.default_branch,
       jobId: job.id,
       githubToken,
     });
     repoDir = cloneResult.repoDir;
+    defaultBranch = cloneResult.defaultBranch;
     cleanup = cloneResult.cleanup;
+    await db.cacheProjectDefaultBranch(job.projectId, defaultBranch);
   } catch (err: unknown) {
-    const rawMessage = err instanceof Error ? err.message : String(err);
-    const message = rawMessage.replace(/https:\/\/[^@]{1,512}@/g, 'https://***@');
-    const isTokenMissing = rawMessage.includes('GITHUB_TOKEN');
     await updateGroupStatus(job.errorGroupId, job.projectId, 'needs_human', {
-      reason: buildReason(
-        isTokenMissing ? 'missing_github_token' : 'repo_access_denied',
-        `Failed to clone repository: ${message}`,
-      ),
+      reason: cloneFailureReason(err),
     }, job);
     jobsFailed++;
     lastJobAt = new Date().toISOString();
@@ -879,7 +861,7 @@ export async function processFixJob(job: ClaimedJob & { errorGroupId: string }, 
       repoPath: repoDir,
       repoUrl,
       githubRepo: project.github_repo,
-      defaultBranch: project.default_branch,
+      defaultBranch,
       githubToken,
       abortSignal: signal,
       assertLeaseOwned: () => db.assertJobLease(job),

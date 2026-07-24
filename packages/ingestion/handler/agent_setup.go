@@ -429,9 +429,11 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	canonical := ""
+	canonicalDefaultBranch := ""
 	for _, repo := range repos {
 		if strings.EqualFold(repo.FullName, session.RepoURL) {
 			canonical = repo.FullName
+			canonicalDefaultBranch = repo.DefaultBranch
 			break
 		}
 	}
@@ -446,23 +448,20 @@ func (d *Dependencies) AgentAuthCallback(w http.ResponseWriter, r *http.Request)
 	if session.AgentKeyPub != nil {
 		agentKeyPub = *session.AgentKeyPub
 	}
-	repoNames := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		repoNames = append(repoNames, repo.FullName)
-	}
 	res, err := d.Queries.ProvisionAgentSession(r.Context(), db.AgentProvisionInput{
-		SessionID:      sessionID,
-		InstallationID: installationID,
-		CanonicalRepo:  canonical,
-		Repos:          repoNames,
-		GitHubOrgName:  installInfo.Account.Login,
-		GitHubOrgID:    installInfo.Account.ID,
-		GitHubUserID:   ghUser.ID,
-		GitHubLogin:    ghUser.Login,
-		DisplayName:    ghUser.Name,
-		Email:          email,
-		EmailVerified:  emailVerified,
-		AvatarURL:      ghUser.AvatarURL,
+		SessionID:              sessionID,
+		InstallationID:         installationID,
+		CanonicalRepo:          canonical,
+		Repos:                  toInstallationRepos(repos),
+		CanonicalDefaultBranch: canonicalDefaultBranch,
+		GitHubOrgName:          installInfo.Account.Login,
+		GitHubOrgID:            installInfo.Account.ID,
+		GitHubUserID:           ghUser.ID,
+		GitHubLogin:            ghUser.Login,
+		DisplayName:            ghUser.Name,
+		Email:                  email,
+		EmailVerified:          emailVerified,
+		AvatarURL:              ghUser.AvatarURL,
 		SealKey: func(rawKey string) (string, error) {
 			return auth.SealAgentKey(agentKeyPub, sessionID, rawKey)
 		},

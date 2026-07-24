@@ -1,19 +1,147 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
+import type { NeedsHumanReason } from '@opslane/shared';
+import { redactCloneDetail } from './harness/redact.js';
+import { DEFAULT_REMEDIATION } from './reason-codes.js';
 
 const execFile = promisify(execFileCb);
 
 export interface CloneOptions {
   githubRepo: string;   // "owner/repo"
-  defaultBranch: string;
   jobId: string;
   timeoutMs?: number;
   githubToken?: string;
+  /** Test/local transport override. Production callers use buildRepoUrl. */
+  repoUrl?: string;
 }
 
 export interface CloneResult {
   repoDir: string;
+  /** Resolved from the clone itself; authoritative for this job. */
+  defaultBranch: string;
   cleanup: () => Promise<void>;
+}
+
+/** Result of a git invocation that is allowed to fail without throwing. */
+export interface GitResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+export type GitRunner = (args: string[]) => Promise<GitResult>;
+
+export type CloneResolutionKind =
+  | 'empty_repository'
+  | 'invalid_default_branch'
+  | 'unresolvable_head';
+
+export class CloneResolutionError extends Error {
+  readonly kind: CloneResolutionKind;
+  readonly repo: string;
+  readonly discoveredBranch?: string;
+
+  constructor(kind: CloneResolutionKind, repo: string, discoveredBranch?: string) {
+    super(CloneResolutionError.describe(kind, repo, discoveredBranch));
+    this.name = 'CloneResolutionError';
+    this.kind = kind;
+    this.repo = repo;
+    this.discoveredBranch = discoveredBranch;
+  }
+
+  private static describe(
+    kind: CloneResolutionKind,
+    repo: string,
+    branch?: string,
+  ): string {
+    switch (kind) {
+      case 'empty_repository':
+        return `${repo} has no commits yet, so there is no branch to work from`;
+      case 'invalid_default_branch':
+        return `default branch '${branch}' does not exist in ${repo}`;
+      case 'unresolvable_head':
+        return `could not determine the default branch of ${repo}`;
+    }
+  }
+}
+
+/** A GitRunner backed by execFile against an already-cloned working directory. */
+export function execFileGitRunner(repoDir: string): GitRunner {
+  return async (args) => {
+    try {
+      const { stdout, stderr } = await execFile('git', args, {
+        cwd: repoDir,
+        timeout: 15_000,
+        env: scrubbedEnv(),
+      });
+      return {
+        stdout: String(stdout),
+        stderr: String(stderr),
+        exitCode: 0,
+      };
+    } catch (err: unknown) {
+      const detail = err as { stdout?: string; stderr?: string; code?: number };
+      return {
+        stdout: String(detail.stdout ?? ''),
+        stderr: String(detail.stderr ?? ''),
+        exitCode: typeof detail.code === 'number' ? detail.code : 1,
+      };
+    }
+  };
+}
+
+/**
+ * Resolve the branch checked out by a plain clone.
+ *
+ * ls-remote must run first: both an empty repository and a repository whose
+ * HEAD points at a missing ref fail rev-parse, while only the empty repository
+ * has no remote heads.
+ */
+export async function resolveClonedBranch(
+  run: GitRunner,
+  repo: string,
+): Promise<string> {
+  const heads = await run(['ls-remote', '--heads', 'origin']);
+  if (heads.exitCode !== 0) {
+    throw new Error(
+      `could not inspect remote branches for ${repo}: ${redactCloneDetail(heads.stderr)}`,
+    );
+  }
+  if (heads.stdout.trim() === '') {
+    throw new CloneResolutionError('empty_repository', repo);
+  }
+
+  const symbolic = await run(['symbolic-ref', '--short', 'HEAD']);
+  if (symbolic.exitCode !== 0 || symbolic.stdout.trim() === '') {
+    throw new CloneResolutionError('unresolvable_head', repo);
+  }
+  const branch = symbolic.stdout.trim();
+
+  const head = await run(['rev-parse', '--verify', 'HEAD']);
+  if (head.exitCode !== 0) {
+    throw new CloneResolutionError('invalid_default_branch', repo, branch);
+  }
+  return branch;
+}
+
+/** Turn clone failures into actionable terminal reasons. */
+export function cloneFailureReason(err: unknown): NeedsHumanReason {
+  if (err instanceof CloneResolutionError) {
+    return {
+      reason_code: err.kind,
+      reason_message: err.message,
+      remediation: DEFAULT_REMEDIATION[err.kind],
+    };
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  const reasonCode = raw.includes('GITHUB_TOKEN')
+    ? 'missing_github_token'
+    : 'repo_access_denied';
+  return {
+    reason_code: reasonCode,
+    reason_message: redactCloneDetail(raw),
+    remediation: DEFAULT_REMEDIATION[reasonCode],
+  };
 }
 
 /** Strict `owner/repo` grammar — no traversal segments, no extra path parts. */
@@ -55,41 +183,48 @@ export function buildGitNetrc(repoUrl: string, token: string): string | null {
  * not in /proc/PID/cmdline or shell history.
  */
 export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
-  const { githubRepo, defaultBranch, jobId, timeoutMs = 30_000 } = options;
+  const { githubRepo, jobId, timeoutMs = 30_000 } = options;
   const token = options.githubToken ?? process.env['GITHUB_TOKEN'];
-  if (!token) {
+  if (!token && !options.repoUrl) {
     throw new Error('GITHUB_TOKEN is not set');
   }
 
-  // Reject stored values that git could parse as options (second-order argument
-  // injection, e.g. a branch of "--upload-pack=..."). Branch names never start
-  // with '-' or contain whitespace; repos are "owner/name".
-  if (!/^[^\s-][^\s]*$/.test(defaultBranch)) {
-    throw new Error('Refusing to clone: unsafe branch name');
-  }
   if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(githubRepo)) {
     throw new Error('Refusing to clone: unsafe repository name');
   }
 
   const repoDir = `/tmp/opslane-repo-${jobId}`;
-  const cloneUrl = buildRepoUrl(githubRepo, token);
+  const cloneUrl = options.repoUrl ?? buildRepoUrl(githubRepo, token);
 
   try {
-    // `--branch=` attached form + `--` end-of-options so neither the branch nor
-    // the positional URL/dir can be reinterpreted as a git option.
+    // A plain clone checks out remote HEAD, the repository's current default.
     await execFile('git', [
-      'clone', '--depth', '1', `--branch=${defaultBranch}`,
+      'clone', '--depth', '1',
       '--', cloneUrl, repoDir,
     ], { timeout: timeoutMs, env: scrubbedEnv() });
   } catch (err: unknown) {
-    // Scrub token from error messages before propagating (bounded quantifier
-    // to avoid polynomial backtracking on adversarial input).
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(msg.replace(/x-access-token:[^@]{1,512}@/g, 'x-access-token:***@'));
+    const detail = err as { message?: string; stderr?: string };
+    throw new Error(redactCloneDetail([
+      detail.message ?? String(err),
+      detail.stderr,
+    ].filter(Boolean).join('\n')));
   }
 
+  let defaultBranch: string;
+  try {
+    defaultBranch = await resolveClonedBranch(
+      execFileGitRunner(repoDir),
+      githubRepo,
+    );
+  } catch (err: unknown) {
+    // Resolution failures happen after clone, before the caller receives its
+    // cleanup handle. Remove the token-bearing checkout before propagating.
+    await execFile('rm', ['-rf', repoDir]).catch(() => {});
+    throw err;
+  }
   return {
     repoDir,
+    defaultBranch,
     cleanup: async () => {
       await execFile('rm', ['-rf', repoDir]).catch(() => {});
     },

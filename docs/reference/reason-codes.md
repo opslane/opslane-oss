@@ -13,6 +13,14 @@ Every `needs_human` incident carries a `reason_code`, a `reason_message`, and a 
 | `policy_blocked` | A repository or org policy blocked the change. Review branch-protection / app permissions, then retry. |
 | `missing_llm_key` | Set the `ANTHROPIC_API_KEY` environment variable on the worker with a valid Anthropic API key. |
 
+## Repository state
+
+| Code | Remediation |
+| --- | --- |
+| `empty_repository` | Push at least one commit to this repository, then retry — there is no branch for Opslane to work from yet. |
+| `invalid_default_branch` | This repository's default branch points at a branch that no longer exists. Set a valid default branch in GitHub (Settings → Branches), then retry. |
+| `unresolvable_head` | Opslane could not determine this repository's default branch. Check the repository is not in an unusual state, then retry. |
+
 ## Investigation and fix quality
 
 | Code | Remediation |
@@ -52,4 +60,4 @@ Every `needs_human` incident carries a `reason_code`, a `reason_message`, and a 
 | `lease_lost` | No action needed — the job lease expired mid-run and the incident will be retried automatically. |
 | `verification_infra_error` | No immediate action needed — verification infrastructure failed (dependency install, test runner crash, or timeout), so the fix could not be proven either way. It will be retried on recurrence; if it persists, check worker logs. |
 
-25 codes total. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `shared/src/types.ts` disagree.
+28 codes total. The [drift check](../../scripts/check-docs-drift.mjs) fails the repository test gate (`pnpm test`, which CI runs) if this page and `shared/src/types.ts` disagree.

@@ -1,5 +1,6 @@
 import type { SetupPrStatus } from '@opslane/shared';
 import { buildRepoUrl, cloneRepo, gitCommitAndPush, validateDiffPaths } from './repo-clone.js';
+import { redactCloneDetail } from './harness/redact.js';
 import { createGitHubClient } from './pr.js';
 import { getInstallationToken } from './github-app.js';
 import { runAgentSetup } from './setup-agent.js';
@@ -9,13 +10,14 @@ import type { ClaimedJob } from './db.js';
 const SETUP_BRANCH = 'opslane/setup';
 
 export interface SetupPrDeps {
-  getProject(projectId: string): Promise<{ github_repo: string; default_branch: string } | null>;
+  getProject(projectId: string): Promise<{ github_repo: string } | null>;
   getInstallToken(projectId: string): Promise<string | undefined>;
   findExistingPr(token: string, repo: string, head: string): Promise<{ url: string; number: number } | null>;
-  clone(opts: { githubRepo: string; defaultBranch: string; jobId: string; githubToken?: string }): Promise<{ repoDir: string; cleanup: () => Promise<void> }>;
+  clone(opts: { githubRepo: string; jobId: string; githubToken?: string }): Promise<{ repoDir: string; defaultBranch: string; cleanup: () => Promise<void> }>;
+  cacheDefaultBranch(projectId: string, branch: string): Promise<void>;
   runAgentSetup(input: {
     repoUrl: string;
-    defaultBranch: string;
+    githubRepo: string;
     githubToken?: string;
     apiKeyEnvVar: string;
     releaseEnvVar: string;
@@ -67,9 +69,18 @@ export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ sta
   let cleanup = async (): Promise<void> => {};
   try {
     const repoUrl = buildRepoUrl(project.github_repo);
+    const cloneResult = await d.clone({
+      githubRepo: project.github_repo,
+      jobId: job.jobId,
+      githubToken: token,
+    });
+    cleanup = cloneResult.cleanup;
+    const defaultBranch = cloneResult.defaultBranch;
+    await d.cacheDefaultBranch(job.projectId, defaultBranch);
+
     const agent = await d.runAgentSetup({
       repoUrl,
-      defaultBranch: project.default_branch,
+      githubRepo: project.github_repo,
       githubToken: token,
       apiKeyEnvVar: job.apiKeyEnvVar,
       releaseEnvVar: job.releaseEnvVar,
@@ -86,21 +97,13 @@ export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ sta
       return { status: 'failed' };
     }
 
-    const cloneResult = await d.clone({
-      githubRepo: project.github_repo,
-      defaultBranch: project.default_branch,
-      jobId: job.jobId,
-      githubToken: token,
-    });
-    cleanup = cloneResult.cleanup;
-
     const repoDir = cloneResult.repoDir;
     await d.assertLeaseOwned();
     await d.commitAndPush(repoDir, SETUP_BRANCH, 'chore: install Opslane SDK', agent.diff);
     await d.assertLeaseOwned();
     const pr = await d.createPr(token, {
       repo: project.github_repo,
-      base: project.default_branch,
+      base: defaultBranch,
       head: SETUP_BRANCH,
       title: '[Opslane] Install Opslane SDK',
       body: setupPrBody(),
@@ -108,9 +111,7 @@ export async function runSetupPr(job: SetupPrJob, d: SetupPrDeps): Promise<{ sta
     await d.record(job.projectId, 'open', { pr_url: pr.url, pr_number: pr.number });
     return { status: 'open' };
   } catch (err: unknown) {
-    const msg = (err instanceof Error ? err.message : String(err))
-      .replace(/x-access-token:[^@]+@/g, 'x-access-token:***@')
-      .replace(/https:\/\/[^@]+@/g, 'https://***@');
+    const msg = redactCloneDetail(err instanceof Error ? err.message : String(err));
     await d.record(job.projectId, 'failed', { error: `Failed to open setup PR: ${msg}` });
     return { status: 'failed' };
   } finally {
@@ -164,6 +165,8 @@ export async function processSetupPrJob(
         return client.listOpenPullsByHead({ owner, repo: name, head });
       },
       clone: (opts) => cloneRepo(opts),
+      cacheDefaultBranch: (projectId, branch) =>
+        db.cacheProjectDefaultBranch(projectId, branch),
       runAgentSetup: (input) => runAgentSetup(input),
       commitAndPush: async (repoDir, branch, message, diff) => {
         await gitCommitAndPush(repoDir, branch, message, diff);

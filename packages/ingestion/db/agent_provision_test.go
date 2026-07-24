@@ -263,6 +263,39 @@ func TestProvisionAgentSession_NewOrgUserProjectKey(t *testing.T) {
 	}
 }
 
+func TestProvisionAgentSessionStoresResolvedDefaultBranch(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	cleanup := newProvisionCleanup(t, pool)
+	fixture := newProvisionFixture()
+	repo := "Master-Owner-" + fixture.suffix + "/Master-Repo"
+	session := createProvisionSession(t, q, cleanup, strings.ToLower(repo))
+	input := fixture.input(session.ID, repo)
+	input.CanonicalDefaultBranch = "master"
+	input.Repos = []db.InstallationRepo{{
+		FullName:      repo,
+		DefaultBranch: "master",
+	}}
+	cleanup.installation(input.InstallationID)
+
+	result, err := q.ProvisionAgentSession(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup.org(result.OrgID)
+
+	var branch *string
+	if err := pool.QueryRow(ctx,
+		`SELECT default_branch FROM projects WHERE id = $1`,
+		result.ProjectID).Scan(&branch); err != nil {
+		t.Fatal(err)
+	}
+	if branch == nil || *branch != "master" {
+		t.Fatalf("default_branch = %v, want master", branch)
+	}
+}
+
 func TestProvisionAgentSession_ReturningUserUsesExistingOrg(t *testing.T) {
 	pool := testPool(t)
 	q := db.New(pool)

@@ -21,6 +21,14 @@ function buildPatchCommand(patchContent: string): string {
   return `echo '${b64}' | base64 -d | git apply --whitespace=fix`;
 }
 
+function githubRepoFromUrl(repoUrl: string): string {
+  const pathname = new URL(repoUrl).pathname.replace(/^\/|\/$/g, '').replace(/\.git$/, '');
+  if (pathname.split('/').length !== 2) {
+    throw new Error(`Eval repo_url must identify a GitHub owner/repository: ${repoUrl}`);
+  }
+  return pathname;
+}
+
 export async function callPipeline(
   evalCase: EvalCase,
   casesDir: string,
@@ -59,7 +67,7 @@ export async function callPipeline(
     sourceFiles: [],  // Agent reads files directly from repo
     visualAnalysis: null,
     repoUrl: evalCase.repo_url,
-    defaultBranch: evalCase.default_branch ?? 'main',
+    githubRepo: githubRepoFromUrl(evalCase.repo_url),
     setupCommands: setupCommands.length > 0 ? setupCommands : undefined,
     budgetUsd: 2.00,  // Higher budget for eval cases
   });

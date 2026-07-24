@@ -114,7 +114,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult>
     sourceFiles: input.sourceFiles,
     visualAnalysis: input.visualAnalysis,
     repoUrl: input.repoUrl,
-    defaultBranch: input.defaultBranch,
+    githubRepo: input.githubRepo,
     githubToken: input.githubToken,
     repoPath: input.repoPath,
     investigation: input.investigation,

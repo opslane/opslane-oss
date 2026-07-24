@@ -13,6 +13,7 @@ vi.mock('../db.js', () => ({
   getErrorEvent: vi.fn(),
   getProject: vi.fn(),
   getProjectGitHubInstallation: vi.fn(),
+  cacheProjectDefaultBranch: vi.fn(),
   updateGroupStatus: vi.fn(),
   updateGroupInvestigation: vi.fn(),
   updateGroupAndCreateFixJob: vi.fn(),
@@ -44,6 +45,11 @@ vi.mock('../logger.js', () => ({
 vi.mock('../repo-clone.js', () => ({
   cloneRepo: vi.fn(),
   buildRepoUrl: vi.fn((githubRepo: string) => `https://github.com/${githubRepo}.git`),
+  cloneFailureReason: vi.fn((error: unknown) => ({
+    reason_code: 'repo_access_denied',
+    reason_message: error instanceof Error ? error.message : String(error),
+    remediation: 'Check repository access',
+  })),
 }));
 vi.mock('../minio-client.js', () => ({ fetchObject: vi.fn(), getMinIOConfig: vi.fn(() => null) }));
 vi.mock('../investigate.js', () => ({ investigateError: vi.fn() }));
@@ -245,7 +251,11 @@ describe('processFixJob — preserves writeup on failure (no revert/null)', () =
     mockGetProject.mockResolvedValue({
       id: 'p1', name: 'app', github_repo: 'org/app', default_branch: 'main', friction_autonomy: 'ask_first',
     } as ProjectData);
-    mockCloneRepo.mockResolvedValue({ repoDir: '/tmp/r', cleanup: vi.fn() } as never);
+    mockCloneRepo.mockResolvedValue({
+      repoDir: '/tmp/r',
+      defaultBranch: 'master',
+      cleanup: vi.fn(),
+    } as never);
     vi.mocked(db.getProjectGitHubInstallation).mockResolvedValue(null as never);
     vi.mocked(db.getReplayForGroup).mockResolvedValue(null as never);
     vi.mocked(db.getReplayArtifacts).mockResolvedValue([] as never);
