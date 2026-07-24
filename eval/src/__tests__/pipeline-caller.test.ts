@@ -63,6 +63,7 @@ describe('callPipeline', () => {
     expect(input.platform).toBe('python');
     expect(input.customerRuntime).toEqual({ name: 'CPython', version: '3.12.4' });
     expect(input.repoUrl).toBe('https://github.com/test/eval-app.git');
+    expect(input.githubRepo).toBe('test/eval-app');
     expect(input.sourceFiles).toEqual([]);
     expect(input.setupCommands).toBeUndefined();
   });

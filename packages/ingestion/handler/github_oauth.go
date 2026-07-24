@@ -370,10 +370,7 @@ func (d *Dependencies) gitHubInstallCallback(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusBadGateway, "could not load GitHub installation repositories")
 		return
 	}
-	repoNames := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		repoNames = append(repoNames, repo.FullName)
-	}
+	installationRepos := toInstallationRepos(repos)
 
 	tx, err := d.Queries.Pool().Begin(r.Context())
 	if err != nil {
@@ -391,7 +388,7 @@ func (d *Dependencies) gitHubInstallCallback(w http.ResponseWriter, r *http.Requ
 		GitHubOrgName:  installInfo.Account.Login,
 		GitHubOrgID:    installInfo.Account.ID,
 		OrgID:          *reservation.TargetOrgID,
-		Repos:          repoNames,
+		Repos:          installationRepos,
 	}); err != nil {
 		if errors.Is(err, db.ErrInstallationOrgConflict) {
 			writeJSONError(w, http.StatusConflict, "installation is already mapped to another organization")
@@ -640,10 +637,7 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 	if err != nil {
 		return fmt.Errorf("list installation repositories: %w", err)
 	}
-	repoNames := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		repoNames = append(repoNames, repo.FullName)
-	}
+	installationRepos := toInstallationRepos(repos)
 	orgID := user.OrgID
 	if targetOrgID != "" {
 		role, err := d.Queries.GetMembership(ctx, user.ID, targetOrgID)
@@ -665,7 +659,7 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 		GitHubOrgName:  installInfo.Account.Login,
 		GitHubOrgID:    installInfo.Account.ID,
 		OrgID:          orgID,
-		Repos:          repoNames,
+		Repos:          installationRepos,
 	}); err != nil {
 		return err
 	}
@@ -673,6 +667,17 @@ func (d *Dependencies) applyCombinedGitHubInstallationContext(ctx context.Contex
 }
 
 // === helpers ===
+
+func toInstallationRepos(repos []gh.Repo) []db.InstallationRepo {
+	result := make([]db.InstallationRepo, 0, len(repos))
+	for _, repo := range repos {
+		result = append(result, db.InstallationRepo{
+			FullName:      repo.FullName,
+			DefaultBranch: repo.DefaultBranch,
+		})
+	}
+	return result
+}
 
 func generateOAuthState(secret []byte) (string, error) {
 	nonce := make([]byte, 16)

@@ -143,7 +143,7 @@ func TestWorkosAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			fmt.Fprint(w, `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`)
 		case r.URL.Path == "/installation/repositories":
-			fmt.Fprintf(w, `{"repositories":[{"full_name":%q}]}`, repoFullName)
+			fmt.Fprintf(w, `{"repositories":[{"full_name":%q,"default_branch":"master"}]}`, repoFullName)
 		default:
 			http.NotFound(w, r)
 		}
@@ -190,6 +190,15 @@ func TestWorkosAgentCallbackEndToEndAndFailureSemantics(t *testing.T) {
 			`SELECT count(*) FROM installation_landed WHERE installation_id = $1 AND $2 = ANY(repos)`,
 			installationID, repoFullName).Scan(&auditCount); err != nil || auditCount != 1 {
 			t.Fatalf("landed audit count=%d err=%v", auditCount, err)
+		}
+		var defaultBranch *string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT default_branch FROM projects WHERE id = $1`,
+			*after.ProjectID).Scan(&defaultBranch); err != nil {
+			t.Fatal(err)
+		}
+		if defaultBranch == nil || *defaultBranch != "master" {
+			t.Fatalf("default_branch=%v, want master", defaultBranch)
 		}
 
 		code, first := pollAgentSession(t, deps, session.ID, raw)

@@ -55,7 +55,11 @@ beforeEach(() => {
   state.commands.length = 0;
   state.failWhenIncludes = undefined;
   state.files = {};
-  state.stdoutFor = {};
+  state.stdoutFor = {
+    'ls-remote': 'abc\trefs/heads/main\n',
+    'symbolic-ref': 'main\n',
+    'rev-parse': 'abc\n',
+  };
   state.kill.mockClear();
 });
 
@@ -63,7 +67,6 @@ describe('createRepoSandbox setupCommands', () => {
   it('runs setup commands after the baseline commit and commits them separately', async () => {
     await createRepoSandbox({
       repoUrl: 'https://github.com/o/r.git',
-      defaultBranch: 'main',
       setupCommands: ['git apply bug.patch'],
     });
 
@@ -76,7 +79,7 @@ describe('createRepoSandbox setupCommands', () => {
   });
 
   it('runs no eval commit when setupCommands is absent', async () => {
-    await createRepoSandbox({ repoUrl: 'https://github.com/o/r.git', defaultBranch: 'main' });
+    await createRepoSandbox({ repoUrl: 'https://github.com/o/r.git' });
 
     expect(state.commands.some((command) => command.includes('eval: setup'))).toBe(false);
   });
@@ -86,7 +89,6 @@ describe('createRepoSandbox setupCommands', () => {
 
     await expect(createRepoSandbox({
       repoUrl: 'https://github.com/o/r.git',
-      defaultBranch: 'main',
       setupCommands: ['git apply bug.patch'],
     })).rejects.toThrow('command failed: git apply bug.patch');
 
@@ -98,7 +100,6 @@ describe('createRepoSandbox setupCommands', () => {
 
     await expect(createRepoSandbox({
       repoUrl: 'https://github.com/o/r.git',
-      defaultBranch: 'main',
     })).rejects.toThrow('command failed: baseline: setup');
 
     expect(state.kill).toHaveBeenCalledTimes(1);
@@ -110,7 +111,6 @@ describe('createRepoSandbox python dependency install', () => {
     state.files = files;
     return createRepoSandbox({
       repoUrl: 'https://github.com/o/r.git',
-      defaultBranch: 'main',
       platform: 'python',
     });
   }
@@ -148,11 +148,13 @@ describe('createRepoSandbox python dependency install', () => {
 
   it('sanitizes the sandbox runtime probe before it reaches the PR body', async () => {
     state.files = { 'requirements.txt': '' };
-    state.stdoutFor = { 'platform.python_implementation': 'CPython[x](http://evil) 3.12.13' };
+    state.stdoutFor = {
+      ...state.stdoutFor,
+      'platform.python_implementation': 'CPython[x](http://evil) 3.12.13',
+    };
 
     const result = await createRepoSandbox({
       repoUrl: 'https://github.com/o/r.git',
-      defaultBranch: 'main',
       platform: 'python',
     });
 

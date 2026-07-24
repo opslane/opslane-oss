@@ -1065,7 +1065,8 @@ export interface ProjectData {
   id: string;
   name: string;
   github_repo: string;
-  default_branch: string;
+  /** NULL until learned from GitHub or resolved from a clone. Never guess. */
+  default_branch: string | null;
   friction_autonomy: FrictionAutonomy;
   pr_posture?: PRPosture;
   draft_pr_cap?: number;
@@ -1079,6 +1080,31 @@ export async function getProject(projectId: string): Promise<ProjectData | null>
     [projectId],
   );
   return rows[0] ?? null;
+}
+
+/**
+ * Refresh the cached default branch. Best-effort by contract: the column is a
+ * cache, never an authority, so a failed write cannot fail a job that already
+ * resolved the correct branch from its clone.
+ */
+export async function cacheProjectDefaultBranch(
+  projectId: string,
+  branch: string,
+  targetPool: Pick<pg.Pool, 'query'> = getPool(),
+): Promise<void> {
+  try {
+    await targetPool.query(
+      `UPDATE projects SET default_branch = $2
+       WHERE id = $1 AND default_branch IS DISTINCT FROM $2`,
+      [projectId, branch],
+    );
+  } catch (err: unknown) {
+    console.warn('[default-branch-cache] refresh failed', {
+      projectId,
+      branch,
+      err,
+    });
+  }
 }
 
 export async function recordSetupPrResult(

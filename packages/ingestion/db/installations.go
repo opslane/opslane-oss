@@ -5,20 +5,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 )
 
 var ErrInstallationOrgConflict = errors.New("installation is already mapped to another organization")
 
+// InstallationRepo retains repository metadata GitHub already returned.
+type InstallationRepo struct {
+	FullName      string
+	DefaultBranch string
+}
+
 // PersistInstallationParams is the complete database representation of a
-// verified GitHub App installation. Repos are canonical owner/name strings.
+// verified GitHub App installation.
 type PersistInstallationParams struct {
 	InstallationID int64
 	GitHubOrgName  string
 	GitHubOrgID    int64
 	OrgID          string
-	Repos          []string
+	Repos          []InstallationRepo
 }
 
 // PersistInstallation writes the rich installation mapping, the legacy org
@@ -44,11 +51,11 @@ func (q *Queries) PersistInstallation(ctx context.Context, tx pgx.Tx, params Per
 		return ErrInstallationOrgConflict
 	}
 
-	repos := params.Repos
-	if repos == nil {
-		repos = []string{}
+	repoNames := make([]string, 0, len(params.Repos))
+	for _, repo := range params.Repos {
+		repoNames = append(repoNames, repo.FullName)
 	}
-	reposJSON, err := json.Marshal(repos)
+	reposJSON, err := json.Marshal(repoNames)
 	if err != nil {
 		return fmt.Errorf("encode installation repos: %w", err)
 	}
@@ -70,7 +77,33 @@ func (q *Queries) PersistInstallation(ctx context.Context, tx pgx.Tx, params Per
 		params.OrgID, params.InstallationID); err != nil {
 		return fmt.Errorf("set org GitHub installation: %w", err)
 	}
-	return q.InsertInstallationLanded(ctx, tx, params.InstallationID, params.OrgID, repos)
+
+	for _, repo := range params.Repos {
+		if repo.FullName == "" || repo.DefaultBranch == "" {
+			continue
+		}
+		// This column is a cache. A failed refresh must not prevent the
+		// installation from landing, so isolate each write in a savepoint.
+		if _, err := tx.Exec(ctx, `SAVEPOINT refresh_default_branch`); err != nil {
+			return fmt.Errorf("savepoint default branch refresh: %w", err)
+		}
+		_, updateErr := tx.Exec(ctx,
+			`UPDATE projects SET default_branch = $3
+			 WHERE org_id = $1 AND lower(github_repo) = lower($2)
+			   AND default_branch IS DISTINCT FROM $3`,
+			params.OrgID, repo.FullName, repo.DefaultBranch)
+		if updateErr != nil {
+			if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT refresh_default_branch`); err != nil {
+				return fmt.Errorf("recover default branch refresh: %w", err)
+			}
+			slog.Warn("default branch cache refresh failed",
+				"org_id", params.OrgID, "repo", repo.FullName, "error", updateErr)
+		}
+		if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT refresh_default_branch`); err != nil {
+			return fmt.Errorf("release default branch refresh savepoint: %w", err)
+		}
+	}
+	return q.InsertInstallationLanded(ctx, tx, params.InstallationID, params.OrgID, repoNames)
 }
 
 // InsertInstallationLanded appends an audit row in the caller's transaction.

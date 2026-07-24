@@ -22,16 +22,18 @@ type AgentProvisionInput struct {
 	SessionID      string
 	InstallationID int64
 	CanonicalRepo  string
-	Repos          []string
-	GitHubOrgName  string
-	GitHubOrgID    int64
-	GitHubUserID   int64
-	GitHubLogin    string
-	DisplayName    string
-	Email          string
-	EmailVerified  bool
-	AvatarURL      string
-	SealKey        func(rawKey string) (string, error)
+	Repos          []InstallationRepo
+	// CanonicalDefaultBranch is taken from the installation repository list.
+	CanonicalDefaultBranch string
+	GitHubOrgName          string
+	GitHubOrgID            int64
+	GitHubUserID           int64
+	GitHubLogin            string
+	DisplayName            string
+	Email                  string
+	EmailVerified          bool
+	AvatarURL              string
+	SealKey                func(rawKey string) (string, error)
 }
 
 type AgentProvisionResult struct {
@@ -212,7 +214,10 @@ func (q *Queries) ProvisionAgentSession(ctx context.Context, in AgentProvisionIn
 
 	installationRepos := in.Repos
 	if len(installationRepos) == 0 {
-		installationRepos = []string{in.CanonicalRepo}
+		installationRepos = []InstallationRepo{{
+			FullName:      in.CanonicalRepo,
+			DefaultBranch: in.CanonicalDefaultBranch,
+		}}
 	}
 	if err := q.PersistInstallation(ctx, tx, PersistInstallationParams{
 		InstallationID: in.InstallationID,
@@ -232,6 +237,15 @@ func (q *Queries) ProvisionAgentSession(ctx context.Context, in AgentProvisionIn
 	project, err := q.CreateProjectTx(ctx, tx, orgID, projectName, &canonicalRepo)
 	if err != nil {
 		return nil, err
+	}
+	// PersistInstallation runs before this project exists, so apply the branch
+	// to the new row after creation in the same transaction.
+	if in.CanonicalDefaultBranch != "" {
+		if _, err := tx.Exec(ctx,
+			`UPDATE projects SET default_branch = $2 WHERE id = $1`,
+			project.ID, in.CanonicalDefaultBranch); err != nil {
+			return nil, fmt.Errorf("set project default branch: %w", err)
+		}
 	}
 	if _, err := q.CreateEnvironmentTx(ctx, tx, project.ID, "production"); err != nil {
 		return nil, err

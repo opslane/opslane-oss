@@ -5,6 +5,7 @@ import { createToolBridge } from './harness/tool-bridge.js';
 import { createDefaultMiddleware } from './harness/tool-middleware.js';
 import { createRepoSandbox, extractDiff, runBuildGate } from './harness/sandbox-repo.js';
 import { logger } from './logger.js';
+import { cloneFailureReason } from './repo-clone.js';
 
 export interface SetupPromptInput {
   apiKeyEnvVar: string;
@@ -38,7 +39,7 @@ export function buildSetupSystemPrompt(input: SetupPromptInput): string {
 
 export interface AgentSetupInput {
   repoUrl: string;
-  defaultBranch: string;
+  githubRepo: string;
   githubToken?: string;
   apiKeyEnvVar: string;
   releaseEnvVar: string;
@@ -73,18 +74,14 @@ export async function runAgentSetup(input: AgentSetupInput): Promise<AgentSetupR
   try {
     sandboxHandle = await createRepoSandbox({
       repoUrl: input.repoUrl,
-      defaultBranch: input.defaultBranch,
+      githubRepo: input.githubRepo,
       githubToken: input.githubToken,
       platform: 'javascript',
     });
   } catch (err: unknown) {
     return {
       status: 'needs_human',
-      reason: {
-        reason_code: 'repo_access_denied',
-        reason_message: err instanceof Error ? err.message : String(err),
-        remediation: 'Ensure the GitHub App has read access to the repo',
-      },
+      reason: cloneFailureReason(err),
     };
   }
 

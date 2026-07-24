@@ -117,21 +117,32 @@ jobs:
           done
           echo "cand_tag=$cand_tag" >> "$GITHUB_OUTPUT"
 
+      - name: Install crane
+        run: |
+          mkdir -p "$HOME/.crane-bin"
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C "$HOME/.crane-bin" crane
+          echo "$HOME/.crane-bin" >> "$GITHUB_PATH"
+
       # Registry promotion happens BEFORE the immutable git tag: retagging is
       # idempotent and repeatable, while a stranded v* tag can never be
       # removed. The tag is only created once both images are verified.
+      # crane copy preserves the exact manifest bytes (and therefore the
+      # digest); `docker buildx imagetools create` would re-wrap a single-arch
+      # image in a new index, changing the digest and breaking digest pinning.
       - name: Re-tag candidate digests as the version (no rebuild)
         env:
           INGESTION_DIGEST: ${{ steps.digests.outputs.ingestion }}
           WORKER_DIGEST: ${{ steps.digests.outputs.worker }}
         run: |
+          echo "$GH_TOKEN" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
           for image in ingestion worker; do
             digest_var=$(echo "$image" | tr '[:lower:]' '[:upper:]')_DIGEST
             digest=$(eval "echo \$$digest_var")
             src="ghcr.io/$OWNER/opslane-$image@$digest"
             dst="ghcr.io/$OWNER/opslane-$image:$VERSION"
-            docker buildx imagetools create --tag "$dst" "$src"
-            promoted=$(docker buildx imagetools inspect "$dst" --format '{{json .Manifest}}' | jq -r .digest)
+            crane copy "$src" "$dst"
+            promoted=$(crane digest "$dst")
             [ "$promoted" = "$digest" ] || { echo "Digest mismatch after retag: $promoted != $digest"; exit 1; }
             echo "$dst -> $digest (verified)"
           done

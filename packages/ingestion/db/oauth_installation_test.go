@@ -30,7 +30,9 @@ func TestInstallationLandedPersistsWithInstallation(t *testing.T) {
 		GitHubOrgName:  "landed-org",
 		GitHubOrgID:    installationID + 1,
 		OrgID:          org.ID,
-		Repos:          []string{"Landed/Repo"},
+		Repos: []db.InstallationRepo{{
+			FullName: "Landed/Repo",
+		}},
 	}); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)

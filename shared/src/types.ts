@@ -120,6 +120,9 @@ export interface NeedsHumanReason {
 export type ReasonCode =
   | 'missing_github_token'
   | 'repo_access_denied'
+  | 'empty_repository'
+  | 'invalid_default_branch'
+  | 'unresolvable_head'
   | 'token_decrypt_failed'
   | 'auth_invalid'
   | 'policy_blocked'

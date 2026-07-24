@@ -31,6 +31,9 @@ import {
 const REASON_CODES = [
   'missing_github_token',
   'repo_access_denied',
+  'empty_repository',
+  'invalid_default_branch',
+  'unresolvable_head',
   'token_decrypt_failed',
   'auth_invalid',
   'policy_blocked',
@@ -47,6 +50,7 @@ const REASON_CODES = [
   'low_confidence_fix',
   'repro_not_achievable',
   'verification_infra_error',
+  'draft_cap_reached',
   'triage_unfixable',
   'unfixable_no_app_frames',
   'unfixable_test_error',

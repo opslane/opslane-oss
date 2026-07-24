@@ -74,7 +74,7 @@ See [replay privacy and masking](../guides/replay-privacy.md) for what replay da
 - **Passwords** (when password authentication is enabled) are not stored locally — registration, authentication, and reset are handled by the configured identity provider (WorkOS).
 - **GitHub App private key** and worker credentials are environment variables — supplied by your deployment, never written to the database.
 - **Notification webhook URLs** are encrypted at rest in the database; the encryption key is supplied as an environment variable.
-- **Agent onboarding sessions** store poll tokens as hashes and API keys sealed with ephemeral agent public keys (24-hour expiry); provisioning requires admin role, and raw values are shown once.
+- **Agent onboarding sessions** store poll tokens as hashes and API keys sealed with ephemeral agent public keys (24-hour expiry); raw values are shown once at provisioning. Provisioning requires admin role.
 - **Pending OAuth verification tokens** from identity providers are sealed and stored temporarily (10-minute TTL) during email verification flows; the encryption key is supplied as an environment variable.
 
 ## Honest gaps (current state)

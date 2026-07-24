@@ -5,7 +5,12 @@ const deps = () => ({
   getProject: vi.fn().mockResolvedValue({ github_repo: 'o/r', default_branch: 'main' }),
   getInstallToken: vi.fn().mockResolvedValue('tok'),
   findExistingPr: vi.fn().mockResolvedValue(null),
-  clone: vi.fn().mockResolvedValue({ repoDir: '/tmp/r', cleanup: vi.fn().mockResolvedValue(undefined) }),
+  clone: vi.fn().mockResolvedValue({
+    repoDir: '/tmp/r',
+    defaultBranch: 'master',
+    cleanup: vi.fn().mockResolvedValue(undefined),
+  }),
+  cacheDefaultBranch: vi.fn().mockResolvedValue(undefined),
   runAgentSetup: vi.fn().mockResolvedValue({ status: 'setup_ready', diff: 'D', confidence: 'high', affectedFiles: ['package.json'] }),
   commitAndPush: vi.fn().mockResolvedValue(undefined),
   createPr: vi.fn().mockResolvedValue({ url: 'https://gh/pr/1', number: 1 }),
@@ -25,6 +30,11 @@ describe('runSetupPr', () => {
 
     expect(r.status).toBe('open');
     expect(d.createPr).toHaveBeenCalledOnce();
+    expect(d.createPr).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ base: 'master' }),
+    );
+    expect(d.cacheDefaultBranch).toHaveBeenCalledWith('p', 'master');
     expect(d.record).toHaveBeenCalledWith('p', 'open', { pr_url: 'https://gh/pr/1', pr_number: 1 });
   });
 

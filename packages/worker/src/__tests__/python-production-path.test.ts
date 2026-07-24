@@ -192,7 +192,11 @@ describeDb('Python two-stage production path', () => {
     vi.clearAllMocks();
     process.env['ANTHROPIC_API_KEY'] = 'test-anthropic-key';
     process.env['GITHUB_TOKEN'] = 'test-github-token';
-    vi.mocked(cloneRepo).mockResolvedValue({ repoDir: '/tmp/python-production-path', cleanup: vi.fn() });
+    vi.mocked(cloneRepo).mockResolvedValue({
+      repoDir: '/tmp/python-production-path',
+      defaultBranch: 'main',
+      cleanup: vi.fn(),
+    });
     vi.mocked(investigateError).mockResolvedValue({
       fixable: true,
       confidence: 'high',
