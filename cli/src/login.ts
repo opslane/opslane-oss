@@ -2,13 +2,15 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import chalk from 'chalk';
 import {
+  defaultTokenPath,
   generatePKCE,
-  persistTokens,
+  persistTokensTo,
   type AuthConfig,
   type TokenPair,
 } from './auth.js';
 import { defaultApiUrl } from './config.js';
 import { canonicalOrigin } from './origin.js';
+import { LoginFailedError } from './onboard/errors.js';
 
 function defaultAuthConfig(): AuthConfig {
   return {
@@ -119,9 +121,13 @@ function waitForCallback(port: number, expectedState: string): Promise<string> {
 /**
  * Run the PKCE-based login flow.
  */
-export async function login(
-  config: AuthConfig = defaultAuthConfig(),
-): Promise<void> {
+export interface LoginOptions extends AuthConfig {
+  tokenPath?: string;
+  quiet?: boolean;
+  waitForCallbackFn?: (port: number, expectedState: string) => Promise<string>;
+}
+
+export async function login(config: LoginOptions = defaultAuthConfig()): Promise<void> {
   const apiUrl = canonicalOrigin(config.apiUrl);
   const { codeVerifier, codeChallenge } = generatePKCE();
   const state = randomBytes(16).toString('hex');
@@ -140,15 +146,19 @@ export async function login(
     `&state=${encodeURIComponent(state)}`,
   ].join('');
 
-  console.log(chalk.bold('\nOpslane Login\n'));
-  console.log('Open this URL in your browser to authenticate:\n');
-  console.log(chalk.cyan(authUrl));
-  console.log('\nWaiting for authentication...\n');
+  if (!config.quiet) {
+    console.log(chalk.bold('\nOpslane Login\n'));
+    console.log('Open this URL in your browser to authenticate:\n');
+    console.log(chalk.cyan(authUrl));
+    console.log('\nWaiting for authentication...\n');
+  }
 
   try {
-    const code = await waitForCallback(port, state);
+    const code = await (config.waitForCallbackFn ?? waitForCallback)(port, state);
 
-    console.log(chalk.dim('Exchanging authorization code for tokens...'));
+    if (!config.quiet) {
+      console.log(chalk.dim('Exchanging authorization code for tokens...'));
+    }
 
     const tokens = await exchangeCode(
       apiUrl,
@@ -158,14 +168,15 @@ export async function login(
       redirectUri,
     );
 
-    await persistTokens(apiUrl, tokens);
+    await persistTokensTo(config.tokenPath ?? defaultTokenPath(), apiUrl, tokens);
 
-    console.log(
-      chalk.green('\nLogin successful! Credentials saved to ~/.opslane/credentials.json'),
-    );
+    if (!config.quiet) {
+      console.log(
+        chalk.green('\nLogin successful! Credentials saved to ~/.opslane/credentials.json'),
+      );
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(chalk.red(`\nLogin failed: ${message}`));
-    process.exitCode = 1;
+    throw new LoginFailedError(message);
   }
 }

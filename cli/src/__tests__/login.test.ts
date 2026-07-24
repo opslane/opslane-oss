@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, readFile, stat, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,8 @@ import {
   clearTokensAt,
   type TokenPair,
 } from '../auth.js';
+import { login } from '../login.js';
+import { LoginFailedError } from '../onboard/errors.js';
 
 describe('generatePKCE', () => {
   it('produces a code_verifier between 43 and 128 characters', () => {
@@ -40,6 +42,51 @@ describe('generatePKCE', () => {
     const { codeChallenge } = generatePKCE();
     // SHA256 = 32 bytes = 43 chars in base64url (without padding)
     expect(codeChallenge.length).toBe(43);
+  });
+});
+
+describe('login embedding contract', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    process.exitCode = undefined;
+  });
+
+  it('throws LoginFailedError instead of poisoning process.exitCode', async () => {
+    process.exitCode = undefined;
+    await expect(login({
+      apiUrl: 'http://localhost:8082',
+      clientId: 'test',
+      quiet: true,
+      waitForCallbackFn: vi.fn().mockRejectedValue(new Error('OAuth error: access_denied')),
+    })).rejects.toBeInstanceOf(LoginFailedError);
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('quiet mode emits no output on success and persists to the injected path', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'opslane-login-'));
+    const tokenPath = join(directory, 'credentials.json');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'access',
+      refresh_token: 'refresh',
+      expires_in: 900,
+    }), { status: 200 })));
+
+    await login({
+      apiUrl: 'http://localhost:8082',
+      clientId: 'test',
+      tokenPath,
+      quiet: true,
+      waitForCallbackFn: vi.fn().mockResolvedValue('oauth-code'),
+    });
+
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    await expect(loadTokensFrom(tokenPath, 'http://localhost:8082'))
+      .resolves.toMatchObject({ accessToken: 'access' });
+    await rm(directory, { recursive: true, force: true });
   });
 });
 

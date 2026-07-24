@@ -765,33 +765,76 @@ test runs in CI.
 
 ## Phase 2 — Deterministic CLI plumbing
 
+> **Refreshed 2026-07-24** by `/plan-eng-review` + outside voice against the landed
+> two-stage engine (Detect → Apply, #185/#190) and the landed milestone 0.5 endpoint
+> (#182). The agent's handoff artifact is **`OnboardingPlan`** (`cli/src/onboard/tools.ts:47`)
+> — fields `app_dir`, `env_prefix`, `env_vars.{api_key, endpoint}`, single app, names only,
+> never values. `collectEdit` does not exist: edit reconciliation is the `EditTracker`
+> class (`events.ts:96`), already internal to `runApply`. Var-name/containment validation
+> landed in `validatePlan`/`validateEnvironmentVariable` (`tools.ts:180-258`).
+
 The CLI (not the agent) owns key material and the server poll. Still no TTY, no live model.
 
-**Deliverable:** a reusable typed poll seam that preserves the CLI's documented status
-contract, provisioning that carries the poll token and survives interruption, a shared env
-writer, and `waitForAppReporting` — all unit-tested with injected fetch.
+**Deliverable:** a typed poll seam that speaks the **server's** status vocabulary, a login
+gate with token refresh and typed failures, synchronous account provisioning with
+**poll-first resume**, a shared atomic env writer, `waitForAppReporting`, and a run log
+keyed by a local run id — all unit-tested with injected fetch — plus one small Go task
+closing the duplicate-project gap.
+
+### Task 2.0: Server guard — adopt an existing project for the same repo (Go, TDD)
+
+`OnboardProvision` dedupes only via the idempotency token `"onboard:"+lower(repo)`
+(`packages/ingestion/db/onboard_provision.go:70`). Projects created by the GitHub-App
+setup flow carry **no** token, and the handler never calls `FindProjectByRepoURL` (the
+setup handler does — `agent_setup.go:74`). Result: onboarding a repo that already has a
+setup-flow project mints a **duplicate project** — events split, `setup --relink` picks
+one arbitrarily.
+
+**Files:** modify `packages/ingestion/handler/onboard_provision.go` /
+`db/onboard_provision.go`; extend `handler/onboard_provision_test.go` and the
+integration test.
+
+**Steps:** failing test — an org with an existing setup-flow project for `owner/repo`
+provisions onboard → **same project id**, no new project row, key rotated into it. Then
+implement: repo-level lookup first (reuse `FindProjectByRepoURL` scoped to the org),
+adopt the existing project; fall through to the idempotency-token path otherwise.
+Bundle: fix the misleading window-closed copy at `agent_setup.go:193` ("re-run setup" →
+name relink for configured repos). **Caution:** these DB-backed tests skip silently
+without `DATABASE_URL` — run against the compose Postgres; CI's `check-go-skips` gate is
+the backstop.
 
 ### Task 2.1: Extract a typed poll seam from setup (refactor + TDD)
 
 `cli/src/setup.ts`'s `pollLoop` is private, prints, deletes pending state, and its helpers
 call `process.exit` — it is **not** reusable as-is. Extract the wire protocol; leave setup's
-UX behavior unchanged. **Contract rule:** `cli/src/contract.ts` documents the canonical
-status vocabulary (`not_found`, `expired`, `internal_error`, `api_unreachable`, ...) — the
-seam **preserves every distinct status**; it never collapses them into a generic `failed`.
+UX behavior unchanged. **Contract rule (revised 2026-07-24):** the seam returns the
+**server's** poll vocabulary **verbatim** — `pending | provisioned | key_ok |
+app_reporting | completed | failed | not_found | expired | rate_limited | internal_error`
+(DB domain at `db/queries.go:3277`; `pollLoop` already handles all of these,
+`setup.ts:169`) — plus `'unreachable'` for transport errors. It never collapses statuses.
+Callers translate to CLI-contract statuses themselves (`contract.ts` remains the
+`setup`-command contract; a comment in `agent-protocol.ts` explains why the two lists
+deliberately differ). This is what lets Task 2.4 distinguish `key_ok` from
+`app_reporting` — the aha signal.
 
 **Files:**
 - Create: `cli/src/agent-protocol.ts`
-- Modify: `cli/src/setup.ts` (rewire `pollLoop` on top of the new function)
+- Modify: `cli/src/setup.ts` (rewire `pollLoop` on top of the new function; **move**
+  `responseJSON` and `retryAfterSeconds` (`setup.ts:74,85`) into `agent-protocol.ts` and
+  import them back — one wire parser, not two)
 - Test: `cli/src/__tests__/agent-protocol.test.ts`
 
 **Step 1: Failing test** — `pollSessionOnce({ apiUrl, sessionId, pollToken, fetchFn })`
-returns a discriminated union whose `status` values are exactly the contract's poll
-statuses plus `'unreachable'` for transport errors, with the payload fields the poll
-endpoint returns (key, endpoint, `org_id`, `project_id`, `repo`, message, `retry_after`).
+returns the discriminated union above, with the payload fields the poll endpoint returns
+(`api_key` **optional**, endpoint, `org_id`, `project_id`, `repo`, message, `retry_after`).
 Cases: sends the `X-Opslane-Poll-Token` header (assert on the injected fetch's calls); 404
-→ `not_found` (verbatim, not `failed`); 429 → `rate_limited` with `retryAfter`; fetch
-rejection → `unreachable` (never a throw); malformed JSON → `internal_error` with the raw
-body in the message.
+→ `not_found` (verbatim, not `failed`); 429 → `rate_limited` with `retryAfter` sourced
+from **body AND `Retry-After` header** (both cases); `provisioned`/`key_ok`/`app_reporting`
+pass through **verbatim** with their payloads; fetch rejection → `unreachable` (never a
+throw); malformed JSON → `internal_error` with the raw body in the message; **two wire
+dialects:** valid JSON with `{"error": "..."}` and no `status` field (the server's
+`writeJSONError` shape for 400/401/403) branches on HTTP status and surfaces the `error`
+string — it is not `internal_error`.
 
 **Step 2:** FAIL. **Step 3:** Implement by lifting the fetch/parse core out of `pollLoop`;
 rewire `pollLoop` to call it, keeping its retry/`api_unreachable` remediation behavior
@@ -818,24 +861,45 @@ order (see the design doc's Alternatives).
 
 **Step 0 — login gate, inline in `onboard` (TDD).** There is **no separate `opslane login`
 step for the user** — `onboard` calls this gate itself. `ensureLoggedIn({ apiUrl, tokenPath,
-loginFn })` → returns valid account tokens: if `loadTokensFrom` yields a live token, return
-it; else run `loginFn` (the existing `login()` — prints the URL, awaits the browser
-callback; the same hosted flow handles **signup**, not just login), then re-load. Test with
-an injected `loginFn` and a temp token file: expired/missing token triggers login exactly
-once; a live token skips it. On cloud this is WorkOS; self-hosted is the GitHub login path —
-same CLI code, the server's `AUTH_PROVIDER` decides which identity provider answers
-`/oauth/authorize`. (The standalone `opslane login` command stays for re-auth, but onboarding
-never requires the user to run it first.)
+loginFn, fetchFn })` → returns valid account tokens, in this order:
+1. `loadTokensFrom` yields a live token → use it.
+2. Else, if a `refreshToken` is stored, try the **refresh grant** (the server exposes it;
+   the CLI stores `refreshToken` today but never reads it — `auth.ts:99` just discards
+   expired tokens). One injected-fetch call; on success persist via `persistTokensTo` and
+   use. Without this, "a live token skips login" is a mostly-dead branch and every run
+   opens a browser.
+3. Else run `loginFn` **exactly once** (the hosted flow handles **signup** too), then
+   re-load. Still no live token → typed **`LoginFailedError`** — never auto-retry the
+   browser.
+
+**`login.ts` amendment (in scope for this task):** `login()` currently swallows errors,
+returns `void`, sets `process.exitCode = 1` (`login.ts:166-170`), and persists only to the
+hardcoded credentials file — a wrapper cannot distinguish "login failed" from "logged into
+a different origin," and tests can't redirect the token path. Change `login()` to **throw
+typed errors** on failure and **accept an injectable token path**; the standalone
+`opslane login` command keeps identical behavior by catching at the command layer. Tests
+use the path-taking pair `loadTokensFrom`/`persistTokensTo` (NOT bare `persistTokens`,
+which hardcodes the real `~/.opslane/credentials.json`).
+
+Tests: live token → no login; expired + refresh ok → no browser; refresh rejected →
+`loginFn` once; `loginFn` ran, still dead → `LoginFailedError`, `loginFn` called exactly
+once. On cloud this is WorkOS; self-hosted is the GitHub login path — same CLI code, the
+server's `AUTH_PROVIDER` decides which identity provider answers `/oauth/authorize`.
 
 **Step 0.5 — a by-repo pending lookup (pending.ts + tests).** The design's resume needs to
 find a pending session by repo, but `cli/src/pending.ts` today only loads by the poll-id
-UUID (`loadPendingSession(pollId)`, pending.ts:47) and names files `<pollId>.json`. Add
-`findPendingByRepo(apiUrl, repo, baseDir?)`: scan the pending dir, parse each file, match on
-`canonicalOrigin(api_url)` **and** `repo.toLowerCase()`, ignore entries older than a TTL
-(reuse `created_at`), and if more than one matches return the newest and delete the rest
-(stale cleanup). Test: no match → null; one match → it; multiple → newest kept, older
-deleted; expired → pruned and null; malformed file → skipped, not thrown. This is a
-prerequisite of the resume behavior below.
+UUID (`loadPendingSession(pollId)`, pending.ts:47) and names files `<pollId>.json`.
+**Pending sessions gain a `kind: 'onboard' | 'setup'` discriminator** (a file without
+`kind` is treated as `setup` — backward compatible): the two flows share one dir, and
+without it onboard could "resume" a GitHub-App session that waits forever for an App
+install onboard never triggers — or delete a legitimate in-flight `setup --start` state.
+Add `findPendingByRepo(apiUrl, repo, baseDir?)`: scan the pending dir, parse each file,
+**filter `kind === 'onboard'`**, match on `canonicalOrigin(api_url)` **and**
+`repo.toLowerCase()`, ignore entries older than a TTL (reuse `created_at`), and if more
+than one matches return the newest and delete the rest (same-kind stale cleanup only).
+Test: no match → null; one match → it; multiple → newest kept, older deleted; expired →
+pruned and null; malformed file → skipped, not thrown; **same repo, different origin →
+null**; **setup-kind session for the same repo → null and NOT deleted**.
 
 **Step 1: Failing test** — `ensureProvisioned({ apiUrl, repo, token, fetchFn, sleepFn, now,
 timeoutMs })` → `{ apiKey, endpoint, orgId, projectId, sessionId, pollToken }`. It runs
@@ -844,20 +908,31 @@ timeoutMs })` → `{ apiKey, endpoint, orgId, projectId, sessionId, pollToken }`
 returns the key, endpoint, ids, session id, and poll token in one response — there is no
 second `auth_url` and no browser step here. (The GitHub App browser trip is a separate,
 later milestone.)
-- Fresh repo: POST the account-provisioning endpoint (milestone 0.5) with the bearer token;
-  on `201`, persist `{poll_id, poll_token, api_url, repo, created_at}` via
+- Fresh repo: POST the account-provisioning endpoint (milestone 0.5, landed as
+  `POST /api/v1/onboard/provision`) with the bearer token; on `201`, persist
+  `{kind: 'onboard', poll_id, poll_token, api_url, repo, created_at}` via
   `savePendingSession` and return the key + endpoint + ids + **sessionId + pollToken** (the
   aha poll in Task 2.4 needs the token).
-- **Resume:** call `findPendingByRepo(apiUrl, repo)` first; if a live pending session
-  exists, return its `{sessionId, pollToken}` and skip the POST — a crash or Ctrl-C between
-  provisioning and `app_reporting` must resume the same poll. The server is independently
-  idempotent by `(org_id, repo)`, so a retry after pending-state loss still returns `201` for
-  the same project with a freshly rotated key; the pending path avoids that unnecessary
-  rotation and preserves the in-flight session.
-- Non-2xx: `401/403` → typed `NotAuthenticatedError` (token expired → caller re-runs the
-  login gate); `429` → wait `retry_after`; network error → bounded retries, then a typed
-  error naming the API URL. Provisioning has one success shape: `201 provisioned`; there is
-  no duplicate-project conflict branch.
+- **Resume is poll-first (revised 2026-07-24, outside-voice finding):** call
+  `findPendingByRepo(apiUrl, repo)`; if a live pending session exists, make **one
+  `pollSessionOnce`** with its token. The poll **re-delivers the raw `api_key` on every
+  poll while the session lives** (`agent_setup.go:192-207` — the sealed key is only
+  withheld after `expires_at`), so one poll simultaneously proves server-side liveness,
+  recovers a key that never reached disk, and catches a key another machine rotated.
+  Alive answer (`provisioned`/`key_ok`/`app_reporting`/`completed` with a key where
+  applicable) → reuse the session and the polled key. Anything else (`expired`,
+  `not_found`, key window closed, `unreachable` after bounded retries) → delete the stale
+  pending record and fall through to the fresh POST (the server rotates the key on the
+  same project). **No saved-credentials precondition** — the server's answer, never a
+  stale disk copy, is the source of truth for the key.
+- Non-2xx (both wire dialects — `{"status":...}` and `writeJSONError`'s `{"error":...}`):
+  `401` → typed `NotAuthenticatedError` (caller re-runs the login gate **once**);
+  `403` → typed **`NotAuthorizedError`** — the route is admin-gated in cloud
+  (`RequireRoleIfCloud("admin")`, `routes.go:113`, a deliberate hardening; decision
+  2026-07-24) — remediation: "ask an org admin to run onboarding or grant you admin";
+  **never re-run login for a 403**. `429` → wait `retry_after`; network error → bounded
+  retries, then a typed error naming the API URL. Success is `201 provisioned`; there is
+  no duplicate-project conflict branch (Task 2.0 guarantees adoption instead).
 - Validates `org_id`/`project_id`/`repo` are present (required by `saveAgentCredentials`)
   and saves credentials as setup does.
 
@@ -866,22 +941,29 @@ later milestone.)
 
 ### Task 2.3: Shared env writer driven by the agent's report (refactor + TDD)
 
-`cli/src/init.ts:107` (`persistApiKeyEnvironment`) already writes `.env.local` correctly —
+`cli/src/init.ts:108` (`persistApiKeyEnvironment`) already writes `.env.local` correctly —
 0600 mode, replace-or-append, `.gitignore` entry. Generalize it instead of writing a weaker
-sibling; the app dir and var names come from the agent's **validated** `OnboardingReport`
-(Task 1.2 enforced containment and the var-name regex), never from hardcoded
-`VITE_OPSLANE_*` assumptions — monorepos and custom prefixes are the whole point.
+sibling; the app dir and var **names** come from the agent's **validated** `OnboardingPlan`
+(`tools.ts:47` — `plan.app_dir` + `plan.env_vars.api_key`/`plan.env_vars.endpoint`, one
+app, validated by `validatePlan`/`validateEnvironmentVariable` at `tools.ts:180-258`),
+never from hardcoded `VITE_OPSLANE_*` assumptions — monorepos and custom prefixes are the
+whole point. The **values** come from provisioning (Task 2.2); names and values meet only
+here. (Apply's writable paths exclude `.env*` by policy, so this writer is the sole
+key-to-disk path.)
 
 **Files:**
 - Create: `cli/src/envfile.ts`
 - Modify: `cli/src/init.ts` (rewire `persistApiKeyEnvironment` onto the shared writer)
 - Test: `cli/src/__tests__/envfile.test.ts`
 
-**Step 1: Failing tests** — `writeEnvLocal(dir, vars: Record<string, string>)`: creates
-`.env.local` with mode 0600 when absent; appends missing keys without touching existing
-lines; replaces an existing value for the same key; adds `.env.local` to the dir's
-`.gitignore` (once); rejects var names failing `/^[A-Z][A-Z0-9_]*$/` (defense in depth
-behind Task 1.2); returns the path written. Use `fs.mkdtemp`.
+**Step 1: Failing tests** — `writeEnvLocal(dir, vars: Record<string, string>)`, built on
+**`writeFileAtomic`** (`fsutil.ts:8` — temp file opened 0600, fsync, rename; no torn
+secrets file, and one write idiom instead of two): creates `.env.local` with mode 0600
+when absent; appends missing keys without touching existing lines; replaces an existing
+value for the same key; **tightens a pre-existing 0644 file to 0600 after write**; the
+write is atomic (temp-and-rename observable via the injected dir); adds `.env.local` to
+the dir's `.gitignore` (once); rejects var names failing `/^[A-Z][A-Z0-9_]*$/` (defense in
+depth behind Detect's validation); returns the path written. Use `fs.mkdtemp`.
 
 **Step 2:** FAIL. **Step 3:** Implement by extracting the init.ts logic to accept arbitrary
 vars; rewire init.ts onto it. **Step 4:** new test green AND existing init tests green.
@@ -894,11 +976,16 @@ vars; rewire init.ts onto it. **Step 4:** new test green AND existing init tests
 - Test: `cli/src/onboard/__tests__/wait.test.ts`
 
 **Step 1: Failing test** — `waitForAppReporting({ apiUrl, sessionId, pollToken, fetchFn,
-sleepFn, timeoutMs })` built on `pollSessionOnce`: sequence `key_ok → key_ok →
-app_reporting` resolves; `completed` also resolves; `expired`/`not_found` reject with the
-contract's remediation message; `rate_limited` honors `retryAfter` before the next poll;
-`unreachable` retries with backoff up to a bound; timeout rejects with a message naming the
-session id.
+sleepFn, timeoutMs })` built on `pollSessionOnce`: sequence `provisioned → key_ok →
+app_reporting` resolves (**`provisioned` counts as waiting** — the key was minted
+synchronously, so the first polls return it before the poll-side flip to `key_ok`);
+`completed` also resolves; **`failed` rejects with `failure_reason` (terminal, never
+retried)**; `expired`/`not_found` reject with the contract's remediation message;
+`rate_limited` honors `retryAfter` before the next poll; `unreachable` retries with
+backoff up to a bound; timeout rejects with a message naming the session id; and the
+function **never touches pending state** (same purity rule as `agent-protocol.ts` — the
+Phase 3 controller owns state; on timeout the pending record survives so a re-run
+resumes).
 
 **Step 2:** FAIL. **Step 3:** Implement (~40 lines). **Step 4:** green. **Step 5: Commit.**
 
@@ -914,8 +1001,13 @@ transcript."
 - Create: `cli/src/onboard/runlog.ts`
 - Test: `cli/src/onboard/__tests__/runlog.test.ts`
 
-**Step 1: Failing test** — `createRunLog({ dir, sessionId, mode, redact })` returns
-`{ record(msg), finish(summary), path }`:
+**Step 1: Failing test** — `createRunLog({ dir, runId, mode, redact })` returns
+`{ record(msg), finish(summary), setSessionId(id), path }`. **The log is keyed by a
+locally generated `runId`, not the server session id** (revised 2026-07-24): the session
+id only exists after provisioning succeeds, so a session-keyed log misses exactly the
+flakiest runs — login failures, 403s, provisioning errors — that the log exists to debug.
+`setSessionId` records the server session id as a field once known (the join key for
+server-side lookups):
 - **Default `mode: 'metadata'`:** `record` writes one line per message with `ts`, `type`,
   tool `name`, a content **hash and byte length** — never the content, args, or results.
   `finish` writes `{ outcome, turns, toolCalls, durationMs, totalCostUsd, usage }`. This is
@@ -926,24 +1018,28 @@ transcript."
   one-line warning that the file may contain source and secrets and to review before
   sharing. Full logs get a size cap (truncate oversized tool results) and a retention bound
   (keep the last N, delete older on start).
-- Path `~/.opslane/logs/onboard-<sessionId>.jsonl` (dir injectable), file mode 0600.
+- Path `~/.opslane/logs/onboard-<runId>.jsonl` (dir injectable), file mode 0600.
 - Test: metadata mode writes no message content or tool args; full mode redacts the key even
-  when it appears inside a tool result; retention prunes beyond the cap.
+  when it appears inside a tool result; retention prunes beyond the cap; a run that fails
+  before provisioning still produces a log; `setSessionId` appears as a recorded field.
 
 **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** green. **Step 5: Commit.**
 
-Wiring (Phase 3): every message goes to `reduceTasks`, `collectEdit`, and `runlog.record`;
-on failure the CLI prints the metadata log path (safe to attach). The full-log path is only
-mentioned when the user opted into `--debug-log`, alongside the review-before-sharing
-warning. Optional dev-only trace layer, mirroring `packages/worker/src/tracing.ts`: with
-`LANGFUSE_PUBLIC_KEY`/`SECRET_KEY` set, emit one OTel span per turn and tool call at the
-stream boundary (the subprocess's internal API calls aren't instrumentable from outside).
-No-op without the env vars.
+Wiring (Phase 3, updated for the two-stage engine): the controller invokes `runDetect` →
+approval → `runApply`; edit reconciliation is **internal** to `runApply` (the
+`EditTracker` class — there is no `collectEdit`). The driver layers `reduceTasks` and
+`runlog.record` onto each stage's `onMessage`; on failure the CLI prints the metadata log
+path (safe to attach). The full-log path is only mentioned when the user opted into
+`--debug-log`, alongside the review-before-sharing warning. Optional dev-only trace layer,
+mirroring `packages/worker/src/tracing.ts`: with `LANGFUSE_PUBLIC_KEY`/`SECRET_KEY` set,
+emit one OTel span per turn and tool call at the stream boundary (the subprocess's
+internal API calls aren't instrumentable from outside). No-op without the env vars.
 
 **Phase 2 validation checkpoint:**
 ```bash
 pnpm --filter @opslane/cli build
 pnpm --filter @opslane/cli test
+(cd packages/ingestion && go build ./... && go test ./...)   # Task 2.0 — needs DATABASE_URL for the DB-backed cases
 ```
 All green — including the pre-existing `setup`, `init`, and contract suites over the
 refactored seams — = Phase 2 complete.
@@ -956,7 +1052,27 @@ The two run-and-observe files (`tui.tsx`, `app.tsx`) wrap a live model + a TTY �
 deliberate TDD exception the prototype documented, confined to this phase.
 
 **Deliverable:** `opslane onboard` works end-to-end on a clean Vite repo: survey → ask →
-wire → human runs app → TUI confirms `app_reporting` for this run's session.
+wire → app runs → TUI confirms `app_reporting` for this run's session.
+
+> **Amendment (2026-07-24 eng review, D5b) — in-TUI consented execution.** The
+> print-and-wait hand-off ("now run `<pm> install`, then `<pm> run dev`") is replaced by
+> the TUI running those commands itself, each behind an Enter-to-confirm prompt, so the
+> user never leaves the terminal:
+> - New tested seam `runConsentedCommand` (injected `spawn`): command text is
+>   **lockfile-derived** (R4 — never model text), streamed output, exit-code surfaced.
+>   Skip path on every prompt prints the copy-paste command (old behavior preserved).
+> - The dev server is spawned and **owned by the TUI**: its stdout is parsed for the
+>   real localhost URL (no port guessing), rendered as a clickable link — "Open your
+>   app: http://localhost:5173". On quit, the TUI stops the dev server and prints the
+>   restart command.
+> - `waitForAppReporting` runs alongside; the ✓ flip happens live when the user clicks
+>   the link and the SDK phones home.
+> - Security posture unchanged: deterministic command text (R4) + per-command human
+>   consent (R2). The *agent's* Bash allowlist still denies installs — this is the
+>   TUI's own child process, not a model tool call.
+> - **Playwright/headless auto-open: rejected** — it manufactures `app_reporting`
+>   without the user seeing their app (fakes the aha), adds a heavyweight dependency,
+>   and breaks on auth-walled apps.
 
 ### Task 3.1: Ink view (port; run-and-observe)
 
@@ -1009,17 +1125,19 @@ Only the shell is run-and-observe.
    requestApproval })` (Task 1.5) and pass it as `canUseTool` into `runAgent`. This is the
    one seam: the policy validates and mutates finish-state, and calls the injected
    `requestApproval` for Edit/Write/Bash; in the shell that renders an Ink prompt, in tests
-   it's a spy. Feed `reduceTasks`, `collectEdit(edits, cwd, msg)`, and `runlog.record` from
-   `onMessage`. In a `finally`: reset the resolver/report slots so a failed run never leaks
+   it's a spy. Feed `reduceTasks` and `runlog.record` from each stage's `onMessage` (edit
+   reconciliation is internal to `runApply` via `EditTracker` — there is no `collectEdit`).
+   In a `finally`: reset the resolver/report slots so a failed run never leaks
    state into a same-process retry.
 4. **Validate the outcome — a `result` message is not success.** Require ALL of: SDK result
    reports success; a report was captured; the report's `editedFiles` set **equals** the
    `collectEdit` set (both already canonical repo-relative from Task 1.3, so a normal run
    matches); each `app.devScript` exists in `<dir>/package.json` `scripts`. Otherwise render
    the specific failure, exit 1, **no env writes, no poll**.
-5. **Write env, symlink-safe.** For each `report.apps[i]`, resolve `join(cwd, app.dir)`
-   through `realpath`, reject if outside `cwd`, then `writeEnv(dir, { [app.apiKeyVar]: apiKey,
-   [app.endpointVar]: endpoint })` (Task 2.3 also revalidates the var-name regex).
+5. **Write env, symlink-safe.** The validated `OnboardingPlan` names one app: resolve
+   `join(cwd, plan.app_dir)` through `realpath`, reject if outside `cwd`, then
+   `writeEnvLocal(dir, { [plan.env_vars.api_key]: apiKey, [plan.env_vars.endpoint]:
+   endpoint })` (Task 2.3 also revalidates the var-name regex).
 6. **Hand-off from verified facts only.** Derive the package manager **from the repo's
    lockfile** (`pnpm-lock.yaml`/`package-lock.json`/`yarn.lock`/`bun.lockb`), not from the
    report's `packageManager` field — the enum stops injection but not a wrong value (finding
@@ -1195,14 +1313,24 @@ not "if abuse appears."
 |--------|---------|-----|------|--------|----------|
 | Codex Review | `/codex review` | Independent 2nd opinion | 2 | issues_found → addressed | Round 1: 24; Round 2: 23; engine-license finding overruled by founder decision |
 | Plan review | manual (founder) | Architecture + contract audit | 1 | issues_found → addressed | 9 findings (3 blocking, 4 high, 2 medium); all addressed 2026-07-22 |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | Phase 2: 16 issues (9 review + 7 outside voice), all folded 2026-07-24 |
+| Outside Voice | Claude subagent (Codex timed out) | Independent plan challenge | 1 | issues_found → addressed | 7 findings; 2 reversed same-day decisions (poll-first resume, login.ts seam) |
 
 **PLAN REVIEW (2026-07-22) — the corrections that mattered:**
 - **Blocking:** added **Phase 0.5** (authenticated account-provisioning endpoint with a full API/DB/test contract) and made Task 2.2 provisioning **synchronous** (no second `auth_url`); **rebuilt the permission architecture** so nothing security-relevant sits in `allowedTools` (Read/Grep were auto-run, so the dotenv and one-finish guards were dead code) — now one composed `createOnboardPolicy` handler with per-run state, an injected approval seam, and secret-aware custom survey tools replacing built-in Read/Grep; added a **by-repo pending lookup** (`findPendingByRepo`) since `pending.ts` only loaded by poll-id UUID.
 - **High:** fixed report/observed-edit **reconciliation** to one canonical repo-relative form with `realpath` symlink containment (normal runs were guaranteed to fail before); resolved the **install contradiction** (agent Bash is checks-only, installs stay the human's job); **run log is metadata-by-default**, full transcript opt-in with redaction/retention/warning; **smoke runs on a truly clean repo** and overlays the tarball `--no-save`.
 - **Medium:** the safety-critical controller is now a **tested core** (`runOnboardCore` with DI) plus a thin Ink shell, with the six required tests; **package manager is derived from the lockfile**, not the model's report field.
 
-**VERDICT:** implementable after these corrections. NOT independently re-reviewed since — the "CODEX CLEARED" claim was removed per the reviewer's note.
+**ENG REVIEW (2026-07-24, Phase 2 scope) — decisions folded into the section above:**
+- **Architecture:** admin gate on `/onboard/provision` **kept** with a typed `NotAuthorizedError` for 403 ("ask an org admin", never re-login); poll seam speaks the **server vocabulary verbatim** (contract.ts stays the setup-command contract); stale pre-split names refreshed (`OnboardingPlan`, `EditTracker`, single-app shape).
+- **Outside voice (all 7 accepted):** new **Task 2.0** — server-side duplicate-project guard (setup-flow projects invisible to the onboard idempotency token) + window-closed copy fix; **resume reversed to poll-first** (the poll re-delivers the key while the session lives — one poll proves liveness, recovers lost keys, catches cross-machine rotation); `login.ts` amended to throw typed errors with an injectable token path; **refresh grant wired** into `ensureLoggedIn`; pending sessions gain a `kind` discriminator; both server wire dialects (`{"status"}` / `{"error"}`) parsed; run log keyed by local run id.
+- **Tests:** 9 gap tests added across the five tasks (403 branch, LoginFailedError, poll-first resume fallback, server-vocab passthrough, atomic write + perm tightening, provisioned-as-waiting, failed-as-terminal, Retry-After header vs body, origin/kind pending mismatches).
+- **Phase 3 amendment (D5b):** in-TUI consented execution — lockfile-derived commands behind Enter-to-confirm, TUI-owned dev server, clickable localhost URL parsed from its stdout; Playwright rejected.
 
-**UNRESOLVED DECISIONS:**
-- Milestone A scope: build Phase 0.5 (account provisioning) up front for the correct login-first order, vs. ship an interim GitHub-App-first A and reorder later. This plan assumes we build 0.5; needs founder confirmation.
-- The corrected plan has not been re-run through an independent review pass; do that before calling it cleared.
+**CODEX:** Codex CLI timed out (5m); the outside voice ran as a Claude subagent — findings verified against source before acceptance.
+
+**CROSS-MODEL:** outside voice overturned two same-day review decisions (D6→poll-first resume, D8→login.ts amendment) with code-verified evidence; both reversals accepted by the founder.
+
+**VERDICT:** ENG CLEARED (Phase 2) — the section is implementation-ready as rewritten; prior plan-review corrections stand. The 2026-07-22 unresolved items are closed: milestone 0.5 was built and landed (#182), and the corrected plan has now been independently re-reviewed (this pass + outside voice).
+
+NO UNRESOLVED DECISIONS

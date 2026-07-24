@@ -1,4 +1,4 @@
-import { chmod, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
@@ -6,6 +6,7 @@ import { detectFramework, type Framework } from './detect.js';
 import { getCodemod } from './codemods/registry.js';
 import { generateFallbackPatches } from './ai-fallback.js';
 import type { FilePatch } from './codemods/types.js';
+import { writeEnvLocal } from './envfile.js';
 
 /**
  * Format patches as a human-readable diff preview.
@@ -106,25 +107,7 @@ function apiKeyEnvironmentVariable(framework: Framework): string {
 }
 
 async function persistApiKeyEnvironment(cwd: string, framework: Framework, apiKey: string): Promise<void> {
-  const envPath = join(cwd, '.env.local');
-  const variable = apiKeyEnvironmentVariable(framework);
-  let current = '';
-  try { current = await readFile(envPath, 'utf8'); } catch { /* create below */ }
-  const line = `${variable}=${apiKey}`;
-  const pattern = new RegExp(`^${variable}=.*$`, 'm');
-  const next = pattern.test(current)
-    ? current.replace(pattern, line)
-    : `${current}${current && !current.endsWith('\n') ? '\n' : ''}${line}\n`;
-  await writeFile(envPath, next, { encoding: 'utf8', mode: 0o600 });
-  await chmod(envPath, 0o600);
-
-  const gitignorePath = join(cwd, '.gitignore');
-  let gitignore = '';
-  try { gitignore = await readFile(gitignorePath, 'utf8'); } catch { /* create below */ }
-  if (!gitignore.split(/\r?\n/).includes('.env.local')) {
-    gitignore += `${gitignore && !gitignore.endsWith('\n') ? '\n' : ''}.env.local\n`;
-    await writeFile(gitignorePath, gitignore, 'utf8');
-  }
+  await writeEnvLocal(cwd, { [apiKeyEnvironmentVariable(framework)]: apiKey });
 }
 
 /**

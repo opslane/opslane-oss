@@ -1,9 +1,15 @@
 import { randomBytes } from 'node:crypto';
-import { open, mkdir, rename, unlink } from 'node:fs/promises';
+import { open, mkdir, rename, stat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const LOCK_RETRY_MS = 20;
-const LOCK_TIMEOUT_MS = 2_000;
+// Long enough to outwait a legitimate holder: token refresh runs under this
+// lock and is itself bounded (see onboard/provision REFRESH_TIMEOUT_MS).
+const LOCK_TIMEOUT_MS = 45_000;
+// A lock older than this belongs to a process that died without releasing it.
+// Kept above the longest legitimate hold and below LOCK_TIMEOUT_MS so a waiter
+// reclaims the lock instead of giving up on it.
+const LOCK_STALE_MS = 30_000;
 
 export async function writeFileAtomic(
   filePath: string,
@@ -24,6 +30,17 @@ export async function writeFileAtomic(
   } catch (error) {
     await unlink(tempPath).catch(() => undefined);
     throw error;
+  }
+}
+
+async function reclaimIfStale(lockPath: string): Promise<void> {
+  try {
+    const { mtimeMs } = await stat(lockPath);
+    if (Date.now() - mtimeMs > LOCK_STALE_MS) {
+      await unlink(lockPath);
+    }
+  } catch {
+    // Already gone, or not ours to reclaim. The retry loop handles both.
   }
 }
 
@@ -49,6 +66,12 @@ export async function withFileLock<T>(
       if (code !== 'EEXIST' || Date.now() >= deadline) {
         throw error;
       }
+      // The release path is a `finally`, which a signal skips, so an
+      // interrupted run can strand the lock and wedge every later write.
+      // Reclaim one that is far older than any legitimate hold. Losing this
+      // race just means another waiter took the lock first, and the retry
+      // below sees it.
+      await reclaimIfStale(lockPath);
       await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
     }
   }

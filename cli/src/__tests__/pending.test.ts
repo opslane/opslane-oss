@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deletePendingSession, loadPendingSession, savePendingSession } from '../pending.js';
+import {
+  deletePendingSession,
+  findPendingByRepo,
+  loadPendingSession,
+  savePendingSession,
+  type PendingSession,
+} from '../pending.js';
 
 const pollId = '123e4567-e89b-42d3-a456-426614174000';
 
@@ -37,5 +43,85 @@ describe('pending session store', () => {
       poll_id: '../evil', poll_token: 'x', api_url: 'https://api.opslane.com',
       repo: 'a/b', created_at: new Date().toISOString(),
     }, directory)).rejects.toThrow('UUID');
+  });
+});
+
+const API = 'http://localhost:8082';
+const ids = [
+  '123e4567-e89b-42d3-a456-426614174001',
+  '123e4567-e89b-42d3-a456-426614174002',
+  '123e4567-e89b-42d3-a456-426614174003',
+];
+
+function onboardSession(
+  id: string,
+  overrides: Partial<PendingSession> = {},
+): PendingSession {
+  return {
+    kind: 'onboard',
+    poll_id: id,
+    poll_token: 'token',
+    api_url: API,
+    repo: 'Acme/Web',
+    created_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+describe('findPendingByRepo', () => {
+  let directory: string;
+  beforeEach(async () => { directory = await mkdtemp(join(tmpdir(), 'opslane-find-pending-')); });
+  afterEach(async () => rm(directory, { recursive: true, force: true }));
+
+  it('returns null when nothing matches', async () => {
+    await expect(findPendingByRepo(API, 'acme/web', directory)).resolves.toBeNull();
+  });
+
+  it('matches repo case-insensitively and origin canonically', async () => {
+    await savePendingSession(onboardSession(ids[0]!, {
+      api_url: 'HTTP://LOCALHOST:8082/path',
+    }), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory))
+      .resolves.toMatchObject({ poll_id: ids[0] });
+  });
+
+  it('does not match another origin', async () => {
+    await savePendingSession(onboardSession(ids[0]!, {
+      api_url: 'http://other:9000',
+    }), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory)).resolves.toBeNull();
+  });
+
+  it('leaves legacy and setup-kind sessions untouched', async () => {
+    await savePendingSession(onboardSession(ids[0]!, { kind: undefined }), directory);
+    await savePendingSession(onboardSession(ids[1]!, { kind: 'setup' }), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory)).resolves.toBeNull();
+    await expect(loadPendingSession(ids[0]!, directory)).resolves.not.toBeNull();
+    await expect(loadPendingSession(ids[1]!, directory)).resolves.not.toBeNull();
+  });
+
+  it('returns the newest match and deletes older duplicates', async () => {
+    await savePendingSession(onboardSession(ids[0]!, {
+      created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+    }), directory);
+    await savePendingSession(onboardSession(ids[1]!), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory))
+      .resolves.toMatchObject({ poll_id: ids[1] });
+    await expect(loadPendingSession(ids[0]!, directory)).resolves.toBeNull();
+  });
+
+  it('prunes expired matches', async () => {
+    await savePendingSession(onboardSession(ids[0]!, {
+      created_at: new Date(Date.now() - 25 * 60 * 60_000).toISOString(),
+    }), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory)).resolves.toBeNull();
+    await expect(loadPendingSession(ids[0]!, directory)).resolves.toBeNull();
+  });
+
+  it('skips malformed files while finding a valid match', async () => {
+    await writeFile(join(directory, `${ids[0]}.json`), 'not json');
+    await savePendingSession(onboardSession(ids[1]!), directory);
+    await expect(findPendingByRepo(API, 'acme/web', directory))
+      .resolves.toMatchObject({ poll_id: ids[1] });
   });
 });

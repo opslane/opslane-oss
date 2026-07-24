@@ -190,7 +190,7 @@ func (d *Dependencies) AgentPoll(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if session.APIKeySealed == nil || time.Now().After(session.ExpiresAt) {
-			resp["message"] = "key delivery window closed; re-run setup to mint a new key"
+			resp["message"] = "key delivery window closed; run \"opslane login\" then \"opslane setup --relink\" for an existing project, or re-run provisioning"
 		} else {
 			apiKey, openErr := auth.OpenAgentKey(pollToken, session.ID, *session.APIKeySealed)
 			if openErr != nil {

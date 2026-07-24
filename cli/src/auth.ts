@@ -100,6 +100,43 @@ export async function loadTokensFrom(
   return tokens;
 }
 
+/**
+ * Serialized read-modify-write over one origin's token pair. The callback sees
+ * expired pairs too, allowing refresh-token rotation to remain atomic.
+ *
+ * The callback must stay fast: it runs under the lock, whose acquisition
+ * timeout is short (see fsutil LOCK_TIMEOUT_MS). Do network work before
+ * calling this and reconcile inside the callback.
+ */
+export async function updateTokensAt(
+  filePath: string,
+  apiUrl: string,
+  update: (current: TokenPair | null) => Promise<TokenPair | null>,
+): Promise<TokenPair | null> {
+  return withFileLock(filePath, async () => {
+    const file = await readTokenFile(filePath, false);
+    const origin = canonicalOrigin(apiUrl);
+    const next = await update(file.tokens[origin] ?? null);
+    if (next) {
+      file.tokens[origin] = next;
+      try {
+        await writeFileAtomic(filePath, `${JSON.stringify(file, null, 2)}\n`);
+      } catch (error) {
+        // The server consumes a refresh token the moment it answers, so a pair
+        // we failed to persist leaves a burned token on disk. Replaying it next
+        // run reads as a stolen-token replay and revokes the whole family,
+        // including the user's dashboard session. Drop the entry so the next
+        // run opens a clean login instead.
+        delete file.tokens[origin];
+        await writeFileAtomic(filePath, `${JSON.stringify(file, null, 2)}\n`)
+          .catch(() => undefined);
+        throw error;
+      }
+    }
+    return next;
+  });
+}
+
 export async function clearTokensAt(filePath: string, apiUrl?: string): Promise<void> {
   if (!apiUrl) {
     await unlink(filePath).catch((error: NodeJS.ErrnoException) => {
