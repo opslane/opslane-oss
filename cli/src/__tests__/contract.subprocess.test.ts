@@ -45,7 +45,10 @@ async function close(server: Server): Promise<void> {
 
 describe('compiled CLI agent contract', () => {
   const temporaryDirectories: string[] = [];
-  beforeAll(() => execFileSync('pnpm', ['exec', 'tsc'], { cwd: cliRoot, stdio: 'pipe' }));
+  // Compiles the whole CLI before the subprocess contract tests. This grows with
+  // the codebase and runs cold on CI, so the default 10s hook timeout is too tight
+  // (it timed out on CI once the Apply stage was added). Give it a real budget.
+  beforeAll(() => execFileSync('pnpm', ['exec', 'tsc'], { cwd: cliRoot, stdio: 'pipe' }), 120_000);
   afterEach(async () => {
     await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   });

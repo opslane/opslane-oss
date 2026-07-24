@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -9,15 +9,21 @@ import {
 import { z } from 'zod';
 
 import { containedRepoRelative, hasSecretSegment } from './paths.js';
+import {
+  OPSLANE_IDENTITY_MIN_VERSION,
+  validatePlannedWiring,
+} from './verify.js';
 
 const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun'] as const;
+/** First release that includes the required SDK identity and Vite 8 support. */
+export const OPSLANE_SDK_VERSION = `^${OPSLANE_IDENTITY_MIN_VERSION}`;
 /**
  * What Apply should do about an error/monitoring SDK already in the repo.
  *
  *   none    - no error SDK found at all. Apply proceeds normally. (the common case)
  *   keep    - another SDK is present; install Opslane alongside it. `name` is that SDK.
  *   migrate - replace the named SDK with Opslane. `name` is that SDK.
- *   no_op   - @opslane/sdk is ALREADY installed; Apply should change nothing.
+ *   no_op   - identity-capable @opslane/sdk is already wired; Apply changes nothing.
  *
  * `none` exists because without it the model reached for `no_op` on a repo with no
  * SDK (observed live on directus), which would have told Apply "already onboarded"
@@ -27,6 +33,16 @@ const EXISTING_SDK_ACTIONS = ['none', 'keep', 'migrate', 'no_op'] as const;
 const EDIT_POSITIONS = ['before', 'after'] as const;
 const ENV_VARIABLE = /^[A-Z][A-Z0-9_]*$/;
 const OPSLANE_TOKEN = /(?:^|_)OPSLANE(?:_|$)/;
+const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+const LOCKFILES: Record<string, (typeof PACKAGE_MANAGERS)[number]> = {
+  'pnpm-lock.yaml': 'pnpm',
+  'package-lock.json': 'npm',
+  'npm-shrinkwrap.json': 'npm',
+  'yarn.lock': 'yarn',
+  'bun.lock': 'bun',
+  'bun.lockb': 'bun',
+};
 
 export interface OnboardingPlan {
   app_dir: string;
@@ -44,7 +60,14 @@ export interface OnboardingPlan {
   edit: {
     file: string;
     entry_hash: string;
+    manifest_file: string;
+    manifest_hash: string;
+    /** Apply places this at module top level alongside existing imports. */
     import_line: string;
+    /**
+     * `anchor`, `position`, and `occurrence` locate this block only. They do
+     * not govern placement of `import_line`.
+     */
     init_block: string;
     anchor: string;
     position: (typeof EDIT_POSITIONS)[number];
@@ -58,7 +81,9 @@ export interface OnboardingPlan {
 }
 
 /**
- * What the MODEL supplies: the full plan minus `edit.entry_hash`.
+ * What the MODEL supplies: the full plan minus host-owned hashes and the SDK
+ * version. The model selects the manifest, while the host contains and hashes
+ * it and pins the dependency version.
  *
  * The Detect agent has only Read/Glob/search — it cannot compute a sha256, so
  * asking it for one made every report_plan call unsatisfiable (it retried until
@@ -66,8 +91,9 @@ export interface OnboardingPlan {
  * from the file it already reads while validating. Exact facts belong to code;
  * judgment belongs to the model.
  */
-export type ReportedPlanInput = Omit<OnboardingPlan, 'edit'> & {
-  edit: Omit<OnboardingPlan['edit'], 'entry_hash'>;
+export type ReportedPlanInput = Omit<OnboardingPlan, 'dependency' | 'edit'> & {
+  dependency: { name: '@opslane/sdk' };
+  edit: Omit<OnboardingPlan['edit'], 'entry_hash' | 'manifest_hash'>;
 };
 
 export type ReportPlanInput =
@@ -128,6 +154,29 @@ function isUnderDirectory(directory: string, file: string): boolean {
   );
 }
 
+export function packageManagerForRepo(
+  root: string,
+  appDir: string,
+): (typeof PACKAGE_MANAGERS)[number] | null {
+  const absoluteRoot = path.resolve(root);
+  let directory = path.resolve(absoluteRoot, appDir === '.' ? '' : appDir);
+  while (directory === absoluteRoot || directory.startsWith(`${absoluteRoot}${path.sep}`)) {
+    const found = new Set(
+      Object.entries(LOCKFILES).flatMap(([file, manager]) =>
+        existsSync(path.join(directory, file)) ? [manager] : [],
+      ),
+    );
+    if (found.size > 1) {
+      throw new Error(`Conflicting package-manager lockfiles in ${path.relative(root, directory) || '.'}`);
+    }
+    const manager = found.values().next().value;
+    if (manager !== undefined) return manager;
+    if (directory === absoluteRoot) break;
+    directory = path.dirname(directory);
+  }
+  return null;
+}
+
 function validateEnvironmentVariable(
   value: unknown,
   envPrefix: string,
@@ -158,12 +207,34 @@ function countOccurrences(contents: string, anchor: string): number {
   return count;
 }
 
+function anchorIsWholeLine(contents: string, anchor: string, occurrence: number): boolean {
+  if (anchor.includes('\n') || anchor.includes('\r')) return false;
+  let offset = 0;
+  let found = -1;
+  for (let index = 0; index <= occurrence; index += 1) {
+    found = contents.indexOf(anchor, offset);
+    if (found === -1) return false;
+    offset = found + anchor.length;
+  }
+  const lineStart = contents.lastIndexOf('\n', found - 1) + 1;
+  const lineEndIndex = contents.indexOf('\n', found + anchor.length);
+  const lineEnd = lineEndIndex === -1 ? contents.length : lineEndIndex;
+  return (
+    /^[\t ]*$/.test(contents.slice(lineStart, found)) &&
+    /^[\t ]*\r?$/.test(contents.slice(found + anchor.length, lineEnd))
+  );
+}
+
 function validatePlan(root: string, value: unknown): OnboardingPlan {
   assertRecord(value, 'plan');
 
   const appDir = canonicalRepoPath(root, value.app_dir, 'app_dir');
   const framework = nonEmptyString(value.framework, 'framework');
   const packageManager = enumValue(value.package_manager, PACKAGE_MANAGERS, 'package manager');
+  const detectedPackageManager = packageManagerForRepo(root, appDir);
+  if (detectedPackageManager !== null && detectedPackageManager !== packageManager) {
+    throw new Error(`package manager must match ${detectedPackageManager} lockfile`);
+  }
   const envPrefix = nonEmptyString(value.env_prefix, 'env_prefix');
   const rationale = nonEmptyString(value.rationale, 'rationale');
 
@@ -172,8 +243,6 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
   if (dependencyName !== '@opslane/sdk') {
     throw new Error('dependency.name must be @opslane/sdk');
   }
-  const dependencyVersion = nonEmptyString(value.dependency.version, 'dependency.version');
-
   assertRecord(value.env_vars, 'env_vars');
   const apiKey = validateEnvironmentVariable(value.env_vars.api_key, envPrefix, 'env_vars.api_key');
   const endpoint = validateEnvironmentVariable(
@@ -191,7 +260,15 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
   const editAbsolute = path.join(root, editFile);
   let fileContents: Buffer;
   try {
-    if (!statSync(editAbsolute).isFile()) {
+    const metadata = statSync(editAbsolute);
+    if (
+      lstatSync(editAbsolute).isSymbolicLink() ||
+      !metadata.isFile() ||
+      // A hard link (nlink > 1) can alias a file OUTSIDE the repo that realpath
+      // cannot detect (a hard link has no target path). Refuse it.
+      metadata.nlink > 1 ||
+      metadata.size > MAX_ENTRY_BYTES
+    ) {
       throw new Error('not a regular file');
     }
     fileContents = readFileSync(editAbsolute);
@@ -203,6 +280,29 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
   // sha256. Apply re-hashes this file and refuses a stale plan.
   const entryHash = createHash('sha256').update(fileContents).digest('hex');
 
+  const manifestFile = canonicalRepoPath(root, value.edit.manifest_file, 'edit.manifest_file');
+  if (!isUnderDirectory(appDir, manifestFile) || path.posix.basename(manifestFile) !== 'package.json') {
+    throw new Error('edit.manifest_file must be a package.json under app_dir');
+  }
+  const manifestAbsolute = path.join(root, manifestFile);
+  let manifestContents: Buffer;
+  try {
+    const metadata = statSync(manifestAbsolute);
+    if (
+      lstatSync(manifestAbsolute).isSymbolicLink() ||
+      !metadata.isFile() ||
+      metadata.nlink > 1 || // hard link may alias an outside file — refuse (see edit.file)
+      metadata.size > MAX_MANIFEST_BYTES
+    ) {
+      throw new Error('not a regular file');
+    }
+    manifestContents = readFileSync(manifestAbsolute);
+    assertRecord(JSON.parse(manifestContents.toString('utf8')), 'edit.manifest_file');
+  } catch {
+    throw new Error('edit.manifest_file must be a valid regular JSON file');
+  }
+  const manifestHash = createHash('sha256').update(manifestContents).digest('hex');
+
   const importLine = nonEmptyString(value.edit.import_line, 'edit.import_line');
   const initBlock = nonEmptyString(value.edit.init_block, 'edit.init_block');
   const anchor = nonEmptyString(value.edit.anchor, 'edit.anchor');
@@ -213,6 +313,19 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
   }
   if (countOccurrences(fileContents.toString('utf8'), anchor) <= (occurrence as number)) {
     throw new Error('edit.anchor does not occur at edit.occurrence in edit.file');
+  }
+  if (!anchorIsWholeLine(fileContents.toString('utf8'), anchor, occurrence as number)) {
+    throw new Error('edit.anchor must match the complete non-whitespace content of its line');
+  }
+  const wiringFailures = validatePlannedWiring({
+    file: editFile,
+    importLine,
+    initBlock,
+    apiKeyVariable: apiKey,
+    endpointVariable: endpoint,
+  });
+  if (wiringFailures.length > 0) {
+    throw new Error(wiringFailures[0]);
   }
 
   assertRecord(value.existing_sdk, 'existing_sdk');
@@ -240,11 +353,13 @@ function validatePlan(root: string, value: unknown): OnboardingPlan {
     framework,
     package_manager: packageManager,
     env_prefix: envPrefix,
-    dependency: { name: '@opslane/sdk', version: dependencyVersion },
+    dependency: { name: '@opslane/sdk', version: OPSLANE_SDK_VERSION },
     env_vars: { api_key: apiKey, endpoint },
     edit: {
       file: editFile,
       entry_hash: entryHash,
+      manifest_file: manifestFile,
+      manifest_hash: manifestHash,
       import_line: importLine,
       init_block: initBlock,
       anchor,
@@ -290,7 +405,6 @@ export function createReportPlanTool(
     env_prefix: z.string(),
     dependency: z.object({
       name: z.literal('@opslane/sdk'),
-      version: z.string(),
     }),
     env_vars: z.object({
       api_key: z.string(),
@@ -303,6 +417,7 @@ export function createReportPlanTool(
       // model made every report_plan call unsatisfiable (it retried until the
       // turn budget ran out and produced no plan). The host stamps the hash
       // below from the file it already reads. Exact facts belong to code.
+      manifest_file: z.string(),
       import_line: z.string(),
       init_block: z.string(),
       anchor: z.string(),
@@ -353,6 +468,58 @@ export function createReportPlanTool(
       onPlan(plan);
       return {
         content: [{ type: 'text', text: 'Onboarding plan accepted.' }],
+      };
+    },
+  );
+}
+
+export interface FinishApplyReport {
+  editedFiles: string[];
+  summary: string;
+}
+
+export function createFinishApplyTool(
+  root: string,
+  state: { finished: boolean },
+  onReport: (report: FinishApplyReport) => void,
+  canFinish: () => boolean = () => true,
+) {
+  let reported = false;
+  return tool(
+    'finish_apply',
+    'Report the files changed while applying the approved onboarding plan exactly once.',
+    {
+      edited_files: z.array(z.string()).min(1),
+      summary: z.string().min(1),
+    },
+    async ({ edited_files: editedFiles, summary }) => {
+      if (reported || state.finished) {
+        throw new Error('Apply result was already finished');
+      }
+      if (!Array.isArray(editedFiles) || editedFiles.length === 0) {
+        throw new Error('edited_files must contain at least one path');
+      }
+      if (typeof summary !== 'string' || summary.trim().length === 0) {
+        throw new Error('summary must be a non-empty string');
+      }
+      if (!canFinish()) {
+        throw new Error('Cannot finish while an edit is unsettled');
+      }
+      const canonical = editedFiles.map((candidate) => {
+        const relative = containedRepoRelative(root, candidate);
+        if (hasSecretSegment(relative)) {
+          throw new Error('edited_files contains a secret file');
+        }
+        return relative;
+      });
+      if (new Set(canonical).size !== canonical.length) {
+        throw new Error('edited_files must not contain duplicates');
+      }
+      onReport({ editedFiles: canonical, summary });
+      reported = true;
+      state.finished = true;
+      return {
+        content: [{ type: 'text', text: 'Apply result accepted.' }],
       };
     },
   );

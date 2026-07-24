@@ -7,6 +7,7 @@ import {
 import { containedRepoRelative, hasSecretSegment } from './paths.js';
 
 const FILE_TOOLS = new Set(['Read', 'Glob', 'Edit', 'Write', 'MultiEdit']);
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit']);
 const MUTATING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'Bash']);
 const ALLOWED_BASH = /^(npm|pnpm|yarn|bun) run (build|typecheck|lint)$/;
 const PATH_KEYS = new Set(['path', 'file_path', 'pattern']);
@@ -37,10 +38,16 @@ function asRecord(value: unknown): Record<string, unknown> {
 export function onboardPreToolUseHook({
   root,
   state,
+  writablePaths,
 }: {
   root: string;
   state?: { finished: boolean };
+  writablePaths?: Iterable<string>;
 }): HookCallback {
+  const canonicalWritable =
+    writablePaths === undefined
+      ? undefined
+      : new Set(Array.from(writablePaths, (candidate) => containedRepoRelative(root, candidate)));
   return async (input) => {
     const preToolInput = input as PreToolUseHookInput;
     const toolName = preToolInput.tool_name;
@@ -63,6 +70,13 @@ export function onboardPreToolUseHook({
           return deny(`${toolName} path is not contained in the repository`);
         }
         if (hasSecretSegment(relative)) return deny(`${toolName} cannot access secret files`);
+        if (
+          canonicalWritable !== undefined &&
+          EDIT_TOOLS.has(toolName) &&
+          !canonicalWritable.has(relative)
+        ) {
+          return deny(`${toolName} is not allowed to modify ${relative}`);
+        }
       }
     }
 
@@ -84,10 +98,24 @@ export type ApprovalRequest = (
 
 export function createOnboardApproval({
   requestApproval,
+  allowedTools = [
+    'Read',
+    'Edit',
+    'Write',
+    'MultiEdit',
+    'Bash',
+    'mcp__onboard__finish_apply',
+    'mcp__onboard__ask_user',
+  ],
 }: {
   requestApproval: ApprovalRequest;
+  allowedTools?: Iterable<string>;
 }): CanUseTool {
+  const allowed = new Set(allowedTools);
   return async (toolName, input) => {
+    if (!allowed.has(toolName)) {
+      return { behavior: 'deny', message: `Onboarding does not allow tool ${toolName}` };
+    }
     if (!MUTATING_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input };
     return (await requestApproval(toolName, input))
       ? { behavior: 'allow', updatedInput: input }
