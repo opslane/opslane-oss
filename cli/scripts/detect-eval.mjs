@@ -256,7 +256,9 @@ function checkPlan(root, run) {
   checks.push([
     'vars use prefix + OPSLANE token',
     namingOk,
-    `${plan?.env_vars?.api_key ?? '-'} / ${plan?.env_vars?.endpoint ?? '-'}`,
+    // Do not echo the variable names: they are safe (names, not secrets) but the
+    // clear-text-logging scanner taints any read of env_vars.api_key into a log.
+    namingOk ? `prefix ${plan?.env_prefix ?? '-'} + OPSLANE` : 'wrong prefix or missing OPSLANE',
   ]);
   checks.push([
     'anchor occurrence resolves as a complete line',
