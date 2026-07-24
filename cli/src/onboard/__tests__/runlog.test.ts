@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -107,6 +107,29 @@ describe('createRunLog', () => {
     const names = (await readdir(d)).sort();
     expect(names).toHaveLength(3);
     expect(names).toContain('onboard-new.jsonl');
+  });
+
+  it('survives a log entry that readdir lists but stat cannot resolve', async () => {
+    const d = await dir();
+    await writeFile(join(d, 'onboard-a.jsonl'), '{}\n');
+    // A dangling symlink reproduces what a concurrent run pruning the same
+    // directory produces: readdir lists the name, stat rejects with ENOENT.
+    await symlink(join(d, 'gone.jsonl'), join(d, 'onboard-b.jsonl'));
+
+    const log = await createRunLog({ dir: d, runId: 'new', mode: 'metadata', maxLogs: 3 });
+
+    expect(log.path).toContain('onboard-new.jsonl');
+    expect(await readdir(d)).toContain('onboard-new.jsonl');
+  });
+
+  it('full mode redacts a field named key, not just api_key', async () => {
+    const d = await dir();
+    const log = await createRunLog({ dir: d, runId: 'bare-key', mode: 'full' });
+    await log.record({ type: 'x', key: 'opk_bare_123', private_key: 'pem_456' });
+
+    const text = await readFile(log.path, 'utf8');
+    expect(text).not.toContain('opk_bare_123');
+    expect(text).not.toContain('pem_456');
   });
 
   it('finish never leaks arbitrary content or registered secrets', async () => {

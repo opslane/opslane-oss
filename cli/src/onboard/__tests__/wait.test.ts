@@ -82,6 +82,51 @@ describe('waitForAppReporting', () => {
     expect(sleepFn).toHaveBeenCalledWith(1_000);
   });
 
+  it('aborts a stalled poll on its own ceiling so retries still run', async () => {
+    let aborted = 0;
+    // A server that accepts the connection and never answers. Without a
+    // per-request ceiling this single call would consume the whole 15 minute
+    // budget and the unreachable backoff below would never get a turn.
+    const fetchFn = vi.fn((_url: string, init?: RequestInit) => (
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted += 1;
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        });
+      })
+    ));
+
+    await expect(waitForAppReporting({
+      ...OPTS,
+      timeoutMs: 15 * 60_000,
+      requestTimeoutMs: 20,
+      maxUnreachable: 2,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      sleepFn: vi.fn().mockResolvedValue(undefined),
+    })).rejects.toThrow(/unreachable/i);
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(aborted).toBe(2);
+  });
+
+  it('never lets the per-request ceiling outlive the remaining budget', async () => {
+    let deadlineMs = 0;
+    const fetchFn = vi.fn((_url: string, init?: RequestInit) => {
+      init?.signal?.addEventListener('abort', () => { deadlineMs = Date.now(); });
+      return Promise.resolve(new Response(JSON.stringify({ status: 'app_reporting' })));
+    });
+
+    // A 5ms budget must win over the 30s default ceiling.
+    const started = Date.now();
+    await expect(waitForAppReporting({
+      ...OPTS,
+      timeoutMs: 5,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    })).resolves.toMatchObject({ status: 'app_reporting' });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(deadlineMs).toBe(0);
+  });
+
   it('bounds unreachable retries', async () => {
     const fetchFn = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
     await expect(waitForAppReporting({ ...OPTS, fetchFn, maxUnreachable: 3 }))

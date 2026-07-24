@@ -243,6 +243,27 @@ describe('ensureProvisioned', () => {
     expect(sleepFn).toHaveBeenCalledWith(5_000);
   });
 
+  it('caps a hostile retry_after instead of parking the CLI', async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(response(429, { status: 'rate_limited', retry_after: 86_400 }))
+      .mockResolvedValueOnce(response(201, PROVISIONED));
+    const sleepFn = vi.fn().mockResolvedValue(undefined);
+    await expect(ensureProvisioned(await base({ fetchFn, sleepFn }))).resolves.toBeDefined();
+    expect(sleepFn).toHaveBeenCalledWith(60_000);
+  });
+
+  it('caps a hostile Retry-After header too', async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'rate_limited' }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '999999' },
+      }))
+      .mockResolvedValueOnce(response(201, PROVISIONED));
+    const sleepFn = vi.fn().mockResolvedValue(undefined);
+    await expect(ensureProvisioned(await base({ fetchFn, sleepFn }))).resolves.toBeDefined();
+    expect(sleepFn).toHaveBeenCalledWith(60_000);
+  });
+
   it('does not retry an ambiguous network failure on POST', async () => {
     const fetchFn = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
     const sleepFn = vi.fn();

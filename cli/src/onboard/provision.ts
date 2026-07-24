@@ -35,16 +35,25 @@ export interface EnsureLoggedInOptions {
   fetchFn?: typeof fetch;
 }
 
+/**
+ * Bounded so the credentials lock this runs under is never held on a stalled
+ * connection. Must stay below fsutil's lock timeout.
+ */
+const REFRESH_TIMEOUT_MS = 15_000;
+
 async function refreshTokens(
   apiUrl: string,
   refreshToken: string,
   fetchFn: typeof fetch,
 ): Promise<TokenPair | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
   try {
     const response = await fetchFn(`${apiUrl}/auth/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),
+      signal: controller.signal,
     });
     if (!response.ok) return null;
     const body: unknown = await response.json();
@@ -62,6 +71,8 @@ async function refreshTokens(
     };
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -72,11 +83,23 @@ export async function ensureLoggedIn(options: EnsureLoggedInOptions): Promise<To
   const live = await loadTokensFrom(options.tokenPath, apiUrl);
   if (live) return live;
 
-  const refreshed = await updateTokensAt(options.tokenPath, apiUrl, async (current) => {
-    if (current && Date.now() < current.expiresAt) return current;
-    if (!current?.refreshToken) return null;
-    return refreshTokens(apiUrl, current.refreshToken, fetchFn);
-  });
+  // The refresh runs under the credentials lock on purpose: a refresh token is
+  // single-use, so two concurrent CLI runs must not both spend it. The fetch is
+  // bounded (REFRESH_TIMEOUT_MS) so the lock is never held indefinitely, and
+  // fsutil reclaims a lock whose holder died before releasing it.
+  let refreshed: TokenPair | null = null;
+  try {
+    refreshed = await updateTokensAt(options.tokenPath, apiUrl, async (current) => {
+      if (current && Date.now() < current.expiresAt) return current;
+      if (!current?.refreshToken) return null;
+      return refreshTokens(apiUrl, current.refreshToken, fetchFn);
+    });
+  } catch {
+    // Either the lock could not be taken or the rotated pair could not be
+    // persisted. updateTokensAt has already dropped any burned token, so fall
+    // through to an interactive login rather than replaying it.
+    refreshed = null;
+  }
   if (refreshed && Date.now() < refreshed.expiresAt) return refreshed;
 
   await options.loginFn();
@@ -106,6 +129,8 @@ export interface EnsureProvisionedOptions {
 }
 
 const RESUMABLE = new Set(['provisioned', 'key_ok', 'app_reporting', 'completed']);
+
+const MAX_RETRY_AFTER_MS = 60_000;
 
 export async function ensureProvisioned(
   options: EnsureProvisionedOptions,
@@ -189,7 +214,9 @@ export async function ensureProvisioned(
     }
     if (response.status === 429 && attempt < max429Retries) {
       const body = await responseJSON(response.clone()) ?? {};
-      await sleepFn(retryAfterSeconds(response, body) * 1_000);
+      // Retry-After is server-controlled and unbounded; cap it so a bad value
+      // parks the CLI for a minute instead of a day.
+      await sleepFn(Math.min(retryAfterSeconds(response, body) * 1_000, MAX_RETRY_AFTER_MS));
       continue;
     }
     break;

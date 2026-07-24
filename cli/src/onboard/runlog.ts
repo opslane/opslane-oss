@@ -30,8 +30,10 @@ export interface RunLog {
 
 // Field-name redaction uses substring matching intentionally so it catches
 // poll_token, refresh_token, accessToken, code_verifier, api_key, and similar.
+// `key` is matched bare rather than as api[_-]?key so plain `key` and
+// `private_key` are covered too; over-redacting a debug log is the safe side.
 const SENSITIVE_FIELD =
-  /(authorization|api[_-]?key|token|secret|verifier|password|credential)/i;
+  /(authorization|key|token|secret|verifier|password|credential)/i;
 const METADATA_SUMMARY_FIELDS = new Set([
   'outcome',
   'turns',
@@ -89,12 +91,16 @@ export async function createRunLog(options: RunLogOptions): Promise<RunLog> {
   const existing = (await readdir(options.dir)).filter((name) =>
     /^onboard-.*\.jsonl$/.test(name),
   );
-  const withTimes = await Promise.all(
-    existing.map(async (name) => ({
-      name,
-      mtime: (await stat(join(options.dir, name))).mtimeMs,
-    })),
-  );
+  // A concurrent run may retire a log between the readdir and the stat, so a
+  // vanished file drops out of retention instead of failing the whole run.
+  const withTimes = (await Promise.all(
+    existing.map(async (name) => {
+      const mtime = await stat(join(options.dir, name))
+        .then((stats) => stats.mtimeMs)
+        .catch(() => null);
+      return mtime === null ? null : { name, mtime };
+    }),
+  )).filter((entry): entry is { name: string; mtime: number } => entry !== null);
   withTimes.sort((a, b) => b.mtime - a.mtime);
   for (const { name } of withTimes.slice(Math.max(0, maxLogs - 1))) {
     await unlink(join(options.dir, name)).catch(() => undefined);

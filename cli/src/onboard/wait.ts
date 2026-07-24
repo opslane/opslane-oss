@@ -9,10 +9,16 @@ export interface WaitOptions {
   timeoutMs?: number;
   pollIntervalMs?: number;
   maxUnreachable?: number;
+  requestTimeoutMs?: number;
   nowFn?: () => number;
 }
 
 const WAITING = new Set(['pending', 'provisioned', 'key_ok']);
+
+// Per-request ceiling. Without it a connection the server accepts and then
+// never answers would burn the whole wait budget on one poll, so the
+// unreachable backoff below would never get a turn.
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export async function waitForAppReporting(options: WaitOptions): Promise<PollResult> {
   const fetchFn = options.fetchFn ?? fetch;
@@ -22,6 +28,7 @@ export async function waitForAppReporting(options: WaitOptions): Promise<PollRes
   const interval = options.pollIntervalMs ?? 3_000;
   const deadline = now() + (options.timeoutMs ?? 15 * 60_000);
   const maxUnreachable = options.maxUnreachable ?? 20;
+  const requestTimeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   let unreachable = 0;
 
   async function pause(ms: number): Promise<void> {
@@ -33,7 +40,10 @@ export async function waitForAppReporting(options: WaitOptions): Promise<PollRes
     const remaining = deadline - now();
     if (remaining <= 0) break;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), remaining);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.min(remaining, requestTimeout),
+    );
     const result = await pollSessionOnce({
       apiUrl: options.apiUrl,
       sessionId: options.sessionId,
