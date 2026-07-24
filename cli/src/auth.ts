@@ -100,6 +100,27 @@ export async function loadTokensFrom(
   return tokens;
 }
 
+/**
+ * Serialized read-modify-write over one origin's token pair. The callback sees
+ * expired pairs too, allowing refresh-token rotation to remain atomic.
+ */
+export async function updateTokensAt(
+  filePath: string,
+  apiUrl: string,
+  update: (current: TokenPair | null) => Promise<TokenPair | null>,
+): Promise<TokenPair | null> {
+  return withFileLock(filePath, async () => {
+    const file = await readTokenFile(filePath, false);
+    const origin = canonicalOrigin(apiUrl);
+    const next = await update(file.tokens[origin] ?? null);
+    if (next) {
+      file.tokens[origin] = next;
+      await writeFileAtomic(filePath, `${JSON.stringify(file, null, 2)}\n`);
+    }
+    return next;
+  });
+}
+
 export async function clearTokensAt(filePath: string, apiUrl?: string): Promise<void> {
   if (!apiUrl) {
     await unlink(filePath).catch((error: NodeJS.ErrnoException) => {

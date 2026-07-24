@@ -12,6 +12,7 @@ import { status } from './status.js';
 import { listErrors, getError } from './errors.js';
 import { AGENT_STATUSES } from './contract.js';
 import { jsonOutput } from './output.js';
+import chalk from 'chalk';
 
 // Derive the version from package.json so Changesets bumps propagate to
 // `opslane --version` without a hand edit (dist/index.js -> ../package.json).
@@ -36,10 +37,18 @@ program
   .command('login')
   .description('Authenticate with Opslane and connect GitHub')
   .option('--api-url <url>', 'Opslane API URL')
-  .action((opts: { apiUrl?: string }) => login({
-    apiUrl: opts.apiUrl ?? process.env['OPSLANE_API_URL'] ?? 'https://api.opslane.com',
-    clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
-  }));
+  .action(async (opts: { apiUrl?: string }) => {
+    try {
+      await login({
+        apiUrl: opts.apiUrl ?? process.env['OPSLANE_API_URL'] ?? 'https://api.opslane.com',
+        clientId: process.env['OPSLANE_CLIENT_ID'] ?? 'opslane-cli',
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nLogin failed: ${message}`));
+      process.exitCode = 1;
+    }
+  });
 
 program
   .command('init')
@@ -130,4 +139,4 @@ errorsCmd
     await getError(id, opts);
   });
 
-program.parse();
+await program.parseAsync(process.argv);

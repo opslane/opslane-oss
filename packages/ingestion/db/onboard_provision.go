@@ -61,6 +61,36 @@ func (q *Queries) ProvisionOnboardSession(ctx context.Context, in OnboardProvisi
 	}
 	defer tx.Rollback(ctx)
 
+	// Adopt an existing untagged project for this org+repo (e.g. created by the
+	// GitHub-App setup flow) so onboarding converges on it instead of minting a
+	// duplicate. Tag exactly one row -- the oldest -- and only when no project
+	// in this org already carries this token. If a tagged project already
+	// exists, it wins and any untagged duplicate remains untouched.
+	if _, err := tx.Exec(ctx, `
+		UPDATE projects
+		SET idempotency_token = $3
+		WHERE id = (
+			SELECT id
+			FROM projects
+			WHERE org_id = $1
+			  AND lower(github_repo) = lower($2)
+			  AND idempotency_token IS NULL
+			ORDER BY created_at ASC
+			LIMIT 1
+			FOR UPDATE
+		)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM projects
+			WHERE org_id = $1 AND idempotency_token = $3
+		)`,
+		in.OrgID,
+		repo,
+		"onboard:"+strings.ToLower(repo),
+	); err != nil {
+		return nil, fmt.Errorf("provision onboard session: adopt existing project: %w", err)
+	}
+
 	provisioning, err := q.provisionProjectTx(
 		ctx,
 		tx,

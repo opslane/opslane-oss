@@ -195,6 +195,155 @@ func TestProvisionOnboardSession(t *testing.T) {
 	}
 }
 
+func TestProvisionOnboardSessionAdoptsExistingUntaggedProject(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	orgID, userID := seedOnboardOrgOwner(t, pool, "adopt")
+
+	var existingID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo)
+		VALUES ($1, 'web', 'Acme/Web')
+		RETURNING id`,
+		orgID,
+	).Scan(&existingID); err != nil {
+		t.Fatalf("seed untagged project: %v", err)
+	}
+
+	result, err := q.ProvisionOnboardSession(
+		ctx,
+		onboardInput(orgID, userID, "acme/web", "adopt"),
+	)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	cleanupOnboardSessions(t, pool, result.SessionID)
+	if result.ProjectID != existingID {
+		t.Fatalf("adopted project = %s, want existing %s", result.ProjectID, existingID)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM projects
+		WHERE org_id = $1 AND lower(github_repo) = lower($2)`,
+		orgID,
+		"acme/web",
+	).Scan(&count); err != nil {
+		t.Fatalf("count matching projects: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("project count = %d, want 1", count)
+	}
+}
+
+func TestProvisionOnboardSessionAdoptsExistingUntaggedProjectWithinOrg(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	firstOrgID, firstUserID := seedOnboardOrgOwner(t, pool, "adopt-first-org")
+	secondOrgID, secondUserID := seedOnboardOrgOwner(t, pool, "adopt-second-org")
+
+	var firstProjectID, secondProjectID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo)
+		VALUES ($1, 'web', 'acme/web')
+		RETURNING id`,
+		firstOrgID,
+	).Scan(&firstProjectID); err != nil {
+		t.Fatalf("seed first org project: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo)
+		VALUES ($1, 'web', 'ACME/WEB')
+		RETURNING id`,
+		secondOrgID,
+	).Scan(&secondProjectID); err != nil {
+		t.Fatalf("seed second org project: %v", err)
+	}
+
+	first, err := q.ProvisionOnboardSession(
+		ctx,
+		onboardInput(firstOrgID, firstUserID, "Acme/Web", "adopt-first-org"),
+	)
+	if err != nil {
+		t.Fatalf("provision first org: %v", err)
+	}
+	cleanupOnboardSessions(t, pool, first.SessionID)
+	second, err := q.ProvisionOnboardSession(
+		ctx,
+		onboardInput(secondOrgID, secondUserID, "acme/web", "adopt-second-org"),
+	)
+	if err != nil {
+		t.Fatalf("provision second org: %v", err)
+	}
+	cleanupOnboardSessions(t, pool, second.SessionID)
+
+	if first.ProjectID != firstProjectID {
+		t.Fatalf("first org project = %s, want %s", first.ProjectID, firstProjectID)
+	}
+	if second.ProjectID != secondProjectID {
+		t.Fatalf("second org project = %s, want %s", second.ProjectID, secondProjectID)
+	}
+	if first.ProjectID == second.ProjectID {
+		t.Fatalf("different orgs adopted the same project %s", first.ProjectID)
+	}
+}
+
+func TestProvisionOnboardSessionAdoptsExistingTaggedProjectInDirtyCoexistence(t *testing.T) {
+	pool := testPool(t)
+	q := db.New(pool)
+	ctx := context.Background()
+	orgID, userID := seedOnboardOrgOwner(t, pool, "adopt-dirty")
+
+	var taggedID, untaggedID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo, idempotency_token)
+		VALUES ($1, 'tagged-web', 'acme/web', 'onboard:acme/web')
+		RETURNING id`,
+		orgID,
+	).Scan(&taggedID); err != nil {
+		t.Fatalf("seed tagged project: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO projects (org_id, name, github_repo)
+		VALUES ($1, 'untagged-web', 'Acme/Web')
+		RETURNING id`,
+		orgID,
+	).Scan(&untaggedID); err != nil {
+		t.Fatalf("seed untagged project: %v", err)
+	}
+
+	result, err := q.ProvisionOnboardSession(
+		ctx,
+		onboardInput(orgID, userID, "acme/web", "adopt-dirty"),
+	)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	cleanupOnboardSessions(t, pool, result.SessionID)
+	if result.ProjectID != taggedID {
+		t.Fatalf("provisioned project = %s, want tagged %s", result.ProjectID, taggedID)
+	}
+
+	var untaggedStillExists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM projects
+			WHERE id = $1 AND org_id = $2 AND idempotency_token IS NULL
+		)`,
+		untaggedID,
+		orgID,
+	).Scan(&untaggedStillExists); err != nil {
+		t.Fatalf("read untagged project: %v", err)
+	}
+	if !untaggedStillExists {
+		t.Fatal("pre-existing untagged project was changed")
+	}
+}
+
 func TestProvisionOnboardSessionConcurrent(t *testing.T) {
 	pool := testPool(t)
 	q := db.New(pool)

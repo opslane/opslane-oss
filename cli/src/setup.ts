@@ -17,6 +17,12 @@ import {
 } from './pending.js';
 import { defaultTokenPath, loadTokensFrom } from './auth.js';
 import { defaultApiUrl } from './config.js';
+import {
+  pollSessionOnce,
+  responseJSON,
+  retryAfterSeconds,
+  type JsonBody,
+} from './agent-protocol.js';
 
 const POLL_INTERVAL_MS = 3_000;
 const BLOCKING_TIMEOUT_SECONDS = 15 * 60;
@@ -40,8 +46,6 @@ export interface SetupOptions {
   pollIntervalMs?: number;
   sleepFn?: (ms: number) => Promise<void>;
 }
-
-type JsonBody = Record<string, unknown>;
 
 export function normalizeRepoURL(remoteURL: string): string | null {
   if (/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(remoteURL)) return remoteURL;
@@ -69,24 +73,6 @@ function timeoutSeconds(value: number | string | undefined, fallback: number): n
   if (value === undefined) return fallback;
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
-async function responseJSON(response: Response): Promise<JsonBody | null> {
-  try {
-    const value: unknown = await response.json();
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-      ? value as JsonBody
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function retryAfterSeconds(response: Response, body: JsonBody): number {
-  const bodyValue = Number(body['retry_after']);
-  if (Number.isFinite(bodyValue) && bodyValue > 0) return bodyValue;
-  const headerValue = Number(response.headers.get('Retry-After'));
-  return Number.isFinite(headerValue) && headerValue > 0 ? headerValue : 60;
 }
 
 function stderrJSON(body: JsonBody): void {
@@ -133,51 +119,47 @@ async function pollLoop(
   let waitingForApp = false;
 
   while (Date.now() < deadline) {
-    let response: Response;
-    try {
-      response = await fetchFn(
-        `${pending.api_url}/api/v1/agent/poll/${encodeURIComponent(pending.poll_id)}`,
-        { headers: { 'X-Opslane-Poll-Token': pending.poll_token } },
-      );
-      reachedServer = true;
-    } catch {
+    const result = await pollSessionOnce({
+      apiUrl: pending.api_url,
+      sessionId: pending.poll_id,
+      pollToken: pending.poll_token,
+      fetchFn,
+    });
+
+    if (result.status === 'unreachable') {
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await sleepFn(Math.min(interval, remaining));
+      continue;
+    }
+    reachedServer = true;
+
+    if (result.status === 'pending') {
       const remaining = deadline - Date.now();
       if (remaining > 0) await sleepFn(Math.min(interval, remaining));
       continue;
     }
 
-    const body = await responseJSON(response);
-    if (!body) {
-      return exitWithStatus('internal_error', { message: 'unparseable server response' }, 1);
-    }
-    const status = body['status'];
-
-    if (status === 'pending') {
-      const remaining = deadline - Date.now();
-      if (remaining > 0) await sleepFn(Math.min(interval, remaining));
-      continue;
-    }
-
-    if (status === 'rate_limited' || response.status === 429) {
+    if (result.status === 'rate_limited') {
       const remaining = deadline - Date.now();
       if (remaining > 0) {
-        await sleepFn(Math.min(retryAfterSeconds(response, body) * 1_000, remaining));
+        await sleepFn(Math.min((result.retryAfterSeconds ?? 60) * 1_000, remaining));
       }
       continue;
     }
 
-    if (status === 'provisioned' || status === 'key_ok' || status === 'app_reporting' || status === 'completed') {
-      const apiKey = typeof body['api_key'] === 'string' ? body['api_key'] : null;
-      if (!apiKey && status !== 'app_reporting') {
+    if (result.status === 'provisioned' || result.status === 'key_ok'
+      || result.status === 'app_reporting' || result.status === 'completed') {
+      const apiKey = result.apiKey;
+      if (!apiKey && result.status !== 'app_reporting') {
         await deletePendingSession(pending.poll_id, pendingDir);
         return exitWithStatus('key_unavailable', {
-          project_id: body['project_id'],
+          project_id: result.projectId ?? undefined,
           remediation: 'run "opslane login" then "opslane setup --relink"',
         }, 1);
       }
-      const orgId = typeof body['org_id'] === 'string' ? body['org_id'] : null;
-      const projectId = typeof body['project_id'] === 'string' ? body['project_id'] : null;
-      const repo = typeof body['repo'] === 'string' ? body['repo'] : pending.repo;
+      const orgId = result.orgId;
+      const projectId = result.projectId;
+      const repo = result.repo ?? pending.repo;
       if (!orgId || !projectId) {
         return exitWithStatus('internal_error', { message: 'provisioned response omitted project credentials' }, 1);
       }
@@ -186,7 +168,7 @@ async function pollLoop(
         if (!saved || saved.project_id !== projectId || saved.org_id !== orgId) {
           await deletePendingSession(pending.poll_id, pendingDir);
           return exitWithStatus('key_unavailable', {
-            project_id: body['project_id'],
+            project_id: result.projectId ?? undefined,
             remediation: 'run "opslane login" then "opslane setup --relink"',
           }, 1);
         }
@@ -207,42 +189,48 @@ async function pollLoop(
         }
       }
 
-      if (status !== 'app_reporting' && status !== 'completed') {
+      if (result.status !== 'app_reporting' && result.status !== 'completed') {
         waitingForApp = true;
         const remaining = deadline - Date.now();
         if (remaining > 0) await sleepFn(Math.min(interval, remaining));
         continue;
       }
       await deletePendingSession(pending.poll_id, pendingDir);
-      jsonOutput({ ...body, status: 'completed' });
+      jsonOutput({
+        status: 'completed',
+        api_key: apiKey ?? undefined,
+        org_id: orgId,
+        project_id: projectId,
+        repo,
+      });
       return;
     }
 
-    if (status === 'failed') {
+    if (result.status === 'failed') {
       await deletePendingSession(pending.poll_id, pendingDir);
       return exitWithStatus('failed', {
-        failure_reason: body['failure_reason'],
-        message: body['message'],
+        failure_reason: result.failureReason ?? undefined,
+        message: result.message ?? undefined,
       }, 1);
     }
 
-    if (status === 'not_found' || response.status === 404) {
+    if (result.status === 'not_found') {
       await deletePendingSession(pending.poll_id, pendingDir);
       return exitWithStatus('not_found', { poll_id: pending.poll_id }, 1);
     }
 
-    if (status === 'expired' || response.status === 410) {
+    if (result.status === 'expired') {
       await deletePendingSession(pending.poll_id, pendingDir);
       return exitWithStatus('expired', { remediation: 're-run setup' }, 1);
     }
 
-    if (status === 'internal_error') {
-      return exitWithStatus('internal_error', { message: body['message'] ?? 'server error' }, 1);
+    if (result.status === 'internal_error') {
+      return exitWithStatus('internal_error', { message: result.message ?? 'server error' }, 1);
     }
 
     return exitWithStatus('internal_error', {
       message: 'unrecognized server status',
-      server_status: status,
+      server_status: result.status === 'unknown' ? result.serverStatus : result.status,
     }, 1);
   }
 
