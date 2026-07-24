@@ -85,7 +85,7 @@ type Project struct {
 	OrgID                   string
 	Name                    string
 	GithubRepo              *string
-	DefaultBranch           string
+	DefaultBranch           *string // NULL until learned from GitHub or a clone
 	FrictionAutonomy        string
 	PrPosture               string
 	AllowPayloadEnvironment bool
@@ -3194,12 +3194,16 @@ func (q *Queries) CreateEnvironmentTx(ctx context.Context, tx pgx.Tx, projectID,
 
 // === GitHub config CRUD ===
 
-// SetProjectGitHubConfig stores the GitHub repo for a project. Tenant-scoped by orgID.
-func (q *Queries) SetProjectGitHubConfig(ctx context.Context, orgID, projectID, githubRepo string) error {
+// SetProjectGitHubConfig stores the GitHub repo and its resolved default branch.
+// Tenant-scoped by orgID.
+func (q *Queries) SetProjectGitHubConfig(
+	ctx context.Context,
+	orgID, projectID, githubRepo, defaultBranch string,
+) error {
 	ct, err := q.pool.Exec(ctx,
-		`UPDATE projects SET github_repo = $3
+		`UPDATE projects SET github_repo = $3, default_branch = $4
 		 WHERE id = $2 AND org_id = $1`,
-		orgID, projectID, githubRepo,
+		orgID, projectID, githubRepo, defaultBranch,
 	)
 	if err != nil {
 		return fmt.Errorf("set project github config: %w", err)

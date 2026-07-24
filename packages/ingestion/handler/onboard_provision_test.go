@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opslane/opslane/packages/ingestion/auth"
 	"github.com/opslane/opslane/packages/ingestion/db"
+	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
 func onboardProvisionRequest(body string, userID, orgID string) *http.Request {
@@ -156,6 +157,46 @@ func TestOnboardProvisionCreatesCanonicalResponseAndRotatesKey(t *testing.T) {
 	}
 	if firstStatus != "expired" || firstSealed != nil {
 		t.Fatalf("superseded session status/sealed = %q/%v, want expired/nil", firstStatus, firstSealed)
+	}
+}
+
+func TestOnboardProvisionMakesNoGitHubCallAndLeavesBranchUnknown(t *testing.T) {
+	pool := githubOAuthTestPool(t)
+	orgID, userID := seedOnboardProvisionActor(t, pool)
+	called := false
+	restore := gh.OverrideHTTPClientForTests(&http.Client{
+		Transport: handlerRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("GitHub must not be called during Phase 1")
+		}),
+	})
+	defer restore()
+
+	repo := "acme/no-github-" + uuid.NewString()
+	recorder := httptest.NewRecorder()
+	(&Dependencies{Queries: db.New(pool)}).OnboardProvision(
+		recorder,
+		onboardProvisionRequest(
+			fmt.Sprintf(`{"repo_url":%q}`, repo),
+			userID,
+			orgID,
+		),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("code=%d, want 201; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if called {
+		t.Fatal("Phase 1 provisioning called GitHub")
+	}
+
+	var branch *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT default_branch FROM projects WHERE org_id = $1 AND github_repo = $2`,
+		orgID, repo).Scan(&branch); err != nil {
+		t.Fatal(err)
+	}
+	if branch != nil {
+		t.Fatalf("default_branch = %q, want NULL", *branch)
 	}
 }
 

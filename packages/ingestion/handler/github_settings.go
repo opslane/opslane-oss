@@ -2,11 +2,13 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	gh "github.com/opslane/opslane/packages/ingestion/github"
 )
 
 type setGitHubConfigRequest struct {
@@ -46,14 +48,58 @@ func (d *Dependencies) SetGitHubConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	orgID := OrgIDFromCtx(r.Context())
-	if err := d.Queries.SetProjectGitHubConfig(r.Context(), orgID, projectID, req.GithubRepo); err != nil {
+	installationID, err := d.Queries.GetOrgGitHubInstallation(r.Context(), orgID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to load GitHub installation")
+		return
+	}
+	if installationID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "GitHub App not installed for this organization")
+		return
+	}
+	appJWT, err := gh.GenerateAppJWT(d.GitHubAppID, d.GitHubAppPrivateKey)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	installationToken, err := gh.GetInstallationToken(appJWT, installationID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "could not reach GitHub, please retry")
+		return
+	}
+	repos, err := gh.ListInstallationRepos(installationToken.Token)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "could not reach GitHub, please retry")
+		return
+	}
+	var matched *gh.Repo
+	for i := range repos {
+		if strings.EqualFold(repos[i].FullName, req.GithubRepo) {
+			matched = &repos[i]
+			break
+		}
+	}
+	if matched == nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+			"the Opslane GitHub App is not installed on %s — install it, then retry",
+			req.GithubRepo,
+		))
+		return
+	}
+	if err := d.Queries.SetProjectGitHubConfig(
+		r.Context(),
+		orgID,
+		projectID,
+		matched.FullName,
+		matched.DefaultBranch,
+	); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to save GitHub config")
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(gitHubConfigResponse{
-		GithubRepo: req.GithubRepo,
+		GithubRepo: matched.FullName,
 		Connected:  true,
 	})
 }

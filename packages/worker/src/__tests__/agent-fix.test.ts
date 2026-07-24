@@ -99,15 +99,30 @@ function makeInput(overrides?: Partial<AgentFixInput>): AgentFixInput {
     sourceFiles: [],
     visualAnalysis: null,
     repoUrl: 'https://github.com/test/repo.git',
-    defaultBranch: 'main',
+    githubRepo: 'test/repo',
     ...overrides,
   };
 }
 
 const DIFF_STDOUT = 'diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-bad\n+good\n';
 
+function gitResolutionResult(cmd: string) {
+  if (cmd.includes('ls-remote')) {
+    return { exitCode: 0, stdout: 'abc\trefs/heads/main\n', stderr: '' };
+  }
+  if (cmd.includes('symbolic-ref')) {
+    return { exitCode: 0, stdout: 'main\n', stderr: '' };
+  }
+  if (cmd.includes('rev-parse')) {
+    return { exitCode: 0, stdout: 'abc\n', stderr: '' };
+  }
+  return undefined;
+}
+
 /** Default commands.run: returns "none" for test detection, diff for git diff, empty otherwise */
 function defaultCommandsRun(cmd: string) {
+  const resolution = gitResolutionResult(cmd);
+  if (resolution) return Promise.resolve(resolution);
   if (cmd.includes('vitest.config') && cmd.includes('echo')) {
     // Test runner detection → no runner
     return Promise.resolve({ exitCode: 0, stdout: 'none', stderr: '' });
@@ -122,6 +137,8 @@ function defaultCommandsRun(cmd: string) {
  *  fix_ready path. Use in tests that assert the full happy path through to a PR-worthy fix. */
 function mockSandboxWithPassingTests() {
   mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+    const resolution = gitResolutionResult(cmd);
+    if (resolution) return resolution;
     if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
     if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
     if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -426,6 +443,8 @@ describe('runAgentFix', () => {
 
   it('returns fix_ready with high confidence when test gate passes', async () => {
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
       if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -529,6 +548,8 @@ describe('runAgentFix', () => {
 
   it('GATE: tests pass but judge fails on the last/only tier → needs_human, no PR', async () => {
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
       if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -548,6 +569,8 @@ describe('runAgentFix', () => {
 
   it('GATE: judge runs even on the last (single) tier', async () => {
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
       if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -632,6 +655,8 @@ describe('runAgentFix', () => {
   it('escalates to Sonnet when judge rejects Haiku fix, then accepts a verified Sonnet fix', async () => {
     // Tests run + pass so a clean fix can clear the gate after escalation.
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
       if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -657,6 +682,8 @@ describe('runAgentFix', () => {
   it('GATE: judge throwing means quality not confirmed → escalate, then needs_human on last tier', async () => {
     // Tests pass, but the judge errors on every tier → we cannot confirm quality → below floor.
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'vitest', stderr: '' };
       if (cmd.includes('npx vitest run')) return { exitCode: 0, stdout: '3 tests passed', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: DIFF_STDOUT, stderr: '' };
@@ -695,6 +722,8 @@ describe('runAgentFix', () => {
     const commands: string[] = [];
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
       commands.push(cmd);
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'none', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: 'diff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-old\n+new\n', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };
@@ -719,6 +748,8 @@ describe('runAgentFix', () => {
     const commands: string[] = [];
     mockSandbox.commands.run.mockImplementation(async (cmd: string) => {
       commands.push(cmd);
+      const resolution = gitResolutionResult(cmd);
+      if (resolution) return resolution;
       if (cmd.includes('vitest.config') && cmd.includes('echo')) return { exitCode: 0, stdout: 'none', stderr: '' };
       if (cmd.includes('git diff')) return { exitCode: 0, stdout: 'diff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-old\n+new\n', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };

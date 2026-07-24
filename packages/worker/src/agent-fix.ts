@@ -16,6 +16,7 @@ import type { RuntimeInfo } from './runtime-info.js';
 import { buildReason, triageReasonCodes } from './reason-codes.js';
 import type { AgentCompletionResult, VisualAnalysisOutput, SourceFile, AgentState } from './harness/types.js';
 import { scrubSecrets } from './harness/redact.js';
+import { cloneFailureReason, CloneResolutionError } from './repo-clone.js';
 import { createEvidenceRecorder, type EvidenceRecorder } from './harness/evidence.js';
 import { VerificationInfraError } from './harness/errors.js';
 import { createRepoSandbox, extractDiff, runBuildGate, type RepoSandbox } from './harness/sandbox-repo.js';
@@ -50,7 +51,7 @@ export interface AgentFixInput {
   sourceFiles: SourceFile[];
   visualAnalysis: VisualAnalysisOutput | null;
   repoUrl: string;
-  defaultBranch: string;
+  githubRepo: string;
   githubToken?: string;
   abortSignal?: AbortSignal;
   maxTurns?: number;
@@ -610,7 +611,7 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
         { 'repo.url': input.repoUrl.replace(/https:\/\/[^@]+@/g, 'https://***@') },
         () => createRepoSandbox({
           repoUrl: input.repoUrl,
-          defaultBranch: input.defaultBranch,
+          githubRepo: input.githubRepo,
           githubToken: input.githubToken,
           setupCommands: input.setupCommands,
           platform: input.platform,
@@ -622,11 +623,13 @@ export async function runAgentFix(input: AgentFixInput): Promise<AgentFixResult>
       if (message.includes('clone failed')) {
         return {
           status: 'needs_human',
-          reason: {
-            reason_code: 'repo_access_denied',
-            reason_message: `Failed to clone repository: ${message}`,
-            remediation: 'Ensure GITHUB_TOKEN has read access to the repository',
-          },
+          reason: cloneFailureReason(setupError),
+        };
+      }
+      if (setupError instanceof CloneResolutionError) {
+        return {
+          status: 'needs_human',
+          reason: cloneFailureReason(setupError),
         };
       }
       throw setupError;

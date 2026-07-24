@@ -215,3 +215,59 @@ func TestMigrations_RollForwardFromPreviousSchema(t *testing.T) {
 		t.Fatalf("latest migration %s failed to roll forward from previous schema: %v", last, err)
 	}
 }
+
+func TestDefaultBranchNullableMigrationPreservesExistingRows(t *testing.T) {
+	admin := testPool(t)
+	files := migrationFiles(t)
+	psql := findPsql(t)
+	pool, dsn := disposableDB(t, admin)
+
+	for _, file := range files[:len(files)-1] {
+		if err := applyMigration(t, psql, dsn, file); err != nil {
+			t.Fatalf("migration %s failed: %v", file, err)
+		}
+	}
+
+	ctx := context.Background()
+	var orgID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO orgs (name) VALUES ('migration-default-branch') RETURNING id`,
+	).Scan(&orgID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO projects (org_id, name, github_repo, default_branch)
+		 VALUES ($1, 'existing', 'o/existing', 'master')`,
+		orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	last := files[len(files)-1]
+	if err := applyMigration(t, psql, dsn, last); err != nil {
+		t.Fatalf("latest migration %s failed: %v", last, err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO projects (org_id, name, github_repo)
+		 VALUES ($1, 'new', 'o/new')`,
+		orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	var existing, created *string
+	if err := pool.QueryRow(ctx,
+		`SELECT default_branch FROM projects WHERE name = 'existing'`,
+	).Scan(&existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT default_branch FROM projects WHERE name = 'new'`,
+	).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	if existing == nil || *existing != "master" {
+		t.Fatalf("existing default_branch = %v, want master", existing)
+	}
+	if created != nil {
+		t.Fatalf("new default_branch = %q, want NULL", *created)
+	}
+}

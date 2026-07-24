@@ -10,6 +10,12 @@ export const DEFAULT_REMEDIATION: Record<ReasonCode, string> = {
     'Connect the GitHub App to this repository (Settings → GitHub) so Opslane can read and open PRs.',
   repo_access_denied:
     'Confirm the GitHub App is installed on this repository and has read + pull-request permissions.',
+  empty_repository:
+    'Push at least one commit to this repository, then retry — there is no branch for Opslane to work from yet.',
+  invalid_default_branch:
+    "This repository's default branch points at a branch that no longer exists. Set a valid default branch in GitHub (Settings → Branches), then retry.",
+  unresolvable_head:
+    "Opslane could not determine this repository's default branch. Check the repository is not in an unusual state, then retry.",
   token_decrypt_failed:
     'Re-connect the GitHub integration — the stored credential could not be decrypted.',
   auth_invalid:
