@@ -1,6 +1,10 @@
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
-import { labelFor, reduceTasks, type TaskLine } from '../events.js';
+import { EditTracker, labelFor, reduceTasks, type TaskLine } from '../events.js';
 
 const assistant = (blocks: unknown[]) => ({ type: 'assistant', message: { content: blocks } });
 const toolUse = (id: string, name: string, input: Record<string, unknown>) => ({
@@ -45,5 +49,61 @@ describe('onboarding task reducer', () => {
     expect(labelFor('Read', { file_path: '/r/src/main.ts' })).toMatch(/read.*main\.ts/i);
     expect(labelFor('mcp__onboard__report_plan', {})).toMatch(/report.*plan/i);
     expect(labelFor('mcp__onboard__search', {})).toMatch(/search/i);
+  });
+});
+
+describe('EditTracker', () => {
+  const fixtureRoot = () => {
+    const root = mkdtempSync(join(tmpdir(), 'opslane-edit-tracker-'));
+    mkdirSync(join(root, 'src'));
+    return root;
+  };
+
+  it('orders committed edits around the successful finish result', () => {
+    const root = fixtureRoot();
+    const tracker = new EditTracker(root);
+
+    tracker.onMessage(assistant([toolUse('edit-1', 'Edit', { file_path: join(root, 'src/main.ts') })]));
+    tracker.onMessage(user([toolResult('edit-1')]));
+    tracker.onMessage(
+      assistant([toolUse('finish-1', 'mcp__onboard__finish_apply', { edited_files: [] })]),
+    );
+    tracker.onMessage(user([toolResult('finish-1')]));
+    tracker.onMessage(assistant([toolUse('edit-2', 'Write', { file_path: join(root, 'src/late.ts') })]));
+    tracker.onMessage(user([toolResult('edit-2')]));
+
+    expect(tracker.committedBeforeFinish()).toEqual(['src/main.ts']);
+    expect(tracker.editsAfterFinish()).toEqual(['src/late.ts']);
+  });
+
+  it('does not commit errored edits and preserves duplicate file commits', () => {
+    const root = fixtureRoot();
+    const tracker = new EditTracker(root);
+
+    tracker.onMessage(
+      assistant([
+        toolUse('edit-1', 'Edit', { file_path: join(root, 'src/main.ts') }),
+        toolUse('edit-2', 'Edit', { file_path: join(root, 'src/main.ts') }),
+        toolUse('edit-3', 'Write', { file_path: join(root, 'src/error.ts') }),
+      ]),
+    );
+    expect(tracker.hasUnsettledEdits()).toBe(true);
+    tracker.onMessage(user([toolResult('edit-1'), toolResult('edit-2'), toolResult('edit-3', true)]));
+    tracker.markFinished('finish-1');
+
+    expect(tracker.hasUnsettledEdits()).toBe(false);
+    expect(tracker.committedBeforeFinish()).toEqual(['src/main.ts', 'src/main.ts']);
+    expect(tracker.editsAfterFinish()).toEqual([]);
+  });
+
+  it('keeps an edit unsettled until its matching tool result arrives', () => {
+    const root = fixtureRoot();
+    const tracker = new EditTracker(root);
+
+    tracker.onMessage(assistant([toolUse('edit-1', 'Edit', { file_path: join(root, 'src/main.ts') })]));
+
+    expect(tracker.hasUnsettledEdits()).toBe(true);
+    tracker.onMessage(user([toolResult('edit-1')]));
+    expect(tracker.hasUnsettledEdits()).toBe(false);
   });
 });

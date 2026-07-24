@@ -25,7 +25,7 @@ The split makes each prompt narrow (more reliable), gives a natural human-approv
 **Tech Stack:** TypeScript (ESM, strict), Node 22, `@anthropic-ai/claude-agent-sdk@0.3.217`, `zod@^4.0.0`, Vitest colocated in `__tests__`. All new code in `cli/src/onboard/`.
 **Deferred to the TUI phase:** `ink`, `react`, `@inkjs/ui`, `@types/react`.
 
-**Out of scope for Phase 1:** the Apply stage (edits, `finish_onboarding`, `EditTracker` reconciliation), the Ink TUI, provisioning, the CLI command. Apply is outlined at the end of this doc as the next phase.
+**Out of scope for Phase 1:** the Apply stage (edits, `finish_apply`, exact verification, rollback, and `EditTracker` reconciliation), the Ink TUI, provisioning, the CLI command. Apply is outlined at the end of this doc as the next phase.
 
 ---
 
@@ -79,7 +79,7 @@ interface OnboardingPlan {
   framework: string;
   package_manager: 'npm'|'pnpm'|'yarn'|'bun';
   env_prefix: string;              // e.g. 'VITE_', 'NEXT_PUBLIC_'
-  dependency: { name: '@opslane/sdk'; version: string };
+  dependency: { name: '@opslane/sdk'; version: string }; // HOST-PINNED, never model-supplied
   env_vars: { api_key: string; endpoint: string };  // each starts with env_prefix + carries OPSLANE
   edit: {
     file: string;                  // repo-relative, canonical, exists, under app_dir
@@ -88,13 +88,15 @@ interface OnboardingPlan {
                                    // report_plan unsatisfiable and starved runs of a plan (found in QA).
                                    // The tool stamps it from the file it already reads. Apply re-hashes;
                                    // stale -> stop + re-detect.
-    import_line: string;           // exact code
-    init_block: string;            // exact code
-    anchor: string;                // an exact substring that occurs in `file`
+    manifest_file: string;         // model-selected canonical package.json under app_dir
+    manifest_hash: string;         // HOST-DERIVED; Apply re-hashes before any model call
+    import_line: string;           // exact code; Apply places at module top-level import section
+    init_block: string;            // exact code; the fields below locate this block only
+    anchor: string;                // one complete line's non-whitespace content; init only
     position: 'before'|'after';
     occurrence: number;            // which match of `anchor` (0-based)
   };
-  existing_sdk: { action: 'none'|'keep'|'migrate'|'no_op'; name: string|null };  // none=no SDK found (common), keep=coexist, migrate=replace named SDK, no_op=Opslane already installed
+  existing_sdk: { action: 'none'|'keep'|'migrate'|'no_op'; name: string|null };  // Apply refuses migrate; no_op requires mechanical confirmation
   rationale: string;               // free-text notes — NON-executable, separate from the edit
 }
 ```
@@ -105,13 +107,14 @@ This resolves the keep-vs-migrate ambiguity explicitly (current code says "migra
 - `createAskUserTool(resolver)`: `tool('ask_user', desc, { question: z.string(), options: z.array(z.string()).min(1), multi: z.boolean().default(false) }, handler)`; handler calls this run's `resolver` (throws if `null`).
 - `createReportPlanTool(root, onPlan)` — the Detect stage's single output. State-guarded: **a second call is rejected** (`already reported`, codex P1.2). The handler validates (reject → the model retries, codex P1.3):
   1. every string field non-empty;
-  2. `app_dir` and `edit.file` pass `containedRepoRelative(root, …)` (store the canonical result) **and** are not `isSecretFile`;
-  3. `edit.file` **exists, is a regular file, and is under `app_dir`**;
+  2. `app_dir`, `edit.file`, and `edit.manifest_file` pass `containedRepoRelative(root, …)` (store canonical results) and are not secret paths;
+  3. both edit files exist and are non-symlink regular files under `app_dir`; the manifest is a valid `package.json`;
   4. `package_manager` ∈ the enum; `existing_sdk.action` ∈ the enum;
   5. `env_vars.api_key`/`.endpoint` match `/^[A-Z][A-Z0-9_]*$/`, **start with `env_prefix`**, and contain the bounded `OPSLANE` token (`/(?:^|_)OPSLANE(?:_|$)/`);
-  6. `edit.anchor` occurs in `edit.file` at least `occurrence+1` times, and `edit.entry_hash` equals the sha256 of `edit.file` now (Detect read the file, so it can assert both);
-  7. on success call `onPlan(plan)` **with canonicalized paths**, mark reported, return a confirmation.
-- **No `dev_script` field** (codex P1.6): Apply does not run the app (it only runs allowlisted build/typecheck/lint), so a run command is not needed, and a free command string is an injection vector. If a later phase needs it, model it as `{ manifest_path, script_name }` validated against that manifest's `scripts` and executed via `spawn(pm, ['run', script], { shell:false })` — never a raw string.
+  6. `edit.anchor` occurs in `edit.file` at least `occurrence+1` times;
+  7. host code stamps both file hashes and the reviewed SDK version, ignoring any model-supplied version;
+  8. on success call `onPlan(plan)` with canonicalized paths, mark reported, return a confirmation.
+- **No `dev_script` field** (codex P1.6): Apply does not run the app or any shell command, so a run command is not needed, and a free command string is an injection vector. If a later phase needs it, model it as `{ manifest_path, script_name }` validated against that manifest's `scripts` and executed via `spawn(pm, ['run', script], { shell:false })` — never a raw string.
 - Export `OnboardingPlan` and `createOnboardServer(...tools) = createSdkMcpServer({ name:'onboard', version:'0.0.0', tools })`.
 
 **Test** (real `mkdtemp` app fixture with a real entry file): `ask_user` routes to its resolver / throws with none; `report_plan` accepts a valid `status:'ok'` plan and calls `onPlan` once; a **second** call rejects (`/already/i`); rejects empty fields, a path escape, a secret `edit.file`, an `edit.file` outside `app_dir` or that doesn't exist, a var not starting with `env_prefix`, a borrowed name (`VITE_APP_DEFENDER_API_KEY` → `/opslane/i`), an unknown `package_manager`, a wrong `entry_hash`, and an `anchor` absent from the file. **Discriminant tests (eng-review Issue 1):** `status:'unsupported'` with a non-empty `reason` is accepted **without** any plan fields; `status:'unsupported'` with an empty/missing `reason` rejects; `status:'ok'` without a full plan rejects. Wiring test: `createOnboardServer(createReportPlanTool(...))` registers `report_plan` with an input schema.
@@ -239,10 +242,10 @@ Result of that smoke run (hand-scored), read-only detect over five popular OSS m
 ## Next phase — Apply Stage (outline, not this phase)
 
 Consumes an approved `OnboardingPlan` and makes exactly those edits.
-- **Tools:** `Read`, `Edit`, `Write` (no `Glob`/`search` needed — the plan already located everything); `Bash` only for the allowlisted `run build|typecheck|lint`; `finish_onboarding`.
-- **Apply consumes the typed `OnboardingPlan`, not prose.** It re-hashes `edit.file`; if `edit.entry_hash` no longer matches, it **stops and re-detects** (the repo changed under it). It finds `edit.anchor` at `edit.occurrence`; if the anchor is missing or ambiguous, it stops. It inserts `edit.import_line` + `edit.init_block` `edit.position` the anchor, applies `dependency` to the manifest, and honors `existing_sdk.action` (`keep`/`migrate`/`no_op`). `rationale` is never executed.
-- **Prompt (if a model is used):** `renderApplySpec({ cwd, plan })` — "apply ONLY the operations in this plan, change nothing else," then `finish_onboarding` with the edited files. Because the plan is fully typed, Apply is a strong candidate for a **deterministic codemod** (no model) — evaluated separately.
-- **Policy:** the same `onboardPreToolUseHook` (now gating real `Edit`/`Write`) + `createOnboardApproval` (per-tool approval) + post-`finish` denial; `finish_onboarding` validation (single app, OPSLANE token, containment) and the ordered `EditTracker` reconciliation (reject edits at/after finish).
+- **Tools:** `Read`, `Edit`, `Write`, and `finish_apply`; no `Glob`, search, `MultiEdit`, or Bash.
+- **Apply consumes the typed `OnboardingPlan`, not prose.** It contains/stats/hashes both edit files before querying; checks the init anchor; snapshots both; places `import_line` in the module import section, places `init_block` at its own anchor, and adds the host-pinned dependency to `manifest_file`. `migrate` is refused; `no_op` is returned only after structural confirmation.
+- **Prompt:** `renderApplySpec({ cwd, plan })` says to apply only the approved operations and end with `finish_apply`.
+- **Policy and proof:** the hook allows writes to exactly the two canonical files, approvals fail closed, `EditTracker` reconciles settlement order, and `verifyApplied` proves the exact entry/manifest deltas before the external report is emitted. Every handled failure attempts byte-identical rollback. Success reports that an install is still required and gives a host-derived command.
 
 ---
 
@@ -253,12 +256,12 @@ The committed code (`587bd93`) is the single combined loop. This plan renames/re
 | Current (combined) | Becomes | Note |
 |---|---|---|
 | `renderSpec({cwd})` | `renderDetectSpec({cwd})` | read-only wording; Apply gets its own `renderApplySpec` |
-| `finish_onboarding` + `OnboardingReport` | `report_plan` + `OnboardingPlan` (Detect); `finish_onboarding` returns in the Apply phase | Detect reports a plan, not a completion |
+| `finish_onboarding` + `OnboardingReport` | `report_plan` + `OnboardingPlan` (Detect); `finish_apply` terminates Apply | Detect reports a plan, not a completion |
 | `runOnboardingAgent(...)` | engine core + `runDetect(...)` wrapper; `runApply(...)` later | shared lifecycle (cancellation, tripwire, result mapping, injectable `queryFn`) stays |
 | `engineOptions(...)` | `detectOptions(...)` (read-only) + `applyOptions(...)` later | tool lists differ per stage |
 
-- **Hook signature:** keep `onboardPreToolUseHook({ root, state? })` — `root` required, `state` **optional**. Detect passes no `state` (no edits, no post-finish rule); Apply passes `state` to get post-finish denial. One hook serves both; do not fork it.
-- **Combined-loop tests + `cli/scripts/live-onboard-check.mjs`** target `runOnboardingAgent`/`finish_onboarding`. When Detect lands, either (a) keep them and repoint at `runApply` once Apply exists, or (b) delete the combined-loop path outright. Pick (b) unless we still want an end-to-end combined smoke; the plan assumes the combined loop is **replaced**, not kept in parallel.
+- **Hook signature:** `onboardPreToolUseHook({ root, state?, writablePaths? })`. Detect passes neither optional field; Apply passes state plus the exact two writable files.
+- **Combined-loop tests + the old live check** targeted `runOnboardingAgent`/`finish_onboarding`; they are replaced by the split controller tests and `cli/scripts/apply-check.mjs`, not kept as a parallel path.
 - **Live run:** drive Detect → (approve) → Apply against a throwaway copy of a real app; confirm the SDK is wired at the planned entry with the planned vars, dep added, `.env` untouched.
 
 ---
@@ -275,7 +278,7 @@ The committed code (`587bd93`) is the single combined loop. This plan renames/re
 | `events.ts` — `reduceTasks` | yes | `EditTracker` waits for Apply |
 | milestone 0.5 provisioning endpoint | untouched | committed, live-tested |
 
-Only `spec.ts` genuinely changes shape (one combined prompt → `renderDetectSpec` + a later `renderApplySpec`), plus `finish_onboarding` → `report_plan` for this stage.
+`spec.ts` splits one combined prompt into `renderDetectSpec` and `renderApplySpec`; the combined terminal report becomes `report_plan` for Detect and `finish_apply` for Apply.
 
 ## NOT in scope (considered and deferred)
 

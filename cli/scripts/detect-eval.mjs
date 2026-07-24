@@ -201,8 +201,33 @@ function checkPlan(root, run) {
     Number.isInteger(edit?.occurrence) &&
     edit.occurrence >= 0 &&
     edit.occurrence < offsets.length;
+  const selectedOffset = occurrenceValid ? offsets[edit.occurrence] : -1;
+  const selectedLineStart =
+    selectedOffset >= 0 ? editContents.lastIndexOf('\n', selectedOffset - 1) + 1 : -1;
+  const selectedLineEndIndex =
+    selectedOffset >= 0
+      ? editContents.indexOf('\n', selectedOffset + edit.anchor.length)
+      : -1;
+  const selectedLineEnd =
+    selectedLineEndIndex === -1 ? editContents.length : selectedLineEndIndex;
+  const anchorIsWholeLine =
+    occurrenceValid &&
+    /^[\t ]*$/.test(editContents.slice(selectedLineStart, selectedOffset)) &&
+    /^[\t ]*\r?$/.test(
+      editContents.slice(selectedOffset + edit.anchor.length, selectedLineEnd),
+    );
   const entryHash =
     editExists ? createHash('sha256').update(readFileSync(editPath)).digest('hex') : '';
+  const manifestPath =
+    typeof edit?.manifest_file === 'string' ? resolve(root, edit.manifest_file) : '';
+  const manifestExists =
+    manifestPath !== '' &&
+    existsSync(manifestPath) &&
+    lstatSync(manifestPath).isFile() &&
+    !lstatSync(manifestPath).isSymbolicLink();
+  const manifestHash = manifestExists
+    ? createHash('sha256').update(readFileSync(manifestPath)).digest('hex')
+    : '';
   const namingOk =
     typeof plan?.env_prefix === 'string' &&
     typeof plan?.env_vars?.api_key === 'string' &&
@@ -234,14 +259,24 @@ function checkPlan(root, run) {
     `${plan?.env_vars?.api_key ?? '-'} / ${plan?.env_vars?.endpoint ?? '-'}`,
   ]);
   checks.push([
-    'anchor occurrence resolves',
-    occurrenceValid,
-    `occurrence=${edit?.occurrence ?? '-'} matches=${offsets.length}`,
+    'anchor occurrence resolves as a complete line',
+    anchorIsWholeLine,
+    `occurrence=${edit?.occurrence ?? '-'} matches=${offsets.length} wholeLine=${anchorIsWholeLine}`,
   ]);
   checks.push([
     'entry hash matches',
     editExists && entryHash === edit?.entry_hash,
     editExists && entryHash === edit?.entry_hash ? 'yes' : 'NO',
+  ]);
+  checks.push([
+    'planned manifest is a regular package.json',
+    manifestExists && manifestPath.endsWith(`${sep}package.json`),
+    edit?.manifest_file ?? '-',
+  ]);
+  checks.push([
+    'manifest hash matches',
+    manifestExists && manifestHash === edit?.manifest_hash,
+    manifestExists && manifestHash === edit?.manifest_hash ? 'yes' : 'NO',
   ]);
   checks.push([
     'repository tree unchanged',

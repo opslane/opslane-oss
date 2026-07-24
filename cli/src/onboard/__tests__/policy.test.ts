@@ -87,6 +87,28 @@ describe('onboarding hard-denial hook', () => {
     expect(denied(await run(finished, 'Edit', { file_path: join(root, 'a.ts') }))).toBe(true);
     expect(denied(await run(finished, 'mcp__onboard__ask_user', {}))).toBe(false);
   });
+
+  it('restricts mutations to the exact canonical writable paths while retaining safe reads', async () => {
+    writeFileSync(join(root, 'package.json'), '{}\n');
+    writeFileSync(join(root, 'src', 'other.ts'), '');
+    const restricted = onboardPreToolUseHook({
+      root,
+      writablePaths: ['src/main.ts', 'package.json'],
+    });
+
+    expect(
+      denied(await run(restricted, 'Edit', { file_path: join(root, 'src', '..', 'src', 'main.ts') })),
+    ).toBe(false);
+    expect(denied(await run(restricted, 'Write', { file_path: join(root, 'package.json') }))).toBe(
+      false,
+    );
+    expect(denied(await run(restricted, 'Edit', { file_path: join(root, 'src', 'other.ts') }))).toBe(
+      true,
+    );
+    expect(denied(await run(restricted, 'Read', { file_path: join(root, 'src', 'other.ts') }))).toBe(
+      false,
+    );
+  });
 });
 
 describe('onboarding approval callback', () => {
@@ -115,5 +137,16 @@ describe('onboarding approval callback', () => {
       behavior: 'allow',
     });
     expect(calls).toBe(0);
+  });
+
+  it('fails closed for tools outside the stage allowlist', async () => {
+    const approval = createOnboardApproval({
+      requestApproval: async () => true,
+      allowedTools: ['Read', 'Edit'],
+    });
+
+    await expect(approval('WebFetch', {}, {} as never)).resolves.toMatchObject({
+      behavior: 'deny',
+    });
   });
 });

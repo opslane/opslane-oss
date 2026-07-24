@@ -1,3 +1,17 @@
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import path from 'node:path';
+
 import {
   query,
   type HookCallback,
@@ -6,16 +20,27 @@ import {
   type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 
-import { onboardPreToolUseHook } from './policy.js';
+import { EditTracker } from './events.js';
+import {
+  createOnboardApproval,
+  onboardPreToolUseHook,
+  type ApprovalRequest,
+} from './policy.js';
+import { containedRepoRelative, hasSecretSegment } from './paths.js';
 import { createSearchTool } from './search-tool.js';
-import { renderDetectSpec } from './spec.js';
+import { renderApplySpec, renderDetectSpec } from './spec.js';
 import {
   createAskUserTool,
+  createFinishApplyTool,
   createOnboardServer,
   createReportPlanTool,
+  OPSLANE_SDK_VERSION,
+  packageManagerForRepo,
   type AskUserResolver,
+  type FinishApplyReport,
   type OnboardingPlan,
 } from './tools.js';
+import { verifyAlreadyOnboarded, verifyApplied } from './verify.js';
 
 const SHADOW_WARNING = 'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED';
 const INTENTIONALLY_SHADOWED_TOOLS = new Set([
@@ -23,6 +48,9 @@ const INTENTIONALLY_SHADOWED_TOOLS = new Set([
   'mcp__onboard__ask_user',
 ]);
 const REPORT_PLAN_TOOL = 'mcp__onboard__report_plan';
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 export type QueryFn = (request: {
   prompt: string;
@@ -34,6 +62,21 @@ export interface EngineResult {
   aborted: boolean;
   subtype?: string;
   reason?: string;
+}
+
+export interface ApplyReport extends FinishApplyReport {
+  installRequired: boolean;
+  installCommand?: string;
+  installCwd: string;
+}
+
+export interface ApplyResult extends EngineResult {
+  editedFiles?: string[];
+  installRequired?: boolean;
+  installCommand?: string;
+  installCwd?: string;
+  failures?: string[];
+  restoreFailures?: string[];
 }
 
 export function detectOptions({
@@ -78,6 +121,42 @@ export function detectOptions({
     },
     abortController,
     maxTurns: 50,
+  };
+}
+
+export function applyOptions({
+  cwd,
+  hook,
+  mcpServers,
+  canUseTool,
+  abortController,
+}: {
+  cwd: string;
+  hook: HookCallback;
+  mcpServers: Record<string, McpServerConfig>;
+  canUseTool: NonNullable<Options['canUseTool']>;
+  abortController: AbortController;
+}): Options {
+  return {
+    cwd,
+    permissionMode: 'default',
+    settingSources: [],
+    strictMcpConfig: true,
+    allowedTools: [],
+    tools: ['Read', 'Edit', 'Write'],
+    disallowedTools: [
+      'Grep',
+      'Glob',
+      'MultiEdit',
+      'Bash',
+      'WebFetch',
+      'WebSearch',
+    ],
+    mcpServers,
+    hooks: { PreToolUse: [{ hooks: [hook] }] },
+    canUseTool,
+    abortController,
+    maxTurns: 30,
   };
 }
 
@@ -153,20 +232,18 @@ function updateReportStream(message: unknown, state: ReportStreamState): void {
   }
 }
 
-export async function runDetect({
-  cwd,
+export async function runAgentCore({
+  prompt,
+  options,
   onMessage,
-  onPlan,
   signal,
-  askUser = null,
-  queryFn = (request) => query(request),
+  queryFn,
 }: {
-  cwd: string;
+  prompt: string;
+  options: (abortController: AbortController) => Options;
   onMessage: (message: SDKMessage) => void;
-  onPlan: (plan: OnboardingPlan) => void;
   signal: AbortSignal;
-  askUser?: AskUserResolver | null;
-  queryFn?: QueryFn;
+  queryFn: QueryFn;
 }): Promise<EngineResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return { ok: false, aborted: false, reason: 'no_api_key' };
@@ -187,6 +264,56 @@ export async function runDetect({
   };
   process.on('warning', onWarning);
 
+  let terminalSubtype: string | undefined;
+  let caughtError: Error | undefined;
+  try {
+    const messages = queryFn({ prompt, options: options(abortController) });
+    for await (const message of messages) {
+      onMessage(message);
+      if (isRecord(message) && message.type === 'result' && typeof message.subtype === 'string') {
+        terminalSubtype = message.subtype;
+      }
+    }
+  } catch (error) {
+    caughtError = error instanceof Error ? error : new Error(String(error));
+  } finally {
+    process.off('warning', onWarning);
+    signal.removeEventListener('abort', abortFromCaller);
+  }
+
+  if (shadowError !== undefined) {
+    return { ok: false, aborted: false, reason: shadowError.message };
+  }
+  if (signal.aborted || abortController.signal.aborted) {
+    return { ok: false, aborted: true, subtype: terminalSubtype, reason: 'aborted' };
+  }
+  if (caughtError !== undefined) {
+    return { ok: false, aborted: false, subtype: terminalSubtype, reason: caughtError.message };
+  }
+  if (terminalSubtype === undefined) {
+    return { ok: false, aborted: false, reason: 'missing_result' };
+  }
+  if (terminalSubtype !== 'success') {
+    return { ok: false, aborted: false, subtype: terminalSubtype, reason: terminalSubtype };
+  }
+  return { ok: true, aborted: false, subtype: terminalSubtype };
+}
+
+export async function runDetect({
+  cwd,
+  onMessage,
+  onPlan,
+  signal,
+  askUser = null,
+  queryFn = (request) => query(request),
+}: {
+  cwd: string;
+  onMessage: (message: SDKMessage) => void;
+  onPlan: (plan: OnboardingPlan) => void;
+  signal: AbortSignal;
+  askUser?: AskUserResolver | null;
+  queryFn?: QueryFn;
+}): Promise<EngineResult> {
   let planCaptures = 0;
   let reportCaptures = 0;
   let unsupportedReason: string | undefined;
@@ -215,60 +342,372 @@ export async function runDetect({
     acceptedResultSeen: false,
     attemptedAfterSuccess: false,
   };
-  let terminalSubtype: string | undefined;
-  let caughtError: Error | undefined;
-
-  try {
-    const messages = queryFn({
-      prompt: renderDetectSpec({ cwd }),
-      options: detectOptions({ cwd, hook, mcpServers, abortController }),
-    });
-    for await (const message of messages) {
+  const core = await runAgentCore({
+    prompt: renderDetectSpec({ cwd }),
+    options: (abortController) => detectOptions({ cwd, hook, mcpServers, abortController }),
+    onMessage: (message) => {
       onMessage(message);
       updateReportStream(message, reportStream);
-      if (
-        isRecord(message) &&
-        message.type === 'result' &&
-        typeof message.subtype === 'string'
-      ) {
-        terminalSubtype = message.subtype;
-      }
-    }
-  } catch (error) {
-    caughtError = error instanceof Error ? error : new Error(String(error));
-  } finally {
-    process.off('warning', onWarning);
-    signal.removeEventListener('abort', abortFromCaller);
-  }
-
-  if (shadowError !== undefined) {
-    return { ok: false, aborted: false, reason: shadowError.message };
-  }
-  if (signal.aborted || abortController.signal.aborted) {
-    return { ok: false, aborted: true, subtype: terminalSubtype, reason: 'aborted' };
-  }
-  if (caughtError !== undefined) {
-    return { ok: false, aborted: false, subtype: terminalSubtype, reason: caughtError.message };
-  }
-  if (terminalSubtype === undefined) {
-    return { ok: false, aborted: false, reason: 'missing_result' };
-  }
-  if (terminalSubtype !== 'success') {
-    return { ok: false, aborted: false, subtype: terminalSubtype, reason: terminalSubtype };
-  }
+    },
+    signal,
+    queryFn,
+  });
+  if (!core.ok) return core;
   if (
     reportCaptures > 1 ||
     planCaptures > 1 ||
     reportStream.successfulResults > 1 ||
     reportStream.attemptedAfterSuccess
   ) {
-    return { ok: false, aborted: false, subtype: terminalSubtype, reason: 'multiple_plans' };
+    return { ...core, ok: false, reason: 'multiple_plans' };
   }
   if (unsupportedReason !== undefined) {
-    return { ok: false, aborted: false, subtype: terminalSubtype, reason: 'unsupported' };
+    return { ...core, ok: false, reason: 'unsupported' };
   }
   if (reportCaptures === 0 || planCaptures === 0) {
-    return { ok: false, aborted: false, subtype: terminalSubtype, reason: 'no_plan' };
+    return { ...core, ok: false, reason: 'no_plan' };
   }
-  return { ok: true, aborted: false, subtype: terminalSubtype };
+  return core;
+}
+
+interface FileSnapshot {
+  root: string;
+  absolute: string;
+  relative: string;
+  contents: Buffer;
+  mode: number;
+}
+
+function hash(contents: Buffer): string {
+  return createHash('sha256').update(contents).digest('hex');
+}
+
+function occurrenceOffset(contents: string, needle: string, occurrence: number): number {
+  let offset = 0;
+  for (let index = 0; index <= occurrence; index += 1) {
+    const found = contents.indexOf(needle, offset);
+    if (found === -1) return -1;
+    if (index === occurrence) return found;
+    offset = found + needle.length;
+  }
+  return -1;
+}
+
+function anchorIsWholeLine(contents: string, anchor: string, occurrence: number): boolean {
+  if (anchor.includes('\n') || anchor.includes('\r')) return false;
+  const offset = occurrenceOffset(contents, anchor, occurrence);
+  if (offset === -1) return false;
+  const lineStart = contents.lastIndexOf('\n', offset - 1) + 1;
+  const lineEndIndex = contents.indexOf('\n', offset + anchor.length);
+  const lineEnd = lineEndIndex === -1 ? contents.length : lineEndIndex;
+  return (
+    /^[\t ]*$/.test(contents.slice(lineStart, offset)) &&
+    /^[\t ]*\r?$/.test(contents.slice(offset + anchor.length, lineEnd))
+  );
+}
+
+function snapshotRegularFile(root: string, relative: string, maxBytes: number): FileSnapshot {
+  const canonical = containedRepoRelative(root, relative);
+  if (canonical !== relative || hasSecretSegment(canonical)) {
+    throw new Error(`unsafe plan path: ${relative}`);
+  }
+  const absolute = path.join(root, canonical);
+  const linkStat = lstatSync(absolute);
+  const metadata = statSync(absolute);
+  if (
+    linkStat.isSymbolicLink() ||
+    !metadata.isFile() ||
+    metadata.nlink > 1 || // hard link may alias an outside file
+    metadata.size > maxBytes
+  ) {
+    throw new Error(`plan path is not a regular file: ${relative}`);
+  }
+  return {
+    root,
+    absolute,
+    relative: canonical,
+    contents: readFileSync(absolute),
+    mode: linkStat.mode,
+  };
+}
+
+function restoreSnapshot(snapshot: FileSnapshot): string | undefined {
+  let descriptor: number | undefined;
+  try {
+    // O_NOFOLLOW only guards the final component. If a PARENT directory was
+    // swapped for a symlink after the snapshot, the write would land outside the
+    // repo. Re-verify the parent still resolves inside the repo before writing.
+    // (A perfectly-timed race between this check and the open is a local
+    // filesystem-racing attack, out of Phase 1b's threat model.)
+    const parentReal = realpathSync(path.dirname(snapshot.absolute));
+    const rootReal = realpathSync(snapshot.root);
+    if (parentReal !== rootReal && !parentReal.startsWith(rootReal + path.sep)) {
+      throw new Error('parent directory escaped the repository');
+    }
+    const flags = existsSync(snapshot.absolute)
+      ? constants.O_WRONLY | constants.O_TRUNC | constants.O_NOFOLLOW
+      : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL;
+    if (existsSync(snapshot.absolute) && lstatSync(snapshot.absolute).isSymbolicLink()) {
+      throw new Error('path became a symbolic link');
+    }
+    descriptor = openSync(snapshot.absolute, flags, snapshot.mode);
+    writeFileSync(descriptor, snapshot.contents);
+    return undefined;
+  } catch (error) {
+    return `${snapshot.relative}: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function sameSet(left: Iterable<string>, right: Iterable<string>): boolean {
+  const a = new Set(left);
+  const b = new Set(right);
+  return a.size === b.size && Array.from(a).every((value) => b.has(value));
+}
+
+function installCommand(packageManager: OnboardingPlan['package_manager']): string {
+  return `${packageManager} install`;
+}
+
+function isStrictlyUnder(directory: string, file: string): boolean {
+  if (directory === '.') return file !== '.';
+  const relative = path.posix.relative(directory, file);
+  return (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith('../') &&
+    !path.posix.isAbsolute(relative)
+  );
+}
+
+export async function runApply({
+  cwd,
+  plan,
+  onMessage,
+  onReport,
+  requestApproval,
+  signal,
+  queryFn = (request) => query(request),
+}: {
+  cwd: string;
+  plan: OnboardingPlan;
+  onMessage: (message: SDKMessage) => void;
+  onReport: (report: ApplyReport) => void;
+  requestApproval: ApprovalRequest;
+  signal: AbortSignal;
+  queryFn?: QueryFn;
+}): Promise<ApplyResult> {
+  if (
+    plan.dependency.name !== '@opslane/sdk' ||
+    plan.dependency.version !== OPSLANE_SDK_VERSION
+  ) {
+    return { ok: false, aborted: false, reason: 'invalid_dependency' };
+  }
+  if (!PACKAGE_MANAGERS.has(plan.package_manager)) {
+    return { ok: false, aborted: false, reason: 'invalid_package_manager' };
+  }
+  let entry: FileSnapshot;
+  let manifest: FileSnapshot;
+  try {
+    const appDir = containedRepoRelative(cwd, plan.app_dir) || '.';
+    if (appDir !== plan.app_dir) {
+      return { ok: false, aborted: false, reason: 'invalid_app_dir' };
+    }
+    const detectedPackageManager = packageManagerForRepo(cwd, appDir);
+    if (
+      detectedPackageManager !== null &&
+      detectedPackageManager !== plan.package_manager
+    ) {
+      return { ok: false, aborted: false, reason: 'invalid_package_manager' };
+    }
+    entry = snapshotRegularFile(cwd, plan.edit.file, MAX_ENTRY_BYTES);
+    manifest = snapshotRegularFile(cwd, plan.edit.manifest_file, MAX_MANIFEST_BYTES);
+    if (
+      path.posix.basename(manifest.relative) !== 'package.json' ||
+      !isStrictlyUnder(appDir, entry.relative) ||
+      !isStrictlyUnder(appDir, manifest.relative) ||
+      entry.relative === manifest.relative
+    ) {
+      return { ok: false, aborted: false, reason: 'invalid_manifest' };
+    }
+    JSON.parse(manifest.contents.toString('utf8'));
+  } catch (error) {
+    return {
+      ok: false,
+      aborted: false,
+      reason: `invalid_plan: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (hash(entry.contents) !== plan.edit.entry_hash) {
+    return { ok: false, aborted: false, reason: 'stale_plan' };
+  }
+  if (hash(manifest.contents) !== plan.edit.manifest_hash) {
+    return { ok: false, aborted: false, reason: 'stale_manifest' };
+  }
+  if (
+    !new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']).has(
+      path.extname(entry.relative).toLowerCase(),
+    )
+  ) {
+    return { ok: false, aborted: false, reason: 'unsupported_entry_extension' };
+  }
+  if (
+    !anchorIsWholeLine(
+      entry.contents.toString('utf8'),
+      plan.edit.anchor,
+      plan.edit.occurrence,
+    )
+  ) {
+    return { ok: false, aborted: false, reason: 'anchor_moved' };
+  }
+  if (plan.existing_sdk.action === 'migrate') {
+    return { ok: false, aborted: false, reason: 'migrate_unsupported' };
+  }
+
+  const installCwd = plan.app_dir;
+  if (plan.existing_sdk.action === 'no_op') {
+    const verified = verifyAlreadyOnboarded({ root: cwd, plan });
+    if (!verified.ok) {
+      return {
+        ok: false,
+        aborted: false,
+        reason: 'invalid_no_op',
+        failures: verified.failures,
+      };
+    }
+    const report: ApplyReport = {
+      editedFiles: [],
+      summary: 'Opslane was already wired into this application.',
+      installRequired: false,
+      installCwd,
+    };
+    try {
+      onReport(report);
+    } catch (error) {
+      return {
+        ok: false,
+        aborted: false,
+        reason: `report_callback_failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return {
+      ok: true,
+      aborted: false,
+      subtype: 'already_onboarded',
+      editedFiles: [],
+      installRequired: false,
+      installCwd,
+    };
+  }
+
+  const rollback = (result: ApplyResult): ApplyResult => {
+    const restoreFailures = [restoreSnapshot(entry), restoreSnapshot(manifest)].filter(
+      (failure): failure is string => failure !== undefined,
+    );
+    return restoreFailures.length === 0
+      ? result
+      : {
+          ok: false,
+          aborted: result.aborted,
+          subtype: result.subtype,
+          reason: 'restore_failed',
+          failures: result.failures,
+          restoreFailures,
+        };
+  };
+
+  const state = { finished: false };
+  const tracker = new EditTracker(cwd);
+  let reportCaptures = 0;
+  let capturedReport: FinishApplyReport | undefined;
+  const capture = (report: FinishApplyReport) => {
+    reportCaptures += 1;
+    capturedReport = report;
+  };
+  const hook = onboardPreToolUseHook({
+    root: cwd,
+    state,
+    writablePaths: [entry.relative, manifest.relative],
+  });
+  const canUseTool = createOnboardApproval({
+    requestApproval,
+    allowedTools: ['Read', 'Edit', 'Write', 'mcp__onboard__finish_apply'],
+  });
+  const mcpServers = {
+    onboard: createOnboardServer(
+      createFinishApplyTool(cwd, state, capture, () => !tracker.hasUnsettledEdits()),
+    ),
+  };
+
+  const core = await runAgentCore({
+    prompt: renderApplySpec({ cwd, plan }),
+    options: (abortController) =>
+      applyOptions({ cwd, hook, mcpServers, canUseTool, abortController }),
+    onMessage: (message) => {
+      onMessage(message);
+      tracker.onMessage(message);
+    },
+    signal,
+    queryFn,
+  });
+  if (!core.ok) return rollback(core);
+  if (reportCaptures !== 1 || capturedReport === undefined || !state.finished) {
+    return rollback({ ...core, ok: false, reason: 'no_apply_report' });
+  }
+  if (tracker.hasUnsettledEdits()) {
+    return rollback({ ...core, ok: false, reason: 'unsettled_edits' });
+  }
+  if (tracker.editsAfterFinish().length > 0) {
+    return rollback({ ...core, ok: false, reason: 'edits_after_finish' });
+  }
+
+  const expectedFiles = [entry.relative, manifest.relative];
+  const committedFiles = tracker.committedBeforeFinish();
+  if (
+    !sameSet(capturedReport.editedFiles, committedFiles) ||
+    !sameSet(capturedReport.editedFiles, expectedFiles)
+  ) {
+    return rollback({ ...core, ok: false, reason: 'edit_reconciliation_failed' });
+  }
+
+  const verification = verifyApplied({
+    root: cwd,
+    plan,
+    editedFiles: capturedReport.editedFiles,
+    originals: { entry: entry.contents, manifest: manifest.contents },
+  });
+  if (!verification.ok) {
+    return rollback({
+      ...core,
+      ok: false,
+      reason: 'verification_failed',
+      failures: verification.failures,
+    });
+  }
+
+  const command = installCommand(plan.package_manager);
+  const report: ApplyReport = {
+    ...capturedReport,
+    installRequired: true,
+    installCommand: command,
+    installCwd,
+  };
+  try {
+    onReport(report);
+  } catch (error) {
+    return rollback({
+      ...core,
+      ok: false,
+      reason: `report_callback_failed: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+  return {
+    ...core,
+    editedFiles: capturedReport.editedFiles,
+    installRequired: true,
+    installCommand: command,
+    installCwd,
+  };
 }
