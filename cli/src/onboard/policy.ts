@@ -5,7 +5,6 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { containedRepoRelative, isSecretFile } from './paths.js';
-import type { FinishState } from './tools.js';
 
 const FILE_TOOLS = new Set(['Read', 'Glob', 'Edit', 'Write', 'MultiEdit']);
 const MUTATING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'Bash']);
@@ -44,14 +43,14 @@ export function onboardPreToolUseHook({
   state,
 }: {
   root: string;
-  state: FinishState;
+  state?: { finished: boolean };
 }): HookCallback {
   return async (input) => {
     const preToolInput = input as PreToolUseHookInput;
     const toolName = preToolInput.tool_name;
     const toolInput = asRecord(preToolInput.tool_input);
 
-    if (state.finished) {
+    if (state?.finished === true) {
       return toolName === 'mcp__onboard__ask_user'
         ? {}
         : deny('Onboarding has already finished');

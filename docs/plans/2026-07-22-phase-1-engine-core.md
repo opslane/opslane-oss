@@ -83,14 +83,18 @@ interface OnboardingPlan {
   env_vars: { api_key: string; endpoint: string };  // each starts with env_prefix + carries OPSLANE
   edit: {
     file: string;                  // repo-relative, canonical, exists, under app_dir
-    entry_hash: string;            // sha256 of `file` at detect time (Apply re-hashes; stale → stop + re-detect)
+    entry_hash: string;            // HOST-DERIVED, never model-supplied. The Detect agent has only
+                                   // Read/Glob/search and cannot compute a sha256 - requiring it made
+                                   // report_plan unsatisfiable and starved runs of a plan (found in QA).
+                                   // The tool stamps it from the file it already reads. Apply re-hashes;
+                                   // stale -> stop + re-detect.
     import_line: string;           // exact code
     init_block: string;            // exact code
     anchor: string;                // an exact substring that occurs in `file`
     position: 'before'|'after';
     occurrence: number;            // which match of `anchor` (0-based)
   };
-  existing_sdk: { action: 'keep'|'migrate'|'no_op'; name: string|null };  // keep=coexist, migrate=replace, no_op=Opslane already present
+  existing_sdk: { action: 'none'|'keep'|'migrate'|'no_op'; name: string|null };  // none=no SDK found (common), keep=coexist, migrate=replace named SDK, no_op=Opslane already installed
   rationale: string;               // free-text notes — NON-executable, separate from the edit
 }
 ```

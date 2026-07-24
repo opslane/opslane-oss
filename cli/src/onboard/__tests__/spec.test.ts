@@ -1,40 +1,39 @@
 import { describe, expect, it } from 'vitest';
 
-import { renderSpec } from '../spec.js';
+import { renderDetectSpec } from '../spec.js';
 
-describe('onboarding agent specification', () => {
-  it('frames the goal, requires repository investigation, and bakes in no convention', () => {
-    const spec = renderSpec({ cwd: '/repo/x' });
+describe('detect-stage agent specification', () => {
+  it('frames a read-only repository investigation and report', () => {
+    const spec = renderDetectSpec({ cwd: '/repo/x' });
 
     expect(spec).toContain('/repo/x');
-    expect(spec).not.toContain('VITE_OPSLANE_');
     expect(spec.toLowerCase()).toContain('read the repository');
-    expect(spec).toMatch(/name the opslane variables after opslane/i);
-    expect(spec).toMatch(/never name them after another product/i);
+    expect(spec).toMatch(/name them after opslane/i);
+    expect(spec).toMatch(/never borrow another product/i);
+    expect(spec).toMatch(/use the repo's own prefix/i);
     for (const required of [
       'goal',
-      'follow',
-      'endpoint',
+      'read',
+      'report_plan',
       'ask_user',
-      'migrate',
-      'finish_onboarding',
-      'never write',
-      'do not run installs',
+      'primary user-facing web app',
+      'multi:false',
+      'no edit tools',
+      'unsupported',
     ]) {
       expect(spec.toLowerCase()).toContain(required);
     }
   });
 
-  it('states the SDK contract and single-app completion constraints', () => {
-    const spec = renderSpec({ cwd: '/repo/x' });
+  it('requires one structured report grounded in the selected app', () => {
+    const spec = renderDetectSpec({ cwd: '/repo/x' });
 
     expect(spec).toContain('@opslane/sdk');
-    expect(spec).toContain('init({ apiKey, endpoint })');
-    expect(spec).toMatch(/exactly one app/i);
-    expect(spec).toMatch(/existing script/i);
+    expect(spec).toMatch(/select exactly one/i);
     expect(spec).toMatch(/exactly once/i);
-    expect(spec).toMatch(/more than one|multiple/i);
-    expect(spec).toMatch(/pick|select/i);
-    expect(spec).not.toMatch(/npm install|pnpm install|yarn add|bun add/);
+    expect(spec).toMatch(/coexist/i);
+    expect(spec).toContain('import_line');
+    expect(spec).toContain('init_block');
+    expect(spec).not.toMatch(/\bedit or write\b/i);
   });
 });

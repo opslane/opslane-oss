@@ -29,7 +29,7 @@ describe('onboarding hard-denial hook', () => {
     symlinkSync('/etc', join(root, 'link'));
   });
 
-  const hook = (state = { finished: false }) => onboardPreToolUseHook({ root, state });
+  const hook = (state?: { finished: boolean }) => onboardPreToolUseHook({ root, state });
 
   it('denies path escapes on every file tool', async () => {
     for (const name of ['Read', 'Glob', 'Edit', 'Write', 'MultiEdit']) {
