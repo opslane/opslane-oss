@@ -301,16 +301,17 @@ func (q *Queries) UpsertEndUser(ctx context.Context, projectID, externalUserID, 
 	return id, nil
 }
 
-// maxScrubAttempts bounds retries on a chunk that will not scrub. Past this it
+// MaxScrubAttempts bounds retries on a chunk that will not scrub. Past this it
 // remains permanently unreadable because scrubbed_at stays NULL.
-const maxScrubAttempts = 5
+const MaxScrubAttempts = 5
 
 // ChunkRef identifies a chunk awaiting scrubbing.
 type ChunkRef struct {
-	SessionID string
-	Seq       int
-	ProjectID string
-	ObjectKey string
+	SessionID     string
+	Seq           int
+	ProjectID     string
+	ObjectKey     string
+	ScrubAttempts int
 }
 
 // ClaimUnscrubbedChunks atomically claims up to limit uploaded chunks,
@@ -332,8 +333,8 @@ func (q *Queries) ClaimUnscrubbedChunks(ctx context.Context, limit int) ([]Chunk
 		           LIMIT $1
 		           FOR UPDATE SKIP LOCKED
 		        )
-		 RETURNING session_id, seq, project_id, object_key`,
-		limit, maxScrubAttempts,
+		 RETURNING session_id, seq, project_id, object_key, scrub_attempts`,
+		limit, MaxScrubAttempts,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("claim unscrubbed chunks: %w", err)
@@ -343,7 +344,7 @@ func (q *Queries) ClaimUnscrubbedChunks(ctx context.Context, limit int) ([]Chunk
 	var out []ChunkRef
 	for rows.Next() {
 		var c ChunkRef
-		if err := rows.Scan(&c.SessionID, &c.Seq, &c.ProjectID, &c.ObjectKey); err != nil {
+		if err := rows.Scan(&c.SessionID, &c.Seq, &c.ProjectID, &c.ObjectKey, &c.ScrubAttempts); err != nil {
 			return nil, fmt.Errorf("scan chunk ref: %w", err)
 		}
 		out = append(out, c)

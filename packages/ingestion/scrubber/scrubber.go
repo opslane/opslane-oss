@@ -88,6 +88,9 @@ func (s *Scrubber) RunOnce(ctx context.Context) (scrubbed, failed int, err error
 			if markErr := s.Q.MarkChunkScrubFailed(ctx, chunk.SessionID, chunk.ProjectID, chunk.Seq, scrubErr.Error()); markErr != nil {
 				slog.Error("recording scrub failure failed", "error", markErr)
 			}
+			if chunk.ScrubAttempts >= db.MaxScrubAttempts {
+				slog.Error("chunk permanently unscrubbed", "session_id", chunk.SessionID, "seq", chunk.Seq, "project_id", chunk.ProjectID, "error", scrubErr)
+			}
 			continue
 		}
 		scrubbed++
